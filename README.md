@@ -59,6 +59,10 @@ OpenKitsune is an open-source, all-in-one AI assistant — multiple AI Agents wo
   💬 <a href="https://discord.gg/vFwxNVNH"><b>Discord Community</b></a>
 </p>
 
+### Origins
+
+OpenKitsune is a community fork and continuation of **OpenAkita** (an earlier open-source self-evolving AI agent project). Starting from the OpenAkita codebase, it has been renamed, refactored, and extended into a multi-agent assistant with a rewritten reasoning runtime, organization orchestration layer, plugin system, desktop (Tauri) + web + mobile clients, and deeper LLM/IM integration. Where source files were ported directly from OpenAkita, the header comment records the origin for traceability.
+
 ---
 
 ## Screenshots
