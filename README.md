@@ -61,6 +61,25 @@ OpenKitsune is an open-source, all-in-one AI assistant — multiple AI Agents wo
 
 ---
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/assets/welcome_screen.png" alt="OpenKitsune Welcome Screen" width="720" />
+  <br/><em>Welcome onboarding</em>
+</p>
+
+<p align="center">
+  <img src="docs/assets/main_chat_ui.png" alt="OpenKitsune Main Chat UI" width="720" />
+  <br/><em>Main chat workspace with multi-agent reasoning</em>
+</p>
+
+<p align="center">
+  <img src="docs/assets/mobile_web_login.png" alt="OpenKitsune Web Mobile Login" width="480" />
+  <br/><em>Web / mobile access</em>
+</p>
+
+---
+
 ## Quick-Start Guide
 
 ### 🚀 For First-Time Users (3 Minutes)
