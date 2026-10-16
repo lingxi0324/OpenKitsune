@@ -9,20 +9,20 @@
 </p>
 
 <p align="center">
-  <a href="https://openkitsune.ai"><img src="https://aka.doubaocdn.com/s/XBIIeJXFyF" alt="Official Website" height="28" /></a>
+  <a href="https://openkitsune.ai"><img src="https://img.shields.io/badge/🌐_Website-openkitsune.ai-orange?style=for-the-badge" alt="Official Website" height="28" /></a>
   &nbsp;
-  <a href="https://openkitsune.ai/download"><img src="https://aka.doubaocdn.com/s/XBIIeJXFyF" alt="Download" height="28" /></a>
+  <a href="https://openkitsune.ai/download"><img src="https://img.shields.io/badge/📥_Download-Desktop_App-blue?style=for-the-badge" alt="Download" height="28" /></a>
   &nbsp;
-  <a href="https://discord.gg/vFwxNVNH"><img src="https://aka.doubaocdn.com/s/XBIIeJXFyF" alt="Discord" height="28" /></a>
+  <a href="https://discord.gg/vFwxNVNH"><img src="https://img.shields.io/badge/💬_Discord-Join_Community-5865F2?style=for-the-badge" alt="Discord" height="28" /></a>
 </p>
 
 <p align="center">
-  <img src="https://aka.doubaocdn.com/s/XBIIeJXFyF" alt="License" height="20" />
-  <img src="https://aka.doubaocdn.com/s/XBIIeJXFyF" alt="Python Version" height="20" />
-  <img src="https://aka.doubaocdn.com/s/XBIIeJXFyF" alt="Version" height="20" />
-  <img src="https://aka.doubaocdn.com/s/XBIIeJXFyF" alt="PyPI" height="20" />
-  <img src="https://aka.doubaocdn.com/s/XBIIeJXFyF" alt="Build Status" height="20" />
-  <img src="https://aka.doubaocdn.com/s/XBIIeJXFyF" alt="Stars" height="20" />
+  <img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg?style=flat-square" alt="License" height="20" />
+  <img src="https://img.shields.io/badge/python-3.11+-blue.svg?style=flat-square" alt="Python Version" height="20" />
+  <img src="https://img.shields.io/github/v/release/openkitsune/openkitsune?color=green&style=flat-square" alt="Version" height="20" />
+  <img src="https://img.shields.io/pypi/v/openkitsune?color=green&style=flat-square" alt="PyPI" height="20" />
+  <img src="https://img.shields.io/github/actions/workflow/status/openkitsune/openkitsune/ci.yml?branch=main&style=flat-square" alt="Build Status" height="20" />
+  <img src="https://img.shields.io/github/stars/openkitsune/openkitsune?style=flat-square" alt="Stars" height="20" />
 </p>
 
 <p align="center">

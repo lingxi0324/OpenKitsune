@@ -2,11 +2,11 @@
 
 
 
-![Official Website](https://aka.doubaocdn.com/s/XBIIeJXFyF)
+![Official Website](https://img.shields.io/badge/🌐_官网-openkitsune.ai-orange?style=for-the-badge)
 
 
 
-![License](https://aka.doubaocdn.com/s/XBIIeJXFyF)
+![License](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg?style=flat-square)
 
 
 
