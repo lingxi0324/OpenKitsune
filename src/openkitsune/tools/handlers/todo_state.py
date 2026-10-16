@@ -23,7 +23,7 @@ Multi-worker deployment (future):
 """
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
     from .todo_handler import PlanHandler
@@ -340,7 +340,7 @@ def get_active_todo_prompt(session_id: str) -> str:
 def hydrate_todo_from_messages(
     session_id: str,
     messages: list[dict],
-    handler_factory: callable | None = None,
+    handler_factory: Optional[Callable] = None,
 ) -> bool:
     """对标 Hermes ``_hydrate_todo_store``：从消息历史水合 Todo。
 

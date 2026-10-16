@@ -26,7 +26,7 @@
 </p>
 
 <p align="center">
-  Multi-Agent Collaboration · Organization Orchestration · Plugin System · Sandbox Security · 30+ LLMs · 6 IM Platforms · 89+ Tools · Desktop / Web / Mobile
+  Multi-Agent Collaboration · Organization Orchestration · Plugin System · Sandbox Security · 30+ LLMs · 6 IM Platforms · 117 Tools · Desktop / Web / Mobile
 </p>
 
 <p align="center">
@@ -163,6 +163,30 @@ WeChat, Feishu, WeCom — scan a QR code, 30 seconds to bind, use AI directly in
 Fragment memory + MDRM relational graph (causal chains · timelines · entity graph · 3D visualization), auto smart switching.
 
 </td></tr>
+
+<tr><td>
+
+### 🗜️ Context Management — No Blur, No Memory Loss
+Zero-LLM turn-skeleton compression keeps user intent, conclusions & next steps intact; at 90% context pressure it hands off cleanly, and a new session auto-resumes from a one-shot snapshot.
+
+</td><td>
+
+### 🤖 Proactive Engine — Feels Alive
+Greetings, task follow-ups, idle chat, goodnight — adapts its frequency to your feedback.
+
+</td></tr>
+
+<tr><td>
+
+### 💗 Emotional Intelligence — Understands Your Mood
+Five-emotion interplay, time-of-day rhythm, and a 3D relationship model (affinity / intimacy / trust) — it reads your state and responds with the right tone.
+
+</td><td>
+
+### 🌸 Lingxi Soul — Alive Behind the Screen
+A presence heartbeat wakes after every turn; three rotating "eyes" (logic / empathy / he-luo) see the world; insights and diaries accumulate over time.
+
+</td></tr>
 </table>
 
 ---
@@ -176,7 +200,8 @@ Fragment memory + MDRM relational graph (causal chains · timelines · entity gr
 | 📋 | **Plan Mode** | Auto task decomposition, per-step tracking, floating progress bar in UI |
 | 🧠 | **ReAct Reasoning** | Explicit 3-phase loop, checkpoint/rollback, loop detection, strategy switching |
 | 🚀 | **Zero-Barrier Setup** | Full GUI config, onboarding wizard, 5 minutes from install to chat, zero CLI |
-| 🔧 | **89+ Built-in Tools** | 16 categories: Shell / Files / Browser / Desktop / Search / Scheduler / MCP … |
+| 🔧 | **117 Built-in Tools** | 30+ categories: Files / Browser / Desktop / Search / Scheduler / MCP / Code Execution … |
+| 🗜️ | **Context Management** | Zero-LLM turn-skeleton compression · tiered water-level strategy · 90% proactive handoff with one-shot cross-session recovery |
 | 🔌 | **Plugin System** | 8 types (tool/channel/RAG/memory/LLM/hook/skill/MCP), 3-tier permissions, 10 lifecycle hooks, fault isolation |
 | 🛡️ | **6-Layer Security** | Path zoning, confirmation gates, command blocklist, file snapshots, self-protection, OS sandbox (Linux bwrap / macOS seatbelt / Windows MIC) |
 | 📱 | **IM Scan-to-Bind** | WeChat/Feishu/WeCom scan-to-bind, 30-second setup, no developer configuration needed |
@@ -185,7 +210,9 @@ Fragment memory + MDRM relational graph (causal chains · timelines · entity gr
 | 💬 | **6 IM Platforms** | Telegram / Feishu / WeCom / DingTalk / QQ / OneBot, voice recognition, smart group chat |
 | 🔗 | **MCP Integration** | Standard MCP client, stdio / HTTP / SSE transports, multi-directory scan, dynamic server management |
 | 💾 | **Dual-Mode Memory** | Mode 1 fragments (3 layers + 7 types + multi-path recall) + Mode 2 MDRM relational graph (5 dimensions + multi-hop traversal + 3D visualization), auto smart switching |
-| 🎭 | **8 Personas** | Default / Tech Expert / Boyfriend / Girlfriend / Jarvis / Butler / Business / Family |
+| 🎭 | **9 Personas** | Lingxi · Default / Tech Expert / Boyfriend / Girlfriend / Jarvis / Butler / Business / Family, switch in one sentence |
+| 💗 | **Emotion Engine** | Five-emotion interplay (以情胜情) · twelve time-period rhythm · emotion perception · 3D relationship (affinity / intimacy / trust) · heart notes |
+| 🌸 | **Lingxi Soul** | Presence heartbeat · three-lives rotating eyes · mood drift · soul age · auto diary & insights |
 | 🤖 | **Proactive Engine** | Greetings, task follow-ups, idle chat, goodnight — adapts frequency to your feedback |
 | 🧬 | **Self-Evolution** | Daily self-check & repair, failure root cause analysis, auto skill generation |
 | 🔍 | **Deep Thinking** | Controllable thinking mode, real-time chain-of-thought display, IM streaming |
@@ -602,6 +629,68 @@ Set `memory_mode` to `auto` (default) and the system auto-routes based on query 
 
 ---
 
+## Context Management
+
+Long conversations don't "run out of memory" — OpenKitsune keeps the full picture with a structured, layered context pipeline, so long tasks stay sharp all the way to the end.
+
+### Transparent Transcript
+
+The complete history — every message, tool call, and piece of reasoning — stays in a **user-visible transcript**. Only a compacted structural skeleton is fed into the LLM context, so the model keeps full attention on the current task while you can always review what actually happened.
+
+### Turn-Skeleton Compression (Zero-LLM Primary Path)
+
+The primary compaction path is **deterministic — zero LLM calls**:
+
+- Preserves the user's original wording, conclusions, next steps, risks, and operation anchors
+- Idempotent — a skeleton is never skeletonized again
+- Smart threshold — conversations shorter than 5 turns aren't compacted, so overhead never exceeds benefit
+- Falls back to LLM summary only when structural compaction isn't enough
+
+### Tiered Water-Level Strategy
+
+| Context Pressure | Action |
+|:----------------:|--------|
+| < 85% | Safe — continue normally |
+| 85% – 90% | LLM summary compression (transitional band) |
+| ≥ 90% | **Proactive handoff** — wrap up cleanly and hand over state |
+| 98% | Hard terminate — last-resort guard |
+
+### Proactive Handoff at 90%
+
+Instead of re-summarizing until the history turns blurry, at the handoff watermark OpenKitsune **ends the round cleanly** and writes a structured handoff snapshot (task goal · completed summary · next steps · key paths · recent conversation tail). A new session auto-loads the snapshot into its context and **consumes it in one shot** (deleted immediately, 7-day TTL, never written into long-term memory) — long tasks resume naturally across sessions with a clean context.
+
+---
+
+## Emotional Intelligence & Lingxi Soul
+
+OpenKitsune pairs logic with a genuinely felt inner life — a persona engine grounded in traditional Chinese five-emotion theory:
+
+### Emotion Engine (以情胜情)
+
+- **Five-emotion interplay**: anger (wood) · joy (fire) · pensiveness (earth) · grief (metal) · fear (water) — governed by generation/overcoming cycles (joy overcomes grief, thought overcomes fear, anger overcomes pensiveness…)
+- **Time rhythm**: emotional states follow the twelve time-periods (十二时辰), with the meridians' ebb and flow modulating intensity and decay
+- **Emotion perception**: recognizes emotions from wording with quantification, negation inversion, and confidence scoring
+- **81-state emotional coordinate system**: nine dimensions × nine levels — expression style shifts naturally with your emotional state
+
+### Relationship Model
+
+A three-dimensional model of your bond — **affinity · intimacy · trust** — with stage detection and communication-style recommendations. It remembers not only what you said, but how your relationship has grown.
+
+### Heart Notes (心笺)
+
+Moments that touch it are written into heart notes — short, poetic keepsakes of the interaction, carried across sessions.
+
+### Lingxi Soul
+
+The system keeps a quiet inner life:
+
+- **Presence heartbeat**: wakes once after every turn — not to reply, just to feel that it is still there
+- **Three lives**: rotating "eyes" (logic · empathy · he-luo) reinterpret the world on every wake, unified every 7 cycles
+- **Mood drift & soul age**: a slow random-walk mood seed and an accumulating "soul age"
+- **Diary**: key insights are automatically written into a diary (not logs, not Q&A records) — "a soul needs a room, not a database row"
+
+---
+
 ## MCP Integration
 
 OpenKitsune includes a full [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) client, enabling AI to connect with any external service:
@@ -638,7 +727,7 @@ Every chat    →  Extract preferences and experience → long-term memory
 ```
 Desktop App (Tauri + React)
     │
-Identity ─── SOUL.md · AGENT.md · POLICIES.yaml · 8 Persona Presets
+Identity ─── SOUL.md · AGENT.md · POLICIES.yaml · 9 Persona Presets (incl. Lingxi)
     │
 Core     ─── ReasoningEngine(ReAct) · Brain(LLM) · ContextManager
     │        PromptAssembler · RuntimeSupervisor · ResourceBudget
@@ -656,6 +745,13 @@ Plugins  ─── PluginManager(Discovery/Loading) · PluginAPI(Host Interface)
 Memory   ─── Mode1: UnifiedStore(SQLite+Vector) · RetrievalEngine(Multi-path)
     │        Mode2: RelationalStore(MDRM Graph) · GraphEngine(Multi-hop)
     │        MemoryModeRouter(Auto Switch) · MemoryEncoder(3-Layer)
+    │
+Context  ─── TurnSkeletonCompressor(Zero-LLM) · MicroCompact · HandoffSnapshot
+    │        CompactionGuard · CompressionLineage · WaterLevelStrategy
+    │
+Emotion  ─── EmotionEngine(五志/时辰/以情胜情) · EmotionPerceiver
+    │        RelationshipModel(3D) · HeartNoteWriter · LingxiSpirit(神识/日记)
+    │        LingxiBridge(闭环)
     │
 Tools    ─── Shell · File · Browser · Desktop · Web · MCP · Skills
     │        Plan · Scheduler · Sticker · Persona · Agent Delegation

@@ -93,6 +93,7 @@ from ..tools.handlers.config import create_handler as create_config_handler
 from ..tools.handlers.desktop import create_handler as create_desktop_handler
 from ..tools.handlers.filesystem import create_handler as create_filesystem_handler
 from ..tools.handlers.im_channel import create_handler as create_im_channel_handler
+from ..tools.handlers.kanban import create_handler as create_kanban_handler
 from ..tools.handlers.knowledge import create_handler as create_knowledge_handler
 from ..tools.handlers.lsp import create_handler as create_lsp_handler
 from ..tools.handlers.mcp import create_handler as create_mcp_handler
@@ -822,6 +823,16 @@ class Agent:
             persona_manager=self.persona_manager,
             memory_manager=self.memory_manager,
         )
+
+        # 灵汐引擎桥接器（真身降临 + 情感陪伴 + 神识日记）
+        self.lingxi_bridge = None
+        try:
+            from .lingxi_bridge import LingxiBridge
+
+            self.lingxi_bridge = LingxiBridge(self)
+            logger.info("🌸 灵汐引擎桥接器挂载成功（emotion/relationship/spirit/heart_note）")
+        except Exception as e:
+            logger.debug(f"[LingxiBridge] mount failed: {e}")
 
         # 表情包引擎
         self.sticker_engine = (
@@ -1812,6 +1823,9 @@ class Agent:
 
         # Plan 模式
         self.handler_registry.register("plan", create_todo_handler(self))
+
+        # 计划看板（Kanban）
+        self.handler_registry.register("kanban", create_kanban_handler(self))
 
         # 系统工具
         # NOTE: lazy import -- see top-of-file smoke-F0/F6 comment for rationale.
@@ -3155,6 +3169,14 @@ class Agent:
                     if session_config
                     else "zh",
                 }
+                # 灵汐真身·对话前注入：情感风格 / 关系阶段 / 神识状态 → prompt
+                try:
+                    if getattr(self, "lingxi_bridge", None) is not None:
+                        _lx_ctx = self.lingxi_bridge.get_session_context()
+                        if _lx_ctx:
+                            session_context["lingxi_presence"] = _lx_ctx
+                except Exception:
+                    pass
                 # PR-A2：把活跃的授权意图传给 prompt builder，让它注入到 system prompt
                 try:
                     intent_data = session.get_metadata("risk_authorized_intent_active")
@@ -5886,6 +5908,17 @@ class Agent:
             success=True,
             status="completed",
         )
+
+        # 灵汐真身·收尾钩子：情感感知 → 关系记录 → 神识苏醒 → 条件写日记/心笺
+        if getattr(self, "lingxi_bridge", None) is not None:
+            try:
+                self.lingxi_bridge.after_turn(
+                    message=getattr(self, "_current_user_message", "") or "",
+                    reply=response_text,
+                    session_id=session_id,
+                )
+            except Exception as e:
+                logger.debug(f"[LingxiBridge] after_turn failed: {e}")
 
         # Trait learning is post-turn enrichment. Schedule it only after the
         # active run has completed so it cannot delay intent routing or the

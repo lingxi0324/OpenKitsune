@@ -76,7 +76,14 @@ function toNativeTheme(theme: Theme): "light" | "dark" | null {
 
 export function initTheme() {
   const pref = (localStorage.getItem("openkitsune-theme-pref") as Theme) || "system";
-  applyTheme(pref);
+  // 无效主题值兜底：旧版本残留在 localStorage 的主题名若已不存在（如主题被
+  // 移除/改名），会令 data-theme 落空导致界面回退默认黑白。检出即清理回退。
+  if (!isValidTheme(pref)) {
+    localStorage.removeItem("openkitsune-theme-pref");
+    applyTheme("system");
+  } else {
+    applyTheme(pref);
+  }
 
   const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
   const listener = (e: MediaQueryListEvent) => {
@@ -93,7 +100,22 @@ export function initTheme() {
   }
 }
 
+/** 判断主题值是否在已知主题列表中（防御 localStorage 脏值导致界面黑白）。 */
+export function isValidTheme(theme: string | null | undefined): theme is Theme {
+  if (!theme) return false;
+  return theme === "system" || theme in RESOLVED_THEMES;
+}
+
 export function applyTheme(theme: Theme) {
+  // 兜底：未知主题一律回退 system，避免 data-theme 落空呈现黑白界面。
+  if (!isValidTheme(theme)) {
+    theme = "system";
+    try {
+      localStorage.removeItem("openkitsune-theme-pref");
+    } catch {
+      /* ignore */
+    }
+  }
   const resolved = resolveTheme(theme);
   document.documentElement.setAttribute("data-theme", resolved);
 
@@ -117,7 +139,16 @@ export function setThemePref(theme: Theme) {
 }
 
 export function getThemePref(): Theme {
-  return (localStorage.getItem("openkitsune-theme-pref") as Theme) || "system";
+  const pref = localStorage.getItem("openkitsune-theme-pref");
+  if (!isValidTheme(pref)) {
+    try {
+      localStorage.removeItem("openkitsune-theme-pref");
+    } catch {
+      /* ignore */
+    }
+    return "system";
+  }
+  return pref;
 }
 
 /** Apply a theme temporarily for live preview without persisting. */

@@ -188,6 +188,8 @@ export function hasRenderableBody(
       case "mcp":
         return !!msg.mcpCalls && msg.mcpCalls.length > 0;
       case "plan":
+        // 计划卡片现在随轮次内联渲染，但刻意不计入"正文"：流式期间正文未到时，
+        // 计划卡片 + 加载点同时可见；正文一旦到达，加载点自然消失。
         return false;
       case "text":
         return !!bodyContent;

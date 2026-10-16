@@ -55,6 +55,7 @@ from .routes import (
     im,
     inbox,
     knowledge,
+    kanban,
     logs,
     marketplace,
     mcp,
@@ -1161,6 +1162,7 @@ def create_app(
     app.include_router(memory.router, tags=["记忆"])
     app.include_router(memory_repair.router, tags=["记忆修复"])
     app.include_router(scheduler.router, tags=["定时任务"])
+    app.include_router(kanban.router, tags=["计划看板"])
     app.include_router(pending_approvals.router, tags=["待审批"])
     app.include_router(optional_features.router, tags=["可选功能"])
     if account_config.enabled:

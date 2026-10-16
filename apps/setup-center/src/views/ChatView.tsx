@@ -4305,7 +4305,8 @@ export function ChatView({
       let currentContent = "";
       let currentThinking = "";
       // [2026-10-09] 后端意图分析结果（intent_ready SSE 事件写入，展示在消息上方）
-      let currentIntentNote = "";
+      // [2026-10-10] Hermes 单阶段意图：intent_ready 后置 null 表示"无意图标签"。
+      let currentIntentNote: string | null = "";
       let currentToolCalls: ChatToolCall[] = [];
       const currentToolCallsByKey = new Map<string, ChatToolCall>();
       const currentToolCallOrder: string[] = [];
@@ -4380,7 +4381,6 @@ export function ChatView({
       const LONG_WAIT_NOTICE_MS = 15_000;
 
       // [Hermes 对标 2026-10-16] 动态叙事：根据当前实时状态生成人性化等待提示，
-      // 不再是干巴巴的"本地模型还在生成"。像人说话一样，不同阶段说不同的话。
       const deriveNarrative = (): string => {
         const secs = Math.round((Date.now() - streamStartedAt) / 1000);
 
@@ -4399,11 +4399,11 @@ export function ChatView({
 
         // 长时间无输出兜底
         if (secs >= LONG_WAIT_NOTICE_MS / 1000) {
-          return "本地模型还在生成，可能需要几十秒。";
+          return "我在思考，你等一下。";
         }
 
         // 默认
-        return `模型生成中…（已等待 ${secs}s）`;
+        return `思考中…（已等待 ${secs}s）`;
       };
 
       // [2026-10-09] 过程可见化：任何阶段状态都立即写入消息气泡（而非等 15s 心跳后才显示）
@@ -4564,7 +4564,8 @@ export function ChatView({
             switch (event.type) {
               case "heartbeat":
                 // [Hermes 对标 2026-10-16] 心跳到达时刷新动态叙事，
-                // 不再硬编码"本地模型还在生成"。
+                // 不再硬编码"思考中"。
+                // 而是根据当前状态动态生成。
                 if (!currentContent) {
                   pushStreamStatus(deriveNarrative());
                 }

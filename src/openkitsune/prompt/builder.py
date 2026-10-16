@@ -622,6 +622,19 @@ def build_system_prompt(
         except Exception as e:
             logger.debug("Failed to build contradiction alert section: %s", e)
 
+    # 6.595 灵汐真身·情感陪伴注入：情感风格 / 关系阶段 / 神识状态
+    # 由 LingxiBridge.get_session_context() 提供，仅在状态有意义时注入，
+    # 不注入则不改变任何现有 prompt 行为。
+    if isinstance(session_context, dict) and session_context.get("lingxi_presence"):
+        try:
+            from .lingxi_section import build_lingxi_presence_section
+
+            _lx_section = build_lingxi_presence_section(session_context["lingxi_presence"])
+            if _lx_section:
+                runtime_parts.append(_lx_section)
+        except Exception as e:
+            logger.debug("Failed to build lingxi presence section: %s", e)
+
     # 6.6 架构概况（powered by {model}，区分主/子 Agent）
 
     arch_section = _build_arch_section(

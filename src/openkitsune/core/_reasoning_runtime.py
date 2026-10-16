@@ -3829,7 +3829,6 @@ class ReasoningEngine:
                         yield {"type": "chain_text", "content": _tool_desc}
                         # [Hermes 对标 2026-10-16] 过程可见化：工具描述同时通过
                         # text_delta 流式发到正文流，用户在等待时能看到"正在做什么"，
-                        # 而不是只盯着"本地模型还在生成…"。用 > 前缀让它在
                         # Markdown 里渲染为引用块，和模型正文自然区分。
                         yield {"type": "text_delta", "content": f"\n> {_tool_desc}\n"}
 

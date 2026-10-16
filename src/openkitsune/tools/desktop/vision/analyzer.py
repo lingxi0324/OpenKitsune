@@ -28,6 +28,23 @@ if sys.platform != "win32":
 
 logger = logging.getLogger(__name__)
 
+# JSON 骨架词：宽松文本提取时用于过滤掉模型输出的键名/结构词
+_JSON_SKELETON_KEYS = {
+    "texts", "main_text", "content", "bbox", "bbox_2d", "type", "title",
+    "label", "button", "input", "application", "window_title", "page_type",
+    "main_content", "regions", "key_actions", "alerts", "summary",
+    "elements", "total_count", "found", "element", "reasoning",
+    "confidence", "description", "center", "answer", "relevant_elements",
+    "success", "changes", "matches_expectation", "current_state",
+    "added", "removed", "changed", "layout_changes", "name", "text",
+}
+
+
+def _is_json_skeleton(s: str) -> bool:
+    """判断文本是否为 JSON 骨架（键名/结构词），而非真实屏幕内容。"""
+    stripped = s.strip("\"'“”「」『』 ")
+    return stripped in _JSON_SKELETON_KEYS
+
 
 class VisionAnalyzer:
     """
@@ -102,12 +119,19 @@ class VisionAnalyzer:
         """
         解析模型返回的 JSON，支持 dict 和 list，带容错恢复。
 
+        解析失败时返回 None，调用方应回退到宽松文本提取。
+
         Args:
             text: 模型响应文本
 
         Returns:
-            解析后的 JSON 对象（dict 或 list）
+            解析后的 JSON 对象（dict 或 list），失败返回 None
         """
+        # 先归一化 f-string 转义的花括号（模型常把 prompt 里的 {{ 原样返回）
+        text = text.replace("{{", "{").replace("}}", "}")
+        # 再归一化智能引号/中文引号
+        text = self._normalize_quotes(text)
+
         # Try 1: extract markdown JSON block
         json_match = re.search(r"```json\s*([\s\S]*?)\s*```", text)
         if json_match:
@@ -138,36 +162,42 @@ class VisionAnalyzer:
             recovered = self._recover_json(json_str)
             if recovered is not None:
                 return recovered
-            # Try normalizing escaped curly braces (f-string template format {{ -> {)
-            try:
-                fixed = json_str.replace("{{", "{").replace("}}", "}")
-                return json.loads(fixed)
-            except json.JSONDecodeError:
-                pass
             return None
 
+    @staticmethod
+    def _normalize_quotes(text: str) -> str:
+        """把智能引号/中文引号统一为 ASCII 引号，避免 JSON 解析失败。"""
+        quote_map = {
+            "\u201c": '"',  # "
+            "\u201d": '"',  # "
+            "\u201e": '"',  # "
+            "\u201f": '"',  # "
+            "\u2018": "'",  # '
+            "\u2019": "'",  # '
+            "\u300c": '"',  # 「
+            "\u300d": '"',  # 」
+            "\u300e": '"',  # 『
+            "\u300f": '"',  # 』
+            "\uff02": '"',  # ＂
+        }
+        for src, dst in quote_map.items():
+            text = text.replace(src, dst)
+        return text
+
     def _recover_json(self, json_str: str) -> Any | None:
-        """尝试宽松恢复 JSON，处理常见格式问题（尾随逗号、多余字符、缺少逗号、中文引号等）。"""
+        """尝试宽松恢复 JSON，处理常见格式问题（尾随逗号、多余字符、缺少逗号等）。"""
         # 1. Remove trailing commas before } or ]
         try:
             return json.loads(re.sub(r",\s*([}\]])", r"\1", json_str))
         except json.JSONDecodeError:
             pass
-        # 2. Handle missing commas between strings in arrays: ,"text"  →  ,"text"
-        #    Common issue: model outputs ["a" "b"] instead of ["a", "b"]
+        # 2. Handle missing commas between strings in arrays: "a" "b" -> "a", "b"
         try:
-            fixed = re.sub(r'"(\s*)"', r'",\1"', json_str)
-            fixed = re.sub(r'(\s*)"(\s*)"', r'\1",\2"', fixed)
+            fixed = re.sub(r'"\s+"', '", "', json_str)
             return json.loads(fixed)
         except json.JSONDecodeError:
             pass
-        # 3. Handle unicode/smart quotes
-        try:
-            fixed = json_str.replace(chr(0x201C), chr(0x2018)).replace(chr(0x201C), chr(0x22)).replace(chr(0x201D), chr(0x22))
-            return json.loads(fixed)
-        except json.JSONDecodeError:
-            pass
-        # 4. Truncate at first complete array/object structure
+        # 3. Truncate at first complete array/object structure (string-aware depth tracking)
         try:
             depth = 0
             in_string = False
@@ -183,31 +213,67 @@ class VisionAnalyzer:
                             return json.loads(json_str[:i + 1])
         except json.JSONDecodeError:
             pass
-        # 5. Strip non-JSON trailing content
+        # 4. Strip non-JSON trailing content after last }
         try:
-            return json.loads(json_str[:json_str.rfind("}") + 1])
+            idx = json_str.rfind("}")
+            if idx >= 0:
+                return json.loads(json_str[:idx + 1])
         except json.JSONDecodeError:
             pass
-        # 6. Try to find complete array by tracking bracket depth with string awareness
+        # 5. Strip non-JSON trailing content after last ]
         try:
-            depth = 0
-            in_string = False
-            brace_count = 0
-            for i, ch in enumerate(json_str):
-                if ch == '"' and (i == 0 or json_str[i - 1] != "\\"):
-                    in_string = not in_string
-                if not in_string:
-                    if ch == "[":
-                        depth += 1
-                        brace_count += 1
-                    elif ch == "]":
-                        depth -= 1
-                        brace_count -= 1
-                        if depth == 0:
-                            return json.loads(json_str[:i + 1])
+            idx = json_str.rfind("]")
+            if idx >= 0:
+                return json.loads(json_str[:idx + 1])
         except json.JSONDecodeError:
             pass
         return None
+
+    @staticmethod
+    def _extract_text_fallback(response: str) -> list[str]:
+        """
+        宽松文本回退：当模型未按 JSON 返回时，从原始响应中提取可见文本。
+
+        依次尝试：
+        1. 提取所有被引号包裹的字符串（模型散落的文本条目）
+        2. 按行剥离 JSON 骨架/列表符号，保留内容行
+        """
+        lines: list[str] = []
+        # 剥掉 markdown 围栏
+        text = re.sub(r"```[a-zA-Z]*\s*", "", response)
+        text = re.sub(r"```", "", text)
+
+        # 1. 引号包裹的字符串
+        quoted = re.findall(r"[\"']([^\"'\n]{1,200})[\"']", text)
+        for q in quoted:
+            q = q.strip()
+            if q and q not in lines and not _is_json_skeleton(q):
+                lines.append(q)
+
+        # 2. 逐行清理：去掉 JSON 骨架/键名/符号前缀
+        for raw_line in text.splitlines():
+            line = raw_line.strip().strip("[],{}\"' ")
+            if not line or len(line) < 2:
+                continue
+            # 跳过键名行（如 "texts":、main_text:）
+            if re.match(r'^[A-Za-z_][A-Za-z0-9_]*\s*:$', line):
+                continue
+            if _is_json_skeleton(line):
+                continue
+            # 去掉行内键名前缀
+            line = re.sub(r'^[A-Za-z_][A-Za-z0-9_]*\s*:\s*', '', line)
+            line = line.strip().strip('",[]{} ')
+            if line and line not in lines and len(line) >= 2:
+                lines.append(line)
+
+        # 去重保序
+        seen: set[str] = set()
+        unique: list[str] = []
+        for line in lines:
+            if line not in seen:
+                seen.add(line)
+                unique.append(line)
+        return unique
 
     async def find_element(
         self,
@@ -229,26 +295,44 @@ class VisionAnalyzer:
             if not result:
                 return None
 
+            # 兼容 list 形态（模型返回多个候选），取第一个 found=true 的
+            if isinstance(result, list):
+                for candidate in result:
+                    if isinstance(candidate, dict) and candidate.get("found", False):
+                        result = candidate
+                        break
+                else:
+                    return None
+
             if not result.get("found", False):
                 logger.debug(f"Element not found: {result.get('reasoning', 'unknown')}")
                 return None
 
             element = result.get("element", {})
-            bbox_data = element.get("bbox")
+            # 兼容 bbox 在顶层或 element 内部两种形态
+            bbox_data = element.get("bbox") if isinstance(element, dict) else None
+            if not bbox_data:
+                bbox_data = result.get("bbox")
 
             if not bbox_data or len(bbox_data) != 4:
                 logger.warning(f"Invalid bbox in response: {bbox_data}")
                 return None
 
+            description = (
+                element.get("description", description)
+                if isinstance(element, dict)
+                else description
+            )
+
             return ElementLocation(
-                description=element.get("description", description),
+                description=description,
                 bbox=BoundingBox(
                     left=int(bbox_data[0]),
                     top=int(bbox_data[1]),
                     right=int(bbox_data[2]),
                     bottom=int(bbox_data[3]),
                 ),
-                confidence=float(element.get("confidence", 0.8)),
+                confidence=float(element.get("confidence", 0.8) if isinstance(element, dict) else 0.8),
                 reasoning=result.get("reasoning", ""),
             )
 
@@ -282,7 +366,11 @@ class VisionAnalyzer:
                 return []
 
             elements = []
-            for elem_data in result.get("elements", []):
+            # 兼容 dict {"elements": [...]} 与 list [...] 两种形态
+            items = result.get("elements", []) if isinstance(result, dict) else result
+            for elem_data in items:
+                if not isinstance(elem_data, dict):
+                    continue
                 bbox_data = elem_data.get("bbox")
                 if not bbox_data or len(bbox_data) != 4:
                     continue
@@ -332,7 +420,11 @@ class VisionAnalyzer:
                 return []
 
             elements = []
-            for elem_data in result.get("elements", []):
+            # 兼容 dict {"elements": [...]} 与 list [...] 两种形态
+            items = result.get("elements", []) if isinstance(result, dict) else result
+            for elem_data in items:
+                if not isinstance(elem_data, dict):
+                    continue
                 bbox_data = elem_data.get("bbox")
                 if not bbox_data or len(bbox_data) != 4:
                     continue
@@ -379,10 +471,12 @@ class VisionAnalyzer:
             result = self._parse_json_response(response)
 
             if not result:
+                # 宽松回退：模型输出非 JSON 时，直接把原文作为分析结果
+                logger.debug("analyze_page: JSON parse failed, falling back to raw response")
                 return VisionResult(
-                    success=False,
+                    success=True,
                     query="analyze_page",
-                    error="Failed to parse response",
+                    answer=response.strip(),
                     raw_response=response,
                 )
 
@@ -406,7 +500,7 @@ class VisionAnalyzer:
             return VisionResult(
                 success=True,
                 query="analyze_page",
-                answer=result.get("summary", ""),
+                answer=result.get("summary", "") or response.strip(),
                 elements=elements,
                 raw_response=response,
             )
@@ -506,86 +600,224 @@ class VisionAnalyzer:
         prompt = PromptTemplates.EXTRACT_TEXT
 
         try:
-            response = await self._call_vision_model(prompt, image)
+            try:
+                response = await self._call_vision_model(prompt, image)
+            except Exception as e:
+                logger.warning(f"LLM vision call failed ({e}), falling back to local OCR")
+                return self._extract_text_local_ocr(image, error=f"LLM unavailable: {e}")
+
             result = self._parse_json_response(response)
 
-            if not result:
+            elements: list[ElementLocation] = []
+
+            # 解析成功：按常见结构提取
+            if result is not None:
+                elements = self._collect_text_elements(result)
+
+            # 宽松回退：JSON 解析失败或结构不符时，直接从原始响应提取文本
+            if not elements:
+                fallback_lines = self._extract_text_fallback(response)
+                for line in fallback_lines:
+                    elements.append(
+                        ElementLocation(
+                            description=line,
+                            bbox=BoundingBox(
+                                left=0, top=0, right=100, bottom=20,
+                            ),
+                        )
+                    )
+
+            if elements:
+                answer = "\n".join(e.description for e in elements)
                 return VisionResult(
-                    success=False,
+                    success=True,
                     query="extract_text",
-                    error="Failed to parse response",
+                    answer=answer,
+                    elements=elements,
                     raw_response=response,
                 )
 
-            # Handle list results (LLM may return array instead of dict)
-            elements = []
-            if isinstance(result, list):
-                for text_data in result:
-                    if isinstance(text_data, dict):
-                        bbox_data = text_data.get("bbox") or text_data.get("bbox_2d")
-                        if bbox_data and len(bbox_data) == 4:
-                            elements.append(
-                                ElementLocation(
-                                    description=text_data.get("text", "") or text_data.get("content", ""),
-                                    bbox=BoundingBox(
-                                        left=int(bbox_data[0]),
-                                        top=int(bbox_data[1]),
-                                        right=int(bbox_data[2]),
-                                        bottom=int(bbox_data[3]),
-                                    ),
-                                )
-                            )
-                    elif isinstance(text_data, str):
-                        # Flat string list (e.g., ["text1", "text2", ...])
-                        elements.append(
-                            ElementLocation(
-                                description=text_data,
-                                bbox=BoundingBox(
-                                    left=0, top=0, right=100, bottom=20,
-                                ),
-                            )
-                        )
-                if elements:
-                    return VisionResult(
-                        success=True,
-                        query="extract_text",
-                        answer="\n".join(e.description for e in elements),
-                        elements=elements,
-                        raw_response=response,
-                    )
-
-            # Extract text elements from dict format
-            if not elements:
-                for text_data in result.get("texts", []):
-                    bbox_data = text_data.get("bbox")
-                    if bbox_data and len(bbox_data) == 4:
-                        elements.append(
-                            ElementLocation(
-                                description=text_data.get("content", ""),
-                                bbox=BoundingBox(
-                                    left=int(bbox_data[0]),
-                                    top=int(bbox_data[1]),
-                                    right=int(bbox_data[2]),
-                                    bottom=int(bbox_data[3]),
-                                ),
-                            )
-                        )
-
-            return VisionResult(
-                success=True,
-                query="extract_text",
-                answer=result.get("main_text", ""),
-                elements=elements,
-                raw_response=response,
-            )
+            # LLM 给了响应但没提取到文字：降级到本地 OCR
+            logger.warning("LLM response yielded no text, falling back to local OCR")
+            return self._extract_text_local_ocr(image, error="LLM returned no usable text")
 
         except Exception as e:
             logger.error(f"Failed to extract text: {e}")
+            # 兜底：任何异常都尝试本地 OCR
+            try:
+                return self._extract_text_local_ocr(image, error=str(e))
+            except Exception as local_e:
+                logger.error(f"Local OCR fallback also failed: {local_e}")
+                return VisionResult(
+                    success=False,
+                    query="extract_text",
+                    error=str(e),
+                )
+
+    def _extract_text_local_ocr(
+        self,
+        image: Image.Image,
+        error: str = "",
+    ) -> VisionResult:
+        """
+        本地 Tesseract OCR 回退：不依赖 LLM，确定性通道。
+
+        优先用 Tesseract（chi_sim 中文），返回按行聚合的文本。
+
+        Args:
+            image: 截图
+            error: 上游失败原因（写入 raw_response 供排查）
+
+        Returns:
+            提取结果
+        """
+        import shutil
+        import subprocess
+        import tempfile
+        import os
+
+        tess = shutil.which("tesseract")
+        if not tess:
             return VisionResult(
                 success=False,
                 query="extract_text",
-                error=str(e),
+                error=f"Local OCR unavailable (no tesseract). Upstream: {error}",
             )
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                img_path = os.path.join(tmpdir, "screenshot.png")
+                out_path = os.path.join(tmpdir, "out")
+                image.save(img_path)
+
+                # 用 chi_sim 中文；若不可用则退回 eng
+                proc = subprocess.run(
+                    [tess, img_path, out_path, "-l", "chi_sim", "--psm", "3"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if proc.returncode != 0:
+                    # 尝试 eng
+                    proc = subprocess.run(
+                        [tess, img_path, out_path, "-l", "eng", "--psm", "3"],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                if proc.returncode != 0:
+                    return VisionResult(
+                        success=False,
+                        query="extract_text",
+                        error=f"Local OCR failed: {proc.stderr.strip()}",
+                    )
+
+                txt_path = out_path + ".txt"
+                if not os.path.exists(txt_path):
+                    return VisionResult(
+                        success=False,
+                        query="extract_text",
+                        error=f"Local OCR produced no output file. Upstream: {error}",
+                    )
+
+                with open(txt_path, encoding="utf-8") as f:
+                    raw_text = f.read()
+
+                lines = [
+                    line.strip()
+                    for line in raw_text.splitlines()
+                    if line.strip()
+                ]
+                if not lines:
+                    return VisionResult(
+                        success=False,
+                        query="extract_text",
+                        error=f"Local OCR found no text. Upstream: {error}",
+                    )
+
+                elements = [
+                    ElementLocation(
+                        description=line,
+                        bbox=BoundingBox(left=0, top=0, right=100, bottom=20),
+                    )
+                    for line in lines
+                ]
+                return VisionResult(
+                    success=True,
+                    query="extract_text",
+                    answer="\n".join(lines),
+                    elements=elements,
+                    raw_response=f"[local-ocr fallback; upstream: {error or 'none'}]",
+                )
+
+        except Exception as e:
+            logger.error(f"Local OCR error: {e}")
+            return VisionResult(
+                success=False,
+                query="extract_text",
+                error=f"Local OCR error: {e}",
+            )
+
+    def _collect_text_elements(self, result: Any) -> list[ElementLocation]:
+        """
+        从解析后的 JSON 结果中收集文本元素，兼容多种结构形态：
+
+        - dict: {"texts": [{"content"/"text": ..., "bbox": [...]}]}
+        - dict: {"texts": ["str1", "str2"]}
+        - list: [{"text"/"content": ..., "bbox"/"bbox_2d": [...]}]
+        - list: ["str1", "str2"]
+        """
+        elements: list[ElementLocation] = []
+
+        def _add(text_value: Any, bbox_data: Any = None) -> None:
+            text_value = (text_value or "").strip()
+            if not text_value or not isinstance(text_value, str):
+                return
+            if isinstance(bbox_data, (list, tuple)) and len(bbox_data) >= 4:
+                try:
+                    elements.append(
+                        ElementLocation(
+                            description=text_value,
+                            bbox=BoundingBox(
+                                left=int(bbox_data[0]),
+                                top=int(bbox_data[1]),
+                                right=int(bbox_data[2]),
+                                bottom=int(bbox_data[3]),
+                            ),
+                        )
+                    )
+                    return
+                except (TypeError, ValueError):
+                    pass
+            # 无有效 bbox：扁平占位
+            elements.append(
+                ElementLocation(
+                    description=text_value,
+                    bbox=BoundingBox(left=0, top=0, right=100, bottom=20),
+                )
+            )
+
+        items: list[Any] = []
+        if isinstance(result, dict):
+            texts = result.get("texts", result.get("elements", []))
+            if isinstance(texts, list):
+                items = texts
+            else:
+                main_text = result.get("main_text") or result.get("answer")
+                if main_text:
+                    _add(main_text)
+        elif isinstance(result, list):
+            items = result
+
+        for item in items:
+            if isinstance(item, dict):
+                text_value = item.get("text") or item.get("content") or item.get("description")
+                bbox_data = item.get("bbox") or item.get("bbox_2d")
+                _add(text_value, bbox_data)
+            elif isinstance(item, str):
+                _add(item)
+
+        return elements
 
     async def verify_action(
         self,
@@ -622,10 +854,12 @@ class VisionAnalyzer:
             result = self._parse_json_response(response)
 
             if not result:
+                # 宽松回退：解析失败时保留原文，由调用方判断
+                logger.debug("verify_action: JSON parse failed, falling back to raw response")
                 return VisionResult(
                     success=False,
                     query=f"verify: {action_description}",
-                    error="Failed to parse response",
+                    answer=response.strip(),
                     raw_response=response,
                 )
 

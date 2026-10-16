@@ -20,6 +20,7 @@ const KnowledgeBaseView = lazy(() => import("./views/KnowledgeBaseView").then(m 
 const PluginManagerView = lazy(() => import("./views/PluginManagerView"));
 const PluginAppHost = lazy(() => import("./views/PluginAppHost"));
 const SchedulerView = lazy(() => import("./views/SchedulerView").then(m => ({ default: m.SchedulerView })));
+const KanbanView = lazy(() => import("./views/KanbanView").then(m => ({ default: m.KanbanView })));
 const MemoryView = lazy(() => import("./views/MemoryView").then(m => ({ default: m.MemoryView })));
 const IdentityView = lazy(() => import("./views/IdentityView").then(m => ({ default: m.IdentityView })));
 const AgentDashboardView = lazy(() => import("./views/AgentDashboardView").then(m => ({ default: m.AgentDashboardView })));
@@ -4771,6 +4772,9 @@ function MainApp() {
     }
     if (view === "scheduler") {
       return <SchedulerView serviceRunning={serviceStatus?.running ?? false} apiBaseUrl={apiBaseUrl} />;
+    }
+    if (view === "kanban") {
+      return <KanbanView serviceRunning={serviceStatus?.running ?? false} apiBaseUrl={apiBaseUrl} />;
     }
     if (view === "memory") {
       return <MemoryView serviceRunning={serviceStatus?.running ?? false} apiBaseUrl={apiBaseUrl} />;

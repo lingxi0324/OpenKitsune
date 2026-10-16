@@ -10,7 +10,7 @@ import {
   IconBug, IconBrain, IconUsers, IconBot,
   IconGear, IconBook, IconStorefront, IconPuzzle, IconFingerprint, IconLayoutGrid,
   IconShield, IconRadar, IconBuilding, IconBarChart, IconRefresh, IconHelp,
-  IconAlertCircle,
+  IconAlertCircle, IconKanban,
 } from "../icons";
 import logoUrl from "../assets/logo.png";
 import { AccountDeviceLoginDialog } from "./AccountDeviceLoginDialog";
@@ -68,7 +68,7 @@ type NavGroupId = "capabilities" | "apps" | "monitor" | "multiAgent" | "store";
 const GROUP_ICON_SIZE = 16;
 const CAPABILITY_VIEWS: ViewId[] = ["skills", "mcp", "plugins", "knowledge", "memory", "scheduler"];
 const MONITOR_VIEWS: ViewId[] = ["token_stats", "skill_usage", "security", "pending_approvals"];
-const MULTI_AGENT_VIEWS: ViewId[] = ["dashboard", "org_editor", "pixel_office", "agent_manager"];
+const MULTI_AGENT_VIEWS: ViewId[] = ["dashboard", "kanban", "org_editor", "pixel_office", "agent_manager"];
 const STORE_VIEWS: ViewId[] = ["agent_store", "skill_store"];
 
 const BETA_SUP = <sup style={{ fontSize: 9, color: "var(--primary, #3b82f6)", fontWeight: 600 }}>Beta</sup>;
@@ -627,6 +627,9 @@ export function Sidebar({
           <div className="navGroupItems">
             <div className={`navItem ${view === "dashboard" ? "navItemActive" : ""}`} onClick={() => onViewChange("dashboard")} role="button" tabIndex={0} title={t("sidebar.dashboard")}>
               <IconUsers size={16} /> {!collapsed && <span>{t("sidebar.dashboard")} {BETA_SUP}</span>}
+            </div>
+            <div className={`navItem ${view === "kanban" ? "navItemActive" : ""}`} onClick={() => onViewChange("kanban")} role="button" tabIndex={0} title={t("sidebar.kanban")}>
+              <IconKanban size={16} /> {!collapsed && <span>{t("sidebar.kanban")} {BETA_SUP}</span>}
             </div>
             <div className={`navItem ${view === "org_editor" ? "navItemActive" : ""}`} onClick={() => onViewChange("org_editor")} role="button" tabIndex={0} title={t("sidebar.orgEditor")}>
               <IconLayoutGrid size={16} /> {!collapsed && <span>{t("sidebar.orgEditor")} {BETA_SUP}</span>}

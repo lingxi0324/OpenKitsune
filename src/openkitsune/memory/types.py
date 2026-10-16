@@ -253,6 +253,22 @@ def truncate_memory_md_with_status(
 # ---------------------------------------------------------------------------
 
 
+def _coerce_memory_type(value: str | None) -> MemoryType:
+    """容忍旧库中已废弃/未知的 type 值，回退到 FACT，避免整批记忆加载失败。"""
+    try:
+        return MemoryType(value) if value else MemoryType.FACT
+    except ValueError:
+        return MemoryType.FACT
+
+
+def _coerce_memory_priority(value: str | None) -> MemoryPriority:
+    """容忍旧库中已废弃/未知的 priority 值（如 'critical'），回退到 SHORT_TERM。"""
+    try:
+        return MemoryPriority(value) if value else MemoryPriority.SHORT_TERM
+    except ValueError:
+        return MemoryPriority.SHORT_TERM
+
+
 @dataclass
 class SemanticMemory:
     """语义记忆 — 实体-属性结构, 支持更新链"""
@@ -332,8 +348,8 @@ class SemanticMemory:
         last_accessed = data.get("last_accessed_at")
         return cls(
             id=data.get("id", _short_uuid()),
-            type=MemoryType(data.get("type", "fact")),
-            priority=MemoryPriority(data.get("priority", "short_term")),
+            type=_coerce_memory_type(data.get("type")),
+            priority=_coerce_memory_priority(data.get("priority")),
             content=data.get("content", ""),
             source=data.get("source", ""),
             subject=data.get("subject", ""),

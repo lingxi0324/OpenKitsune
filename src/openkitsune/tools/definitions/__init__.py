@@ -57,6 +57,7 @@ from .filesystem import FILESYSTEM_TOOLS
 from .im_channel import IM_CHANNEL_TOOLS
 from .knowledge import KNOWLEDGE_TOOLS
 from .lsp import LSP_TOOLS
+from .kanban import KANBAN_TOOLS
 from .mcp import MCP_TOOLS
 from .memory import MEMORY_TOOLS
 from .mode import MODE_TOOLS
@@ -113,6 +114,7 @@ BASE_TOOLS = (
     + STRUCTURED_OUTPUT_TOOLS
     + WORKTREE_TOOLS
     + KNOWLEDGE_TOOLS
+    + KANBAN_TOOLS
     + VOICE_TOOLS
 )
 
@@ -185,6 +187,7 @@ __all__ = [
     "TOOL_SEARCH_TOOLS",
     "LSP_TOOLS",
     "KNOWLEDGE_TOOLS",
+    "KANBAN_TOOLS",
     "SLEEP_TOOLS",
     "STRUCTURED_OUTPUT_TOOLS",
     "WORKTREE_TOOLS",
