@@ -34,7 +34,7 @@ from .types import normalize_tags
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 
 # Process-level singleton registry: same db_path → same MemoryStorage instance
 _instance_registry: dict[str, MemoryStorage] = {}
@@ -316,6 +316,8 @@ class MemoryStorage:
                 self._migrate_v3_to_v4(mig_conn, commit=False)
             if from_version < 5:
                 self._migrate_v4_to_v5(mig_conn, commit=False)
+            if from_version < 7:
+                self._migrate_v6_to_v7(mig_conn, commit=False)
 
             self._set_schema_version(_SCHEMA_VERSION, conn=mig_conn, commit=False)
             mig_conn.execute("COMMIT")
@@ -632,6 +634,92 @@ class MemoryStorage:
         if commit:
             c.commit()
 
+    def _migrate_v6_to_v7(
+        self,
+        conn: sqlite3.Connection | None = None,
+        *,
+        commit: bool = True,
+    ) -> None:
+        """Add semantic method-logic columns to ``memories`` and new aux tables.
+
+        语义方法逻辑（semantics.py）要求记忆条目具备：分层（layer）、生命周期
+        状态（status）、声明指纹（fingerprint）、乐观并发修订号（revision）、
+        信任层级（trust_tier）、内容来源（content_origin）、写者给定日期
+        （valid_from）、核心优先级（core_priority）、kind 语义（kind）、
+        实体（entity）。同时新增三张辅助表：
+
+        - ``write_requests``：request_id 幂等去重（重复写入返回原结果）
+        - ``tombstones``：purge 墓碑，同声明（指纹）后续写入被拒绝
+        - ``mutations``：变更流（delta 游标读取）
+        """
+        c = conn or self._conn
+        cur = c.execute("PRAGMA table_info(memories)")
+        cols = {row[1] for row in cur.fetchall()}
+        _SEMANTIC_COLUMNS = [
+            ("layer", "TEXT DEFAULT ''"),
+            ("status", "TEXT DEFAULT 'active'"),
+            ("fingerprint", "TEXT DEFAULT ''"),
+            ("revision", "INTEGER DEFAULT 1"),
+            ("trust_tier", "TEXT DEFAULT ''"),
+            ("content_origin", "TEXT DEFAULT ''"),
+            ("valid_from", "TEXT"),
+            ("core_priority", "INTEGER DEFAULT 0"),
+            ("kind", "TEXT DEFAULT ''"),
+            ("entity", "TEXT DEFAULT ''"),
+        ]
+        for col_name, col_def in _SEMANTIC_COLUMNS:
+            if col_name not in cols:
+                c.execute(f"ALTER TABLE memories ADD COLUMN {col_name} {col_def}")
+        for idx_name, idx_col in (
+            ("idx_memories_layer", "layer"),
+            ("idx_memories_status", "status"),
+            ("idx_memories_fingerprint", "fingerprint"),
+            ("idx_memories_kind", "kind"),
+            ("idx_memories_entity", "entity"),
+        ):
+            c.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON memories({idx_col})")
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS write_requests (
+                request_id TEXT PRIMARY KEY,
+                fingerprint TEXT DEFAULT '',
+                memory_id TEXT DEFAULT '',
+                status TEXT DEFAULT '',
+                entity TEXT DEFAULT '',
+                kind TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tombstones (
+                fingerprint TEXT PRIMARY KEY,
+                claim TEXT NOT NULL,
+                purged_at TEXT NOT NULL,
+                reason TEXT DEFAULT ''
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mutations (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id TEXT NOT NULL,
+                op TEXT NOT NULL,
+                layer TEXT DEFAULT '',
+                entity TEXT DEFAULT '',
+                status TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_mutations_memory ON mutations(memory_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_mutations_time ON mutations(created_at)")
+        if commit:
+            c.commit()
+        logger.info("[MemoryStorage] v6→v7: semantic columns + write_requests/tombstones/mutations tables")
+
     def _create_tables(
         self,
         conn: sqlite3.Connection | None = None,
@@ -710,6 +798,32 @@ class MemoryStorage:
             "CREATE INDEX IF NOT EXISTS idx_memories_owner "
             "ON memories(workspace_id, user_id, scope, scope_owner)"
         )
+
+        # v7: 语义方法列（对应 semantics.py / lcs-fusion-memory 的
+        # kind/trust_tier/provenance/entity/visibility/ttl_expire_at/status/
+        # superseded_by/revision/core/core_priority/layer）
+        _SEMANTIC_COLUMNS = [
+            ("layer", "TEXT DEFAULT ''"),
+            ("status", "TEXT DEFAULT 'active'"),
+            ("fingerprint", "TEXT DEFAULT ''"),
+            ("revision", "INTEGER DEFAULT 1"),
+            ("trust_tier", "TEXT DEFAULT ''"),
+            ("content_origin", "TEXT DEFAULT ''"),
+            ("valid_from", "TEXT"),
+            ("core_priority", "INTEGER DEFAULT 0"),
+            ("kind", "TEXT DEFAULT ''"),
+            ("entity", "TEXT DEFAULT ''"),
+        ]
+        for col_name, col_def in _SEMANTIC_COLUMNS:
+            try:
+                c.execute(f"ALTER TABLE memories ADD COLUMN {col_name} {col_def}")
+            except sqlite3.OperationalError:
+                pass  # 列已存在
+        c.execute("CREATE INDEX IF NOT EXISTS idx_memories_layer ON memories(layer)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON memories(fingerprint)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_memories_entity ON memories(entity)")
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS episodes (
@@ -923,6 +1037,41 @@ class MemoryStorage:
             )
         """)
 
+        # v7: 幂等写入表（对应 lcs-fusion-memory 的
+        # write_requests / tombstones / mutations）
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS write_requests (
+                request_id TEXT PRIMARY KEY,
+                fingerprint TEXT DEFAULT '',
+                memory_id TEXT DEFAULT '',
+                status TEXT DEFAULT '',
+                entity TEXT DEFAULT '',
+                kind TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS tombstones (
+                fingerprint TEXT PRIMARY KEY,
+                claim TEXT NOT NULL,
+                purged_at TEXT NOT NULL,
+                reason TEXT DEFAULT ''
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS mutations (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id TEXT NOT NULL,
+                op TEXT NOT NULL,
+                layer TEXT DEFAULT '',
+                entity TEXT DEFAULT '',
+                status TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_mutations_memory ON mutations(memory_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_mutations_time ON mutations(created_at)")
+
         # ==============================================================
         # Phase 2: CREATE INDEX — all tables already exist at this point
         # ==============================================================
@@ -1085,8 +1234,11 @@ class MemoryStorage:
                      access_count, tags, created_at, updated_at, expires_at, metadata,
                      subject, predicate, confidence, decay_rate,
                      last_accessed_at, superseded_by, source_episode_id,
-                     scope, scope_owner, agent_id, user_id, workspace_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     scope, scope_owner, agent_id, user_id, workspace_id,
+                     layer, status, fingerprint, revision, trust_tier,
+                     content_origin, valid_from, core_priority, kind, entity)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         memory.get("id", ""),
@@ -1113,6 +1265,16 @@ class MemoryStorage:
                         memory.get("agent_id", ""),
                         memory.get("user_id", "default"),
                         memory.get("workspace_id", "default"),
+                        memory.get("layer", "") or "",
+                        memory.get("status", "active") or "active",
+                        memory.get("fingerprint", "") or "",
+                        memory.get("revision", 1) or 1,
+                        memory.get("trust_tier", "") or "",
+                        memory.get("content_origin", "") or "",
+                        memory.get("valid_from"),
+                        memory.get("core_priority", 0) or 0,
+                        memory.get("kind", "") or "",
+                        memory.get("entity", "") or "",
                     ),
                 )
                 self._conn.commit()
@@ -1134,8 +1296,11 @@ class MemoryStorage:
                      access_count, tags, created_at, updated_at, expires_at, metadata,
                      subject, predicate, confidence, decay_rate,
                      last_accessed_at, superseded_by, source_episode_id,
-                     scope, scope_owner, agent_id, user_id, workspace_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     scope, scope_owner, agent_id, user_id, workspace_id,
+                     layer, status, fingerprint, revision, trust_tier,
+                     content_origin, valid_from, core_priority, kind, entity)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -1163,6 +1328,16 @@ class MemoryStorage:
                             m.get("agent_id", ""),
                             m.get("user_id", "default"),
                             m.get("workspace_id", "default"),
+                            m.get("layer", "") or "",
+                            m.get("status", "active") or "active",
+                            m.get("fingerprint", "") or "",
+                            m.get("revision", 1) or 1,
+                            m.get("trust_tier", "") or "",
+                            m.get("content_origin", "") or "",
+                            m.get("valid_from"),
+                            m.get("core_priority", 0) or 0,
+                            m.get("kind", "") or "",
+                            m.get("entity", "") or "",
                         )
                         for m in memories
                     ],
@@ -1270,6 +1445,17 @@ class MemoryStorage:
             "workspace_id",
             "agent_id",
             "expires_at",
+            # v7: 语义列
+            "layer",
+            "status",
+            "fingerprint",
+            "revision",
+            "trust_tier",
+            "content_origin",
+            "valid_from",
+            "core_priority",
+            "kind",
+            "entity",
         }
         filtered = {k: v for k, v in updates.items() if k in allowed}
         if not filtered:
@@ -1315,6 +1501,12 @@ class MemoryStorage:
         limit: int = 50,
         offset: int = 0,
         active_only: bool = True,
+        # v7: 语义过滤
+        layer: str | None = None,
+        status: str | None = None,
+        kind: str | None = None,
+        entity: str | None = None,
+        trust_tier: str | None = None,
     ) -> list[dict]:
         if not self._conn:
             return []
@@ -1374,10 +1566,27 @@ class MemoryStorage:
         if accessed_after:
             conditions.append("(last_accessed_at IS NOT NULL AND last_accessed_at >= ?)")
             params.append(accessed_after)
+        # —— v7: 语义过滤 ——
+        if layer:
+            conditions.append("layer = ?")
+            params.append(layer)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if kind:
+            conditions.append("kind = ?")
+            params.append(kind)
+        if entity:
+            conditions.append("entity = ?")
+            params.append(entity)
+        if trust_tier:
+            conditions.append("trust_tier = ?")
+            params.append(trust_tier)
         if active_only:
             conditions.append("(expires_at IS NULL OR expires_at >= ?)")
             params.append(datetime.now().isoformat())
             conditions.append("(superseded_by IS NULL OR superseded_by = '')")
+            conditions.append("(status IS NULL OR status = '' OR status = 'active')")
 
         where = " AND ".join(conditions) if conditions else "1=1"
         params.extend([limit, offset])
@@ -1906,6 +2115,149 @@ class MemoryStorage:
                 if _is_db_locked(e):
                     raise
                 logger.error(f"Failed to save scratchpad: {e}")
+
+    # ======================================================================
+    # v7: 幂等 / 墓碑 / 变更流
+    # ======================================================================
+
+    def record_write_request(
+        self,
+        request_id: str,
+        *,
+        fingerprint: str = "",
+        memory_id: str = "",
+        status: str = "",
+        entity: str = "",
+        kind: str = "",
+    ) -> None:
+        """记录一次 remember 写入请求（request_id 幂等键）。"""
+        if not self._conn or not request_id:
+            return
+        now = datetime.now().isoformat()
+        with self._lock:
+            try:
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO write_requests
+                    (request_id, fingerprint, memory_id, status, entity, kind, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (request_id, fingerprint, memory_id, status, entity, kind, now),
+                )
+                self._conn.commit()
+            except Exception as e:
+                if _is_db_locked(e):
+                    raise
+                logger.debug(f"record_write_request({request_id}) failed: {e}")
+
+    def get_write_request(self, request_id: str) -> dict | None:
+        """按 request_id 读取已记录的写入回执（幂等重放返回原结果）。"""
+        if not self._conn or not request_id:
+            return None
+        try:
+            cur = self._conn.execute(
+                "SELECT * FROM write_requests WHERE request_id = ?", (request_id,)
+            )
+            rows = self._rows_to_dicts(cur)
+            return rows[0] if rows else None
+        except Exception as e:
+            logger.debug(f"get_write_request({request_id}) failed: {e}")
+            return None
+
+    def put_tombstone(self, fingerprint: str, claim: str, reason: str = "") -> None:
+        """写入墓碑：purge 后同声明（指纹）后续写入被拒绝。"""
+        if not self._conn or not fingerprint:
+            return
+        now = datetime.now().isoformat()
+        with self._lock:
+            try:
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO tombstones (fingerprint, claim, purged_at, reason)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (fingerprint, claim, now, reason),
+                )
+                self._conn.commit()
+            except Exception as e:
+                if _is_db_locked(e):
+                    raise
+                logger.debug(f"put_tombstone({fingerprint}) failed: {e}")
+
+    def get_tombstone(self, fingerprint: str) -> dict | None:
+        """按指纹读取墓碑；无则 None。"""
+        if not self._conn or not fingerprint:
+            return None
+        try:
+            cur = self._conn.execute(
+                "SELECT * FROM tombstones WHERE fingerprint = ?", (fingerprint,)
+            )
+            rows = self._rows_to_dicts(cur)
+            return rows[0] if rows else None
+        except Exception as e:
+            logger.debug(f"get_tombstone({fingerprint}) failed: {e}")
+            return None
+
+    def append_mutation(
+        self,
+        memory_id: str,
+        op: str,
+        *,
+        layer: str = "",
+        entity: str = "",
+        status: str = "",
+    ) -> int | None:
+        """向变更流追加一条记录，返回 seq（失败返回 None）。"""
+        if not self._conn or not memory_id:
+            return None
+        now = datetime.now().isoformat()
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO mutations (memory_id, op, layer, entity, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (memory_id, op, layer, entity, status, now),
+                )
+                self._conn.commit()
+                return cur.lastrowid
+            except Exception as e:
+                if _is_db_locked(e):
+                    raise
+                logger.debug(f"append_mutation({memory_id}, {op}) failed: {e}")
+                return None
+
+    def list_mutations(
+        self,
+        *,
+        since_seq: int = 0,
+        limit: int = 100,
+        memory_id: str | None = None,
+        op: str | None = None,
+    ) -> list[dict]:
+        """读取变更流（delta 游标：since_seq 之后，按 seq 升序）。"""
+        if not self._conn:
+            return []
+        try:
+            conditions: list[str] = ["seq > ?"]
+            params: list[Any] = [since_seq]
+            if memory_id:
+                conditions.append("memory_id = ?")
+                params.append(memory_id)
+            if op:
+                conditions.append("op = ?")
+                params.append(op)
+            where = " AND ".join(conditions)
+            params.append(limit)
+            cursor = self._conn.execute(
+                f"SELECT * FROM mutations WHERE {where} ORDER BY seq ASC LIMIT ?",
+                params,
+            )
+            return self._rows_to_dicts(cursor)
+        except Exception as e:
+            logger.error(f"Failed to list mutations: {e}")
+            return []
 
     # ======================================================================
     # Session Tenants (v4)

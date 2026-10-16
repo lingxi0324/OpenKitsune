@@ -1,6 +1,6 @@
 """KV 驱逐桥接：把 ContextManager 的 compacted_spans 接到 llama.cpp server。
 
-OpenKitsune 与 F:\\llama-cpp-server 的适配层（services/kv_evict_llamacpp.py）
+OpenKitsune 与 llama.cpp server 的适配层（services/kv_evict_llamacpp.py）
 解耦桥接：适配层可导入时构造 LlamaCppKvEvictor 并绑定
 ``context_manager.kv_cache_evict_callback``；任何失败（导入/配置/网络）仅
 记录并静默降级，绝不阻断 Agent 启动。
@@ -36,7 +36,7 @@ def attach_kv_evict_callback(
         logger.warning("[KVEvictBridge] kv_evict adapter path not configured; skip")
         return False
     try:
-        # 适配层位于 F:\\llama-cpp-server\\services（独立服务资产，不属于
+        # 适配层位于 llama.cpp server 的 services 目录（独立服务资产，不属于
         # OpenKitsune 包），动态加入 sys.path 后按名导入，避免硬编码包依赖。
         if adapter_path not in sys.path:
             sys.path.insert(0, adapter_path)

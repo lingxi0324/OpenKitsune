@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .consolidator import MemoryConsolidator
+from .name_normalize import normalize_names
 from .extractor import MemoryExtractor
 from .types import MEMORY_MD_MAX_CHARS, Memory, MemoryPriority, MemoryType, truncate_memory_md
 
@@ -195,7 +196,7 @@ class DailyConsolidator:
 
         # 用户偏好
         if by_type["preference"]:
-            lines.append("## 用户偏好")
+            lines.append(normalize_names("## 用户偏好"))
             for m in by_type["preference"]:
                 lines.append(f"- {m.content}")
             lines.append("")
@@ -397,7 +398,7 @@ class DailyConsolidator:
         lines = [
             "# User Custom Persona",
             "",
-            "> 从用户交互中归集的个性化偏好，每日自动更新。",
+            normalize_names("> 从用户交互中归集的个性化偏好，每日自动更新。"),
             f"> 最后更新: {now.strftime('%Y-%m-%d %H:%M')}",
             "",
         ]

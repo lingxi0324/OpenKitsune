@@ -1,7 +1,6 @@
 """Session-persistent Python kernels for execute_code (OpenKitsune port).
 
-Adapted from Hermes ``tools/code_kernel.py`` (see
-``C:\\Users\\Administrator\\.hermes\\hermes-agent\\tools\\code_kernel.py``) with
+Adapted from Hermes ``tools/code_kernel.py`` with
 Hermes-only dependencies removed:
 
 * one child per ``(owner, python, cwd, tool-set)`` key, one code cell per call,

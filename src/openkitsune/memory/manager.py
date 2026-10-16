@@ -42,6 +42,7 @@ from .retention import apply_retention
 from .retrieval import RetrievalEngine
 from .session_identity import DESKTOP_USER_ID
 from .telemetry import emit_memory_health_event
+from .name_normalize import is_user_subject, normalize_memory
 from .types import (
     Attachment,
     AttachmentDirection,
@@ -793,7 +794,7 @@ class MemoryManager:
     @classmethod
     def _identity_slot_for(cls, memory: SemanticMemory) -> str:
         subject = (memory.subject or "").strip().lower()
-        if subject not in {"用户", "user", "当前用户", "我"}:
+        if not is_user_subject(subject):
             return ""
         predicate = (memory.predicate or "").strip().lower()
         for alias, slot in cls._IDENTITY_SLOT_ALIASES.items():
@@ -868,6 +869,8 @@ class MemoryManager:
         skip_dedup: bool = False,
     ) -> str:
         """Save user-owned semantic memory through the single owner-aware path."""
+        # 称呼归一化：任何保存入口统一替换（identity slot 路径同样覆盖）
+        normalize_memory(memory)
         write_scope, write_owner = self._current_write_scope()
         if scope:
             write_scope = "user" if scope == "global" else scope
@@ -1557,7 +1560,7 @@ class MemoryManager:
         """Mirror structured user identity facts into UserProfileManager when possible."""
         if not content:
             return
-        if (subject or "").strip().lower() not in {"用户", "user", "当前用户"}:
+        if not is_user_subject(subject):
             return
         profile_mgr = getattr(self, "profile_manager", None)
         if profile_mgr is None:
@@ -2836,3 +2839,172 @@ class MemoryManager:
             "unprocessed_sessions": len(self.consolidator.get_unprocessed_sessions()),
             "v2_store": v2_stats,
         }
+
+    # ==================== 语义方法族（v7，语义对齐 /memory/*） ====================
+
+    def remember(
+        self,
+        claim: str,
+        *,
+        entity: str = "",
+        kind: str = "fact",
+        ttl: str | None = None,
+        content_origin: str = "",
+        request_id: str = "",
+        replaces: str | None = None,
+        source: str = "openkitsune",
+        priority: str = "SHORT_TERM",
+        importance: float = 0.5,
+        scope: str | None = None,
+        scope_owner: str = "",
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> dict:
+        """``remember``（语义方法族）高层入口（自动套用当前 session/owner 上下文）。"""
+        scope = scope or ("user" if self._current_workspace_id else "user")
+        user_id = user_id or self._current_user_id or "default"
+        workspace_id = workspace_id or self._current_workspace_id or "default"
+        return self.store.remember(
+            claim,
+            entity=entity,
+            kind=kind,
+            ttl=ttl,
+            content_origin=content_origin,
+            request_id=request_id,
+            replaces=replaces,
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            source=source,
+            priority=priority,
+            importance=importance,
+        )
+
+    def recall_facts(
+        self,
+        question: str,
+        *,
+        entity: str = "",
+        budget_tokens: int = 1200,
+        include_expired: bool = False,
+        scope: str | None = None,
+        scope_owner: str = "",
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> dict:
+        """``recall_facts``（语义方法族）高层入口。"""
+        scope = scope or "user"
+        user_id = user_id or self._current_user_id or "default"
+        workspace_id = workspace_id or self._current_workspace_id or "default"
+        return self.store.recall_facts(
+            question,
+            entity=entity,
+            budget_tokens=budget_tokens,
+            include_expired=include_expired,
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+
+    def edit_memory(
+        self,
+        memory_id: str,
+        text: str,
+        *,
+        expected_revision: int | None = None,
+        force: bool = False,
+        reason: str = "memory-edit",
+    ) -> dict:
+        """``edit_memory``（语义方法族）高层入口（乐观并发修订）。"""
+        return self.store.edit_memory(
+            memory_id, text, expected_revision=expected_revision, force=force, reason=reason
+        )
+
+    def forget_memory(self, memory_id: str, reason: str = "memory-forget") -> dict:
+        """``forget_memory``（语义方法族）高层入口（软过期）。"""
+        return self.store.forget_memory(memory_id, reason=reason)
+
+    def purge_memory(self, memory_id: str, reason: str = "memory-purge") -> dict:
+        """``purge_memory``（语义方法族）高层入口（硬删 + 墓碑）。"""
+        return self.store.purge_memory(memory_id, reason=reason)
+
+    def core_status(self) -> dict:
+        """``core_status``（语义方法族）：核心记忆预算状态。"""
+        return self.store.core_status()
+
+    def core_set(self, memory_id: str, *, add: bool = True, priority: int = 0) -> dict:
+        """``core_set``（语义方法族）：核心层调整。"""
+        return self.store.core_set(memory_id, add=add, priority=priority)
+
+    def core_suggest(self, *, limit: int = 5) -> dict:
+        """``core_suggest``（语义方法族）：候选核心记忆。"""
+        return self.store.core_suggest(limit=limit)
+
+    def delta(self, since: int, *, session_id: str = "", limit: int = 100) -> dict:
+        """``delta``（语义方法族）：变更流游标读取。"""
+        return self.store.delta(since, session_id=session_id, limit=limit)
+
+    def maintain(self, *, dry_run: bool = False) -> dict:
+        """``maintain``（语义方法族）：TTL 到期 + 近重复报告。"""
+        return self.store.maintain(dry_run=dry_run)
+
+    def list_memories_filtered(
+        self,
+        *,
+        layer: str | None = None,
+        kind: str | None = None,
+        entity: str | None = None,
+        trust: str | None = None,
+        status: str | None = None,
+        include_expired: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+        scope: str | None = None,
+        scope_owner: str = "",
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> dict:
+        """``list_memories_filtered``（语义方法族）：多层过滤记忆条目（layer/kind/entity/trust/status）。"""
+        scope = scope or "user"
+        user_id = user_id or self._current_user_id or "default"
+        workspace_id = workspace_id or self._current_workspace_id or "default"
+        rows = self.store.db.query(
+            layer=layer,
+            kind=kind,
+            entity=entity,
+            trust_tier=trust,
+            status=status,
+            active_only=not include_expired,
+            limit=limit,
+            offset=offset,
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        entries = [
+            {
+                "id": r.get("id"),
+                "content": r.get("content"),
+                "entity": r.get("entity") or r.get("subject") or "",
+                "kind": r.get("kind") or (r.get("type") or "").lower(),
+                "layer": r.get("layer") or "",
+                "status": r.get("status") or "active",
+                "trust_tier": r.get("trust_tier") or "",
+                "revision": r.get("revision") or 1,
+                "created_at": r.get("created_at"),
+                "updated_at": r.get("updated_at"),
+                "expires_at": r.get("expires_at"),
+            }
+            for r in rows
+        ]
+        total = self.store.db.count(
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            active_only=not include_expired,
+        )
+        return {"total": total, "entries": entries}

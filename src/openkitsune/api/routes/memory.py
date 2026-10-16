@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from openkitsune.memory.retention import apply_retention
 from openkitsune.memory.session_identity import DESKTOP_USER_ID
+from openkitsune.memory.name_normalize import is_user_subject
 from openkitsune.memory.types import MemoryPriority, MemoryType, SemanticMemory
 
 logger = logging.getLogger(__name__)
@@ -408,7 +409,7 @@ def _legacy_review_counts(store: Any) -> dict[str, int]:
 
 
 def _identity_slot_for(subject: str, predicate: str) -> str:
-    if (subject or "").strip().lower() not in {"用户", "user", "当前用户", "我"}:
+    if not is_user_subject(subject):
         return ""
     pred = (predicate or "").strip().lower()
     for alias, slot in IDENTITY_SLOT_ALIASES.items():

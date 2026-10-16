@@ -21,7 +21,7 @@
 环境变量：
     LLM_API_URL    — LLM API 地址（默认 http://127.0.0.1:11434/v1/chat/completions）
     LLM_MODEL      — 模型名称（默认 huihui_ai/qwen2.5-1m-abliterated:7b）
-    KNOWLEDGE_BASE — 知识库根目录（默认 C:\\Users\\Administrator\\Desktop\\我的文件夹\\丹道玄医录）
+    KNOWLEDGE_BASE — 知识库根目录（必须显式设置；不提供默认机器路径）
 """
 
 import json
@@ -235,10 +235,7 @@ SHI_GAN_TO_HEHUA = {
 # 环境变量
 LLM_API_URL = os.environ.get("LLM_API_URL", "http://127.0.0.1:11434/v1/chat/completions")
 LLM_MODEL = os.environ.get("LLM_MODEL", "huihui_ai/qwen2.5-1m-abliterated:7b")
-KNOWLEDGE_BASE = os.environ.get(
-    "KNOWLEDGE_BASE",
-    r"C:\Users\Administrator\Desktop\我的文件夹\丹道玄医录"
-)
+KNOWLEDGE_BASE = os.environ.get("KNOWLEDGE_BASE", "") or None
 
 
 # =============================================================
@@ -610,6 +607,8 @@ def _six_step_analysis(pan: dict, symptoms: str, department: str,
 
 def _load_knowledge_files() -> dict:
     """加载知识库参考文件"""
+    if not KNOWLEDGE_BASE:
+        return {}
     knowledge_path = Path(KNOWLEDGE_BASE)
     if not knowledge_path.exists():
         return {}

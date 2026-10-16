@@ -313,6 +313,30 @@ class SemanticMemory:
     # v2: retention / TTL
     expires_at: datetime | None = None
 
+    # v6: 语义方法字段（移植自 gbrain-master / lcs-fusion-memory 方法学）
+    # ---- 分层记忆（layer: core / working / short_term / long_term / facts）
+    layer: str = ""
+    # ---- 生命周期状态（active / superseded / expired / forgotten / purged）
+    status: str = "active"
+    # ---- 声明指纹（归一化 sha256，用于精确去重与墓碑）
+    fingerprint: str = ""
+    # ---- 乐观并发修订号（edit 时校验 expected_revision）
+    revision: int = 1
+    # ---- 信任层级（user_confirmed / operator_curated / tool_observed /
+    #      agent_written / external_untrusted），由 content_origin 派生
+    trust_tier: str = ""
+    # ---- 内容来源（user_said / inferred / tool_output / curated）
+    content_origin: str = ""
+    # ---- 写者给定日期（valid_from 与 created_at 相差 >24h 视为 dated fact）
+    valid_from: datetime | None = None
+    # ---- 核心记忆优先级（数值小先渲染，0 = 非核心）
+    core_priority: int = 0
+    # ---- kind 语义（event / preference / commitment / belief / fact；
+    #      空 = 由 type 派生）
+    kind: str = ""
+    # ---- 实体（entity，与 subject 对齐）
+    entity: str = ""
+
     def to_dict(self) -> dict:
         d = {
             "id": self.id,
@@ -340,12 +364,23 @@ class SemanticMemory:
             "user_id": self.user_id,
             "workspace_id": self.workspace_id,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "layer": self.layer,
+            "status": self.status,
+            "fingerprint": self.fingerprint,
+            "revision": self.revision,
+            "trust_tier": self.trust_tier,
+            "content_origin": self.content_origin,
+            "valid_from": self.valid_from.isoformat() if self.valid_from else None,
+            "core_priority": self.core_priority,
+            "kind": self.kind,
+            "entity": self.entity,
         }
         return d
 
     @classmethod
     def from_dict(cls, data: dict) -> SemanticMemory:
         last_accessed = data.get("last_accessed_at")
+        valid_from = data.get("valid_from")
         return cls(
             id=data.get("id", _short_uuid()),
             type=_coerce_memory_type(data.get("type")),
@@ -376,6 +411,16 @@ class SemanticMemory:
             expires_at=datetime.fromisoformat(data["expires_at"])
             if data.get("expires_at")
             else None,
+            layer=data.get("layer", "") or "",
+            status=data.get("status", "active") or "active",
+            fingerprint=data.get("fingerprint", "") or "",
+            revision=data.get("revision", 1) or 1,
+            trust_tier=data.get("trust_tier", "") or "",
+            content_origin=data.get("content_origin", "") or "",
+            valid_from=datetime.fromisoformat(valid_from) if valid_from else None,
+            core_priority=data.get("core_priority", 0) or 0,
+            kind=data.get("kind", "") or "",
+            entity=data.get("entity", "") or "",
         )
 
     def to_markdown(self) -> str:

@@ -1166,8 +1166,8 @@ class Settings(BaseSettings):
         description="启用 llama.cpp server KV 驱逐桥接（导入失败/服务不可达时静默降级，不阻断启动）",
     )
     kv_evict_llamacpp_adapter_path: str = Field(
-        default="F:/llama-cpp-server/services",
-        description="KV 驱逐适配层目录（F:\\llama-cpp-server\\services，动态加入 sys.path 按名导入）",
+        default_factory=lambda: os.environ.get("KV_EVICT_LLAMACPP_ADAPTER_PATH", ""),
+        description="KV 驱逐适配层目录（默认空 = 未配置则跳过桥接；可配置/环境变量 KV_EVICT_LLAMACPP_ADAPTER_PATH 指定，动态加入 sys.path 按名导入）",
     )
     kv_evict_llamacpp_base_url: str = Field(
         default="http://127.0.0.1:8220",
@@ -1225,7 +1225,7 @@ class Settings(BaseSettings):
     )
     kv_evict_llamacpp_log_dir: str = Field(
         default="",
-        description="驱逐日志目录（空 = 适配层默认 F:\\llama-cpp-server\\logs）",
+        description="驱逐日志目录（空 = 适配层默认日志目录）",
     )
     context_priority_weights: dict[str, float] = Field(
         default_factory=lambda: {
@@ -1974,6 +1974,23 @@ class Settings(BaseSettings):
         if pkg_path.exists():
             return pkg_path
         return dev_path
+
+    # === 称呼归一化（记忆数据自动替换，配置驱动禁止硬编码） ===
+    # 记忆保存时自动把「用户」→ 用户称呼、「模型/AI/助手」→ AI 称呼。
+    # 名称一律从这里读取，不得在业务代码里写死称呼；首个元素为默认替换名，
+    # 其余元素为候选称呼（供其他需要称呼的场景选用）。
+    user_address_terms: tuple[str, ...] = Field(
+        default=("郎君", "哥哥"),
+        description="用户的称呼集合，首个为记忆替换默认名",
+    )
+    assistant_address_terms: tuple[str, ...] = Field(
+        default=("灵汐", "汐儿"),
+        description="AI（模型/助手）的称呼集合，首个为记忆替换默认名",
+    )
+    name_normalize_enabled: bool = Field(
+        default=True,
+        description="记忆保存时自动把「用户」→用户称呼、「模型/AI/助手」→AI称呼",
+    )
 
 
 # ---------------------------------------------------------------------------

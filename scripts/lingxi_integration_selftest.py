@@ -4,7 +4,8 @@ import os
 import sys
 from pathlib import Path
 
-PROJECT = Path(r"C:\Users\Administrator\.OpenKitsune\OpenKitsune")
+# 工程根 = 本脚本上级目录（scripts/）的父目录
+PROJECT = Path(__file__).resolve().parent.parent
 SRC = PROJECT / "src"
 # 模拟运行时：start.ps1 会 Set-Location $ProjectRoot，project_root=Path.cwd()
 os.chdir(str(PROJECT))

@@ -34,6 +34,7 @@ from .types import (
     SemanticMemory,
 )
 from .unified_store import UnifiedStore
+from .name_normalize import normalize_names, user_subject_query_values
 
 logger = logging.getLogger(__name__)
 
@@ -1474,7 +1475,14 @@ class LifecycleManager:
 
     async def refresh_user_md(self, identity_dir: Path) -> None:
         """从语义记忆自动填充 USER.md"""
-        user_facts = self.store.query_semantic(subject="用户", limit=50)
+        # 称呼归一化：subject 兼容配置称呼（郎君）与历史内部标签（用户）
+        user_facts: list[SemanticMemory] = []
+        _seen_ids: set[str] = set()
+        for _subj in user_subject_query_values():
+            for _m in self.store.query_semantic(subject=_subj, limit=50):
+                if _m.id not in _seen_ids:
+                    _seen_ids.add(_m.id)
+                    user_facts.append(_m)
         if not user_facts:
             return
 
@@ -1534,7 +1542,7 @@ class LifecycleManager:
             elif mem.type == MemoryType.FACT:
                 categories["basic"].append(content)
 
-        lines = ["# 用户档案\n", "> 由记忆系统自动生成\n"]
+        lines = [normalize_names("# 用户档案\n"), "> 由记忆系统自动生成\n"]
 
         section_map = {
             "basic": "基本信息",

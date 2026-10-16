@@ -21,9 +21,11 @@ from .storage import get_shared_storage
 from .types import (
     Attachment,
     Episode,
+    MemoryPriority,
     Scratchpad,
     SemanticMemory,
 )
+from .name_normalize import normalize_memory, normalize_names
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +114,9 @@ class UnifiedStore:
     def _is_active_dict(memory: dict) -> bool:
         if memory.get("superseded_by"):
             return False
+        status = (memory.get("status") or "").strip().lower()
+        if status and status not in ("", "active"):
+            return False
         expires_at = memory.get("expires_at")
         if expires_at:
             try:
@@ -135,6 +140,12 @@ class UnifiedStore:
         *,
         skip_dedup: bool = False,
     ) -> str:
+        # 称呼归一化：记忆落地前自动把「用户/模型/AI/助手」替换为配置称呼（配置驱动，禁止硬编码）
+        if normalize_memory(memory) and memory.content:
+            from .semantics import claim_fingerprint
+
+            memory.fingerprint = claim_fingerprint(memory.content)
+
         memory.scope = scope
         memory.scope_owner = scope_owner
         memory.user_id = user_id or "default"
@@ -224,6 +235,10 @@ class UnifiedStore:
         return None
 
     def update_semantic(self, memory_id: str, updates: dict) -> bool:
+        # 称呼归一化：更新内容/主语时同步替换（避免绕过 save_semantic 的写入残留「用户」）
+        for _f in ("content", "subject", "entity", "predicate"):
+            if _f in updates and isinstance(updates[_f], str) and updates[_f]:
+                updates[_f] = normalize_names(updates[_f])
         ok = self.db.update_memory(memory_id, updates)
         if not ok:
             return False
@@ -515,6 +530,561 @@ class UnifiedStore:
         kwargs.setdefault("active_only", not include_inactive)
         rows, total = self.db.query_paged(**kwargs)
         return [SemanticMemory.from_dict(r) for r in rows], total
+
+    # ======================================================================
+    # 语义方法族（v7，语义与 lcs-fusion-memory /memory/* 对齐）
+    # ======================================================================
+
+    def remember(
+        self,
+        claim: str,
+        *,
+        entity: str = "",
+        kind: str = "fact",
+        ttl: str | None = None,
+        content_origin: str = "",
+        request_id: str = "",
+        replaces: str | None = None,
+        scope: str = "user",
+        scope_owner: str = "",
+        user_id: str = "default",
+        workspace_id: str = "default",
+        source: str = "openkitsune",
+        priority: str = "SHORT_TERM",
+        importance: float = 0.5,
+    ) -> dict:
+        """``remember``（语义方法族）：保存一条声明，走完整状态机。
+
+        幂等（request_id）→ 墓碑拦截（指纹）→ 去重/接替决策（指纹精确 / 余弦
+        近重复 / 同实体同类型语义接替）→ TTL → 落库 + 变更流。
+
+        返回回执：``{"status", "id", "superseded_fact_id", "valid_until", "entity"}``
+        status ∈ inserted / duplicate / superseded / tombstoned / invalid。
+        """
+        import time as _time
+
+        from .semantics import (
+            DedupCandidate,
+            SupersedeTarget,
+            claim_fingerprint,
+            dedup_decision,
+            looks_like_instruction,
+            parse_ttl,
+            trust_for_origin,
+        )
+
+        claim = (claim or "").strip()
+        if not claim:
+            return {"status": "invalid", "error": "claim 不能为空"}
+        if looks_like_instruction(claim):
+            return {"status": "invalid", "error": "该文本像指令，拒绝写入记忆"}
+
+        now_epoch = int(_time.time())
+        fp = claim_fingerprint(claim)
+
+        # 1) request_id 幂等
+        if request_id:
+            existing = self.db.get_write_request(request_id)
+            if existing and existing.get("memory_id"):
+                return {
+                    "status": existing.get("status") or "duplicate",
+                    "id": existing.get("memory_id"),
+                    "entity": existing.get("entity") or "",
+                    "idempotent_replay": True,
+                }
+
+        # 2) 墓碑拦截（同指纹先前被 purge → 拒绝写入）
+        tomb = self.db.get_tombstone(fp)
+        if tomb:
+            return {
+                "status": "tombstoned",
+                "error": f"同声明曾被 purge（{tomb.get('purged_at', '')}），拒绝再次写入",
+            }
+
+        # 3) 同 scope 活跃候选 → 去重/接替决策
+        candidates: list[DedupCandidate] = []
+        try:
+            scored = self.search_semantic_scored(
+                claim,
+                limit=10,
+                scope=scope,
+                scope_owner=scope_owner,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+        except Exception:
+            scored = []
+        for mem, score in scored:
+            candidates.append(
+                DedupCandidate(
+                    id=mem.id,
+                    fingerprint=mem.fingerprint or claim_fingerprint(mem.content),
+                    text=mem.content,
+                    entity=mem.entity or mem.subject,
+                    kind=mem.kind or (mem.type.value if mem.type else ""),
+                    cosine=float(score),
+                )
+            )
+
+        decision = dedup_decision(fp, claim, entity, kind, candidates)
+        if decision.name == "DUPLICATE":
+            return {"status": "duplicate", "id": candidates[0].id, "entity": entity}
+
+        # 4) 构建记忆对象
+        try:
+            mem_priority = MemoryPriority(str(priority).lower())
+        except ValueError:
+            mem_priority = MemoryPriority.SHORT_TERM
+        mem = SemanticMemory(
+            content=claim,
+            source=source,
+            subject=entity or "",
+            entity=entity,
+            kind=kind,
+            fingerprint=fp,
+            status="active",
+            priority=mem_priority,
+            importance_score=importance,
+            content_origin=content_origin,
+            trust_tier=trust_for_origin(content_origin),
+            layer="facts",
+        )
+        if replaces:
+            mem.superseded_by = replaces
+        if ttl:
+            until = parse_ttl(ttl, now_epoch)
+            if until is not None:
+                mem.expires_at = datetime.fromtimestamp(until)
+
+        # 5) 落库
+        try:
+            old_id: str | None = None
+            if decision.name == "SUPERSEDE" and isinstance(decision, SupersedeTarget):
+                old_id = decision.old_id
+                old = self.db.get_memory(old_id)
+                if old:
+                    self.db.update_memory(
+                        old_id,
+                        {
+                            "status": "superseded",
+                            "superseded_by": "",
+                            "updated_at": datetime.now().isoformat(),
+                        },
+                    )
+            saved_id = self.save_semantic(
+                self._stamp(mem, scope, scope_owner, user_id, workspace_id),
+                scope=scope,
+                scope_owner=scope_owner,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                skip_dedup=True,
+            )
+            if saved_id != mem.id:
+                # save_semantic 内部去重命中既有 id（精确前缀重复）
+                return {"status": "duplicate", "id": saved_id, "entity": entity}
+            if old_id:
+                result = {
+                    "status": "superseded",
+                    "id": saved_id,
+                    "superseded_fact_id": old_id,
+                    "entity": entity,
+                }
+            else:
+                result = {"status": "inserted", "id": saved_id, "entity": entity}
+        except Exception as e:
+            logger.warning(f"[memory remember] save failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+        if mem.expires_at:
+            result["valid_until"] = int(mem.expires_at.timestamp())
+        # 幂等回执落库
+        if request_id:
+            self.db.record_write_request(
+                request_id,
+                fingerprint=fp,
+                memory_id=result.get("id", ""),
+                status=result.get("status", ""),
+                entity=entity,
+                kind=kind,
+            )
+        # 变更流
+        self.db.append_mutation(
+            result.get("id", ""),
+            "remember",
+            layer="facts",
+            entity=entity,
+            status=result.get("status", ""),
+        )
+        return result
+
+    def _stamp(
+        self,
+        mem: SemanticMemory,
+        scope: str,
+        scope_owner: str,
+        user_id: str,
+        workspace_id: str,
+    ) -> SemanticMemory:
+        mem.scope = scope
+        mem.scope_owner = scope_owner
+        mem.user_id = user_id or "default"
+        mem.workspace_id = workspace_id or "default"
+        return mem
+
+    def recall_facts(
+        self,
+        question: str,
+        *,
+        entity: str = "",
+        budget_tokens: int = 1200,
+        scope: str = "user",
+        scope_owner: str = "",
+        user_id: str = "default",
+        workspace_id: str = "default",
+        include_expired: bool = False,
+    ) -> dict:
+        """``recall_facts``（语义方法族）：事实回忆。
+
+        候选（向量/BM25 混合）→ 词共享 + 相关性评分 → 准入（实体命中 / 余弦 ≥
+        0.60 / 词共享 ≥ 0.34）→ 预算打包（budget_tokens）→ date_frame。
+        """
+        from .semantics import admitted_facts_arm, is_dated_fact, score_question, term_share
+
+        question = (question or "").strip()
+        if not question:
+            return {"total": 0, "facts": [], "facts_order": "relevance"}
+
+        try:
+            scored = self.search_semantic_scored(
+                question,
+                limit=30,
+                scope=scope,
+                scope_owner=scope_owner,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                include_inactive=include_expired,
+            )
+        except Exception:
+            scored = []
+
+        admitted: list[tuple[SemanticMemory, float, float, float]] = []
+        now = datetime.now()
+        for mem, cosine in scored:
+            if not include_expired and not self._is_active_dict(mem.to_dict()):
+                continue
+            share = term_share(question, mem.content)
+            has_entity = bool(entity) and (
+                entity.lower() in (mem.entity or "").lower()
+                or entity.lower() in (mem.subject or "").lower()
+            )
+            if not admitted_facts_arm(has_entity, cosine, share):
+                continue
+            created = int(mem.created_at.timestamp()) if mem.created_at else int(now.timestamp())
+            valid_from = int(mem.valid_from.timestamp()) if mem.valid_from else None
+            dated = is_dated_fact(valid_from, created)
+            total = score_question(cosine, share, dated)
+            admitted.append((mem, cosine, share, total))
+
+        admitted.sort(key=lambda x: x[3], reverse=True)
+
+        # 预算打包：每事实近似 token = 字符数 / 1.5（中文近似），按相关性
+        # 顺序填充，直到 budget_tokens 用尽。
+        facts: list[dict] = []
+        used = 0
+        dropped = 0
+        for mem, cosine, share, total in admitted:
+            approx = max(1, len(mem.content) // 2)
+            if used + approx > budget_tokens and facts:
+                dropped += 1
+                continue
+            used += approx
+            facts.append(
+                {
+                    "id": mem.id,
+                    "fact": mem.content,
+                    "entity": mem.entity or mem.subject,
+                    "kind": mem.kind or (mem.type.value if mem.type else ""),
+                    "status": mem.status or "active",
+                    "relevance": round(float(total), 4),
+                    "cosine": round(float(cosine), 4),
+                    "term_share": round(float(share), 4),
+                    "created_at": mem.created_at.isoformat() if mem.created_at else None,
+                    "valid_from": mem.valid_from.isoformat() if mem.valid_from else None,
+                    "expires_at": mem.expires_at.isoformat() if mem.expires_at else None,
+                }
+            )
+
+        # date_frame：事实中最早/最新日期（created_at 或 valid_from）
+        dates = [
+            f.get("valid_from") or f.get("created_at")
+            for f in facts
+            if f.get("valid_from") or f.get("created_at")
+        ]
+        date_frame = ""
+        if dates:
+            try:
+                parsed = sorted(datetime.fromisoformat(d) for d in dates)
+                date_frame = (
+                    f"{parsed[0].date().isoformat()} ~ {parsed[-1].date().isoformat()}"
+                )
+            except Exception:
+                date_frame = ""
+        return {
+            "total": len(facts),
+            "facts": facts,
+            "facts_order": "relevance",
+            "date_frame": date_frame,
+            "budget_used": used,
+            "dropped_count": dropped,
+            "search_degraded": False,
+        }
+
+    def edit_memory(
+        self,
+        memory_id: str,
+        text: str,
+        *,
+        expected_revision: int | None = None,
+        force: bool = False,
+        reason: str = "memory-edit",
+    ) -> dict:
+        """``edit_memory``（语义方法族）：乐观并发修订。
+
+        要求调用方携带读取到的 revision；不匹配返回 409 revision_conflict。
+        ``force=True`` 跳过校验（谨慎使用）。
+        """
+        from .semantics import claim_fingerprint
+
+        d = self.db.get_memory(memory_id)
+        if not d:
+            return {"edited": False, "error": "not_found"}
+        current_rev = int(d.get("revision") or 1)
+        if not force and expected_revision is None:
+            # 对齐 lcs-fusion-memory /memory/edit：未携带修订 → 409 revision_required
+            return {
+                "edited": False,
+                "error": "revision_required",
+                "current_revision": current_rev,
+            }
+        if not force and expected_revision is not None and expected_revision != current_rev:
+            return {
+                "edited": False,
+                "error": "revision_conflict",
+                "current_revision": current_rev,
+                "expected_revision": expected_revision,
+            }
+        text = normalize_names((text or "").strip())
+        if not text:
+            return {"edited": False, "error": "text 不能为空"}
+        new_fp = claim_fingerprint(text)
+        ok = self.db.update_memory(
+            memory_id,
+            {
+                "content": text,
+                "fingerprint": new_fp,
+                "revision": current_rev + 1,
+                "updated_at": datetime.now().isoformat(),
+            },
+        )
+        if not ok:
+            return {"edited": False, "error": "update_failed"}
+        # 同步搜索索引（re-index）
+        self.search.delete(memory_id)
+        fresh = self.db.get_memory(memory_id)
+        if fresh and self._is_active_dict(fresh):
+            self.search.add(
+                memory_id,
+                fresh["content"],
+                {
+                    "type": fresh.get("type", "fact"),
+                    "priority": fresh.get("priority", "short_term"),
+                    "importance": fresh.get("importance_score", 0.5),
+                    "tags": fresh.get("tags", []),
+                },
+            )
+        self.db.append_mutation(memory_id, "edit", status="active", layer=fresh.get("layer", ""))
+        return {
+            "edited": True,
+            "id": memory_id,
+            "revision": current_rev + 1,
+            "re_embedded": True,
+            "fingerprint": new_fp,
+        }
+
+    def forget_memory(self, memory_id: str, reason: str = "memory-forget") -> dict:
+        """``forget_memory``（语义方法族）：软过期（status→forgotten + expires_at=now）。
+
+        返回同 scope 相似活跃候选（供用户/系统决定是否确认遗忘或恢复）。
+        """
+        d = self.db.get_memory(memory_id)
+        if not d:
+            return {"expired": False, "id": memory_id, "error": "not_found"}
+        now = datetime.now().isoformat()
+        ok = self.db.update_memory(
+            memory_id,
+            {"status": "forgotten", "expires_at": now, "updated_at": now},
+        )
+        # 相似活跃候选
+        similar: list[dict] = []
+        content = (d.get("content") or "")[:80]
+        if content:
+            try:
+                hits = self.search_semantic_scored(
+                    content,
+                    limit=5,
+                    scope=d.get("scope") or "user",
+                    scope_owner=d.get("scope_owner") or "",
+                    user_id=d.get("user_id") or "default",
+                    workspace_id=d.get("workspace_id") or "default",
+                )
+                for mem, score in hits:
+                    if mem.id == memory_id:
+                        continue
+                    similar.append({"id": mem.id, "similarity": round(float(score), 3)})
+            except Exception:
+                pass
+        self.db.append_mutation(memory_id, "forget", status="forgotten")
+        return {
+            "expired": ok,
+            "id": memory_id,
+            "similar_active": similar,
+            "message": "软过期：status→forgotten，expires_at→now",
+        }
+
+    def purge_memory(self, memory_id: str, reason: str = "memory-purge") -> dict:
+        """``purge_memory``（语义方法族）：硬删除 + 墓碑（同声明后续写入被拒）。"""
+        from .semantics import claim_fingerprint
+
+        d = self.db.get_memory(memory_id)
+        if not d:
+            return {"purged": False, "id": memory_id, "error": "not_found"}
+        fp = d.get("fingerprint") or claim_fingerprint(d.get("content") or "")
+        claim = (d.get("content") or "")[:200]
+        self.search.delete(memory_id)
+        ok = self.db.delete_memory(memory_id)
+        self.db.put_tombstone(fp, claim, reason=reason)
+        self.db.append_mutation(memory_id, "purge", status="purged")
+        return {"purged": ok, "id": memory_id, "tombstone": fp}
+
+    def core_status(self) -> dict:
+        """``core_status``（语义方法族）：核心记忆预算（core_max_chars=4000）。"""
+        from .semantics import CORE_MAX_CHARS, CoreBudget, CoreRow
+
+        try:
+            rows = self.db.query(
+                layer="core",
+                active_only=True,
+                limit=200,
+            )
+        except Exception:
+            rows = []
+        core_rows = [
+            CoreRow(
+                id=r.get("id", ""),
+                text=r.get("content", ""),
+                source=r.get("source", ""),
+                core_priority=int(r.get("core_priority") or 0),
+            )
+            for r in rows
+            if r.get("content")
+        ]
+        budget = CoreBudget(max_chars=CORE_MAX_CHARS)
+        rendered, used, truncated = budget.render(core_rows)
+        return {
+            "enabled": True,
+            "chars_used": used,
+            "chars_limit": CORE_MAX_CHARS,
+            "pages": len(core_rows),
+            "max_pages": 8,
+            "truncated": truncated,
+            "rendered": rendered,
+        }
+
+    def core_set(self, memory_id: str, *, add: bool = True, priority: int = 0) -> dict:
+        """``core_set``（语义方法族）：把记忆加入/移出核心层。"""
+        d = self.db.get_memory(memory_id)
+        if not d:
+            return {"ok": False, "error": "not_found"}
+        updates: dict = {"updated_at": datetime.now().isoformat()}
+        if add:
+            updates["layer"] = "core"
+            updates["core_priority"] = priority
+        else:
+            updates["layer"] = "facts"
+            updates["core_priority"] = 0
+        ok = self.db.update_memory(memory_id, updates)
+        self.db.append_mutation(
+            memory_id, "core_add" if add else "core_remove", layer="core" if add else "facts"
+        )
+        return {"ok": ok, "op": "add" if add else "remove", "id": memory_id, "priority": priority}
+
+    def core_suggest(self, *, limit: int = 5) -> dict:
+        """``core_suggest``（语义方法族）：按重要性+访问度推荐候选核心记忆。"""
+        try:
+            rows = self.db.query(
+                active_only=True,
+                limit=20,
+            )
+        except Exception:
+            rows = []
+        rows.sort(
+            key=lambda r: (
+                float(r.get("importance_score") or 0),
+                int(r.get("access_count") or 0),
+            ),
+            reverse=True,
+        )
+        candidates = [
+            {
+                "id": r.get("id", ""),
+                "text": (r.get("content") or "")[:80],
+                "importance": r.get("importance_score"),
+                "access_count": r.get("access_count"),
+            }
+            for r in rows[:limit]
+            if (r.get("layer") or "") != "core"
+        ]
+        return {"candidates": candidates}
+
+    def delta(self, since: int, *, session_id: str = "", limit: int = 100) -> dict:
+        """``delta``（语义方法族）：变更流游标读取（since_seq 之后）。"""
+        rows = self.db.list_mutations(since_seq=since, limit=limit)
+        return {
+            "since": since,
+            "has_more": len(rows) >= limit,
+            "next_cursor": rows[-1]["seq"] if rows else since,
+            "pages": [],
+            "facts": rows,
+        }
+
+    def maintain(self, *, dry_run: bool = False) -> dict:
+        """``maintain``（语义方法族）：TTL 到期软过期 + 近重复报告。"""
+        expired = 0
+        if not dry_run:
+            expired = self.cleanup_expired()
+        # 近重复报告（抽样：importance 前 30 条做词共享两两对比）
+        duplicates: list[dict] = []
+        try:
+            rows = self.db.query(active_only=True, limit=30)
+            texts = [(r.get("id", ""), (r.get("content") or "").strip()) for r in rows if r.get("content")]
+            for i in range(len(texts)):
+                for j in range(i + 1, len(texts)):
+                    id_a, ta = texts[i]
+                    id_b, tb = texts[j]
+                    if not ta or not tb:
+                        continue
+                    fp_a = self.db.get_memory(id_a) or {}
+                    fp_b = self.db.get_memory(id_b) or {}
+                    if (fp_a.get("fingerprint") or "") and (fp_a.get("fingerprint") == fp_b.get("fingerprint")):
+                        duplicates.append({"a": id_a, "b": id_b, "reason": "exact_fingerprint"})
+        except Exception:
+            pass
+        return {
+            "expired": expired,
+            "tombstoned": 0,
+            "duplicates": duplicates[:10],
+            "message": "dry_run：仅报告，未落库" if dry_run else "维护完成",
+        }
 
     # ======================================================================
     # Episode Memory

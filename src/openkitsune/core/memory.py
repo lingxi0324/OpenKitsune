@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import settings
+from ..memory.name_normalize import normalize_names
 from ..storage.database import Database
 from ..storage.models import MemoryEntry
 
@@ -123,6 +124,8 @@ class Memory:
 
     def save_memory(self, content: str) -> None:
         """保存 MEMORY.md"""
+        # 称呼归一化：核心记忆文件落地前自动替换「用户/模型/AI/助手」（配置驱动）
+        content = normalize_names(content)
         # 更新时间戳
         content = re.sub(
             r"\*最后更新: .+\*",

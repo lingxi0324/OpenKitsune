@@ -7,11 +7,20 @@
 保留 confidence 原值不破坏类型；先备份再写回。
 """
 import json
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
 
-TARGET = Path(r"C:\Users\Administrator\.OpenKitsune\evolution\capability_domains.json")
+# 默认目标 = 工程根（scripts/ 上级）的 evolution/capability_domains.json，
+# 可用环境变量 CAPABILITY_DOMAINS_PATH 覆盖（不硬编码机器路径）。
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TARGET = Path(
+    os.environ.get(
+        "CAPABILITY_DOMAINS_PATH",
+        str(PROJECT_ROOT / "evolution" / "capability_domains.json"),
+    )
+)
 
 
 def mark(node: dict) -> None:
