@@ -1,12 +1,12 @@
-![OpenKitsune Logo](docs/assets/logo.png)
+![OpenKitsune Logo](https://raw.githubusercontent.com/lingxi0324/OpenKitsune/main/docs/assets/logo.png)
 
 
 
-![Official Website](docs/assets/logo.png)
+![Official Website](https://raw.githubusercontent.com/lingxi0324/OpenKitsune/main/docs/assets/logo.png)
 
 
 
-![License](docs/assets/logo.png)
+![License](https://raw.githubusercontent.com/lingxi0324/OpenKitsune/main/docs/assets/logo.png)
 
 
 
@@ -127,7 +127,7 @@ OpenKitsune 由 **OpenAkita**（一个早期开源的自进化 AI Agent 项目�
 
 
 
-![OpenKitsune 快速配置](docs/assets/fox_setup.jpg)
+![OpenKitsune 快速配置](https://raw.githubusercontent.com/lingxi0324/OpenKitsune/main/docs/assets/fox_setup.jpg)
 
 
 
@@ -209,7 +209,7 @@ OpenKitsune 支持**桌面端、Web 端、移动端**—— 随时随地，多�
 
 
 
-![OpenKitsune 桌面应用](docs/assets/fox_chat_ui.jpg)
+![OpenKitsune 桌面应用](https://raw.githubusercontent.com/lingxi0324/OpenKitsune/main/docs/assets/fox_chat_ui.jpg)
 
 基于 **Tauri 2.x + React + TypeScript** 的跨平台桌面应用：
 
@@ -235,7 +235,7 @@ OpenKitsune 支持**桌面端、Web 端、移动端**—— 随时随地，多�
 
 
 
-![▶ 观看移动端操作演示](docs/assets/fox_mobile.jpg)
+![▶ 观看移动端操作演示](https://raw.githubusercontent.com/lingxi0324/OpenKitsune/main/docs/assets/fox_mobile.jpg)
 
 
 
@@ -255,7 +255,7 @@ OpenKitsune 支持**桌面端、Web 端、移动端**—— 随时随地，多�
 
 
 
-![▶ 观看组织编排演示](docs/assets/fox_org.jpg)
+![▶ 观看组织编排演示](https://raw.githubusercontent.com/lingxi0324/OpenKitsune/main/docs/assets/fox_org.jpg)
 
 不只是多个 Agent 协作，而是搭建一家 **AI 公司**。OpenKitsune 内置完整的组织编排引擎（AgentOrg），支持在图形界面中可视化搭建公司架构，让 AI 像真实公司一样分工协作、自主运营：
 
@@ -298,7 +298,7 @@ OpenKitsune 支持**桌面端、Web 端、移动端**—— 随时随地，多�
 
 
 
-![▶ 观看多智能体协同工作演示](docs/assets/fox_multi_agent.jpg)
+![▶ 观看多智能体协同工作演示](https://raw.githubusercontent.com/lingxi0324/OpenKitsune/main/docs/assets/fox_multi_agent.jpg)
 
 OpenKitsune 内置完整的多 Agent 协作系统 —— 不是只有一个 AI，而是一个 **AI 团队**：
 
@@ -345,7 +345,7 @@ OpenKitsune 内置完整的多 Agent 协作系统 —— 不是只有一个 AI�
 
 
 
-![▶ 观看扫码绑定教程](docs/assets/fox_scan.jpg)
+![▶ 观看扫码绑定教程](https://raw.githubusercontent.com/lingxi0324/OpenKitsune/main/docs/assets/fox_scan.jpg)
 
 **不需要申请开发者账号、不需要配置回调 URL、不需要懂技术**—— 扫一扫二维码，30 秒完成绑定：
 
@@ -809,7 +809,7 @@ OpenKitsune 对国内用户做了全面优化：
 
 
 
-![微信公众号](docs/assets/fox_contacts.jpg)
+![微信公众号](https://raw.githubusercontent.com/lingxi0324/OpenKitsune/main/docs/assets/fox_contacts.jpg)
 
 
 
