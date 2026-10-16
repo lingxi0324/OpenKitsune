@@ -9,20 +9,20 @@
 </p>
 
 <p align="center">
-  <a href="https://openkitsune.ai"><img src="https://img.shields.io/badge/🌐_Website-openkitsune.ai-orange?style=for-the-badge" alt="Official Website" height="28" /></a>
+  <a href="https://openkitsune.ai"><img src="docs/assets/logo.png" alt="Official Website" height="28" /></a>
   &nbsp;
-  <a href="https://openkitsune.ai/download"><img src="https://img.shields.io/badge/📥_Download-Desktop_App-blue?style=for-the-badge" alt="Download" height="28" /></a>
+  <a href="https://openkitsune.ai/download"><img src="docs/assets/logo.png" alt="Download" height="28" /></a>
   &nbsp;
-  <a href="https://discord.gg/vFwxNVNH"><img src="https://img.shields.io/badge/💬_Discord-Join_Community-5865F2?style=for-the-badge" alt="Discord" height="28" /></a>
+  <a href="https://discord.gg/vFwxNVNH"><img src="docs/assets/logo.png" alt="Discord" height="28" /></a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg?style=flat-square" alt="License" height="20" />
-  <img src="https://img.shields.io/badge/python-3.11+-blue.svg?style=flat-square" alt="Python Version" height="20" />
-  <img src="https://img.shields.io/github/v/release/openkitsune/openkitsune?color=green&style=flat-square" alt="Version" height="20" />
-  <img src="https://img.shields.io/pypi/v/openkitsune?color=green&style=flat-square" alt="PyPI" height="20" />
-  <img src="https://img.shields.io/github/actions/workflow/status/openkitsune/openkitsune/ci.yml?branch=main&style=flat-square" alt="Build Status" height="20" />
-  <img src="https://img.shields.io/github/stars/openkitsune/openkitsune?style=flat-square" alt="Stars" height="20" />
+  <img src="docs/assets/logo.png" alt="License" height="20" />
+  <img src="docs/assets/logo.png" alt="Python Version" height="20" />
+  <img src="docs/assets/logo.png" alt="Version" height="20" />
+  <img src="docs/assets/logo.png" alt="PyPI" height="20" />
+  <img src="docs/assets/logo.png" alt="Build Status" height="20" />
+  <img src="docs/assets/logo.png" alt="Stars" height="20" />
 </p>
 
 <p align="center">
@@ -68,17 +68,17 @@ OpenKitsune is a community fork and continuation of **OpenAkita** (an earlier op
 ## Screenshots
 
 <p align="center">
-  <img src="docs/assets/welcome_screen.png" alt="OpenKitsune Welcome Screen" width="720" />
+  <img src="docs/assets/fox_welcome.jpg" alt="OpenKitsune Welcome Screen" width="720" />
   <br/><em>Welcome onboarding</em>
 </p>
 
 <p align="center">
-  <img src="docs/assets/main_chat_ui.png" alt="OpenKitsune Main Chat UI" width="720" />
+  <img src="docs/assets/fox_chat_ui.jpg" alt="OpenKitsune Main Chat UI" width="720" />
   <br/><em>Main chat workspace with multi-agent reasoning</em>
 </p>
 
 <p align="center">
-  <img src="docs/assets/mobile_web_login.png" alt="OpenKitsune Web Mobile Login" width="480" />
+  <img src="docs/assets/fox_mobile.jpg" alt="OpenKitsune Web Mobile Login" width="480" />
   <br/><em>Web / mobile access</em>
 </p>
 
@@ -229,7 +229,7 @@ A presence heartbeat wakes after every turn; three rotating "eyes" (logic / empa
 **Fully GUI-based, no command line** — this is what sets OpenKitsune apart from other open-source AI assistants:
 
 <p align="center">
-  <img src="docs/assets/en/desktop_quick_config.gif" alt="OpenKitsune Quick Setup" width="800" />
+  <img src="docs/assets/fox_setup.jpg" alt="OpenKitsune Quick Setup" width="800" />
 </p>
 
 | Step | What You Do | Time |
@@ -291,7 +291,7 @@ OpenKitsune supports **Desktop, Web, and Mobile** — use it anywhere, on any de
 ### Desktop App
 
 <p align="center">
-  <img src="docs/assets/desktop_terminal_en.png" alt="OpenKitsune Desktop App" width="800" />
+  <img src="docs/assets/fox_chat_ui.jpg" alt="OpenKitsune Desktop App" width="800" />
 </p>
 
 Cross-platform desktop app built with **Tauri 2.x + React + TypeScript**:
@@ -316,7 +316,7 @@ Dark/light theme · Onboarding wizard · Auto-update · Bilingual (EN/CN) · Sta
 
 <p align="center">
   <a href="https://b23.tv/pWki3Vw">
-    <img src="docs/assets/en/mobile_app_demo_cover.png" alt="▶ Watch Mobile App Demo" width="720" />
+    <img src="docs/assets/fox_mobile.jpg" alt="▶ Watch Mobile App Demo" width="720" />
   </a>
   <br/>
   <sub>▶ Click to watch the Mobile App demo on Bilibili</sub>
@@ -333,7 +333,7 @@ Dark/light theme · Onboarding wizard · Auto-update · Bilingual (EN/CN) · Sta
 
 <p align="center">
   <a href="https://b23.tv/jvoWpgj">
-    <img src="docs/assets/en/org.jpg" alt="▶ Watch Organization Orchestration Demo" width="720" />
+    <img src="docs/assets/fox_org.jpg" alt="▶ Watch Organization Orchestration Demo" width="720" />
   </a>
   <br/>
   <sub>▶ Click to watch: Built a company on OpenKitsune, and it runs autonomously (Bilibili)</sub>
@@ -374,7 +374,7 @@ Beyond multi-Agent collaboration — build an entire **AI company**. OpenKitsune
 
 <p align="center">
   <a href="https://www.bilibili.com/video/BV1psP5zTEE7">
-    <img src="docs/assets/en/multi_agent_demo_cover.png" alt="▶ Watch Multi-Agent Collaboration Demo" width="720" />
+    <img src="docs/assets/fox_multi_agent.jpg" alt="▶ Watch Multi-Agent Collaboration Demo" width="720" />
   </a>
   <br/>
   <sub>▶ Click to watch the Multi-Agent collaboration demo on Bilibili</sub>
@@ -413,7 +413,7 @@ You: "Create a competitive analysis report"
 
 <p align="center">
   <a href="https://b23.tv/dkKTjO5">
-    <img src="docs/assets/en/im_qrcode.jpg" alt="▶ Watch Scan-to-Bind Tutorial" width="720" />
+    <img src="docs/assets/fox_scan.jpg" alt="▶ Watch Scan-to-Bind Tutorial" width="720" />
   </a>
   <br/>
   <sub>▶ Click to watch: OpenKitsune scan-to-bind for WeChat, Feishu, WeCom (Bilibili)</sub>
@@ -792,22 +792,22 @@ Tracing  ─── AgentTracer(12 SpanTypes) · DecisionTrace · TokenStats
 <table>
   <tr>
     <td align="center">
-      <img src="docs/assets/wechat_official.png" width="180" alt="WeChat Official Account" /><br/>
+      <img src="docs/assets/fox_contacts.jpg" width="180" alt="WeChat Official Account" /><br/>
       <b>WeChat Official</b><br/>
       <sub>Follow for updates</sub>
     </td>
     <td align="center">
-      <img src="docs/assets/person_wechat.jpg" width="180" alt="Personal WeChat" /><br/>
+      <img src="docs/assets/fox_contacts.jpg" width="180" alt="Personal WeChat" /><br/>
       <b>WeChat (Personal)</b><br/>
       <sub>Note "OpenKitsune" to join group</sub>
     </td>
     <td align="center">
-      <img src="docs/assets/wechat_group.jpg" width="180" alt="WeChat Group" /><br/>
+      <img src="docs/assets/fox_contacts.jpg" width="180" alt="WeChat Group" /><br/>
       <b>WeChat Group</b><br/>
       <sub>Scan to join (⚠️ refreshed weekly)</sub>
     </td>
     <td align="center">
-      <img src="docs/assets/qq_group.png" width="180" alt="QQ Group" /><br/>
+      <img src="docs/assets/fox_contacts.jpg" width="180" alt="QQ Group" /><br/>
       <b>QQ Group: 854429727</b><br/>
       <sub>Scan or search to join</sub>
     </td>
