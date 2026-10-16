@@ -303,7 +303,6 @@ path = "hatch_build.py"
 "skills/youtube-summarizer" = "openkitsune/builtin_skills/external/youtube-summarizer"
 "skills/bilibili-watcher" = "openkitsune/builtin_skills/external/bilibili-watcher"
 "skills/video-downloader" = "openkitsune/builtin_skills/external/video-downloader"
-"skills/image-understander" = "openkitsune/builtin_skills/external/image-understander"
 "skills/image-understanding" = "openkitsune/builtin_skills/external/image-understanding"
 
 # 知识与效率
