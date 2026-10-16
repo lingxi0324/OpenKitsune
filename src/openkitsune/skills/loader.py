@@ -1,0 +1,1208 @@
+"""
+技能加载器
+
+遵循 Agent Skills 规范 (agentskills.io/specification)
+从标准目录结构加载 SKILL.md 定义的技能
+"""
+
+import logging
+import os
+import shutil
+import subprocess
+import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+from ..core.log_health import record_health_event
+from .categories import (
+    RESERVED_NAMESPACE_DIRS,
+    CategoryRegistry,
+)
+from .category_store import CategoryStore
+from .parser import ParsedSkill, SkillMetadata, SkillParser
+from .registry import SkillRegistry
+
+_CURRENT_PLATFORM = sys.platform  # "win32", "darwin", "linux"
+
+logger = logging.getLogger(__name__)
+
+_RuntimeRegistryRecord = dict[str, object]
+SkillLoadFilter = Callable[[Path], bool]
+
+
+@dataclass
+class SkillLoadIssue:
+    """A non-fatal skill loading problem from the most recent scan."""
+
+    skill_id: str
+    path: str
+    error: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "skill_id": self.skill_id,
+            "path": self.path,
+            "error": self.error,
+        }
+
+
+def _resolve_user_workspace_skills() -> Path:
+    """动态解析当前用户工作区的技能目录。
+
+    生产模式下使用 config.settings.skills_path（自动适配当前工作区和自定义根目录），
+    导入失败时回退到基于 OPENKITSUNE_ROOT / 默认路径。
+    """
+    try:
+        from ..config import settings
+
+        return settings.skills_path
+    except Exception:
+        import os
+
+        root = os.environ.get("OPENKITSUNE_ROOT", "").strip()
+        if root:
+            return Path(root) / "workspaces" / "default" / "skills"
+        return Path.home() / ".openkitsune" / "workspaces" / "default" / "skills"
+
+
+def _builtin_skills_root() -> Path | None:
+    """
+    返回内置技能目录（随 wheel 分发）。
+
+    期望结构：
+    openkitsune/
+      builtin_skills/
+        system/<tool-name>/SKILL.md
+    """
+    try:
+        root = Path(__file__).resolve().parents[1] / "builtin_skills"
+        return root if root.exists() and root.is_dir() else None
+    except Exception:
+        return None
+
+
+# 标准技能目录 (按优先级排序)
+SKILL_DIRECTORIES = [
+    # 内置系统技能（随 pip 包分发，优先级最高）
+    "__builtin__",
+    # 用户工作区（运行时根据当前工作区动态解析）
+    "__user_workspace__",
+    # 项目级别（开发模式下仍可扫描）
+    "skills",
+]
+
+# 系统技能目录（优先加载）
+SYSTEM_SKILL_DIRECTORIES = [
+    "skills",  # 系统技能也放在 skills/ 目录下，通过 system: true 标记区分
+]
+
+# 默认不启用的外部技能（新安装 / 无 data/skills.json 时生效）。
+# 这里必须使用注册表的 skill_id（即目录名），不能使用 frontmatter 的命名空间 name。
+# 用户通过前端面板手动勾选后会创建 skills.json，之后以用户选择为准。
+DEFAULT_DISABLED_SKILLS: frozenset[str] = frozenset(
+    {
+        "algorithmic-art",
+        "apify-scraper",
+        "bilibili-watcher",
+        "changelog-generator",
+        "chinese-novelist",
+        "chinese-writing",
+        "code-review",
+        "content-research-writer",
+        "douyin-tool",
+        "frontend-design",
+        "github-automation",
+        "gmail-automation",
+        "google-calendar-automation",
+        "image-understanding",
+        "internal-comms",
+        "moltbook",
+        "obsidian-skills",
+        "ppt-creator",
+        "pretty-mermaid",
+        "slack-gif-creator",
+        "superpowers-brainstorming",
+        "superpowers-debugging",
+        "superpowers-receiving-review",
+        "superpowers-tdd",
+        "superpowers-verification",
+        "superpowers-writing-plans",
+        "theme-factory",
+        "video-downloader",
+        "webapp-testing",
+        "wechat-article",
+        "xiaohongshu-creator",
+        "youtube-summarizer",
+        # IM 办公 CLI
+        "feishu-cli",
+        "wecom-cli",
+        "dingtalk-cli",
+        # AI 视频生成
+        "seedance-video",
+        # 出行与地图
+        "amap-maps",
+        "fliggy-travel",
+        "didi-ride",
+        # 腾讯生态
+        "qq-channel",
+        "tencent-meeting",
+        "tencent-survey",
+        "tencent-news",
+        "tencent-ima",
+        # 百度系 Skills
+        "baidu-search",
+        "baidu-netdisk",
+        "baidu-baike",
+        "baidu-maps",
+        "baidu-scholar",
+        "miaoda-app-builder",
+        "baidu-paddleocr-doc",
+        "baidu-paddleocr-text",
+        "baidu-deep-research",
+        "baidu-ecommerce",
+        "baidu-marketing",
+        "baidu-picture-book",
+        "baidu-ppt-gen",
+        "baidu-video-notes",
+        "baidu-yijian",
+        "baidu-famou",
+        "xiaodu-control",
+        # 电商工具
+        "taobaoke-tool",
+        # 网易云音乐
+        "netease-music",
+    }
+)
+
+
+class SkillLoader:
+    """
+    技能加载器
+
+    支持:
+    - 从标准目录自动发现技能
+    - 解析 SKILL.md 文件
+    - 加载技能脚本
+    - 渐进式披露
+    """
+
+    def __init__(
+        self,
+        registry: SkillRegistry | None = None,
+        parser: SkillParser | None = None,
+        category_registry: "CategoryRegistry | None" = None,
+    ):
+        self.registry = registry if registry is not None else SkillRegistry()
+        self.parser = parser or SkillParser()
+        if category_registry is not None:
+            self.category_registry = category_registry
+        else:
+            _default_reg = CategoryRegistry()
+            _default_reg.set_store(CategoryStore())
+            self.category_registry = _default_reg
+        self._loaded_skills: dict[str, ParsedSkill] = {}
+        self._last_load_issues: list[SkillLoadIssue] = []
+        self._category_catalog_paths: set[Path] = set()
+        self._default_category_bindings: dict[str, str] = {}
+
+    def _load_category_catalog(self, directory: Path) -> None:
+        """Merge read-only category defaults shipped beside a skill directory."""
+        catalog_path = directory / "catalog.json"
+        try:
+            resolved = catalog_path.resolve()
+        except OSError:
+            return
+        if resolved in self._category_catalog_paths or not resolved.is_file():
+            return
+
+        self._category_catalog_paths.add(resolved)
+        catalog = CategoryStore(resolved)
+        for category in catalog.list_categories():
+            name = str(category.get("name") or "").strip()
+            if not name:
+                continue
+            self.category_registry.upsert(
+                name,
+                description=str(category.get("description") or "").strip() or None,
+            )
+        for skill_id, category in catalog.get_bindings().items():
+            self._default_category_bindings.setdefault(skill_id, category)
+
+    @property
+    def last_load_issues(self) -> list[dict[str, str]]:
+        """Non-fatal skill load issues from the most recent full scan."""
+        return [issue.to_dict() for issue in self._last_load_issues]
+
+    def _remember_load_issue(self, skill_dir: Path, error: str) -> None:
+        """Record why a skill was skipped without failing the whole refresh."""
+        issue = SkillLoadIssue(
+            skill_id=skill_dir.name,
+            path=str(skill_dir),
+            error=error.strip()[:500],
+        )
+        for index, existing in enumerate(self._last_load_issues):
+            if existing.path == issue.path:
+                self._last_load_issues[index] = issue
+                return
+        self._last_load_issues.append(issue)
+
+    def discover_skill_directories(self, base_path: Path | None = None) -> list[Path]:
+        """
+        发现所有技能目录
+
+        Args:
+            base_path: 基础路径 (项目根目录)
+
+        Returns:
+            存在的技能目录列表
+        """
+        base_path = base_path or Path.cwd()
+        directories = []
+
+        for skill_dir in SKILL_DIRECTORIES:
+            if skill_dir == "__builtin__":
+                builtin = _builtin_skills_root()
+                if builtin is not None:
+                    directories.append(builtin)
+                    logger.debug(f"Found builtin skill directory: {builtin}")
+                continue
+
+            if skill_dir == "__user_workspace__":
+                path = _resolve_user_workspace_skills()
+            elif skill_dir.startswith("~"):
+                path = Path(skill_dir).expanduser()
+            else:
+                path = base_path / skill_dir
+
+            if path.exists() and path.is_dir():
+                directories.append(path)
+                logger.debug(f"Found skill directory: {path}")
+
+        return directories
+
+    def load_all(
+        self,
+        base_path: Path | None = None,
+        *,
+        load_filter: SkillLoadFilter | None = None,
+    ) -> int:
+        cache_path = (base_path or Path.cwd()) / "data" / "cache" / "skill-metadata.json"
+        with self.parser.persistent_cache(cache_path):
+            return self._load_all(base_path, load_filter=load_filter)
+
+    def _load_all(
+        self,
+        base_path: Path | None = None,
+        *,
+        load_filter: SkillLoadFilter | None = None,
+    ) -> int:
+        """
+        从所有标准目录加载技能
+
+        Args:
+            base_path: 基础路径
+
+        Returns:
+            加载的技能数量
+        """
+        self._last_load_issues = []
+        self._category_catalog_paths.clear()
+        self._default_category_bindings.clear()
+        try:
+            self.category_registry.clear()
+        except Exception:
+            pass
+
+        # 从 JSON store 加载用户自定义分类定义
+        try:
+            self.category_registry.load_from_store()
+        except Exception:
+            pass
+
+        directories = self.discover_skill_directories(base_path)
+        loaded = 0
+        runtime_records: list[_RuntimeRegistryRecord] = []
+
+        for skill_dir in directories:
+            self._load_category_catalog(skill_dir)
+            # __builtin__ / skills/system/ 等只读源以及被识别为 system 的根
+            # 视为只读分类容器；用户工作区与项目 skills/ 视为可写
+            try:
+                builtin_root = _builtin_skills_root()
+            except Exception:
+                builtin_root = None
+            is_readonly_root = (
+                builtin_root is not None and skill_dir.resolve() == builtin_root.resolve()
+            )
+            loaded += self.load_from_directory(
+                skill_dir,
+                _readonly=is_readonly_root,
+                load_filter=load_filter,
+                _runtime_registry_records=runtime_records,
+            )
+
+        loaded += self._load_cli_anything_skills(_runtime_registry_records=runtime_records)
+        self._flush_runtime_registry_records(runtime_records)
+
+        return loaded
+
+    def _load_cli_anything_skills(
+        self,
+        *,
+        _runtime_registry_records: list[_RuntimeRegistryRecord] | None = None,
+    ) -> int:
+        """Discover and load SKILL.md files from pip-installed cli-anything-* packages.
+
+        CLI-Anything generates SKILL.md alongside each CLI harness. When installed
+        via pip, these live under the package's site-packages directory (e.g.
+        ``cli_anything/gimp/SKILL.md``). This method scans for them so that
+        ``pip install cli-anything-gimp`` makes the skill auto-discoverable.
+        """
+        loaded = 0
+        try:
+            import importlib.metadata as importlib_metadata
+        except ImportError:
+            return 0
+
+        # Reading METADATA for every installed package dominated this discovery
+        # pass on Windows. Filter directory names before opening distribution
+        # metadata; only cli-anything packages can contribute these skills.
+        distributions = []
+        seen: set[Path] = set()
+        for entry in sys.path:
+            root = Path(entry or ".")
+            try:
+                for candidate in root.iterdir():
+                    name = candidate.name.lower().replace("-", "_")
+                    if not name.startswith("cli_anything") or not name.endswith(
+                        (".dist_info", ".egg_info")
+                    ):
+                        continue
+                    resolved = candidate.resolve()
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        distributions.append(importlib_metadata.Distribution.at(candidate))
+            except OSError:
+                continue
+
+        for dist in distributions:
+            name = (dist.metadata.get("Name") or "").lower()
+            if not name.startswith("cli-anything-"):
+                continue
+
+            dist_files = dist.files
+            if not dist_files:
+                continue
+
+            for rel_path in dist_files:
+                if rel_path.name.upper() == "SKILL.MD":
+                    try:
+                        full_path = rel_path.locate()
+                        if isinstance(full_path, Path) and full_path.exists():
+                            skill_dir = full_path.parent
+                            skill = self.load_skill(
+                                skill_dir,
+                                force=True,
+                                _runtime_registry_records=_runtime_registry_records,
+                            )
+                            if skill:
+                                loaded += 1
+                                logger.info(
+                                    f"Loaded cli-anything skill from pip package: {name} ({skill_dir})"
+                                )
+                    except Exception as e:
+                        logger.debug(f"Failed to load cli-anything skill from {name}: {e}")
+
+        if loaded:
+            logger.info("Indexed %d cli-anything skill descriptors from pip packages", loaded)
+        return loaded
+
+    @staticmethod
+    def _flush_runtime_registry_records(records: list[_RuntimeRegistryRecord]) -> None:
+        if not records:
+            return
+        try:
+            from .runtime_registry import mark_skills_loaded
+
+            mark_skills_loaded(records)
+        except Exception:
+            logger.debug("Failed to update skill runtime registry batch", exc_info=True)
+
+    def load_from_directory(
+        self,
+        directory: Path,
+        *,
+        force: bool = True,
+        _readonly: bool = False,
+        load_filter: SkillLoadFilter | None = None,
+        _runtime_registry_records: list[_RuntimeRegistryRecord] | None = None,
+    ) -> int:
+        """从目录递归加载所有技能。
+
+        分类不再由目录层级推断，而是通过 JSON bindings 绑定。
+        目录扫描仍递归进入所有子目录以发现 SKILL.md。
+
+        递归规则：
+        - 子目录含 SKILL.md -> 视为一个技能，调用 ``load_skill``
+        - 子目录名属于 ``RESERVED_NAMESPACE_DIRS`` -> 命名空间容器，
+          递归（system 目录标记只读）
+        - 隐藏目录 / 内部目录（.git、__pycache__）-> 跳过
+        - 其他子目录 -> 递归扫描
+
+        Args:
+            directory: 技能目录
+            force: 是否允许覆盖已注册的同名 skill
+            _readonly: 内部参数。当前根是否为只读
+
+        Returns:
+            加载的技能数量
+        """
+        if not directory.exists():
+            logger.warning(f"Skill directory not found: {directory}")
+            return 0
+
+        self._load_category_catalog(directory)
+
+        loaded = 0
+        runtime_records = _runtime_registry_records if _runtime_registry_records is not None else []
+        flush_runtime_records = _runtime_registry_records is None
+
+        for item in directory.iterdir():
+            if not item.is_dir():
+                continue
+
+            skill_md = item / "SKILL.md"
+            if skill_md.exists():
+                if load_filter is not None and not load_filter(item):
+                    logger.debug("Skipped skill before parse by load filter: %s", item)
+                    continue
+                try:
+                    skill = self.load_skill(
+                        item,
+                        force=force,
+                        _runtime_registry_records=runtime_records,
+                    )
+                    if skill:
+                        loaded += 1
+                        cat = skill.metadata.category
+                        if cat:
+                            try:
+                                self.category_registry.add_skill(cat, item.name)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    self._remember_load_issue(item, str(e))
+                    if record_health_event(
+                        "skill",
+                        f"{item.name}:load",
+                        str(e),
+                        severity="error",
+                        suggestion="请检查技能目录是否包含合法 SKILL.md，以及 frontmatter/脚本路径是否正确。",
+                    ):
+                        logger.error(f"Failed to load skill from {item}: {e}")
+            elif item.name in RESERVED_NAMESPACE_DIRS:
+                child_readonly = _readonly or item.name == "system"
+                loaded += self.load_from_directory(
+                    item,
+                    force=force,
+                    _readonly=child_readonly,
+                    load_filter=load_filter,
+                    _runtime_registry_records=runtime_records,
+                )
+            elif item.name.startswith(".") or item.name.startswith("_"):
+                continue
+            else:
+                loaded += self.load_from_directory(
+                    item,
+                    force=force,
+                    _readonly=_readonly,
+                    load_filter=load_filter,
+                    _runtime_registry_records=runtime_records,
+                )
+
+        if flush_runtime_records:
+            self._flush_runtime_registry_records(runtime_records)
+        logger.info("Indexed %d skill descriptors from %s", loaded, directory)
+        return loaded
+
+    @staticmethod
+    def _cheap_skill_id_candidates(skill_dir: Path) -> set[str]:
+        """Return allowlist keys for a skill directory without parsing SKILL.md."""
+        candidates = {skill_dir.name}
+        parts = list(skill_dir.parts)
+
+        for index, part in enumerate(parts):
+            if part in RESERVED_NAMESPACE_DIRS and index < len(parts) - 1:
+                rel = Path(*parts[index + 1 :]).as_posix()
+                if rel:
+                    candidates.add(rel)
+
+        # Most bundled external skills use namespaced metadata in the form
+        # ``openkitsune/skills@<dir>``. Preset profiles and default allowlists use
+        # that key, so matching it here avoids reading SKILL.md just to learn it.
+        candidates.add(f"openkitsune/skills@{skill_dir.name}")
+        candidates.add(f"obra/superpowers@{skill_dir.name.removeprefix('superpowers-')}")
+
+        try:
+            skill_md = skill_dir / "SKILL.md"
+            with skill_md.open("r", encoding="utf-8") as handle:
+                for _ in range(24):
+                    line = handle.readline()
+                    if not line or line.strip() == "---" and _ > 0:
+                        break
+                    if line.lstrip().startswith("name:"):
+                        raw_name = line.split(":", 1)[1].strip().strip("\"'")
+                        if raw_name:
+                            candidates.add(raw_name)
+                        break
+        except Exception:
+            pass
+
+        return {c for c in candidates if c}
+
+    @staticmethod
+    def build_preparse_allowlist_filter(
+        external_allowlist: set[str] | None,
+        *,
+        agent_referenced_skills: set[str] | None = None,
+    ) -> SkillLoadFilter | None:
+        """Build a filter that skips disabled external skills before parsing.
+
+        ``None`` preserves legacy all-external loading. When a set is provided,
+        system skills are always kept, explicitly allowed skills are loaded, and
+        preset-referenced skills are loaded so the later prune step can mark
+        them disabled instead of removing them from sub-agent discovery.
+        """
+        if external_allowlist is None:
+            return None
+
+        allowed = {str(s).strip() for s in external_allowlist if str(s).strip()}
+        keep_extra = {str(s).strip() for s in agent_referenced_skills or set() if str(s).strip()}
+
+        def _filter(skill_dir: Path) -> bool:
+            if "system" in skill_dir.parts:
+                return True
+            candidates = SkillLoader._cheap_skill_id_candidates(skill_dir)
+            return bool(candidates & allowed) or bool(candidates & keep_extra)
+
+        return _filter
+
+    @staticmethod
+    def _is_os_compatible(supported_os: list[str]) -> bool:
+        """Check if the current platform is in the skill's supported OS list.
+
+        Empty list means all platforms are supported.
+        """
+        if not supported_os:
+            return True
+        return _CURRENT_PLATFORM in supported_os
+
+    def load_skill(
+        self,
+        skill_dir: Path,
+        *,
+        plugin_source: str | None = None,
+        force: bool = False,
+        _runtime_registry_records: list[_RuntimeRegistryRecord] | None = None,
+    ) -> ParsedSkill | None:
+        """加载单个技能。
+
+        分类优先级：
+        1. JSON bindings（CategoryStore）中的绑定 — 最高优先
+        2. SKILL.md frontmatter 中声明的 category — 兜底
+
+        Args:
+            skill_dir: 技能目录
+            plugin_source: 插件来源标识
+            force: 允许覆盖已注册的同名 skill
+
+        Returns:
+            ParsedSkill 或 None
+        """
+        try:
+            skill = self.parser.parse_directory(skill_dir)
+
+            self._load_i18n(skill_dir, skill.metadata)
+
+            # 用户 JSON bindings 优先，其次使用随技能目录分发的只读默认分类；
+            # 未收录的用户技能继续使用自身 frontmatter category。
+            sid = skill_dir.name
+            bound_category = self.category_registry.resolve_category(sid)
+            if bound_category:
+                skill.metadata.category = bound_category
+            elif default_category := self._default_category_bindings.get(sid):
+                skill.metadata.category = default_category
+
+            # OS compatibility check
+            if not self._is_os_compatible(skill.metadata.supported_os):
+                logger.debug(
+                    f"Skipping skill {skill.metadata.name}: "
+                    f"not compatible with {_CURRENT_PLATFORM} "
+                    f"(requires {skill.metadata.supported_os})"
+                )
+                return None
+
+            # 验证: hard errors block registration, warnings are logged
+            errors = self.parser.validate(skill)
+            hard_errors = [e for e in (errors or []) if e.startswith("ERROR:")]
+            warnings = [e for e in (errors or []) if not e.startswith("ERROR:")]
+            for w in warnings:
+                if record_health_event(
+                    "skill",
+                    f"{skill_dir.name}:validation_warning",
+                    w,
+                    suggestion="技能可以继续加载，但建议修正 metadata 字段以避免运行时行为不明确。",
+                ):
+                    logger.warning(f"Skill validation warning: {w}")
+            if hard_errors:
+                self._remember_load_issue(
+                    skill_dir,
+                    "; ".join(e.removeprefix("ERROR:").strip() for e in hard_errors),
+                )
+                for e in hard_errors:
+                    if record_health_event(
+                        "skill",
+                        f"{skill_dir.name}:validation_error",
+                        e,
+                        severity="error",
+                        suggestion="技能已被拒绝加载，请修正 SKILL.md 必填字段或 schema。",
+                    ):
+                        logger.error(f"Skill validation error: {e}")
+                if record_health_event(
+                    "skill",
+                    f"{skill_dir.name}:rejected",
+                    "rejected due to validation errors",
+                    severity="error",
+                    suggestion="技能已跳过加载，避免重复报错。",
+                ):
+                    logger.error(f"Skill '{skill_dir.name}' rejected due to validation errors")
+                return None
+
+            sid = skill_dir.name
+
+            registered = self.registry.register(
+                skill,
+                skill_id=sid,
+                plugin_source=plugin_source,
+                force=force,
+            )
+            if not registered:
+                logger.warning(f"Skill '{sid}' registration rejected (conflict)")
+                return None
+
+            self._loaded_skills[sid] = skill
+            try:
+                deps = getattr(skill.metadata, "python_dependencies", []) or []
+                record: _RuntimeRegistryRecord = {
+                    "skill_id": sid,
+                    "source_path": str(skill_dir),
+                    "enabled": True,
+                    "dependencies": list(deps),
+                }
+                if _runtime_registry_records is not None:
+                    _runtime_registry_records.append(record)
+                else:
+                    from .runtime_registry import mark_skills_loaded
+
+                    mark_skills_loaded([record])
+            except Exception:
+                logger.debug("Failed to update skill runtime registry for %s", sid, exc_info=True)
+            logger.debug("Indexed skill descriptor: %s (name=%s)", sid, skill.metadata.name)
+            return skill
+
+        except Exception as e:
+            self._remember_load_issue(skill_dir, str(e))
+            if record_health_event(
+                "skill",
+                f"{skill_dir.name}:load",
+                str(e),
+                severity="error",
+                suggestion="请检查技能 metadata、引用文件和脚本路径；该错误已聚合限频。",
+            ):
+                logger.error(f"Failed to load skill from {skill_dir}: {e}")
+            return None
+
+    def _load_i18n(self, skill_dir: Path, metadata: SkillMetadata) -> None:
+        """加载国际化数据到 metadata。
+
+        优先 agents/openai.yaml 的 i18n 字段，回退 .openkitsune-i18n.json。
+        """
+        from .i18n import read_i18n
+
+        data = read_i18n(skill_dir)
+        for lang, fields in data.items():
+            if not isinstance(fields, dict):
+                continue
+            if "name" in fields:
+                metadata.name_i18n[lang] = str(fields["name"])
+            if "description" in fields:
+                metadata.description_i18n[lang] = str(fields["description"])
+
+    def _resolve_skill(self, key: str) -> ParsedSkill | None:
+        """按 skill_id 查找，未命中时回退到 name 匹配。"""
+        skill = self._loaded_skills.get(key)
+        if skill is not None:
+            return skill
+        for s in self._loaded_skills.values():
+            if s.metadata.name == key:
+                return s
+        return None
+
+    def get_skill(self, key: str) -> ParsedSkill | None:
+        """获取已加载的技能（接受 skill_id 或 name）"""
+        return self._resolve_skill(key)
+
+    def get_skill_body(self, key: str) -> str | None:
+        """
+        获取技能的完整指令 (body)
+
+        这是渐进式披露的第二级:
+        - 第一级: 元数据 (name, description) - 启动时加载
+        - 第二级: 完整指令 (body) - 激活时加载
+        - 第三级: 资源文件 - 按需加载
+        """
+        skill = self._resolve_skill(key)
+        if skill:
+            return skill.get_body()
+        return None
+
+    def compute_effective_allowlist(self, external_allowlist: set[str] | None) -> set[str] | None:
+        """根据 skills.json 的 allowlist 和默认禁用列表，计算最终的有效 allowlist。
+
+        - skills.json 存在且有 external_allowlist -> 直接使用（用户显式选择）
+        - skills.json 不存在（external_allowlist is None）-> 用全部外部技能 - DEFAULT_DISABLED_SKILLS
+        """
+        if external_allowlist is not None:
+            return external_allowlist
+
+        if not DEFAULT_DISABLED_SKILLS:
+            return None
+
+        all_external = {
+            sid
+            for sid, skill in self._loaded_skills.items()
+            if not getattr(skill.metadata, "system", False)
+        }
+        return all_external - DEFAULT_DISABLED_SKILLS
+
+    def prune_external_by_allowlist(
+        self,
+        external_allowlist: set[str] | None,
+        agent_referenced_skills: set[str] | None = None,
+    ) -> int:
+        """
+        根据外部技能 allowlist 裁剪 / 标记已加载技能。
+
+        约定：
+        - system 技能永远保留且启用
+        - external_allowlist 为 None → 不做限制（全部启用）
+        - external_allowlist 为 set() → 禁用所有外部技能
+
+        不在 allowlist 中的外部技能：
+        - 被 agent_referenced_skills 引用 → 保留但标记 disabled=True
+          （子 Agent INCLUSIVE 模式可显式启用）
+        - 否则 → 从注册表和 loader 中移除
+        """
+        if external_allowlist is None:
+            for name in self._loaded_skills:
+                self.registry.set_disabled(name, False)
+            return 0
+
+        keep_extra = agent_referenced_skills or set()
+        removed = 0
+        disabled_count = 0
+        for name, skill in list(self._loaded_skills.items()):
+            try:
+                if getattr(skill.metadata, "system", False):
+                    self.registry.set_disabled(name, False)
+                    continue
+            except Exception:
+                continue
+
+            metadata_name = str(getattr(skill.metadata, "name", "") or "")
+            if name in external_allowlist or metadata_name in external_allowlist:
+                self.registry.set_disabled(name, False)
+            elif name in keep_extra or metadata_name in keep_extra:
+                self.registry.set_disabled(name, True)
+                disabled_count += 1
+            else:
+                self._loaded_skills.pop(name, None)
+                try:
+                    self.registry.unregister(name)
+                except Exception:
+                    pass
+                removed += 1
+
+        if removed or disabled_count:
+            logger.info(
+                f"External skills filtered: {removed} removed, "
+                f"{disabled_count} disabled (kept for sub-agents)"
+            )
+        return removed
+
+    def get_script_content(self, name: str, script_name: str) -> str | None:
+        """
+        获取技能脚本内容
+
+        Args:
+            name: 技能名称
+            script_name: 脚本文件名
+
+        Returns:
+            脚本内容或 None
+        """
+        skill = self._loaded_skills.get(name)
+        if not skill:
+            return None
+
+        script_path = self._resolve_script_path(skill, script_name)
+        if script_path:
+            return script_path.read_text(encoding="utf-8")
+
+        return None
+
+    _SCRIPT_SUFFIXES = frozenset({".py", ".sh", ".bash", ".js", ".ts", ".mjs"})
+    _SCRIPT_IGNORE = frozenset({"__init__.py", "__pycache__"})
+
+    def _list_available_scripts(self, skill: ParsedSkill) -> list[str]:
+        """列出技能中所有可执行脚本（scripts/ 递归 + 根目录顶层）。"""
+        scripts: list[str] = []
+
+        if skill.scripts_dir and skill.scripts_dir.is_dir():
+            for f in sorted(skill.scripts_dir.rglob("*")):
+                if (
+                    f.is_file()
+                    and f.suffix in self._SCRIPT_SUFFIXES
+                    and f.name not in self._SCRIPT_IGNORE
+                ):
+                    rel = f.relative_to(skill.scripts_dir)
+                    scripts.append(f"scripts/{rel.as_posix()}")
+
+        for f in sorted(skill.skill_dir.iterdir()):
+            if (
+                f.is_file()
+                and f.suffix in self._SCRIPT_SUFFIXES
+                and f.name not in self._SCRIPT_IGNORE
+            ):
+                scripts.append(f.name)
+
+        return scripts
+
+    def _resolve_script_path(self, skill: ParsedSkill, script_name: str) -> Path | None:
+        """在技能的 scripts/ 目录和根目录中查找脚本文件。
+
+        很多外部技能（如 Anthropic 的 xlsx、pdf 等）把脚本直接放在技能根目录
+        而非 scripts/ 子目录，因此需要双重查找。
+
+        安全: 解析后的路径必须仍在技能目录内，防止 ``../`` 穿越。
+        """
+        for base in (skill.scripts_dir, skill.skill_dir):
+            if base is None:
+                continue
+            candidate = (base / script_name).resolve()
+            try:
+                candidate.relative_to(skill.skill_dir.resolve())
+            except ValueError:
+                logger.warning(
+                    "Script path traversal blocked: %s resolves outside skill dir %s",
+                    script_name,
+                    skill.skill_dir,
+                )
+                return None
+            if candidate.exists():
+                return candidate
+        return None
+
+    def run_script(
+        self,
+        name: str,
+        script_name: str,
+        args: list[str] | None = None,
+        cwd: Path | None = None,
+        python_executable: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> tuple[bool, str]:
+        """
+        运行技能脚本
+
+        Args:
+            name: 技能名称
+            script_name: 脚本文件名
+            args: 命令行参数
+            cwd: 工作目录
+
+        Returns:
+            (成功, 输出) 元组
+        """
+        skill = self._resolve_skill(name)
+        if not skill:
+            return False, f"Skill not found: {name}"
+
+        script_path = self._resolve_script_path(skill, script_name)
+        if not script_path:
+            available = self._list_available_scripts(skill)
+            if available:
+                return False, (
+                    f"Script not found: {script_name}\n"
+                    f"Available scripts: {', '.join(available)}\n"
+                    f'Use one of the available scripts, or use get_skill_info("{name}") '
+                    f"to check usage instructions."
+                )
+            else:
+                return False, (
+                    f"Script not found: {script_name}\n"
+                    f"This skill has NO executable scripts — it is an instruction-only skill.\n"
+                    f"DO NOT retry run_skill_script for this skill.\n"
+                    f'Instead: use get_skill_info("{name}") to read the skill instructions, '
+                    f"then write Python code and execute it via run_shell."
+                )
+
+        # 确定如何运行脚本
+        args = args or []
+
+        if script_path.suffix == ".py":
+            # Prefer the caller-provided managed env. Fall back to the legacy
+            # packaged/source interpreter for backwards compatibility.
+            from openkitsune.runtime_manager import get_python_executable
+
+            py = python_executable or get_python_executable()
+            if not py:
+                return False, "Python 解释器不可用，无法执行脚本"
+            cmd = [py, str(script_path)] + args
+        elif script_path.suffix in (".sh", ".bash"):
+            bash_path = shutil.which("bash")
+            if not bash_path:
+                # Windows 上尝试 Git Bash 的常见路径
+                if sys.platform == "win32":
+                    import os as _os
+
+                    _sd = _os.environ.get("SYSTEMDRIVE", "C:")
+                    for candidate in [
+                        rf"{_sd}\Program Files\Git\bin\bash.exe",
+                        rf"{_sd}\Program Files (x86)\Git\bin\bash.exe",
+                    ]:
+                        if Path(candidate).exists():
+                            bash_path = candidate
+                            break
+                if not bash_path:
+                    return False, (
+                        f"Cannot run {script_name}: 'bash' not found on this system. "
+                        f"On Windows, install Git for Windows (https://git-scm.com) to get bash."
+                    )
+            cmd = [bash_path, str(script_path)] + args
+        elif script_path.suffix == ".js":
+            cmd = ["node", str(script_path)] + args
+        else:
+            # 尝试直接运行
+            cmd = [str(script_path)] + args
+
+        try:
+            from openkitsune.runtime_manager import build_user_subprocess_environment
+
+            run_env = build_user_subprocess_environment(env)
+            skill_dir_str = str(skill.skill_dir.resolve())
+            existing_pythonpath = run_env.get("PYTHONPATH", "")
+            pythonpath_parts = [p for p in existing_pythonpath.split(os.pathsep) if p]
+            if skill_dir_str not in pythonpath_parts:
+                run_env["PYTHONPATH"] = (
+                    skill_dir_str
+                    if not pythonpath_parts
+                    else skill_dir_str + os.pathsep + existing_pythonpath
+                )
+
+            extra: dict = {}
+            if sys.platform == "win32":
+                extra["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+            MAX_OUTPUT_BYTES = 1 * 1024 * 1024  # 1 MB
+
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd or skill.skill_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=run_env,
+                **extra,
+            )
+            try:
+                raw_stdout, raw_stderr = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                return False, "Script execution timed out"
+            except Exception as comm_err:
+                proc.kill()
+                proc.wait()
+                return False, f"Script communication failed: {comm_err}"
+
+            truncated = False
+            stdout_bytes = raw_stdout[:MAX_OUTPUT_BYTES] if raw_stdout else b""
+            stderr_bytes = raw_stderr[:MAX_OUTPUT_BYTES] if raw_stderr else b""
+            if (raw_stdout and len(raw_stdout) > MAX_OUTPUT_BYTES) or (
+                raw_stderr and len(raw_stderr) > MAX_OUTPUT_BYTES
+            ):
+                truncated = True
+
+            output = stdout_bytes.decode("utf-8", errors="replace")
+            if stderr_bytes:
+                output += f"\nSTDERR:\n{stderr_bytes.decode('utf-8', errors='replace')}"
+            if truncated:
+                output += "\n\n[OUTPUT TRUNCATED — exceeded 1 MB limit]"
+
+            return proc.returncode == 0, output
+
+        except Exception as e:
+            return False, f"Script execution failed: {e}"
+
+    def get_reference(self, name: str, ref_name: str) -> str | None:
+        """
+        获取技能参考文档
+
+        Args:
+            name: 技能名称（接受 skill_id 或 display name）
+            ref_name: 参考文档名称 (如 REFERENCE.md)
+
+        Returns:
+            文档内容或 None
+        """
+        skill = self._resolve_skill(name)
+        if not skill or not skill.references_dir:
+            return None
+
+        ref_path = (skill.references_dir / ref_name).resolve()
+        try:
+            ref_path.relative_to(skill.references_dir.resolve())
+        except ValueError:
+            logger.warning(
+                "Reference path traversal blocked: %s resolves outside references dir %s",
+                ref_name,
+                skill.references_dir,
+            )
+            return None
+        if ref_path.exists():
+            return ref_path.read_text(encoding="utf-8", errors="replace")
+
+        return None
+
+    def unload_skill(self, name: str) -> bool:
+        """卸载技能"""
+        if name in self._loaded_skills:
+            del self._loaded_skills[name]
+            self.registry.unregister(name)
+            logger.info(f"Unloaded skill: {name}")
+            return True
+        return False
+
+    def reload_skill(self, name: str) -> ParsedSkill | None:
+        """重新加载技能"""
+        skill = self._loaded_skills.get(name)
+        if not skill:
+            return None
+
+        skill_dir = skill.skill_dir
+        plugin_source = None
+        entry = self.registry.get(name)
+        if entry:
+            plugin_source = entry.plugin_source
+        self.unload_skill(name)
+        return self.load_skill(skill_dir, plugin_source=plugin_source, force=True)
+
+    @property
+    def loaded_count(self) -> int:
+        """已加载技能数量"""
+        return len(self._loaded_skills)
+
+    @property
+    def loaded_skills(self) -> list[ParsedSkill]:
+        """所有已加载的技能"""
+        return list(self._loaded_skills.values())
+
+    @property
+    def system_skills(self) -> list[ParsedSkill]:
+        """所有系统技能"""
+        return [s for s in self._loaded_skills.values() if s.metadata.system]
+
+    @property
+    def external_skills(self) -> list[ParsedSkill]:
+        """所有外部技能"""
+        return [s for s in self._loaded_skills.values() if not s.metadata.system]
+
+    def get_skill_by_tool_name(self, tool_name: str) -> ParsedSkill | None:
+        """
+        根据工具名获取技能
+
+        Args:
+            tool_name: 原工具名称（如 'browser_navigate'）
+
+        Returns:
+            ParsedSkill 或 None
+        """
+        for skill in self._loaded_skills.values():
+            if skill.metadata.tool_name == tool_name:
+                return skill
+        return None
+
+    def get_skills_by_handler(self, handler: str) -> list[ParsedSkill]:
+        """
+        根据处理器名获取所有相关技能
+
+        Args:
+            handler: 处理器名称（如 'browser'）
+
+        Returns:
+            技能列表
+        """
+        return [s for s in self._loaded_skills.values() if s.metadata.handler == handler]
+
+    def get_tool_definitions(self) -> list[dict]:
+        """
+        获取所有系统技能的工具定义
+
+        用于传递给 LLM API 的 tools 参数
+
+        Returns:
+            工具定义列表
+        """
+        from ..tools.definitions import BASE_TOOLS
+
+        definitions = []
+
+        # 从系统技能生成工具定义
+        for skill in self.system_skills:
+            # 查找对应的原始工具定义
+            original_def = None
+            for tool in BASE_TOOLS:
+                if tool.get("name") == skill.metadata.tool_name:
+                    original_def = tool
+                    break
+
+            if original_def:
+                # 使用原始定义但更新描述（如果 SKILL.md 中有更详细的）
+                tool_def = original_def.copy()
+                # 可以在这里用 SKILL.md 中的描述覆盖
+                definitions.append(tool_def)
+            else:
+                # 没有原始定义，从 SKILL.md 生成
+                definitions.append(
+                    {
+                        "name": skill.metadata.tool_name,
+                        "description": skill.metadata.description,
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {},
+                        },
+                    }
+                )
+
+        return definitions
+
+    def is_system_skill(self, name: str) -> bool:
+        """检查是否为系统技能"""
+        skill = self._loaded_skills.get(name)
+        return skill.metadata.system if skill else False
+
+    def get_handler_name(self, name: str) -> str | None:
+        """获取技能的处理器名称"""
+        skill = self._loaded_skills.get(name)
+        return skill.metadata.handler if skill else None

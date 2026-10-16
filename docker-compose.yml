@@ -1,0 +1,21 @@
+services:
+  openkitsune:
+    build: .
+    container_name: openkitsune
+    restart: unless-stopped
+    ports:
+      - "18900:18900"
+    volumes:
+      - ./data:/app/data
+      - ./identity:/app/identity
+      - ./skills:/app/skills
+    env_file:
+      - .env
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=18900
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18900/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

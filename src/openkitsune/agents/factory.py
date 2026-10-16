@@ -1,0 +1,939 @@
+"""
+AgentFactory — 根据 AgentProfile 创建差异化 Agent 实例
+AgentInstancePool — per-session + per-profile 实例管理 + 空闲回收
+
+Pool key 格式: ``{session_id}::{profile_id}``
+同一会话可持有多个不同 profile 的 Agent 实例并行运行。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import TYPE_CHECKING, Any
+
+from .profile import AgentProfile, AgentType, SkillsMode
+
+if TYPE_CHECKING:
+    from openkitsune.agent.core import Agent
+
+logger = logging.getLogger(__name__)
+
+_IDLE_TIMEOUT_SECONDS = 30 * 60  # 30 分钟空闲回收
+_REAP_INTERVAL_SECONDS = 60  # 每分钟检查一次
+
+# INCLUSIVE 模式下始终保留的基础控制工具。业务能力（文件、网络、记忆、
+# 浏览器等）必须由 profile.tools 精确放行。
+ESSENTIAL_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "get_tool_info",
+        "set_task_timeout",
+    }
+)
+
+MCP_GATEWAY_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "call_mcp_tool",
+        "list_mcp_servers",
+        "get_mcp_instructions",
+        "connect_mcp_server",
+        "disconnect_mcp_server",
+    }
+)
+
+SKILL_GATEWAY_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "list_skills",
+        "get_skill_info",
+        "get_skill_reference",
+        "run_skill_script",
+        "execute_skill",
+    }
+)
+
+ESSENTIAL_SYSTEM_SKILLS: frozenset[str] = frozenset(
+    {
+        # 规划（多步任务的核心）
+        "create-todo",
+        "update-todo-step",
+        "get-todo-status",
+        "complete-todo",
+        # 技能发现（渐进式披露入口 — 外部技能必须先 get_skill_info 读指令）
+        "get-skill-info",
+        "list-skills",
+        # 文件系统（外部技能执行的基础 — 读指令→写代码→run-shell 执行）
+        "run-shell",
+        "read-file",
+        "write-file",
+        "list-directory",
+        # IM 通道（接收用户输入、交付文件）
+        "deliver-artifacts",
+        "get-chat-history",
+        "get-image-file",
+        "get-voice-file",
+        # 记忆
+        "search-memory",
+        "add-memory",
+        # 信息检索
+        "web-search",
+        # 系统
+        "get-tool-info",
+        "set-task-timeout",
+    }
+)
+
+
+class _GlobalStoreSource:
+    """Adapter that exposes a global UnifiedStore as a RetrievalEngine external source.
+
+    Used by isolated-memory agents with memory_inherit_global=True to also
+    retrieve from the shared global memory during search.
+
+    Phase 2b.1 安全洞修复：必须按当前 (user_id, workspace_id) 透传过滤，
+    否则 isolated agent 在 "继承全局" 模式下会拉到别的用户的记忆。
+    检索仅返回 ``scope="user"`` 范围、且 `user_id/workspace_id` 与
+    isolated MemoryManager 当前租户匹配的记忆，禁止跨用户、跨工作区。
+
+    RetrievalEngine._call_external_sources_sync expects:
+      - ``source.source_name: str``
+      - ``async source.retrieve(query, limit) -> list[dict]``
+        each dict with keys: id, content, relevance
+    """
+
+    source_name = "global_memory"
+
+    def __init__(self, global_store, owner_provider):
+        """
+        Args:
+            global_store: 共享的全局 UnifiedStore
+            owner_provider: 无参可调用对象，返回当前 (user_id, workspace_id) 元组。
+                通常绑定到 isolated MemoryManager._current_owner，以便每次
+                检索时拿到该 Agent 当前会话的真实租户身份。
+        """
+        self._store = global_store
+        self._owner_provider = owner_provider
+
+    async def retrieve(self, query: str, limit: int = 8) -> list[dict]:
+        try:
+            user_id, workspace_id = self._owner_provider()
+        except Exception as e:
+            logger.warning(
+                "[_GlobalStoreSource] owner_provider failed (%s); refusing cross-user fallback",
+                e,
+            )
+            return []
+        if not user_id or user_id in {"default", "anonymous", "legacy", "system", ""}:
+            logger.debug(
+                "[_GlobalStoreSource] user_id=%r is non-personal; "
+                "skipping global memory inheritance to avoid leaking shared bucket.",
+                user_id,
+            )
+            return []
+        try:
+            memories = self._store.search_semantic(
+                query,
+                limit=limit,
+                scope="user",
+                scope_owner="",
+                user_id=user_id,
+                workspace_id=workspace_id or "default",
+            )
+        except Exception as e:
+            logger.warning("[_GlobalStoreSource] tenant-scoped search failed: %s", e)
+            return []
+        results = []
+        for mem in memories:
+            results.append(
+                {
+                    "id": f"global::{mem.id}",
+                    "content": mem.to_markdown(),
+                    "relevance": 0.6,
+                }
+            )
+        return results
+
+
+class AgentFactory:
+    """
+    根据 AgentProfile 创建 Agent 实例。
+
+    - 按 profile 配置过滤技能
+    - 注入自定义提示词
+    - 设置 agent name/icon
+    """
+
+    async def create(
+        self,
+        profile: AgentProfile,
+        *,
+        parent_brain: Any = None,
+        share_from: Any = None,
+        **kwargs: Any,
+    ) -> Agent:
+        from openkitsune.agent.core import Agent, get_primary_agent
+
+        agent = Agent(name=profile.get_display_name(), brain=parent_brain, **kwargs)
+
+        # ── share_from 选取策略（P0-A 性能修复）──
+        # 默认尝试复用进程主 Agent 的注册表 —— sub-agent 不再各自加载一次
+        # 124 个工具/22 个插件/30 个 handler，把节点切换延迟从 30~80s 降到 <1s。
+        # 但只有"完全共享"配置才能安全 share_from（plugin/identity/memory 任何
+        # 一个隔离都会破坏共享语义，必须走传统的 lightweight full-init）。
+        # 注意：``plugins_mode == "all"`` 且没显式列 plugins 视作"全部继承"。
+        share_target = share_from if share_from is not None else get_primary_agent()
+        can_share = (
+            share_target is not None
+            and share_target is not agent
+            and getattr(share_target, "_initialized", False)
+            and getattr(profile, "identity_mode", "shared") == "shared"
+            and getattr(profile, "memory_mode", "shared") == "shared"
+            and (
+                getattr(profile, "plugins_mode", "all") == "all"
+                or not getattr(profile, "plugins", None)
+            )
+        )
+
+        if can_share:
+            await agent.initialize(start_scheduler=False, lightweight=True, share_from=share_target)
+        else:
+            await agent.initialize(start_scheduler=False, lightweight=True)
+        agent.configure_runtime_environment(profile)
+
+        self._apply_skill_filter(agent, profile)
+        self._apply_tool_filter(agent, profile)
+        self._apply_mcp_filter(agent, profile)
+        await self._apply_plugin_filter(agent, profile)
+
+        # Sync PromptAssembler catalog references after filtering.
+        # _apply_tool_filter / _apply_mcp_filter may replace agent.tool_catalog /
+        # mcp_catalog with new objects; the PromptAssembler still holds the old refs.
+        pa = getattr(agent, "prompt_assembler", None)
+        if pa is not None:
+            pa._tool_catalog = agent.tool_catalog
+            pa._mcp_catalog = agent.mcp_catalog
+
+        # Rebuild the initial system prompt so it reflects the filtered catalogs.
+        # INCLUSIVE 模式无论 skills 是否为空都需要重建（空列表 = 隐藏全部非必要技能）。
+        needs_rebuild = (
+            profile.tools_mode == "inclusive"
+            or (profile.tools_mode == "exclusive" and profile.tools)
+            or profile.mcp_mode == "inclusive"
+            or (profile.mcp_mode == "exclusive" and profile.mcp_servers)
+            or profile.skills_mode == SkillsMode.INCLUSIVE
+            or (profile.skills_mode == SkillsMode.EXCLUSIVE and profile.skills)
+        )
+        if needs_rebuild and hasattr(agent, "_context"):
+            agent._context.system = agent._build_system_prompt()
+
+        # ── 身份隔离 ──
+        if profile.identity_mode == "custom":
+            self._apply_identity_override(agent, profile)
+
+        # ── 记忆隔离 ──
+        if profile.memory_mode == "isolated":
+            self._apply_memory_isolation(agent, profile)
+
+        # ── 权限规则注入 (MA1) ──
+        if profile.permission_rules:
+            try:
+                from openkitsune.agent.permission import from_config
+
+                ruleset = from_config(
+                    {
+                        r["permission"]: {r.get("pattern", "*"): r["action"]}
+                        for r in profile.permission_rules
+                        if "permission" in r and "action" in r
+                    }
+                )
+                if ruleset and hasattr(agent, "_tool_executor"):
+                    agent._tool_executor._extra_permission_rules = ruleset
+                    logger.info(
+                        f"Injected {len(ruleset)} permission rule(s) from profile {profile.id}"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to inject permission_rules for {profile.id}: {e}")
+
+        if profile.custom_prompt:
+            agent._custom_prompt_suffix = profile.custom_prompt
+
+        if profile.preferred_endpoint:
+            agent._preferred_endpoint = profile.preferred_endpoint
+            agent._endpoint_policy = profile.endpoint_policy or "prefer"
+
+        logger.info(
+            f"AgentFactory created: {profile.id} "
+            f"(skills_mode={profile.skills_mode.value}, "
+            f"skills={profile.skills}, "
+            f"tools_mode={profile.tools_mode}, "
+            f"mcp_mode={profile.mcp_mode}, "
+            f"plugins_mode={profile.plugins_mode}, "
+            f"identity_mode={profile.identity_mode}, "
+            f"memory_mode={profile.memory_mode}, "
+            f"preferred_endpoint={profile.preferred_endpoint or 'auto'}, "
+            f"endpoint_policy={profile.endpoint_policy or 'prefer'})"
+        )
+        return agent
+
+    @staticmethod
+    def _normalize_skill_name(name: str) -> str:
+        """归一化技能名：下划线转连字符、统一小写"""
+        return name.lower().replace("_", "-")
+
+    @staticmethod
+    def _build_skill_match_set(names: list[str]) -> tuple[set[str], set[str]]:
+        """构建技能名匹配集，同时支持完整命名空间和短名匹配。
+
+        Returns:
+            (exact_set, short_set) — exact_set 包含完整归一化名称，
+            short_set 包含 ``@`` 后的短名（用于跨格式回退匹配）。
+        """
+        n = AgentFactory._normalize_skill_name
+        exact: set[str] = set()
+        short: set[str] = set()
+        for s in names:
+            norm = n(s)
+            exact.add(norm)
+            short.add(norm.split("@", 1)[-1] if "@" in norm else norm)
+        return exact, short
+
+    @staticmethod
+    def _skill_in_set(skill_name: str, exact_set: set[str], short_set: set[str]) -> bool:
+        """判断技能名是否在匹配集中（兼容命名空间和短名）。"""
+        norm = AgentFactory._normalize_skill_name(skill_name)
+        if norm in exact_set:
+            return True
+        return (norm.split("@", 1)[-1] if "@" in norm else norm) in short_set
+
+    @staticmethod
+    def _is_essential(skill_name: str) -> bool:
+        """判断是否为基础设施系统工具（INCLUSIVE 模式始终保留）。"""
+        return AgentFactory._normalize_skill_name(skill_name) in ESSENTIAL_SYSTEM_SKILLS
+
+    @staticmethod
+    def _apply_skill_filter(agent: Agent, profile: AgentProfile) -> None:
+        if profile.skills_mode == SkillsMode.ALL:
+            return
+
+        # EXCLUSIVE with empty list → nothing to exclude
+        if profile.skills_mode == SkillsMode.EXCLUSIVE and not profile.skills:
+            return
+
+        registry = agent.skill_registry
+        all_skills = [skill.skill_id for skill in registry.list_all(include_disabled=True)]
+        changed = 0
+
+        if profile.skills_mode == SkillsMode.INCLUSIVE:
+            # INCLUSIVE: 渐进式披露 — 未勾选的技能从 L1（系统提示目录）隐藏，
+            # 但保留在注册表中，LLM 可通过 list_skills / get_skill_info 按需发现。
+            if profile.skills:
+                exact, short = AgentFactory._build_skill_match_set(profile.skills)
+            else:
+                exact, short = set(), set()
+
+            for skill_name in all_skills:
+                if AgentFactory._is_essential(skill_name):
+                    continue
+                if not AgentFactory._skill_in_set(skill_name, exact, short):
+                    registry.set_catalog_hidden(skill_name, True)
+                    changed += 1
+
+            # 显式选择的技能即使全局 disabled 也应在此 Agent 上可用
+            if profile.skills:
+                for skill in registry.list_all(include_disabled=True):
+                    if skill.disabled and AgentFactory._skill_in_set(skill.skill_id, exact, short):
+                        skill.disabled = False
+
+        elif profile.skills_mode == SkillsMode.EXCLUSIVE:
+            # EXCLUSIVE: 完全移除黑名单中的技能（不可发现）
+            exact, short = AgentFactory._build_skill_match_set(profile.skills)
+            for skill_name in all_skills:
+                if AgentFactory._is_essential(skill_name):
+                    continue
+                if AgentFactory._skill_in_set(skill_name, exact, short):
+                    registry.unregister(skill_name)
+                    changed += 1
+
+        if changed:
+            agent.skill_catalog.invalidate_cache()
+            agent.skill_catalog.generate_catalog()
+            agent._update_skill_tools()
+
+    @staticmethod
+    def _apply_tool_filter(agent: Agent, profile: AgentProfile) -> None:
+        """按 profile.tools + tools_mode 过滤 Agent 的工具列表。
+
+        tools 字段支持类目名（如 "research"）和具体工具名的混合。
+        INCLUSIVE 模式下只保留基础控制工具，以及由 MCP/Skill 区块独立放行
+        所需的入口工具。
+        """
+        if profile.tools_mode == "all":
+            return
+        if profile.tools_mode == "exclusive" and not profile.tools:
+            return
+
+        from ..orgs.tool_categories import expand_tool_categories
+
+        specified = expand_tool_categories(profile.tools)
+        always_allowed = AgentFactory._always_allowed_tool_names(profile)
+
+        if profile.tools_mode == "inclusive":
+            agent._tools = [
+                t for t in agent._tools if t["name"] in specified or t["name"] in always_allowed
+            ]
+        elif profile.tools_mode == "exclusive":
+            agent._tools = [
+                t for t in agent._tools if t["name"] not in specified or t["name"] in always_allowed
+            ]
+
+        agent._tools.sort(key=lambda t: t["name"])
+
+        from ..tools.catalog import ToolCatalog
+
+        agent.tool_catalog = ToolCatalog(agent._tools)
+        logger.info(
+            f"Tool filter applied: mode={profile.tools_mode}, remaining={len(agent._tools)} tools"
+        )
+
+    @staticmethod
+    def _apply_mcp_filter(agent: Agent, profile: AgentProfile) -> None:
+        """按 profile.mcp_servers + mcp_mode 过滤 Agent 的 MCP catalog。
+
+        创建一个 filtered clone 替换 agent.mcp_catalog，
+        使 call_mcp_tool handler 只能访问 clone 中的 server。
+        """
+        if profile.mcp_mode == "all":
+            return
+        if profile.mcp_mode == "exclusive" and not profile.mcp_servers:
+            return
+
+        catalog = getattr(agent, "mcp_catalog", None)
+        if catalog is None or not hasattr(catalog, "clone_filtered"):
+            return
+
+        filtered = catalog.clone_filtered(profile.mcp_servers, mode=profile.mcp_mode)
+        agent.mcp_catalog = filtered
+        logger.info(
+            f"MCP filter applied: mode={profile.mcp_mode}, "
+            f"servers={profile.mcp_servers}, "
+            f"remaining={filtered.server_count} servers"
+        )
+
+    @staticmethod
+    def _always_allowed_tool_names(profile: AgentProfile) -> frozenset[str]:
+        allowed = set(ESSENTIAL_TOOL_NAMES)
+        if profile.mcp_mode != "inclusive" or profile.mcp_servers:
+            allowed.update(MCP_GATEWAY_TOOL_NAMES)
+        if profile.skills_mode != SkillsMode.INCLUSIVE or profile.skills:
+            allowed.update(SKILL_GATEWAY_TOOL_NAMES)
+        return frozenset(allowed)
+
+    @staticmethod
+    def _apply_identity_override(agent: Agent, profile: AgentProfile) -> None:
+        """加载 Profile 专属身份文件，覆盖 agent.identity 并重建 system prompt。"""
+        from .identity_resolver import ProfileIdentityResolver
+        from .profile import get_profile_store
+
+        store = get_profile_store()
+        profile_dir = store.ensure_profile_dir(profile.id)
+        profile_identity_dir = profile_dir / "identity"
+
+        from ..config import settings
+
+        global_identity_dir = settings.identity_path
+
+        resolver = ProfileIdentityResolver(profile_identity_dir, global_identity_dir)
+        identity = resolver.build_identity()
+        identity.load()
+
+        agent.identity = identity
+
+        if hasattr(agent, "_context"):
+            agent._context.system = agent._build_system_prompt()
+
+        logger.info(f"Identity override applied: profile={profile.id}, dir={profile_identity_dir}")
+
+    @staticmethod
+    def _isolated_memory_md_seed(profile: AgentProfile) -> str:
+        """Phase 2b.3：生成 isolated agent 的 MEMORY.md 初始内容。
+
+        刻意不引用全局记忆，让 daily_consolidator 在该 Agent 运行一段时间后
+        用它**自己**的对话和经验填充。
+        """
+        from datetime import datetime
+
+        name = (profile.name or profile.id).strip()
+        return (
+            f"# {name} — 独立记忆\n\n"
+            f"<!-- Phase 2b.3 seeded {datetime.now().isoformat(timespec='seconds')} -->\n\n"
+            f"_这是 Agent `{profile.id}` 的独立记忆文件。_\n\n"
+            f"这个 Agent 配置了 `memory_isolation=isolated`，所以它有自己的偏好、"
+            f"经验和事实记忆，不会和其它 Agent / 全局记忆混在一起。\n\n"
+            f"当 Agent 在对话里习得新的偏好、规则或事实，后台 lifecycle 任务会"
+            f"把它们写到这里。_无需手动编辑。_\n"
+        )
+
+    @staticmethod
+    def _apply_memory_isolation(agent: Agent, profile: AgentProfile) -> None:
+        """替换 agent.memory_manager 为独立的 MemoryManager 实例。"""
+        from ..config import settings
+        from ..memory.manager import MemoryManager
+        from .profile import get_profile_store
+
+        store = get_profile_store()
+        profile_dir = store.ensure_profile_dir(profile.id)
+        memory_dir = profile_dir / "memory"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+
+        # Phase 2b.3：isolated agent 首次启动 seed 一份属于自己的 MEMORY.md。
+        #
+        # 旧实现（v4 之前）：找不到 profile 自己的 MEMORY.md 时回退到全局
+        # ``settings.memory_path``。这有两个问题：
+        # 1) 启动时读到的是**别人**（全局）的偏好和经验，破坏 isolated 语义；
+        # 2) daily_consolidator.refresh_memory_md() 会用 isolated MemoryManager
+        #    的数据**覆写**全局 MEMORY.md —— 这是真正的数据污染 bug。
+        #
+        # 新实现：永远使用 profile 私有的路径；不存在就写入一份带注释头的
+        # 空模板，让用户知道这是该 Agent 的独立记忆区域。
+        memory_md_path = profile_dir / "identity" / "MEMORY.md"
+        if not memory_md_path.exists():
+            try:
+                memory_md_path.parent.mkdir(parents=True, exist_ok=True)
+                seed = AgentFactory._isolated_memory_md_seed(profile)
+                memory_md_path.write_text(seed, encoding="utf-8")
+                logger.info(
+                    "[Memory] Seeded isolated MEMORY.md for %s at %s",
+                    profile.id,
+                    memory_md_path,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Memory] Failed to seed MEMORY.md for %s (%s); falling "
+                    "back to global path. This may temporarily cross-pollinate "
+                    "global memory.",
+                    profile.id,
+                    e,
+                )
+                memory_md_path = settings.memory_path
+
+        isolated_mm = MemoryManager(
+            data_dir=memory_dir,
+            memory_md_path=memory_md_path,
+            identity_dir=profile_dir / "identity",
+            brain=agent.brain,
+            embedding_model=settings.embedding_model,
+            embedding_device=settings.embedding_device,
+            model_download_source=settings.model_download_source,
+            search_backend=settings.search_backend,
+            embedding_api_provider=settings.embedding_api_provider,
+            embedding_api_key=settings.embedding_api_key,
+            embedding_api_model=settings.embedding_api_model,
+            agent_id=profile.id,
+        )
+
+        if profile.memory_inherit_global:
+            global_store = agent.memory_manager.store
+            isolated_mm._global_store_ref = global_store
+            # P2b.1：把 owner_provider 绑定到 isolated_mm 的 _current_owner，
+            # 让全局检索严格按当前 (user_id, workspace_id) 过滤，
+            # 防止 isolated agent 从全局拉到别的用户/工作区的记忆。
+            isolated_mm.retrieval_engine._external_sources.append(
+                _GlobalStoreSource(global_store, isolated_mm._current_owner)
+            )
+
+        rebind_memory_manager = getattr(agent, "rebind_memory_manager", None)
+        if callable(rebind_memory_manager):
+            rebind_memory_manager(isolated_mm)
+        else:
+            # Compatibility for third-party Agent implementations that have
+            # not adopted the unified rebinding hook yet.
+            agent.memory_manager = isolated_mm
+
+        logger.info(
+            f"Memory isolation applied: profile={profile.id}, "
+            f"dir={memory_dir}, inherit_global={profile.memory_inherit_global}"
+        )
+
+    @staticmethod
+    async def _apply_plugin_filter(agent: Agent, profile: AgentProfile) -> None:
+        """按 profile.plugins + plugins_mode 过滤 Agent 的插件。
+
+        对不应保留的插件执行 unload，清理其 hooks、tools、channels。
+        """
+        if profile.plugins_mode == "all" or not profile.plugins:
+            return
+
+        pm = getattr(agent, "_plugin_manager", None)
+        if pm is None:
+            return
+
+        specified = set(profile.plugins)
+        loaded_ids = list(pm.loaded_plugins.keys())
+
+        for plugin_id in loaded_ids:
+            should_keep = (profile.plugins_mode == "inclusive" and plugin_id in specified) or (
+                profile.plugins_mode == "exclusive" and plugin_id not in specified
+            )
+            if not should_keep:
+                try:
+                    await pm.unload_plugin(plugin_id)
+                    logger.info(f"Plugin filter: unloaded {plugin_id}")
+                except Exception as e:
+                    logger.warning(f"Plugin filter: failed to unload {plugin_id}: {e}")
+
+
+class _PoolEntry:
+    __slots__ = (
+        "agent",
+        "profile_id",
+        "session_id",
+        "created_at",
+        "last_used",
+        "runtime_config_version",
+        "profile_generation",
+    )
+
+    def __init__(
+        self,
+        agent: Agent,
+        profile_id: str,
+        session_id: str,
+        runtime_config_version: int = 0,
+        profile_generation: int = 0,
+    ):
+        self.agent = agent
+        self.profile_id = profile_id
+        self.session_id = session_id
+        self.created_at = time.monotonic()
+        self.last_used = time.monotonic()
+        self.runtime_config_version = runtime_config_version
+        self.profile_generation = profile_generation
+
+    def touch(self) -> None:
+        self.last_used = time.monotonic()
+
+    @property
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self.last_used
+
+    @property
+    def pool_key(self) -> str:
+        return f"{self.session_id}::{self.profile_id}"
+
+
+class AgentInstancePool:
+    """
+    Agent 实例池 — per-session + per-profile 绑定 + 空闲自动回收。
+
+    Pool key 格式: ``{session_id}::{profile_id}``
+
+    同一会话可同时持有多个不同 profile 的 Agent 实例。
+    例如 session_123 可以同时运行 default, browser-agent, data-analyst。
+    """
+
+    def __init__(
+        self,
+        factory: AgentFactory | None = None,
+        idle_timeout: float = _IDLE_TIMEOUT_SECONDS,
+        profile_store=None,
+    ):
+        self._factory = factory or AgentFactory()
+        self._idle_timeout = idle_timeout
+        self._profile_store = profile_store
+        # Key: "{session_id}::{profile_id}"
+        self._pool: dict[str, _PoolEntry] = {}
+        # Per-composite-key locks for concurrent creation
+        self._create_locks: dict[str, asyncio.Lock] = {}
+        self._reaper_task: asyncio.Task | None = None
+        self._runtime_config_version: int = 0
+        self._profile_generations: dict[str, int] = {}
+
+    @staticmethod
+    def _make_key(session_id: str, profile_id: str) -> str:
+        return f"{session_id}::{profile_id}"
+
+    @staticmethod
+    def _schedule_shutdown(agent: Any) -> None:
+        if not hasattr(agent, "shutdown"):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            loop.create_task(agent.shutdown())
+        except Exception:
+            pass
+
+    async def start(self) -> None:
+        self._reaper_task = asyncio.create_task(self._reap_loop())
+        logger.info("AgentInstancePool reaper started")
+
+    async def stop(self) -> None:
+        if self._reaper_task:
+            self._reaper_task.cancel()
+            try:
+                await self._reaper_task
+            except asyncio.CancelledError:
+                pass
+        self._pool.clear()
+        logger.info("AgentInstancePool stopped")
+
+    def notify_skills_changed(self) -> None:
+        """全局技能变更通知 — 使池中已有 Agent 在下次使用时重建。"""
+        self.notify_runtime_config_changed("skills")
+
+    def notify_runtime_config_changed(self, reason: str = "runtime_config") -> None:
+        """Mark pooled Agent instances stale after runtime-affecting config changes.
+
+        Agent instances own Brain/LLMClient/tool catalogs.  Reusing an old
+        instance after changing skills or LLM endpoints keeps stale runtime
+        state alive until process restart, so the pool tracks a single runtime
+        version and recreates entries lazily on the next request.
+        """
+        self._runtime_config_version += 1
+        logger.info(
+            "Pool runtime config version bumped to %s (reason=%s)",
+            self._runtime_config_version,
+            reason,
+        )
+
+    def invalidate_profile(self, profile_id: str) -> int:
+        """Drop all pooled Agent instances bound to *profile_id*."""
+        self._profile_generations[profile_id] = self._profile_generations.get(profile_id, 0) + 1
+        to_remove = [key for key, entry in self._pool.items() if entry.profile_id == profile_id]
+        removed = 0
+        for key in to_remove:
+            entry = self._pool.pop(key, None)
+            if entry is None:
+                continue
+            removed += 1
+            self._schedule_shutdown(entry.agent)
+
+        stale_locks = [k for k in self._create_locks if k not in self._pool]
+        for key in stale_locks:
+            lock = self._create_locks[key]
+            if not lock.locked():
+                self._create_locks.pop(key, None)
+
+        if removed:
+            logger.info(f"Pool invalidated profile={profile_id} across {removed} session(s)")
+        return removed
+
+    async def get_or_create(
+        self,
+        session_id: str,
+        profile: AgentProfile,
+    ) -> Agent:
+        """获取已有实例或创建新实例。
+
+        Key = session_id::profile_id，同 session 不同 profile 各自独立。
+        All dict operations are safe under asyncio's single-threaded event loop;
+        only the async create_lock is needed to serialize factory.create() calls.
+
+        当全局运行时配置版本变更时，旧的 Agent 会被丢弃并重建，
+        确保技能、LLM 端点等会影响 Agent/Brain 构造的配置同步到所有池 Agent。
+        """
+        profile_id = profile.id
+        key = self._make_key(session_id, profile_id)
+        if key not in self._create_locks:
+            self._create_locks[key] = asyncio.Lock()
+        create_lock = self._create_locks[key]
+
+        async with create_lock:
+            while True:
+                current_version = self._runtime_config_version
+                profile_generation = self._profile_generations.get(profile_id, 0)
+                entry = self._pool.get(key)
+                if entry and (
+                    entry.runtime_config_version == current_version
+                    and entry.profile_generation == profile_generation
+                ):
+                    entry.touch()
+                    return entry.agent
+                if entry:
+                    self._pool.pop(key, None)
+                    self._schedule_shutdown(entry.agent)
+
+                parent_brain = None
+                session_entries = [
+                    e
+                    for e in self._pool.values()
+                    if e.session_id == session_id
+                    and hasattr(e.agent, "brain")
+                    and e.runtime_config_version == current_version
+                    and e.profile_generation
+                    == self._profile_generations.get(e.profile_id, 0)
+                ]
+                if session_entries:
+                    # Prefer default/system profiles, then earliest created
+                    def _sort_key(e: _PoolEntry) -> tuple:
+                        entry_profile = getattr(e.agent, "_agent_profile", None)
+                        is_default = e.profile_id == "default"
+                        is_system = (
+                            entry_profile is not None
+                            and getattr(entry_profile, "type", None) == AgentType.SYSTEM
+                        )
+                        return (not is_default, not is_system, e.created_at)
+
+                    best = min(session_entries, key=_sort_key)
+                    parent_brain = best.agent.brain
+
+                if parent_brain is None:
+                    agent = await self._factory.create(profile)
+                else:
+                    agent = await self._factory.create(profile, parent_brain=parent_brain)
+
+                runtime_changed = current_version != self._runtime_config_version
+                profile_changed = profile_generation != self._profile_generations.get(profile_id, 0)
+                if runtime_changed or profile_changed:
+                    self._schedule_shutdown(agent)
+                    if profile_changed:
+                        store = self._get_shared_profile_store()
+                        latest_profile = store.get(profile_id) if store is not None else None
+                        if latest_profile is None:
+                            raise KeyError(f"Agent profile no longer exists: {profile_id}")
+                        profile = latest_profile
+                    continue
+
+                self._pool[key] = _PoolEntry(
+                    agent,
+                    profile_id,
+                    session_id,
+                    current_version,
+                    profile_generation,
+                )
+                break
+
+        logger.info(f"Pool created agent: session={session_id}, profile={profile.id}")
+        return agent
+
+    def get_existing(
+        self,
+        session_id: str,
+        profile_id: str | None = None,
+    ) -> Agent | None:
+        """Return an existing Agent without creating a new one.
+
+        If *profile_id* is given, looks up the exact (session, profile) pair.
+        Otherwise returns the first (and typically only) agent for the session
+        — used by control endpoints (cancel/skip/insert).
+        """
+        if profile_id:
+            key = self._make_key(session_id, profile_id)
+            entry = self._pool.get(key)
+            if entry:
+                entry.touch()
+                return entry.agent
+            return None
+
+        for entry in self._pool.values():
+            if entry.session_id == session_id:
+                entry.touch()
+                return entry.agent
+        return None
+
+    def get_all_for_session(self, session_id: str) -> list[_PoolEntry]:
+        """Return all pool entries for a given session."""
+        return [e for e in self._pool.values() if e.session_id == session_id]
+
+    def release(self, session_id: str, profile_id: str | None = None) -> None:
+        """标记实例进入空闲等待回收。"""
+        if profile_id:
+            key = self._make_key(session_id, profile_id)
+            entry = self._pool.get(key)
+            if entry:
+                entry.touch()
+        else:
+            for entry in self._pool.values():
+                if entry.session_id == session_id:
+                    entry.touch()
+
+    def get_stats(self) -> dict:
+        entries = list(self._pool.values())
+
+        sessions: dict[str, list[dict]] = {}
+        for e in entries:
+            sessions.setdefault(e.session_id, []).append(
+                {
+                    "profile_id": e.profile_id,
+                    "idle_seconds": round(e.idle_seconds, 1),
+                }
+            )
+
+        return {
+            "total": len(entries),
+            "sessions": [
+                {
+                    "session_id": sid,
+                    "profile_id": agents[0]["profile_id"],
+                    "idle_seconds": min(a["idle_seconds"] for a in agents),
+                    "agents": agents,
+                }
+                for sid, agents in sessions.items()
+            ],
+        }
+
+    def _get_shared_profile_store(self):
+        """Get the ProfileStore — prefer the injected reference, fallback to module singleton."""
+        if self._profile_store is not None:
+            return self._profile_store
+        try:
+            from openkitsune.agents.profile import get_profile_store
+
+            return get_profile_store()
+        except Exception:
+            return None
+
+    async def _reap_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(_REAP_INTERVAL_SECONDS)
+                self._reap_idle()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"AgentInstancePool reaper error: {e}")
+
+    def _reap_idle(self) -> None:
+        reaped_profile_ids: list[str] = []
+
+        stale_locks = [k for k in self._create_locks if k not in self._pool]
+        for k in stale_locks:
+            lock = self._create_locks[k]
+            if not lock.locked():
+                self._create_locks.pop(k, None)
+
+        to_remove = []
+        for key, entry in self._pool.items():
+            if entry.idle_seconds <= self._idle_timeout:
+                continue
+            astate = getattr(entry.agent, "agent_state", None)
+            if astate is not None and getattr(astate, "has_active_task", False) is True:
+                continue
+            to_remove.append(key)
+        for key in to_remove:
+            entry = self._pool.pop(key)
+            reaped_profile_ids.append(entry.profile_id)
+            logger.info(
+                f"Pool reaped idle agent: session={entry.session_id}, "
+                f"profile={entry.profile_id}, "
+                f"idle={entry.idle_seconds:.0f}s"
+            )
+            try:
+                self._schedule_shutdown(entry.agent)
+            except Exception:
+                pass
+
+        # Clean up ephemeral profiles for reaped agents (outside lock)
+        if reaped_profile_ids:
+            try:
+                store = self._get_shared_profile_store()
+                if store:
+                    for pid in reaped_profile_ids:
+                        p = store.get(pid)
+                        if p and getattr(p, "ephemeral", False):
+                            store.remove_ephemeral(pid)
+                            logger.info(f"Pool reaper cleaned ephemeral profile: {pid}")
+            except Exception as e:
+                logger.warning(f"Pool reaper ephemeral cleanup failed: {e}")

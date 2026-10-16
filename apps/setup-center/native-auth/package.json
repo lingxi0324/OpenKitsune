@@ -1,0 +1,10 @@
+{
+  "name": "@openkitsune/native-auth",
+  "version": "1.0.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "capacitor": { "android": { "src": "android" }, "ios": { "src": "ios" } },
+  "peerDependencies": { "@capacitor/core": ">=8.0.0" }
+}

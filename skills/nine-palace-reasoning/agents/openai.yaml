@@ -1,0 +1,4 @@
+i18n:
+  zh:
+    name: 九宫推演
+    description: 九宫并行推演引擎 — 八宫Agent并行推演 + 中宫灵汐收敛整合

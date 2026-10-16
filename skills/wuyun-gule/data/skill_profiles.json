@@ -1,0 +1,52 @@
+{
+  "profiles": {
+    "aggressive": {
+      "description": "激进·高资本活跃·追涨杀跌",
+      "up_th": 0.03,
+      "active_level": 1.3,
+      "capital_weight": 0.25,
+      "qimen_weight": 0.2,
+      "wuyun_weight": 0.4
+    },
+    "balanced_v2": {
+      "description": "平衡·四层棘轮最优权重 ★",
+      "up_th": 0.05,
+      "active_level": 1.0,
+      "capital_weight": 0.2,
+      "qimen_weight": 0.2,
+      "wuyun_weight": 0.4
+    },
+    "conservative": {
+      "description": "保守·低资本权重·侧重长期",
+      "up_th": 0.08,
+      "active_level": 0.7,
+      "capital_weight": 0.15,
+      "qimen_weight": 0.15,
+      "wuyun_weight": 0.55
+    },
+    "pure_wuyun": {
+      "description": "纯五运六气·无资本无奇门",
+      "up_th": 0.05,
+      "active_level": 0.0,
+      "capital_weight": 0.0,
+      "qimen_weight": 0.0,
+      "wuyun_weight": 1.0
+    },
+    "short_term_qimen": {
+      "description": "短线·奇门主导·高灵敏度",
+      "up_th": 0.02,
+      "active_level": 1.2,
+      "capital_weight": 0.15,
+      "qimen_weight": 0.3,
+      "wuyun_weight": 0.35
+    }
+  },
+  "default_profile": "balanced_v2",
+  "metadata": {
+    "version": "v3.0",
+    "created": "2026-06-19",
+    "baseline_v1": "64.6%",
+    "four_layer_v2": "54-67%",
+    "five_profiles": "aggressive/balanced_v2/conservative/pure_wuyun/short_term_qimen"
+  }
+}

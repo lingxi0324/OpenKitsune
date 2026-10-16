@@ -1,0 +1,427 @@
+[project]
+name = "openkitsune"
+version = "1.27.42"
+description = "全能自进化AI Agent - 基于Kitsune模式，永不放弃"
+readme = "README.md"
+license = { text = "AGPL-3.0-only" }
+requires-python = ">=3.11"
+authors = [
+    { name = "OpenKitsune", email = "zacon365@gmail.com" }
+]
+keywords = ["ai", "agent", "claude", "autonomous", "self-evolving"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    # Core LLM
+    "anthropic>=0.40.0",
+    "openai>=1.0.0",
+
+    # MCP (Model Context Protocol)
+    "mcp>=1.0.0",
+
+    # Web Search
+    "ddgs>=8.0.0",
+
+    # CLI and UI
+    "rich>=13.7.0",
+    "prompt-toolkit>=3.0.43",
+    "typer>=0.12.0,<1",
+
+    # Async and HTTP
+    "httpx[socks]>=0.27.0",
+    "aiohttp>=3.13.0",
+    "aiofiles>=24.1.0",
+    "nest-asyncio>=1.5.0",
+
+    # Database
+    "aiosqlite>=0.20.0",
+
+    # Data validation
+    "pydantic>=2.5.0,<3",
+    "pydantic-settings>=2.1.0",
+
+    # Git operations
+    "gitpython>=3.1.40",
+
+    # YAML for config
+    "pyyaml>=6.0.1",
+
+    # Utilities
+    "python-dotenv>=1.0.0",
+    "tenacity>=8.2.3",
+    "simplejson>=3.19.2",
+    "packaging>=24.0",
+    "cryptography>=42.0,<47.0",
+    # C17: cross-process audit / scheduler / event_store locking.
+    "filelock>=3.13.0",
+
+    # HTTP API (serve mode + Desktop Terminal)
+    "fastapi>=0.110.0,<1",
+    "uvicorn>=0.27.0",
+
+    # Credential store (account OIDC): keyring with automatic Windows backend.
+    # 整改（2026-10-07）：此前缺失导致账号接口 88 次 500。
+    "keyring>=25.0.0",
+
+    # WebSocket gateway (serve mode + Desktop Terminal streaming).
+    # 整改（2026-10-07）：此前缺失导致 81 次 "Unsupported upgrade request"。
+    "websockets>=15.0,<17",
+
+    # IM Channels - Telegram (default)
+    "python-telegram-bot>=22.7",
+
+    # Browser automation (built-in)
+    "playwright>=1.40.0",
+
+    # Image processing
+    "Pillow>=10.0.0",
+
+    # Read-only extraction for cloud knowledge-base PDF content
+    "pypdf>=5.0,<7.0",
+
+    # HTML parsing for media-strategy plugin sources
+    "beautifulsoup4>=4.12.0",
+]
+
+[project.optional-dependencies]
+# 飞书 IM 通道
+feishu = [
+    "lark-oapi>=1.6.2",         # 2026 上游版本，含消息/事件/卡片 API 更新
+    "qrcode>=8.0",
+]
+
+# 钉钉 IM 通道 (Stream 模式)
+dingtalk = [
+    "dingtalk-stream>=0.24.3",
+]
+
+# 企业微信 IM 通道
+wework = [
+    "aiohttp>=3.13.0",          # 多个 CVE 修复 + 性能改进
+    "pycryptodome>=3.23.0",     # ARM64 wheel + AES-GCM 性能 + 安全更新
+]
+
+# 企业微信 WebSocket 长连接通道
+wework_ws = [
+    "websockets>=15.0,<16.0",   # 兼容 lark-oapi(<16) 且保留 additional_headers API
+    "cryptography>=46.0.7",     # 补丁级安全更新
+]
+
+# OneBot 协议通道 (NapCat/Lagrange 等)
+onebot = [
+    "websockets>=15.0,<16.0",
+]
+
+# QQ 官方机器人
+# 注意：QQ 官方 API 已支持 silk/wav/mp3/flac 直接上传（2024+），
+# 发送语音不再需要 pilk 编码。如需接收/转写用户发送的 SILK 语音
+# （由 src/openkitsune/channels/media/audio_utils.py 处理），请额外
+# `pip install pilk` 或安装 voice extra。
+qqbot = [
+    "websockets>=15.0,<16.0",   # QQ Gateway WebSocket 连接；需兼容 lark-oapi(<16)
+    "aiohttp>=3.13.0",          # Webhook 模式 HTTP 回调服务器
+]
+
+# 微信个人号 (iLink Bot API)
+wechat = [
+    "pycryptodome>=3.23.0",
+]
+
+# 语音接收/转写支持（QQ + 微信用户发来的 SILK v3 语音 → WAV）
+# 仅在需要语音转写功能时安装；不影响发送侧（QQ send_voice 已不依赖 pilk）。
+voice = [
+    "pilk>=0.2.1",
+    # -- 语音检测（VAD）与本地录音 --
+    "sounddevice>=0.5.0",
+    "numpy>=1.26.0",
+    # -- 本地语音识别（faster-whisper，离线隐私）--
+    "faster-whisper>=1.1.0",
+    # -- 语音合成默认引擎（edge-tts，免费无需 Key）--
+    "edge-tts>=6.1.0",
+]
+
+# 语音合成云引擎（按需安装；edge 免费引擎在 voice extra 已含）
+# 用法： pip install -e ".[voice-tts-cloud]"
+voice-tts-cloud = [
+    "openai>=1.60.0",            # OpenAI / DeepInfra 兼容 TTS
+    "elevenlabs>=1.0.0",         # ElevenLabs TTS
+    "mistralai>=1.0.0",          # Mistral Voxtral TTS
+]
+
+# 本地 TTS 引擎（按需安装；CPU 推理）
+# 用法： pip install -e ".[voice-tts-local]"
+voice-tts-local = [
+    "piper-tts>=1.2.0",          # Piper 神经 VITS（44 语言）
+    "soundfile>=0.12.0",         # KittenTTS WAV 写出
+]
+
+# 一等公民插件依赖的最小 SDK 版本
+# (plugins/tongyi-image / plugins/seedance-video — 它们 import
+# `from openkitsune_plugin_sdk import PluginBase, PluginAPI, ...` 等核心类)。
+# Monorepo 开发时 src/openkitsune/plugins/sdk_loader.py 会兜底注入本地源码;
+# 这里是给 pip-install 场景显式声明的最低版本。
+# Note: 0.7.0 主动收缩了 SDK API surface (移除了 contrib 子包),
+# 旧版本 0.3.x–0.6.x 上的 contrib 调用都已迁出 (见 CHANGELOG)。
+plugins = [
+    "openkitsune-plugin-sdk>=0.7.0",
+]
+
+# Windows 桌面自动化
+windows = [
+    "mss>=9.0.0",
+    "pyautogui>=0.9.54",
+    "pywinauto>=0.6.8; platform_system == 'Windows'",
+    "pyperclip>=1.8.2",
+    "psutil>=5.9.0",
+]
+
+# 桌面运行时依赖（Tauri Setup Center 默认安装到 app-venv）
+# 包含运行 OpenKitsune 桌面后端所必需的默认能力：
+#   - 桌面交互所需进程/剪贴板工具
+#   - Windows 平台自动化（仅在 Windows 上生效，靠 marker 控制）
+# 不强制拉所有 IM 通道依赖；channel deps 由 Tauri runtime manager / channel
+# bootstrap 在 agent-venv / app-venv 按需安装。
+desktop = [
+    "openkitsune-plugin-sdk>=0.7.0",
+    "websockets>=15.0,<16.0",
+    "psutil>=5.9.0",
+    "pyperclip>=1.8.2",
+    "keyring>=24.0,<26.0",
+    "mss>=9.0.0; platform_system == 'Windows'",
+    "pyautogui>=0.9.54; platform_system == 'Windows'",
+    "pywinauto>=0.6.8; platform_system == 'Windows'",
+]
+
+# 全部可选依赖（core + 所有 IM 通道 + 桌面自动化 + 插件 SDK）
+all = [
+    # -- IM 通道 --
+    "lark-oapi>=1.6.2",
+    "dingtalk-stream>=0.24.3",
+    "aiohttp>=3.13.0",
+    "pycryptodome>=3.23.0",
+    "websockets>=15.0,<16.0",
+    "cryptography>=46.0.7",
+    "pilk>=0.2.1",  # 语音接收/转写（QQ/微信 SILK 解码），发送不再需要
+    # -- 桌面自动化 --
+    "mss>=9.0.0",
+    "pyautogui>=0.9.54",
+    "pywinauto>=0.6.8; platform_system == 'Windows'",
+    "pyperclip>=1.8.2",
+    "keyring>=24.0,<26.0",
+    "psutil>=5.9.0",
+    # -- AI 媒体插件脚手架（保持与 [project.optional-dependencies].plugins 同步）--
+    "openkitsune-plugin-sdk>=0.7.0",
+]
+
+# 财务自动化插件（plugins/finance-auto）运行时依赖
+# 保持与 `plugins/finance-auto/requirements.txt` 同步。
+# 用法： pip install -e ".[finance-auto]"
+# 关闭审计项 EX-P1-5（_finance_plugin_audit_extended_report.md）。
+finance-auto = [
+    "openpyxl>=3.1.5,<4.0",        # .xlsx Tier 1 解析
+    "xlrd==1.2.0",                 # .xls Tier 2（2.x 已移除 .xls 支持，故锁定）
+    "xltpl>=0.20,<1.0",            # 审计模板 .xlsx 渲染（PyPI 当前 HEAD = 0.21）
+    "keyring>=24.0,<26.0",         # OS keyring（Windows Credential Manager / macOS Keychain / Secret Service）
+    "pywin32>=306; sys_platform == 'win32'",  # .xls Tier 3 COM fallback（Windows-only）
+    "cryptography>=42.0,<46.0",    # AES-256-GCM + PBKDF2-HMAC-SHA256
+]
+
+# 开发依赖
+dev = [
+    "pytest>=8.0.0,<9",
+    "pytest-asyncio>=0.23.0,<1",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.9",
+    "mypy>=1.8.0",
+    "pyright>=1.1.0",
+]
+
+[project.scripts]
+openkitsune = "openkitsune.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/openkitsune",
+    "skills",
+    "mcps",
+    "identity",
+    "hatch_build.py",
+    "scripts/write_build_version.py",
+    "VERSION",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openkitsune"]
+exclude = [
+    "src/openkitsune/_bundled_version.txt",
+]
+artifacts = [
+    # Optional release assets staged by `python scripts/stage_package_assets.py`.
+    # They are intentionally package-local build outputs so default
+    # `python -m build` / `pip install .` do not require Node/VitePress outputs.
+    "src/openkitsune/web/**",
+    "src/openkitsune/docs_dist/**",
+]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+# 把系统技能、精选外部技能、内置 MCP 配置一并打进 wheel，
+# 保证 `pip install openkitsune` 后可用。外部技能按用户任务分类维护；
+# 不要把整个 skills/ 目录或未经 OpenKitsune 适配的技能集合打包。
+# skills/system → site-packages/openkitsune/builtin_skills/system/
+# 精选 skills/* → site-packages/openkitsune/builtin_skills/external/  (不含 system/)
+# mcps          → site-packages/openkitsune/builtin_mcps/
+[tool.hatch.build.targets.wheel.force-include]
+"skills/system" = "openkitsune/builtin_skills/system"
+"skills/catalog.json" = "openkitsune/builtin_skills/catalog.json"
+"mcps" = "openkitsune/builtin_mcps"
+
+# 内容创作与发布
+"skills/xiaohongshu-creator" = "openkitsune/builtin_skills/external/xiaohongshu-creator"
+"skills/wechat-article" = "openkitsune/builtin_skills/external/wechat-article"
+"skills/chinese-writing" = "openkitsune/builtin_skills/external/chinese-writing"
+"skills/chinese-novelist" = "openkitsune/builtin_skills/external/chinese-novelist"
+"skills/douyin-tool" = "openkitsune/builtin_skills/external/douyin-tool"
+"skills/content-research-writer" = "openkitsune/builtin_skills/external/content-research-writer"
+
+# 视频与图像
+"skills/youtube-summarizer" = "openkitsune/builtin_skills/external/youtube-summarizer"
+"skills/bilibili-watcher" = "openkitsune/builtin_skills/external/bilibili-watcher"
+"skills/video-downloader" = "openkitsune/builtin_skills/external/video-downloader"
+"skills/image-understander" = "openkitsune/builtin_skills/external/image-understander"
+"skills/image-understanding" = "openkitsune/builtin_skills/external/image-understanding"
+
+# 知识与效率
+"skills/obsidian-skills" = "openkitsune/builtin_skills/external/obsidian-skills"
+"skills/pretty-mermaid" = "openkitsune/builtin_skills/external/pretty-mermaid"
+"skills/ppt-creator" = "openkitsune/builtin_skills/external/ppt-creator"
+
+# 搜索与研究
+"skills/apify-scraper" = "openkitsune/builtin_skills/external/apify-scraper"
+
+# 开发与测试
+"skills/code-review" = "openkitsune/builtin_skills/external/code-review"
+"skills/webapp-testing" = "openkitsune/builtin_skills/external/webapp-testing"
+"skills/superpowers-brainstorming" = "openkitsune/builtin_skills/external/superpowers-brainstorming"
+"skills/superpowers-tdd" = "openkitsune/builtin_skills/external/superpowers-tdd"
+"skills/superpowers-debugging" = "openkitsune/builtin_skills/external/superpowers-debugging"
+"skills/superpowers-verification" = "openkitsune/builtin_skills/external/superpowers-verification"
+"skills/superpowers-receiving-review" = "openkitsune/builtin_skills/external/superpowers-receiving-review"
+"skills/superpowers-writing-plans" = "openkitsune/builtin_skills/external/superpowers-writing-plans"
+
+# Identity templates: shipped as bundled examples so the setup wizard can
+# seed the user-customizable identity/*.md files on first install. The
+# wizard's `_resolve_identity_template` looks up these paths under the
+# installed `openkitsune` package directory when no repo checkout is on the
+# Python path (i.e. for `pip install openkitsune` users). Without this
+# block, wheel-installed users would fall through to the prompt builder's
+# 5-line `_STATIC_FALLBACKS["identity_core"]` template instead of the
+# full SOUL.md / AGENT.md / persona library shipped with the project.
+#
+# User-customizable runtime state (SOUL.md, AGENT.md, USER.md, MEMORY.md,
+# identity/runtime/**, identity/personas/user_custom.md) is intentionally
+# NOT packaged: those files are gitignored and live in the user's project
+# directory; the wizard copies these *.example/*.template files there on
+# first run.
+"identity/SOUL.md.example" = "openkitsune/identity/SOUL.md.example"
+"identity/AGENT.md.example" = "openkitsune/identity/AGENT.md.example"
+"identity/USER.md.example" = "openkitsune/identity/USER.md.example"
+"identity/MEMORY.md.example" = "openkitsune/identity/MEMORY.md.example"
+"identity/POLICIES.yaml" = "openkitsune/identity/POLICIES.yaml"
+"identity/CREDITS.md" = "openkitsune/identity/CREDITS.md"
+"identity/SYSTEM_TASKS.yaml.template" = "openkitsune/identity/SYSTEM_TASKS.yaml.template"
+"identity/personas/boyfriend.md" = "openkitsune/identity/personas/boyfriend.md"
+"identity/personas/business.md" = "openkitsune/identity/personas/business.md"
+"identity/personas/butler.md" = "openkitsune/identity/personas/butler.md"
+"identity/personas/default.md" = "openkitsune/identity/personas/default.md"
+"identity/personas/family.md" = "openkitsune/identity/personas/family.md"
+"identity/personas/girlfriend.md" = "openkitsune/identity/personas/girlfriend.md"
+"identity/personas/jarvis.md" = "openkitsune/identity/personas/jarvis.md"
+"identity/personas/tech_expert.md" = "openkitsune/identity/personas/tech_expert.md"
+"identity/personas/user_custom.md.example" = "openkitsune/identity/personas/user_custom.md.example"
+"identity/prompts/policies.md" = "openkitsune/identity/prompts/policies.md"
+
+[tool.uv]
+# The bundled runtime and finance automation plugin intentionally require
+# incompatible cryptography lines and cannot be installed together.
+conflicts = [
+    [
+        { extra = "all" },
+        { extra = "finance-auto" },
+    ],
+    [
+        { extra = "wework-ws" },
+        { extra = "finance-auto" },
+    ],
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+ignore = [
+    "E501",   # line length handled by formatter; keep ignored
+    "E402",   # module-level import not at top (circular-import avoidance, conditional init)
+    "B005",   # strip with multi-char strings (intentional character set removal)
+    "B008",   # function call in default argument (standard FastAPI File/Depends pattern)
+    "B027",   # empty method without abstract decorator (optional-override stubs)
+    "B904",   # require `raise ... from err` inside except (too noisy for now)
+    "N806",   # non-lowercase variable in function (constants in functions, third-party patterns)
+    "N814",   # CamelCase imported as constant (local alias pattern like `IntentType as _IT`)
+    "N818",   # exception name should end with Error (renaming would break existing API)
+    "SIM102", # collapsible-if (style-only)
+    "SIM103", # needless-bool (style-only)
+    "SIM105", # prefer contextlib.suppress (style-only)
+    "SIM116", # dict-lookup instead of if-chain (less readable in some contexts)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/openkitsune/integrations/**" = ["F401", "F821", "SIM117", "E722", "UP035"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+strict = false
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = false
+disallow_any_generics = false
+warn_return_any = false
+warn_unused_ignores = true
+no_implicit_optional = true
+ignore_errors = true
+disable_error_code = [
+    "attr-defined",
+    "call-arg",
+    "no-any-return",
+    "union-attr",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Skip perf tests by default; CI calls them explicitly with ``-m perf``
+# or ``-m "perf or not perf"``. See tests/perf/test_policy_v2_perf.py
+# (C22 P3-3) for rationale.
+addopts = "-m 'not perf'"
+markers = [
+    "perf: SLO / performance baseline tests; deselected by default. Run with `pytest -m perf` or override via `--override-ini=addopts=`.",
+    "integration: tests that require external services or local system dependencies",
+]

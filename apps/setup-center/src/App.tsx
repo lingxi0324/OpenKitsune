@@ -1,0 +1,5571 @@
+import { chatIsReady } from "./utils/backendReadiness";
+import { createContext, useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense, startTransition } from "react";
+import { useTranslation } from "react-i18next";
+import { invoke, listen, IS_TAURI, IS_WEB, IS_CAPACITOR, IS_LOCAL_WEB, getAppVersion, onWsEvent, reconnectWsNow, setWsApiBaseUrl, logger } from "./platform";
+import { getActiveServer, getActiveServerId } from "./platform/servers";
+import { checkAuth, installFetchInterceptor, AUTH_EXPIRED_EVENT, clearAccessToken, setTauriRemoteMode, isTauriRemoteMode } from "./platform/auth";
+import { LoginView } from "./views/LoginView";
+import { SetupView } from "./views/SetupView";
+import { ServerManagerView } from "./views/ServerManagerView";
+import { ChatView } from "./views/ChatView";
+import type { LinkDiagnostic } from "./components/LinkDiagnosticsPanel";
+
+// Lazy-loaded views — keeps first-screen bundle small (4.7 Code Splitting)
+const SkillManager = lazy(() => import("./views/SkillManager").then(m => ({ default: m.SkillManager })));
+const IMView = lazy(() => import("./views/IMView").then(m => ({ default: m.IMView })));
+const TokenStatsView = lazy(() => import("./views/TokenStatsView").then(m => ({ default: m.TokenStatsView })));
+const SkillUsageView = lazy(() => import("./views/SkillUsageView").then(m => ({ default: m.SkillUsageView })));
+const MCPView = lazy(() => import("./views/MCPView").then(m => ({ default: m.MCPView })));
+const KnowledgeBaseView = lazy(() => import("./views/KnowledgeBaseView").then(m => ({ default: m.KnowledgeBaseView })));
+const PluginManagerView = lazy(() => import("./views/PluginManagerView"));
+const PluginAppHost = lazy(() => import("./views/PluginAppHost"));
+const SchedulerView = lazy(() => import("./views/SchedulerView").then(m => ({ default: m.SchedulerView })));
+const MemoryView = lazy(() => import("./views/MemoryView").then(m => ({ default: m.MemoryView })));
+const IdentityView = lazy(() => import("./views/IdentityView").then(m => ({ default: m.IdentityView })));
+const AgentDashboardView = lazy(() => import("./views/AgentDashboardView").then(m => ({ default: m.AgentDashboardView })));
+const AgentManagerView = lazy(() => import("./views/AgentManagerView").then(m => ({ default: m.AgentManagerView })));
+const OrgEditorView = lazy(() => import("./views/OrgEditorView").then(m => ({ default: m.OrgEditorView })));
+const PixelOfficeView = lazy(() => import("./views/PixelOfficeView").then(m => ({ default: m.PixelOfficeView })));
+const AgentStoreView = lazy(() => import("./views/AgentStoreView").then(m => ({ default: m.AgentStoreView })));
+const SkillStoreView = lazy(() => import("./views/SkillStoreView").then(m => ({ default: m.SkillStoreView })));
+const SecurityView = lazy(() => import("./views/SecurityView"));
+const PendingApprovalsView = lazy(() => import("./views/PendingApprovalsView").then(m => ({ default: m.PendingApprovalsView })));
+const PetView = lazy(() => import("./views/PetView").then(m => ({ default: m.PetView })));
+const InboxView = lazy(() => import("./views/InboxView").then(m => ({ default: m.InboxView })));
+
+import { FeedbackModal, type FeedbackPrefill } from "./views/FeedbackModal";
+import { IMConfigView } from "./views/IMConfigView";
+import { AgentSystemView } from "./views/AgentSystemView";
+import { MyFeedbackView } from "./views/MyFeedbackView";
+import { LLMView } from "./views/LLMView";
+import { StatusView } from "./views/StatusView";
+import { RuntimeEnvironmentDialog, type RuntimeDiagnostics } from "./components/RuntimeEnvironmentPanel";
+import type {
+  EndpointSummary as EndpointSummaryType,
+  PlatformInfo, WorkspaceSummary, ProviderInfo,
+  EndpointDraft,
+  EnvMap, StepId, Step, ViewId,
+} from "./types";
+import {
+  IconCheckCircle, IconXCircle, IconInfo,
+  IconAlertCircle, IconCheck,
+} from "./icons";
+import { ArrowRight, ChevronRight, Loader2, RefreshCw, ScrollText, AlertTriangle, CheckCircle2 } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import logoUrl from "./assets/logo.png";
+import "highlight.js/styles/github.css";
+import { getThemePref, setThemePref, THEME_CHANGE_EVENT, type Theme } from "./theme";
+import { resolveOnboardingCompletionStep } from "./utils/onboardingOutcome";
+import { copyToClipboard } from "./utils/clipboard";
+import {
+  BUILTIN_PROVIDERS,
+  DEFAULT_PIP_INDEX_PRESET_ID,
+  DEFAULT_PIP_INDEX_URL,
+  PIP_INDEX_PRESETS,
+  WEB_SEARCH_ENV_KEYS,
+  type PipIndexPresetId,
+} from "./constants";
+import { safeFetch } from "./providers";
+import {
+  joinPath,
+} from "./utils";
+import type { AppServiceStatus } from "./AppContext";
+
+type ServiceStatus = AppServiceStatus & {
+  port?: number;
+  heartbeatPhase?: string;
+  heartbeatHttpReady?: boolean;
+  heartbeatImReady?: boolean;
+  heartbeatReady?: boolean;
+  lastLinkDiagnostic?: LinkDiagnostic | null;
+};
+
+const externalRunningStatus = (pid: number | null = null): ServiceStatus => ({
+  running: true,
+  pid,
+  pidFile: "",
+  managedBy: "external",
+  isManagedChild: false,
+});
+
+const stoppedStatus = (): ServiceStatus => ({
+  running: false,
+  pid: null,
+  pidFile: "",
+  managedBy: "unknown",
+  isManagedChild: false,
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 前后端交互路由原则（全局适用）：
+//   后端运行中 → 所有配置读写、模型列表、连接测试 **优先走后端 HTTP API**
+//                后端负责持久化、热加载、配置兼容性验证
+//   后端未运行（onboarding / 首次配置 / wizard full 模式 finish 步骤前）
+//                → 走本地 Tauri Rust 操作或前端直连服务商 API
+//   判断函数：shouldUseHttpApi()  /  httpApiBase()
+//   容错机制：HTTP API 调用失败时自动回退到 Tauri 本地操作（应对后端重启等瞬态异常）
+//
+// 两种使用模式均完整支持：
+//   1. Onboarding（打包模式）：NSIS → onboarding wizard → 写本地 → 启动服务 → HTTP API
+//   2. Wizard Full（开发者模式）：选工作区 → 装 venv → 配置端点(本地) → 启动服务 → HTTP API
+// ═══════════════════════════════════════════════════════════════════════
+import { ConfirmDialog } from "./components/ConfirmDialog";
+import { DegradedBanner } from "./components/DegradedBanner";
+import { ModalOverlay } from "./components/ModalOverlay";
+import { Sidebar } from "./components/Sidebar";
+import { Topbar } from "./components/Topbar";
+import { AppUpdateDialog, UpdateProgressToast } from "./components/AppUpdateDialog";
+import { INSTALL_TASK_OPEN } from './marketplace/installTasks';
+import { MarketplaceInstallDialog } from "./components/MarketplaceInstallDialog";
+import { useNotifications } from "./hooks/useNotifications";
+import { notifySuccess, notifyError, notifyLoading, dismissLoading } from "./utils/notify";
+import { Toaster } from "@/components/ui/sonner";
+import { toast } from "sonner";
+import { useVersionCheck } from "./hooks/useVersionCheck";
+import { useEnvManager } from "./hooks/useEnvManager";
+import { useConfigApplyPreview } from "./hooks/useConfigApplyPreview";
+import { AdvancedView } from "./views/AdvancedView";
+import { ToolsView } from "./views/ToolsView";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { INBOX_REFRESH_EVENT, INBOX_UNREAD_CHANGED_EVENT } from "./components/InboxBadge";
+import { isHighPriorityInbox, type InboxUpdatePayload, type InboxWsMessagePayload } from "./inboxTypes";
+
+/** Health-check timeout for recurring monitoring (heartbeat + refreshStatus).
+ *  Startup/one-shot probes keep their own shorter timeouts.
+ *  5s accommodates slow devices where the event loop may be busy. */
+const HEALTH_POLL_TIMEOUT_MS = 5_000;
+const DEFAULT_LOCAL_API_BASE = "http://127.0.0.1:18900";
+// First-run startup can install channel/plugin dependencies before the API is
+// reachable on older builds or dirty user environments. Keep the UI waiting
+// with progress instead of declaring "HTTP unreachable" too early.
+const LOCAL_SERVICE_READY_TIMEOUT_MS = 120_000;
+const ONBOARDING_HTTP_READY_TIMEOUT_MS = 180_000;
+const HTTP_READY_POLL_INTERVAL_MS = 2_000;
+// Frontend-side startup hold. Rust boot-grace relies on a pid file, but there is
+// a short window after runtime setup and before pid/HTTP readiness where both
+// pid-based checks can be false. Keep the UI monotonic in "starting" there.
+const BACKEND_STARTUP_HOLD_MS = 180_000;
+const BACKEND_STARTUP_PROBE_HOLD_MS = 30_000;
+
+interface EnvFieldCtx {
+  envDraft: EnvMap;
+  setEnvDraft: React.Dispatch<React.SetStateAction<EnvMap>>;
+  secretShown: Record<string, boolean>;
+  setSecretShown: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
+  busy: string | null;
+  t: (key: string, opts?: Record<string, unknown>) => string;
+}
+
+const EnvFieldContext = createContext<EnvFieldCtx | null>(null);
+
+const _HASH_TO_VIEW: Record<string, ViewId> = {
+  "chat": "chat", "im": "im", "skills": "skills", "mcp": "mcp", "knowledge": "knowledge",
+  "scheduler": "scheduler", "memory": "memory", "status": "status",
+  "token-stats": "token_stats", "skill-usage": "skill_usage", "identity": "identity",
+  "dashboard": "dashboard", "org-editor": "org_editor",
+  "pixel-office": "pixel_office",
+  "agent-manager": "agent_manager", "agent-store": "agent_store",
+  "skill-store": "skill_store", "wizard": "wizard", "docs": "docs",
+  "security": "security", "pending-approvals": "pending_approvals",
+  "plugins": "plugins", "my_feedback": "my_feedback",
+};
+
+const _VIEW_TO_HASH: Record<string, string> = Object.fromEntries(
+  Object.entries(_HASH_TO_VIEW).map(([k, v]) => [v, k]),
+);
+
+const _HASH_TO_STEP: Record<string, StepId> = {
+  "llm": "llm", "im": "im", "tools": "tools", "agent": "agent", "advanced": "advanced",
+};
+
+function _parseHashRoute(hash: string): { view: ViewId; stepId?: StepId } | null {
+  const path = hash.replace(/^#\/?/, "");
+  if (path.startsWith("skills?")) return { view: "skills" };
+  if (!path) return null;
+  if (_HASH_TO_VIEW[path]) return { view: _HASH_TO_VIEW[path] };
+  if (path.startsWith("config/")) {
+    const step = path.slice(7);
+    if (_HASH_TO_STEP[step]) return { view: "wizard", stepId: _HASH_TO_STEP[step] as StepId };
+  }
+  if (path.startsWith("app/")) {
+    const pluginId = path.slice(4);
+    if (pluginId) return { view: `plugin_app:${pluginId}` as ViewId };
+  }
+  return null;
+}
+
+function _viewToHash(view: string, stepId?: string): string {
+  if (view === "wizard" && stepId) {
+    return `#/config/${stepId}`;
+  }
+  if (view.startsWith("plugin_app:")) {
+    return `#/app/${view.slice("plugin_app:".length)}`;
+  }
+  return _VIEW_TO_HASH[view] ? `#/${_VIEW_TO_HASH[view]}` : "";
+}
+
+export function App() {
+  if (window.location.pathname === '/pet') {
+    return <Suspense fallback={null}><PetView /></Suspense>;
+  }
+  return <MainApp />;
+}
+
+function UserDocsFrame({
+  docsBase,
+  docsVersion,
+  title,
+}: {
+  docsBase: string;
+  docsVersion?: string | null;
+  title: string;
+}) {
+  const [available, setAvailable] = useState<"checking" | "yes" | "no">("checking");
+  const docsCacheKey = docsVersion || "current";
+  const docsUrl = docsVersion
+    ? `${docsBase}/user-docs/v${encodeURIComponent(docsVersion)}/?ov=${encodeURIComponent(docsCacheKey)}`
+    : `${docsBase}/user-docs/?ov=${encodeURIComponent(docsCacheKey)}`;
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(docsUrl, { method: "GET", cache: "no-store", signal: AbortSignal.timeout(5_000) })
+      .then((res) => {
+        if (!cancelled) setAvailable(res.ok ? "yes" : "no");
+      })
+      .catch(() => {
+        if (!cancelled) setAvailable("no");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [docsUrl]);
+
+  if (available === "yes") {
+    return (
+      <iframe
+        src={docsUrl}
+        style={{ flex: 1, border: "none", width: "100%", height: "100%", borderRadius: 8, background: "var(--bg, #fff)" }}
+        title={title}
+      />
+    );
+  }
+
+  return (
+    <div className="card" style={{ margin: 16, padding: 32, textAlign: "center" }}>
+      <h2 className="cardTitle">用户文档暂不可用</h2>
+      <p style={{ color: "var(--muted)", fontSize: 13, lineHeight: 1.7, margin: "8px auto 16px", maxWidth: 520 }}>
+        当前安装包未包含本地文档资源，后端没有挂载 <code>/user-docs/</code>。核心功能不受影响，可以先访问在线文档。
+      </p>
+      <button onClick={() => window.open("https://openkitsune.ai", "_blank", "noopener,noreferrer")}>
+        打开在线文档
+      </button>
+      {available === "checking" && (
+        <div style={{ marginTop: 12, fontSize: 12, color: "var(--muted)" }}>正在检查本地文档...</div>
+      )}
+    </div>
+  );
+}
+
+function MainApp() {
+  const { t } = useTranslation();
+
+  // ── Web / Capacitor auth gate ──
+  // IS_LOCAL_WEB: hostname is 127.0.0.1/localhost/::1 — backend authenticates
+  // by client IP, no tokens or round-trips needed.  This eliminates the entire
+  // class of "checkAuth timeout → login page flash" bugs.
+  const needsRemoteAuth = (IS_WEB || IS_CAPACITOR) && !IS_LOCAL_WEB;
+  const [webAuthed, setWebAuthed] = useState(!needsRemoteAuth);
+  const [authChecking, setAuthChecking] = useState(needsRemoteAuth);
+  const [showPwBanner, setShowPwBanner] = useState(false);
+  const [showServerManager, setShowServerManager] = useState(false);
+  const [previewMode, setPreviewMode] = useState(false);
+  const [needServerConfig, setNeedServerConfig] = useState(
+    () => IS_CAPACITOR && !getActiveServer(),
+  );
+  // Setup gate: backend's middleware_setup_gate sends 428 when no web-access
+  // password is configured AND the caller is not a trusted local connection.
+  // We mirror the same condition here so the SPA can route the user to the
+  // SetupView before any "logged out" toast or login screen confuses them.
+  const [setupRequired, setSetupRequired] = useState(false);
+  // Tauri remote auth: when Tauri desktop connects to a remote backend that requires login
+  const [tauriRemoteLoginUrl, setTauriRemoteLoginUrl] = useState<string | null>(null);
+
+  // ── Top-level: react to 428 setup_required signals from any in-flight fetch
+  // (see providers.ts safeFetch). Mounted unconditionally so even local-web
+  // sessions can be redirected if the user explicitly invokes reset-password.
+  useEffect(() => {
+    const onSetupRequired = () => setSetupRequired(true);
+    window.addEventListener("openkitsune:setup-required", onSetupRequired);
+    return () => {
+      window.removeEventListener("openkitsune:setup-required", onSetupRequired);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!needsRemoteAuth) {
+      // Password banner disabled — the remote access dialog already shows password status.
+      return;
+    }
+    if (IS_CAPACITOR && !getActiveServer()) {
+      setAuthChecking(false);
+      return;
+    }
+    const apiBase = IS_CAPACITOR ? (getActiveServer()?.url || "") : "";
+    let cancelled = false;
+    // Probe setup-status first: if the backend says setup is required we go
+    // straight to SetupView and skip the (pointless) checkAuth round-trip.
+    // The endpoint is in AUTH_EXEMPT_PATHS so it works without a token.
+    fetch(`${apiBase}/api/auth/setup-status`, {
+      method: "GET",
+      credentials: "include",
+      signal: AbortSignal.timeout(IS_CAPACITOR ? 5_000 : 8_000),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null)
+      .then((status) => {
+        if (cancelled) return;
+        if (status && status.setup_required === true) {
+          setSetupRequired(true);
+          setAuthChecking(false);
+          return;
+        }
+        // Setup already done (or skipped because we're trusted-local on the
+        // server side): proceed to normal auth check.
+        checkAuth(apiBase).then((ok) => {
+          if (cancelled) return;
+          if (ok) installFetchInterceptor();
+          setWebAuthed(ok);
+          setAuthChecking(false);
+        });
+      });
+    const onExpired = () => setWebAuthed(false);
+    window.addEventListener(AUTH_EXPIRED_EVENT, onExpired);
+    return () => {
+      cancelled = true;
+      window.removeEventListener(AUTH_EXPIRED_EVENT, onExpired);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!IS_TAURI) return;
+    let cancelled = false;
+    invoke<any>("take_startup_recovery_notice")
+      .then((payload) => {
+        if (cancelled || !payload) return;
+        const reason = String(payload.reason || "");
+        const message = reason === "native_frontend_crash"
+          ? "OpenKitsune 刚刚从前端异常退出中恢复。后台服务和数据仍然保留，可以继续使用。"
+          : "OpenKitsune 刚刚从桌面端崩溃中自动恢复。后台服务和数据仍然保留，可以继续使用。";
+        notifySuccess(message);
+        logger.warn("Boot", "Recovered from previous frontend crash", payload);
+      })
+      .catch(() => {
+        // Older desktop builds do not expose this command.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+
+  // ── Mobile keyboard: track visual viewport for reliable height ──
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const update = () => {
+      document.documentElement.style.setProperty('--app-height', `${vv.height}px`);
+      if (Math.abs(vv.height - window.innerHeight) < 1) {
+        window.scrollTo(0, 0);
+      }
+    };
+    update();
+    vv.addEventListener('resize', update);
+    vv.addEventListener('scroll', update);
+    return () => {
+      vv.removeEventListener('resize', update);
+      vv.removeEventListener('scroll', update);
+    };
+  }, []);
+
+  const [themePrefState, setThemePrefState] = useState<Theme>(getThemePref());
+  useEffect(() => {
+    const handler = (e: Event) => setThemePrefState((e as CustomEvent<Theme>).detail);
+    window.addEventListener(THEME_CHANGE_EVENT, handler);
+    return () => window.removeEventListener(THEME_CHANGE_EVENT, handler);
+  }, []);
+  const [info, setInfo] = useState<PlatformInfo | null>(null);
+  const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
+  const [currentWorkspaceId, setCurrentWorkspaceId] = useState<string | null>(null);
+  const { confirmDialog, setConfirmDialog, askConfirm } = useNotifications();
+  const busy: string | null = null;
+  // ── Restart overlay state ──
+  const [restartOverlay, setRestartOverlay] = useState<{
+    phase: "saving" | "restarting" | "waiting" | "done" | "fail" | "notRunning";
+    hint?: string;
+    doneMessage?: string;
+  } | null>(null);
+
+
+  // ── Service conflict & version state ──
+  const [conflictDialog, setConflictDialog] = useState<{ pid: number; version: string } | null>(null);
+  const [pendingStartWsId, setPendingStartWsId] = useState<string | null>(null); // workspace ID waiting for conflict resolution
+  const {
+    desktopVersion, backendVersion, setBackendVersion,
+    versionMismatch, setVersionMismatch,
+    newRelease, setNewRelease,
+    updateAvailable, setUpdateAvailable, updateProgress, setUpdateProgress,
+    checkVersionMismatch, checkForAppUpdate,
+    skipReleaseVersion, remindReleaseLater,
+    doDownloadAndInstall, doRelaunchAfterUpdate,
+  } = useVersionCheck();
+  const appUpdateCheckStartedRef = useRef(false);
+  const manualUpdateCheckRunningRef = useRef(false);
+  const [manualUpdateChecking, setManualUpdateChecking] = useState(false);
+
+  const handleManualUpdateCheck = useCallback(async () => {
+    if (manualUpdateCheckRunningRef.current) return;
+    manualUpdateCheckRunningRef.current = true;
+    setManualUpdateChecking(true);
+    const loadingId = notifyLoading(t("version.checking"));
+    try {
+      const result = await checkForAppUpdate({ manual: true });
+      dismissLoading(loadingId);
+      if (result.status === "up-to-date") {
+        notifySuccess(t("version.upToDate", { version: result.current }));
+      } else if (result.status === "error") {
+        notifyError(t("version.checkFailed", { error: result.error }));
+      }
+    } catch (error) {
+      notifyError(t("version.checkFailed", { error: String(error) }));
+    } finally {
+      dismissLoading(loadingId);
+      manualUpdateCheckRunningRef.current = false;
+      setManualUpdateChecking(false);
+    }
+  }, [checkForAppUpdate, t]);
+
+  // ── 独立初始化 autostart 状态（不依赖 refreshStatus 的复杂前置条件，Web 跳过） ──
+  useEffect(() => {
+    if (!IS_TAURI) return;
+    invoke<boolean>("autostart_is_enabled")
+      .then((en) => setAutostartEnabled(en))
+      .catch(() => setAutostartEnabled(null));
+    invoke<boolean>("get_auto_update")
+      .then((en) => setAutoUpdateEnabled(en))
+      .catch(() => setAutoUpdateEnabled(true));
+  }, []);
+
+  // Ensure boot overlay is removed once React actually mounts.
+  useEffect(() => {
+    try {
+      document.getElementById("boot")?.remove();
+      window.dispatchEvent(new Event("openkitsune_app_ready"));
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    const onResize = () => {
+      const w = window.innerWidth;
+      const mobile = w <= 768;
+      setIsMobile(mobile);
+      if (!mobile) setMobileSidebarOpen(false);
+      if (!mobile && w <= 980) {
+        if (!sidebarAutoCollapsed.current) {
+          sidebarAutoCollapsed.current = true;
+          setSidebarCollapsed(true);
+        }
+      } else if (w > 980 && sidebarAutoCollapsed.current) {
+        sidebarAutoCollapsed.current = false;
+        setSidebarCollapsed(false);
+      }
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const steps: Step[] = useMemo(
+    () => [
+      { id: "llm" as StepId, title: t("config.step.endpoints"), desc: t("config.step.endpointsDesc") },
+      { id: "im" as StepId, title: t("config.imTitle"), desc: t("config.step.imDesc") },
+      { id: "tools" as StepId, title: t("config.step.tools"), desc: t("config.step.toolsDesc") },
+      { id: "agent" as StepId, title: t("config.step.agent"), desc: t("config.step.agentDesc") },
+      { id: "advanced" as StepId, title: t("config.step.advanced"), desc: t("config.step.advancedDesc") },
+    ],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [t],
+  );
+
+  const [view, setView] = useState<ViewId>(() => {
+    const parsed = _parseHashRoute(window.location.hash);
+    if (parsed) return parsed.view;
+    return (IS_WEB || IS_CAPACITOR) ? "chat" : "wizard";
+  });
+  const [appInitializing, setAppInitializing] = useState(!(IS_WEB || IS_CAPACITOR));
+  const [configMode, setConfigMode] = useState(() => view === "wizard" || view === "identity");
+  const lastAppViewRef = useRef<ViewId>(view === "wizard" || view === "identity" ? "chat" : view);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const sidebarAutoCollapsed = useRef(false);
+  const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.innerWidth <= 768);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [bugReportOpen, setBugReportOpen] = useState(false);
+  const [feedbackPrefill, setFeedbackPrefill] = useState<FeedbackPrefill | null>(null);
+  const [feedbackRefreshKey, setFeedbackRefreshKey] = useState(0);
+  const [inboxRefreshKey, setInboxRefreshKey] = useState(0);
+  const [inboxDialogOpen, setInboxDialogOpen] = useState(false);
+  const [inboxUnreadCount, setInboxUnreadCount] = useState(0);
+  useEffect(() => {
+    const revealInstall = () => { setInboxDialogOpen(false); setMobileSidebarOpen(false); };
+    window.addEventListener(INSTALL_TASK_OPEN, revealInstall);
+    return () => window.removeEventListener(INSTALL_TASK_OPEN, revealInstall);
+  }, []);
+
+  const [unreadFeedbackCount, setUnreadFeedbackCount] = useState(0);
+  const [pendingApprovalsCount, setPendingApprovalsCount] = useState(0);
+  const [disabledViews, setDisabledViews] = useState<string[]>([]);
+  const multiAgentEnabled = true;
+  const [storeVisible, setStoreVisible] = useState(() => localStorage.getItem("openkitsune_storeVisible") === "true");
+  const transitionToView = useCallback((nextView: ViewId) => {
+    startTransition(() => {
+      setView(nextView);
+    });
+  }, []);
+  // ── Hash-based deep link routing ──
+  useEffect(() => {
+    const onHashChange = () => {
+      const parsed = _parseHashRoute(window.location.hash);
+      if (parsed) {
+        transitionToView(parsed.view);
+        if (parsed.stepId) setStepId(parsed.stepId);
+      }
+    };
+    // Listen for postMessage from embedded docs iframe (cross-origin safe)
+    const onMessage = (e: MessageEvent) => {
+      if (e.data?.type === "openkitsune-navigate" && typeof e.data.hash === "string") {
+        window.location.hash = e.data.hash;
+      }
+    };
+    window.addEventListener("hashchange", onHashChange);
+    window.addEventListener("message", onMessage);
+    return () => {
+      window.removeEventListener("hashchange", onHashChange);
+      window.removeEventListener("message", onMessage);
+    };
+  }, [transitionToView]);
+
+  // ── Data mode: "local" (Tauri commands) or "remote" (HTTP API) ──
+  // Web mode always starts in "remote" since the backend is already running
+  const [dataMode, setDataMode] = useState<"local" | "remote">((IS_WEB || IS_CAPACITOR) ? "remote" : "local");
+  const [apiBaseUrl, setApiBaseUrl] = useState(() =>
+    IS_CAPACITOR ? (getActiveServer()?.url || "")
+    : IS_WEB ? ""
+    : (localStorage.getItem("openkitsune_apiBaseUrl") || DEFAULT_LOCAL_API_BASE),
+  );
+  const [connectDialogOpen, setConnectDialogOpen] = useState(false);
+  const [connectAddress, setConnectAddress] = useState("");
+
+  // Tauri remote: listen for auth expiration and redirect to login
+  useEffect(() => {
+    if (!IS_TAURI) return;
+    const onExpired = () => {
+      if (isTauriRemoteMode()) {
+        setTauriRemoteLoginUrl(apiBaseUrl);
+      }
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, onExpired);
+  }, [apiBaseUrl]);
+
+  useEffect(() => {
+    if (!IS_TAURI) return;
+    setWsApiBaseUrl(dataMode === "remote" ? apiBaseUrl : DEFAULT_LOCAL_API_BASE);
+    reconnectWsNow();
+  }, [apiBaseUrl, dataMode]);
+
+  const [stepId, setStepId] = useState<StepId>(() => {
+    const parsed = _parseHashRoute(window.location.hash);
+    return parsed?.stepId || "llm";
+  });
+  const navigateToView = useCallback((nextView: ViewId, nextStepId?: StepId) => {
+    const newHash = _viewToHash(nextView, nextStepId);
+    startTransition(() => {
+      setView(nextView);
+      if (nextStepId) setStepId(nextStepId);
+      if (isMobile) setMobileSidebarOpen(false);
+    });
+    if (newHash) {
+      if (window.location.hash !== newHash) window.location.hash = newHash;
+    } else if (window.location.hash) {
+      history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
+  }, [isMobile]);
+
+  useEffect(() => {
+    if (view === "wizard" || view === "identity") {
+      setConfigMode(true);
+      return;
+    }
+    lastAppViewRef.current = view;
+    setConfigMode(false);
+  }, [view]);
+
+  useEffect(() => {
+    if (stepId === "workspace") {
+      invoke<{ defaultRoot: string; currentRoot: string; customRoot: string | null }>("get_root_dir_info")
+        .then((info) => {
+          setObCurrentRoot(info.currentRoot);
+          if (info.customRoot) {
+            setObCustomRootInput(info.customRoot);
+            setObCustomRootApplied(true);
+          }
+        })
+        .catch(() => {});
+    }
+  }, [stepId]);
+
+  // ── Onboarding Wizard (首次安装引导) ──
+  type OnboardingStep = "ob-welcome" | "ob-agreement" | "ob-llm" | "ob-im" | "ob-finish" | "ob-progress" | "ob-failed" | "ob-done";
+  const [obStep, setObStep] = useState<OnboardingStep>("ob-welcome");
+  const [, setObInstallLog] = useState<string[]>([]);
+  const [obInstalling, setObInstalling] = useState(false);
+  const [obEnvCheck, setObEnvCheck] = useState<{
+    openkitsuneRoot: string;
+    hasOldVenv: boolean; hasOldRuntime: boolean; hasOldWorkspaces: boolean;
+    oldVersion: string | null; currentVersion: string; conflicts: string[];
+    diskUsageMb: number; runningProcesses: string[];
+  } | null>(null);
+  /** onboarding 启动时检测到已运行的本地后端服务（用户可选择跳过 onboarding 直接连接） */
+  const [obDetectedService, setObDetectedService] = useState<{
+    version: string; pid: number | null;
+  } | null>(null);
+  type OnboardingBackendStartupPhase = "idle" | "checking" | "starting" | "waiting" | "ready" | "error";
+  const [obBackendStartup, setObBackendStartup] = useState<{
+    phase: OnboardingBackendStartupPhase;
+    startedAt: number | null;
+    elapsedSec: number;
+    detail?: string;
+  }>({ phase: "idle", startedAt: null, elapsedSec: 0 });
+
+  useEffect(() => {
+    if (!["checking", "starting", "waiting"].includes(obBackendStartup.phase) || !obBackendStartup.startedAt) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setObBackendStartup((prev) => prev.startedAt
+        ? { ...prev, elapsedSec: Math.max(0, Math.floor((Date.now() - prev.startedAt) / 1000)) }
+        : prev);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [obBackendStartup.phase, obBackendStartup.startedAt]);
+
+  const [obAutostart, setObAutostart] = useState(true); // 开机自启，默认勾选
+  const [obAgreementInput, setObAgreementInput] = useState("");
+
+  // Custom root directory
+  const [obShowCustomRoot, setObShowCustomRoot] = useState(false);
+  const [obCustomRootInput, setObCustomRootInput] = useState("");
+  const [obCustomRootApplied, setObCustomRootApplied] = useState(false);
+  const [obCustomRootMigrate, setObCustomRootMigrate] = useState(false);
+  const [obCurrentRoot, setObCurrentRoot] = useState("");
+  const [obCustomRootBusy, setObCustomRootBusy] = useState(false);
+
+  // Quick workspace switcher
+  const [wsDropdownOpen, setWsDropdownOpen] = useState(false);
+  const [wsQuickCreateOpen, setWsQuickCreateOpen] = useState(false);
+  const [wsQuickName, setWsQuickName] = useState("");
+  const [obAgreementError, setObAgreementError] = useState(false);
+
+  /** 探测本地是否有后端服务在运行（用于 onboarding 前提示用户） */
+  async function obProbeRunningService() {
+    try {
+      const res = await fetch("http://127.0.0.1:18900/api/health", { signal: AbortSignal.timeout(2000) });
+      if (res.ok) {
+        const data = await res.json();
+        setObDetectedService({ version: data.version || "unknown", pid: data.pid ?? null });
+      }
+    } catch {
+      // 无服务运行，正常进入 onboarding
+      setObDetectedService(null);
+    }
+  }
+
+  /** 连接已检测到的本地服务，跳过 onboarding */
+  async function obConnectExistingService() {
+    if (!IS_TAURI) return;
+    try {
+      // 1. 确保有默认工作区
+      const wsList = await invoke<WorkspaceSummary[]>("list_workspaces");
+      if (!wsList.length) {
+        const wsId = "default";
+        await invoke("create_workspace", { name: t("onboarding.defaultWorkspace"), id: wsId, setCurrent: true });
+        await invoke("set_current_workspace", { id: wsId });
+        setCurrentWorkspaceId(wsId);
+        setWorkspaces([{ id: wsId, name: t("onboarding.defaultWorkspace"), path: "", isCurrent: true }]);
+      } else {
+        setWorkspaces(wsList);
+        if (!currentWorkspaceId && wsList.length > 0) {
+          setCurrentWorkspaceId(wsList[0].id);
+        }
+      }
+      // 2. 设置服务状态为已运行
+      const baseUrl = "http://127.0.0.1:18900";
+      setApiBaseUrl(baseUrl);
+      setServiceStatus(externalRunningStatus(obDetectedService?.pid ?? null));
+      // 3. 刷新状态 & 自动检查端点
+      refreshStatus("local", baseUrl, true);
+      autoCheckEndpoints(baseUrl);
+      // 4. 跳过 onboarding，进入主界面
+      await invoke("set_onboarding_completed", { completed: true });
+      navigateToView("status");
+    } catch (e) {
+      logger.error("App", "obConnectExistingService failed", { error: String(e) });
+    }
+  }
+
+  // 首次运行检测（在此完成前不渲染主界面，防止先闪主页再跳 onboarding）
+  useEffect(() => {
+    (async () => {
+      try {
+        const firstRun = await invoke<boolean>("is_first_run");
+        if (firstRun) {
+          await invoke("set_onboarding_completed", { completed: false });
+          await obProbeRunningService();
+          navigateToView("onboarding");
+          obLoadEnvCheck();
+        } else {
+          // 非首次启动：直接进入状态页面
+          navigateToView("status");
+        }
+      } catch {
+        // is_first_run 命令不可用（开发模式），忽略
+      } finally {
+        setAppInitializing(false);
+      }
+    })();
+    const unlisten = listen<string>("app-launch-mode", async (e) => {
+      if (e.payload === "first-run") {
+        await invoke("set_onboarding_completed", { completed: false });
+        await obProbeRunningService();
+        navigateToView("onboarding");
+        obLoadEnvCheck();
+      }
+    });
+    // ── DEV: Ctrl+Shift+O 强制进入 onboarding 测试模式 ──
+    const devKeyHandler = (ev: KeyboardEvent) => {
+      if (ev.ctrlKey && ev.shiftKey && ev.key === "O") {
+        ev.preventDefault();
+        logger.debug("App", "Force entering onboarding mode");
+        setObStep("ob-welcome");
+        setObDetectedService(null);
+        obProbeRunningService();
+        navigateToView("onboarding");
+        obLoadEnvCheck();
+      }
+    };
+    window.addEventListener("keydown", devKeyHandler);
+    return () => {
+      unlisten.then((u) => u());
+      window.removeEventListener("keydown", devKeyHandler);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // workspace quick-create name is managed by Topbar via wsQuickName state
+
+  // python / venv / install
+  const [venvStatus, setVenvStatus] = useState<string>("");
+  const [installLiveLog, setInstallLiveLog] = useState<string>("");
+  const [installProgress, setInstallProgress] = useState<{ stage: string; percent: number } | null>(null);
+  const [pipInstallPolling, setPipInstallPolling] = useState(false);
+  const [pipInstallId, setPipInstallId] = useState("default");
+  const [indexUrl, setIndexUrl] = useState<string>(DEFAULT_PIP_INDEX_URL);
+  const [pipIndexPresetId] = useState<PipIndexPresetId>(DEFAULT_PIP_INDEX_PRESET_ID);
+  const [customIndexUrl, setCustomIndexUrl] = useState<string>("");
+  const [, setVenvReady] = useState(false);
+  const [openkitsuneInstalled, setOpenkitsuneInstalled] = useState(false);
+  const [, setSelectedPypiVersion] = useState<string>(""); // "" = 推荐同版本
+  const [runtimeDiag, setRuntimeDiag] = useState<RuntimeDiagnostics | null>(null);
+  const [runtimeDiagChecking, setRuntimeDiagChecking] = useState(false);
+  const [diagnosticsRequested, setDiagnosticsRequested] = useState(false);
+  const [runtimeDialogOpen, setRuntimeDialogOpen] = useState(false);
+
+  // providers & models
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [savedEndpoints, setSavedEndpoints] = useState<EndpointDraft[]>([]);
+  const [savedCompilerEndpoints, setSavedCompilerEndpoints] = useState<EndpointDraft[]>([]);
+  const [savedSttEndpoints, setSavedSttEndpoints] = useState<EndpointDraft[]>([]);
+  const [savedImageEndpoints, setSavedImageEndpoints] = useState<EndpointDraft[]>([]);
+
+  // status panel data
+  const [, setStatusLoading] = useState(false);
+  const [, setStatusError] = useState<string | null>(null);
+  const [endpointSummary, setEndpointSummary] = useState<
+    { name: string; provider: string; apiType: string; baseUrl: string; model: string; keyEnv: string; keyPresent: boolean; enabled?: boolean }[]
+  >([]);
+  const [skillSummary, setSkillSummary] = useState<{ count: number; systemCount: number; externalCount: number } | null>(null);
+  const [skillsDetail, setSkillsDetail] = useState<
+    { skill_id: string; name: string; description: string; name_i18n?: Record<string, string> | null; description_i18n?: Record<string, string> | null; system: boolean; enabled?: boolean; tool_name?: string | null; category?: string | null; path?: string | null }[] | null
+  >(null);
+  const [autostartEnabled, setAutostartEnabled] = useState<boolean | null>(null);
+  const [autoUpdateEnabled, setAutoUpdateEnabled] = useState<boolean | null>(null);
+  // autoStartBackend 已合并到"开机自启"：--background 模式自动拉起后端，无需独立开关
+  const [serviceStatus, setServiceStatus] = useState<ServiceStatus | null>(null);
+  // ── 后端启动阶段（独立于 serviceStatus）──
+  // serviceStatus 只能表达 "running:true|false"，无法区分"未启动"和"正在启动中"。
+  // 老 UI 在自动启动期间一旦 invoke is_backend_auto_starting 偶发返回 false 或失败，
+  // 立刻把 serviceStatus 写成 {running:false} → StatusView 那条红色"后端服务未启动"
+  // banner 立刻闪一下，等几秒后端起来又变回 running:true → 用户体验上就是
+  // "启动中→未启动→运行中" 的诡异闪烁。
+  // 用 backendBootPhase 显式表达"启动中"语义，让 StatusView 在 starting 期间
+  // 显示蓝色"正在启动"而不是红色"未启动"。
+  const [backendBootPhase, setBackendBootPhase] = useState<"unknown" | "starting" | "running" | "stopped" | "error">(
+    IS_TAURI ? "starting" : "running",
+  );
+  // 心跳状态机: "alive" | "suspect" | "degraded" | "dead"
+  const [heartbeatState, setHeartbeatState] = useState<"alive" | "suspect" | "degraded" | "dead">("dead");
+  const heartbeatStateRef = useRef<"alive" | "suspect" | "degraded" | "dead">("dead");
+  const heartbeatFailCount = useRef(0);
+  /** 连续成功次数，从 degraded/suspect 回到 alive 需至少 2 次，避免偶发超时导致绿黄反复横跳 */
+  const heartbeatAliveSuccessCountRef = useRef(0);
+  const lastReadinessReadyRef = useRef<boolean | null>(null);
+  const wsRefreshDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const backendStartupHoldUntilRef = useRef(IS_TAURI ? Date.now() + BACKEND_STARTUP_PROBE_HOLD_MS : 0);
+  const stopInProgressRef = useRef(false);
+  const [pageVisible, setPageVisible] = useState(true);
+  const visibilityGraceRef = useRef(false); // 休眠恢复宽限期
+  const lastPluginAppsReadyEventRef = useRef(0);
+  const holdBackendStarting = useCallback((durationMs = BACKEND_STARTUP_HOLD_MS) => {
+    if (!IS_TAURI) return;
+    backendStartupHoldUntilRef.current = Math.max(
+      backendStartupHoldUntilRef.current,
+      Date.now() + durationMs,
+    );
+    heartbeatFailCount.current = 0;
+    setBackendBootPhase("starting");
+  }, []);
+  const clearBackendStartingHold = useCallback(() => {
+    backendStartupHoldUntilRef.current = 0;
+  }, []);
+  const isBackendStartingHeld = useCallback(() => (
+    IS_TAURI && Date.now() < backendStartupHoldUntilRef.current
+  ), []);
+  const notifyPluginAppsReady = useCallback(() => {
+    const now = Date.now();
+    if (now - lastPluginAppsReadyEventRef.current < 30_000) return;
+    lastPluginAppsReadyEventRef.current = now;
+    try {
+      window.dispatchEvent(
+        new CustomEvent("openkitsune:plugin-apps-changed", {
+          detail: { source: "backend-ready" },
+        }),
+      );
+    } catch { /* ignore */ }
+  }, []);
+  const [detectedProcesses, setDetectedProcesses] = useState<Array<{ pid: number; cmd: string }>>([]);
+  const [serviceLog, setServiceLog] = useState<{ path: string; content: string; truncated: boolean } | null>(null);
+  const [, setServiceLogError] = useState<string | null>(null);
+  const serviceLogRef = useRef<HTMLPreElement>(null);
+  const logAtBottomRef = useRef(true);
+  const [, setAppVersion] = useState<string>("");
+  const [, setOpenkitsuneVersion] = useState<string>("");
+
+  // Health check state
+  const [endpointHealth, setEndpointHealth] = useState<Record<string, {
+    status: string; latencyMs: number | null; error: string | null; errorCategory: string | null;
+    consecutiveFailures: number; cooldownRemaining: number; isExtendedCooldown: boolean; lastCheckedAt: string | null;
+  }>>({});
+  const [imHealth, setImHealth] = useState<Record<string, {
+    status: string; error: string | null; lastCheckedAt: string | null; progress?: { percent?: number | null } | null;
+  }>>({});
+  const {
+    envDraft, envBaseline, setEnvDraft,
+    secretShown, setSecretShown,
+    ensureEnvLoaded, saveEnvKeys,
+    resetEnvLoaded, markEnvLoaded, mergeEffectiveEnvDefaults,
+  } = useEnvManager({
+    currentWorkspaceId,
+    shouldUseHttpApi,
+    httpApiBase,
+  });
+  const footerSaveConfig = view === "wizard" ? getFooterSaveConfig() : null;
+  const configApplyPreview = useConfigApplyPreview({
+    keys: footerSaveConfig?.keys ?? [],
+    draft: envDraft,
+    baseline: envBaseline,
+    enabled: shouldUseHttpApi(),
+    apiBase: httpApiBase(),
+    onEffectiveValues: mergeEffectiveEnvDefaults,
+  });
+
+  const envFieldCtx = useMemo<EnvFieldCtx>(() => ({
+    envDraft, setEnvDraft, secretShown, setSecretShown, busy, t,
+  }), [envDraft, secretShown, busy, t]);
+
+  async function refreshAll() {
+    if (IS_TAURI) {
+      const res = await invoke<PlatformInfo>("get_platform_info");
+      setInfo(res);
+      const ws = await invoke<WorkspaceSummary[]>("list_workspaces");
+      setWorkspaces(ws);
+      const cur = await invoke<string | null>("get_current_workspace_id");
+      setCurrentWorkspaceId(cur);
+    } else {
+      // Web/Capacitor: fetch workspace list from HTTP API
+      try {
+        const base = httpApiBase();
+        const wsRes = await safeFetch(`${base}/api/workspaces`);
+        const wsData = await wsRes.json();
+        const wsList: WorkspaceSummary[] = (wsData.workspaces || []).map((w: any) => ({
+          id: w.id, name: w.name, path: w.path, isCurrent: w.isCurrent,
+        }));
+        setWorkspaces(wsList);
+        setCurrentWorkspaceId(wsData.current_workspace_id || wsList.find((w: WorkspaceSummary) => w.isCurrent)?.id || "default");
+        const infoPath = wsList.find((w: WorkspaceSummary) => w.isCurrent)?.path || "";
+        setInfo({ os: "web", arch: "", homeDir: "", openkitsuneRootDir: infoPath });
+      } catch {
+        // Backend not reachable yet (auth pending, first load) — use safe defaults
+        setInfo({ os: "web", arch: "", homeDir: "", openkitsuneRootDir: "" });
+        if (!currentWorkspaceId) setCurrentWorkspaceId("default");
+      }
+    }
+  }
+
+  // 自动启动 loading toast 的 id 提升为 ref；strict 模式下 effect 会
+  // mount→unmount→remount，原本的局部 _busyAutoStart 会随第一次卸载丢失
+  // 引用，导致 dismissLoading 拿不到 id，老 toast 永久残留（"幽灵 toast"）。
+  // 用 ref 保存最新 id，并在 cleanup 中显式 dismiss + 置 null，保证任何
+  // 路径（成功/失败/被中途 cancel）都能清掉同一只气泡。
+  const autoStartToastRef = useRef<string | number | null>(null);
+
+  // Web mode init: runs after auth is confirmed
+  const webInitDone = useRef(false);
+  useEffect(() => {
+    if ((!IS_WEB && !IS_CAPACITOR) || !webAuthed || webInitDone.current) return;
+    webInitDone.current = true;
+    let cancelled = false;
+    (async () => {
+      await refreshAll();
+      if (cancelled) return;
+      const capBase = IS_CAPACITOR ? apiBaseUrl : "";
+      if (!IS_CAPACITOR) setApiBaseUrl("");
+      setServiceStatus(externalRunningStatus());
+      try {
+        const hRes = await safeFetch(`${capBase}/api/health`, { signal: AbortSignal.timeout(3_000) });
+        const hData = await hRes.json();
+        if (hData.version) setBackendVersion(hData.version);
+      } catch { /* ignore */ }
+      try {
+        const dvRes = await safeFetch(`${capBase}/api/config/disabled-views`);
+        const dvData = await dvRes.json();
+        if (!cancelled) setDisabledViews(dvData.disabled_views || []);
+      } catch { /* ignore */ }
+      try { await refreshStatus("local", capBase, true); } catch { /* ignore */ }
+      autoCheckEndpoints(capBase);
+    })();
+    return () => { cancelled = true; };
+  }, [webAuthed]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (IS_WEB) return;
+
+        // ── Tauri 模式：完整初始化流程 ──
+        try {
+          const v = await getAppVersion();
+          if (!cancelled) {
+            setAppVersion(v);
+            setSelectedPypiVersion(v);
+          }
+        } catch {
+          // ignore
+        }
+        await refreshAll();
+        if (!cancelled) {
+          try {
+            const plat = await invoke<PlatformInfo>("get_platform_info");
+            const vd = joinPath(plat.openkitsuneRootDir, "venv");
+            const v = await invoke<string>("openkitsune_version", { venvDir: vd });
+            if (!cancelled && v) {
+              setOpenkitsuneInstalled(true);
+              setOpenkitsuneVersion(v);
+              setVenvStatus(`安装完成 (v${v})`);
+              setVenvReady(true);
+            }
+          } catch { /* venv not found or openkitsune not installed */ }
+
+          try {
+            const raw = await readWorkspaceFile("data/llm_endpoints.json");
+            const parsed = JSON.parse(raw);
+            const eps = Array.isArray(parsed?.endpoints) ? parsed.endpoints : [];
+            if (!cancelled && eps.length > 0) {
+              setSavedEndpoints(eps.map((e: any) => ({
+                name: String(e?.name || ""), provider: String(e?.provider || ""),
+                api_type: String(e?.api_type || ""), base_url: String(e?.base_url || ""),
+                model: String(e?.model || ""), api_key_env: String(e?.api_key_env || ""),
+                priority: Number(e?.priority || 1),
+                max_tokens: Number(e?.max_tokens ?? 0),
+                context_window: Number(e?.context_window || 200000),
+                timeout: Number(e?.timeout || 180),
+                capabilities: Array.isArray(e?.capabilities) ? e.capabilities.map((x: any) => String(x)) : [],
+                enabled: e?.enabled !== false,
+              })));
+            }
+          } catch { /* ignore */ }
+
+          if (!cancelled) {
+            const localUrl = "http://127.0.0.1:18900";
+
+            const connectToRunningService = async (url: string) => {
+              const healthRes = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(3000) });
+              if (!healthRes.ok) return false;
+              if (cancelled) return true;
+              const healthData = await healthRes.json();
+              const svcVersion = healthData.version || "";
+              const readiness = healthData?.readiness || {};
+              const readinessReady = chatIsReady(readiness);
+              const readinessPhase = String(readiness.phase || healthData.startup_phase || "");
+              setApiBaseUrl(url);
+              if (readinessReady) clearBackendStartingHold();
+              setServiceStatus({
+                running: true,
+                pid: healthData.pid || null,
+                pidFile: "",
+                managedBy: "external",
+                isManagedChild: false,
+                heartbeatPhase: readinessPhase || undefined,
+                heartbeatHttpReady: readiness.http_ready,
+                heartbeatImReady: readiness.im_ready,
+                heartbeatReady: chatIsReady(readiness),
+                lastLinkDiagnostic: healthData.last_link_diagnostic || null,
+              });
+              setBackendBootPhase(readinessReady ? "running" : "starting");
+              if (svcVersion) setBackendVersion(svcVersion);
+              notifyPluginAppsReady();
+              try { await refreshStatus("local", url, true); } catch { /* ignore */ }
+              autoCheckEndpoints(url);
+              if (svcVersion) setTimeout(() => checkVersionMismatch(svcVersion), 500);
+              return true;
+            };
+
+            let alreadyConnected = false;
+            try {
+              alreadyConnected = await connectToRunningService(localUrl);
+            } catch { /* 服务未运行 */ }
+
+            if (!alreadyConnected && !cancelled) {
+              holdBackendStarting(BACKEND_STARTUP_PROBE_HOLD_MS);
+              let handled = false;
+              try {
+                const autoStarting = await invoke<boolean>("is_backend_auto_starting");
+                if (autoStarting) {
+                  handled = true;
+                  holdBackendStarting();
+                  // 复用同一只 ref：strict mode 第二次 mount 时若 ref 还有
+                  // 旧 id，先 dismiss 再创建新的，避免双 toast 叠加。
+                  if (autoStartToastRef.current !== null) {
+                    try { dismissLoading(autoStartToastRef.current); } catch { /* ignore */ }
+                  }
+                  autoStartToastRef.current = notifyLoading(t("topbar.autoStarting"));
+                  let serviceReady = false;
+                  let spawnDone = false;
+                  let postSpawnWait = 0;
+
+                  for (let attempt = 0; attempt < 90 && !cancelled; attempt++) {
+                    await new Promise((r) => setTimeout(r, 2000));
+                    try {
+                      serviceReady = await connectToRunningService(localUrl);
+                      if (serviceReady) break;
+                    } catch { /* still starting */ }
+                    if (!spawnDone) {
+                      try {
+                        const still = await invoke<boolean>("is_backend_auto_starting");
+                        if (!still) spawnDone = true;
+                      } catch { spawnDone = true; }
+                    }
+                    if (spawnDone) {
+                      postSpawnWait++;
+                      if (postSpawnWait > 30) break;
+                    }
+                  }
+                  if (!cancelled) {
+                    if (serviceReady) {
+                      visibilityGraceRef.current = true;
+                      heartbeatFailCount.current = 0;
+                      setTimeout(() => { visibilityGraceRef.current = false; }, 10000);
+                    }
+                    if (autoStartToastRef.current !== null) {
+                      dismissLoading(autoStartToastRef.current);
+                      autoStartToastRef.current = null;
+                    }
+                    if (serviceReady) {
+                      notifySuccess(t("topbar.autoStartSuccess"));
+                    } else {
+                      clearBackendStartingHold();
+                      setServiceStatus(stoppedStatus());
+                      setBackendBootPhase("error");
+                      notifyError(t("topbar.autoStartFail"));
+                    }
+                  }
+                }
+              } catch { /* is_backend_auto_starting 不可用，忽略 */ }
+              if (!handled && !cancelled) {
+                // 兜底：is_backend_auto_starting 返回 false 或 invoke 不可用。
+                // 不要立即把 serviceStatus 写成 false（那样 StatusView 会立刻
+                // 闪一下红色"未启动"banner），而是再做一次 grace-window 健康
+                // 探测：1.5s 内连续 3 次 fetch /api/health 都失败才算真没启动。
+                // 这是为了对付 Tauri setup 完成与前端 mount 的时序竞争——
+                // 此时后端可能正在 spawn，HTTP 端口随时会起来。
+                let confirmed = false;
+                for (let i = 0; i < 3 && !cancelled && !confirmed; i++) {
+                  await new Promise((r) => setTimeout(r, 500));
+                  try {
+                    confirmed = await connectToRunningService(localUrl);
+                    if (confirmed) break;
+                  } catch { /* still down */ }
+                }
+                if (!confirmed && !cancelled) {
+                  // 1.5s grace 没能拨通 HTTP，但**不要直接判 stopped 闪一下红条**。
+                  // 真正的状态由 5s 心跳轮询收敛——心跳分支会先问 Rust
+                  // backend_in_boot_grace_cmd / is_backend_auto_starting，
+                  // 若仍在 boot grace 就保持 "starting"；若真的死了再降级 dead。
+                  // 这里保留 unknown，避免 mount 与 spawn 竞态时刺出一个 stopped 帧。
+                  setServiceStatus(stoppedStatus());
+                  holdBackendStarting(BACKEND_STARTUP_PROBE_HOLD_MS);
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        if (!cancelled) notifyError(String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+      // strict mode unmount 或路由切换时把 loading toast 显式 dismiss，
+      // 防止"正在启动服务"幽灵气泡卡到下一轮 mount 之后仍可见。
+      if (autoStartToastRef.current !== null) {
+        try { dismissLoading(autoStartToastRef.current); } catch { /* ignore */ }
+        autoStartToastRef.current = null;
+      }
+    };
+  }, [clearBackendStartingHold, holdBackendStarting, notifyPluginAppsReady]);
+
+  // ── 页面可见性监听（休眠/睡眠恢复感知）──
+  // Capacitor 环境下 visibilitychange 和 appStateChange 可能同时触发，
+  // 用 lastResumeRef 做 3 秒去重避免 WS 双重重连。
+  const lastResumeRef = useRef(0);
+  const handleAppResumed = useCallback(() => {
+    const now = Date.now();
+    if (now - lastResumeRef.current < 3000) return;
+    lastResumeRef.current = now;
+        visibilityGraceRef.current = true;
+        heartbeatFailCount.current = 0;
+        setTimeout(() => { visibilityGraceRef.current = false; }, 10000);
+        reconnectWsNow();
+        window.dispatchEvent(new Event("openkitsune_app_resumed"));
+        logger.info("App", "Resumed from background");
+  }, []);
+
+  useEffect(() => {
+    const handler = () => {
+      const visible = !document.hidden;
+      setPageVisible(visible);
+      if (visible) handleAppResumed();
+    };
+    document.addEventListener("visibilitychange", handler);
+    return () => document.removeEventListener("visibilitychange", handler);
+  }, [handleAppResumed]);
+
+  // ── Capacitor: 原生 appStateChange 补充 ──
+  // iOS WKWebView 进入后台时可能被系统挂起，visibilitychange 不一定触发。
+  // @capacitor/app 提供原生级生命周期事件，100% 可靠。
+  useEffect(() => {
+    if (!IS_CAPACITOR) return;
+    let cancelled = false;
+    let removeListener: (() => void) | undefined;
+    import("@capacitor/app").then(({ App }) => {
+      if (cancelled) return;
+      App.addListener("appStateChange", ({ isActive }) => {
+        setPageVisible(isActive);
+        if (isActive) handleAppResumed();
+      }).then((handle) => {
+        if (cancelled) { handle.remove(); return; }
+        removeListener = () => handle.remove();
+      });
+    }).catch(() => {});
+    return () => { cancelled = true; removeListener?.(); };
+  }, [handleAppResumed]);
+
+  // ── 心跳轮询：三级状态机 + 防误判 ──
+  useEffect(() => {
+    // 只在有 workspace 且非配置向导中时启动心跳
+    if (!currentWorkspaceId) return;
+
+    const interval = pageVisible ? 5000 : 30000; // visible 5s, hidden 30s
+    const timer = setInterval(async () => {
+      // 自重启互锁：restartOverlay 期间暂停心跳
+      if (restartOverlay) return;
+      if (stopInProgressRef.current) return;
+
+      const effectiveBase = httpApiBase();
+      try {
+        const res = await fetch(`${effectiveBase}/api/health`, { signal: AbortSignal.timeout(HEALTH_POLL_TIMEOUT_MS) });
+        if (res.ok) {
+          heartbeatFailCount.current = 0;
+          const wasUnhealthy = heartbeatStateRef.current === "degraded" || heartbeatStateRef.current === "suspect";
+          heartbeatAliveSuccessCountRef.current = wasUnhealthy
+            ? heartbeatAliveSuccessCountRef.current + 1
+            : 1;
+          const needTwoToRecover = wasUnhealthy && heartbeatAliveSuccessCountRef.current < 2;
+          if (heartbeatStateRef.current !== "alive" && !needTwoToRecover) {
+            heartbeatStateRef.current = "alive";
+            setHeartbeatState("alive");
+            if (IS_TAURI) try { await invoke("set_tray_backend_status", { status: "alive" }); } catch { /* ignore */ }
+          }
+          // /api/health 200 只代表 HTTP API 可达，不再等同于业务完全启动完成。
+          // 新后端会返回 readiness，旧后端没有该字段时按 ready=true 兼容。
+          let readinessReady = true;
+          let readinessPhase = "";
+          let readinessHttpReady: boolean | undefined;
+          let readinessImReady: boolean | undefined;
+          let readinessFullyReady: boolean | undefined;
+          let lastLinkDiagnostic: LinkDiagnostic | null | undefined;
+          let healthPid: number | null | undefined;
+          // 提取后端版本与 readiness
+          try {
+            const data = await res.json();
+            if (data.version) setBackendVersion(data.version);
+            const readiness = data?.readiness || {};
+            readinessReady = chatIsReady(readiness);
+            readinessPhase = String(readiness.phase || data.startup_phase || "");
+            readinessHttpReady = readiness.http_ready;
+            readinessImReady = readiness.im_ready;
+            readinessFullyReady = chatIsReady(readiness);
+            lastLinkDiagnostic = data.last_link_diagnostic || null;
+            healthPid = typeof data.pid === "number" ? data.pid : undefined;
+          } catch { /* ignore */ }
+          const wasReady = lastReadinessReadyRef.current;
+          lastReadinessReadyRef.current = readinessReady;
+          if (readinessReady) clearBackendStartingHold();
+          setServiceStatus(prev => ({
+            ...(prev || { pid: null, pidFile: "" }),
+            running: true,
+            pid: healthPid ?? prev?.pid ?? null,
+            managedBy: prev?.isManagedChild ? prev.managedBy : "external",
+            isManagedChild: prev?.isManagedChild === true,
+            heartbeatPhase: readinessPhase || prev?.heartbeatPhase,
+            heartbeatHttpReady: readinessHttpReady ?? prev?.heartbeatHttpReady,
+            heartbeatImReady: readinessImReady ?? prev?.heartbeatImReady,
+            heartbeatReady: readinessFullyReady ?? prev?.heartbeatReady,
+            lastLinkDiagnostic:
+              lastLinkDiagnostic !== undefined ? lastLinkDiagnostic : prev?.lastLinkDiagnostic,
+          }));
+          setBackendBootPhase(readinessReady ? "running" : "starting");
+          notifyPluginAppsReady();
+          if (wasReady === false && readinessReady) {
+            void refreshStatus(undefined, undefined, true).catch(() => {});
+          }
+        } else {
+          throw new Error("non-ok");
+        }
+      } catch {
+        // 宽限期内不计入
+        if (visibilityGraceRef.current) return;
+        if (isBackendStartingHeld()) {
+          heartbeatFailCount.current = 0;
+          if (heartbeatStateRef.current !== "suspect") {
+            heartbeatStateRef.current = "suspect";
+            setHeartbeatState("suspect");
+          }
+          setBackendBootPhase("starting");
+          setServiceStatus(prev =>
+              prev ? { ...prev, running: false } : stoppedStatus()
+          );
+          return;
+        }
+
+        // ── 启动宽限：后端 dual-venv hack cold start 实测要 90~120 秒 ──
+        // 这段时间内 fetch /api/health 必然失败，但后端正在加载 122 个 skills、
+        // 初始化 Memory/IM 通道、启动 uvicorn。如果走老逻辑（5 次失败 = 25s 转 dead），
+        // UI 会在启动期闪一下"未启动"红条。
+        // 改成：先问 Rust 后端是否仍在 boot grace。
+        //   1) backend_in_boot_grace_cmd —— 基于 PID 文件 started_at 判定（含 PID 死亡 30s 容忍窗）
+        //   2) 退化到 is_backend_auto_starting —— 兼容旧 Rust 端
+        // 命中任一就保持 "starting"，重置 failCount，不进入 suspect/degraded/dead。
+        if (IS_TAURI && dataMode !== "remote") {
+          let stillStarting = false;
+          try {
+            stillStarting = await invoke<boolean>("backend_in_boot_grace_cmd", {
+              workspaceId: currentWorkspaceId,
+            });
+          } catch {
+            // 老版本 Rust 后端没有 backend_in_boot_grace_cmd，退化路径
+            try {
+              stillStarting = await invoke<boolean>("is_backend_auto_starting");
+            } catch { /* invoke 不可用 — 走原有降级逻辑 */ }
+          }
+          if (stillStarting) {
+            heartbeatFailCount.current = 0;
+            holdBackendStarting(60_000);
+            return;
+          }
+        }
+
+        heartbeatAliveSuccessCountRef.current = 0;
+        heartbeatFailCount.current += 1;
+        const suspectThreshold = 2;  // 连续失败 ≥2 才进入 suspect，单次孤立超时不变黄
+        const degradeThreshold = 5;  // 连续失败 ≥5 才检查 PID 升级为 degraded/dead
+        if (heartbeatFailCount.current < suspectThreshold) {
+          return;
+        }
+        if (heartbeatFailCount.current < degradeThreshold) {
+          if (heartbeatStateRef.current !== "suspect") {
+            heartbeatStateRef.current = "suspect";
+            setHeartbeatState("suspect");
+          }
+          return;
+        }
+
+        if (IS_TAURI && dataMode !== "remote") {
+          try {
+            const alive = await invoke<boolean>("openkitsune_check_pid_alive", { workspaceId: currentWorkspaceId });
+            if (alive) {
+              if (heartbeatStateRef.current !== "degraded") {
+                heartbeatStateRef.current = "degraded";
+                setHeartbeatState("degraded");
+                try { await invoke("set_tray_backend_status", { status: "degraded" }); } catch { /* ignore */ }
+              }
+              setServiceStatus(prev =>
+                prev ? { ...prev, running: true } : externalRunningStatus(),
+              );
+              return;
+            }
+          } catch { /* invoke 失败，视为不可用 */ }
+        }
+
+        // 进程确认已死 → DEAD
+        if (heartbeatStateRef.current !== "dead") {
+          heartbeatStateRef.current = "dead";
+          setHeartbeatState("dead");
+          if (IS_TAURI) try { await invoke("set_tray_backend_status", { status: "dead" }); } catch { /* ignore */ }
+        }
+        setServiceStatus(prev =>
+          prev ? { ...prev, running: false } : stoppedStatus(),
+        );
+        clearBackendStartingHold();
+        setBackendBootPhase("stopped");
+        setBackendVersion(null);
+        // 注意：不要在 dead 状态下重置 heartbeatFailCount！
+        // 否则下轮心跳 failCount 从 0 开始 → 进入 suspect → 再次变为 dead → 重复发送系统通知。
+        // failCount 会在服务恢复 (alive) 时自动重置为 0（见上方 res.ok 分支）。
+      }
+    }, interval);
+
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentWorkspaceId, dataMode, apiBaseUrl, pageVisible, restartOverlay]);
+
+  const venvDir = useMemo(() => {
+    if (!info) return "";
+    return joinPath(info.openkitsuneRootDir, "venv");
+  }, [info]);
+
+  // tray/menu bar -> open status panel
+  useEffect(() => {
+    let unlisten: null | (() => void) = null;
+    (async () => {
+      unlisten = await listen("open_status", async () => {
+        navigateToView("status");
+        try {
+          await refreshStatus(undefined, undefined, true);
+        } catch {
+          // ignore
+        }
+      });
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentWorkspaceId, venvDir]);
+
+  // Tauri-local pip install progress is polled from Rust state. The worker
+  // thread never holds a Tauri AppHandle, avoiding late event-loop proxy clones
+  // during shutdown.
+  useEffect(() => {
+    if (!pipInstallPolling || !IS_TAURI) return;
+    let cancelled = false;
+    let cursor = 0;
+    const poll = async () => {
+      try {
+        const p = await invoke<{
+          cursor: number;
+          done: boolean;
+          failed: boolean;
+          stage?: string | null;
+          percent?: number | null;
+          chunks?: string[];
+          missed?: boolean;
+        }>("pip_install_progress", { installId: pipInstallId, cursor });
+        if (cancelled) return;
+        cursor = Number(p.cursor || cursor);
+        if (p.stage) {
+          setInstallProgress({
+            stage: String(p.stage),
+            percent: Math.max(0, Math.min(100, Number(p.percent || 0))),
+          });
+        }
+        const chunks = Array.isArray(p.chunks) ? p.chunks.join("") : "";
+        if (chunks) {
+          setInstallLiveLog((prev) => {
+            const next = prev + (p.missed ? "\n[log truncated]\n" : "") + chunks;
+            const max = 80_000;
+            return next.length > max ? next.slice(next.length - max) : next;
+          });
+        }
+        if (p.done) setPipInstallPolling(false);
+      } catch {
+        // Keep polling while install is in progress; startup can briefly race.
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => {
+      void poll();
+    }, 400);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [pipInstallPolling, pipInstallId]);
+
+  // tray quit failed: service still running
+  useEffect(() => {
+    let unlisten: null | (() => void) = null;
+    (async () => {
+      unlisten = await listen("quit_failed", async (ev) => {
+        const p = ev.payload as any;
+        const msg = String(p?.message || "退出失败：后台服务仍在运行。请先停止服务。");
+        navigateToView("status");
+        notifyError(msg);
+        try {
+          await refreshStatus(undefined, undefined, true);
+        } catch {
+          // ignore
+        }
+      });
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  const fetchInboxUnreadCount = useCallback(async () => {
+    if (!shouldUseHttpApi()) {
+      setInboxUnreadCount(0);
+      return;
+    }
+    try {
+      const resp = await safeFetch(`${httpApiBase()}/api/inbox/unread-count`, {
+        signal: AbortSignal.timeout(3_000),
+      });
+      const data = await resp.json();
+      const next = Math.max(0, Number(data?.unread_count || 0));
+      setInboxUnreadCount(next);
+      window.dispatchEvent(
+        new CustomEvent(INBOX_UNREAD_CHANGED_EVENT, {
+          detail: { unreadCount: next },
+        }),
+      );
+    } catch {
+      // Inbox is optional on older backend builds.
+    }
+  }, [serviceStatus?.running, dataMode, apiBaseUrl]);
+
+  useEffect(() => {
+    void fetchInboxUnreadCount();
+  }, [fetchInboxUnreadCount]);
+
+  // ── Backend WebSocket events: keep derived status fresh across Web/Tauri ──
+  // IM channels intentionally start after the HTTP API so the desktop can connect early.
+  // On Tauri, relying only on the first /api/im/channels fetch leaves the StatusView stuck
+  // at "configured/unknown" until another user action refreshes it. Subscribe here too so
+  // the backend's im:channel_status event reconciles the UI as soon as adapters finish.
+  useEffect(() => {
+    if (!IS_TAURI && !IS_WEB && !IS_CAPACITOR) return;
+    if ((IS_WEB || IS_CAPACITOR) && !webAuthed) return;
+    const unsub = onWsEvent((event, data) => {
+      const p = data as any;
+      if (!p) return;
+      if (event === "pip_install_event") {
+        if (p.kind === "stage") {
+          setInstallProgress({ stage: String(p.stage || ""), percent: Math.max(0, Math.min(100, Number(p.percent || 0))) });
+        } else if (p.kind === "line") {
+          const text = String(p.text || "");
+          if (text) setInstallLiveLog((prev) => { const n = prev + text; return n.length > 80_000 ? n.slice(n.length - 80_000) : n; });
+        }
+      } else if (
+        event === "service_status_changed" || event === "skills:changed" ||
+        event === "im:channel_status" || event === "im:new_message"
+      ) {
+        if (wsRefreshDebounceRef.current) clearTimeout(wsRefreshDebounceRef.current);
+        wsRefreshDebounceRef.current = setTimeout(() => {
+          wsRefreshDebounceRef.current = null;
+          refreshStatus().catch(() => {});
+        }, 2_000);
+      }
+      if (event === "inbox:unread_changed") {
+        const next = Math.max(0, Number(p.unread_count || 0));
+        setInboxUnreadCount(next);
+        setInboxRefreshKey((value) => value + 1);
+        window.dispatchEvent(
+          new CustomEvent(INBOX_UNREAD_CHANGED_EVENT, {
+            detail: { unreadCount: next },
+          }),
+        );
+      }
+      if (event === "inbox:new_message") {
+        const payload = p as InboxWsMessagePayload;
+        setInboxRefreshKey((value) => value + 1);
+        void fetchInboxUnreadCount();
+        window.dispatchEvent(new CustomEvent(INBOX_REFRESH_EVENT));
+        if (isHighPriorityInbox(payload.priority)) {
+          const messageTitle = String(payload.title || t("inbox.newMessageFallback"));
+          toast.warning(messageTitle, {
+            description: t("inbox.newImportantMessage"),
+            action: {
+              label: t("inbox.openInbox"),
+              onClick: () => setInboxDialogOpen(true),
+            },
+          });
+        }
+      }
+      if (event === "inbox:update_available") {
+        const payload = p as InboxUpdatePayload;
+        setInboxRefreshKey((value) => value + 1);
+        void fetchInboxUnreadCount();
+        toast.info(String(payload.title || t("inbox.updateAvailable")), {
+          description: payload.version
+            ? t("inbox.updateAvailableVersion", { version: payload.version })
+            : t("inbox.updateAvailableHint"),
+          action: {
+            label: t("version.updateNow"),
+            onClick: () => { void checkForAppUpdate(); },
+          },
+        });
+        void checkForAppUpdate();
+      }
+      // 桥接技能变更：把 WS 'skills:changed' 转成全局 window CustomEvent，
+      // 各组件（SkillManager / OrgEditorView 等）可以监听同一事件实现实时刷新，
+      // 无需让 App 知道具体组件存在。``action`` 透传给监听方按需做差异化处理。
+      if (event === "skills:changed") {
+        try {
+          window.dispatchEvent(new CustomEvent("openkitsune:skills-changed", {
+            detail: { action: String(p.action || "") },
+          }));
+        } catch {
+          // ignore - browser may not support CustomEvent in some sandboxes
+        }
+      }
+    });
+    return unsub;
+  }, [webAuthed, fetchInboxUnreadCount, checkForAppUpdate, t]);
+
+  // Keep preset <-> index-url consistent
+  useEffect(() => {
+    const t = indexUrl.trim();
+    if (pipIndexPresetId === "custom") {
+      if (customIndexUrl !== indexUrl) setCustomIndexUrl(indexUrl);
+      return;
+    }
+    const preset = PIP_INDEX_PRESETS.find((p) => p.id === pipIndexPresetId);
+    const target = (preset?.url || "").trim();
+    if (target !== t) setIndexUrl(preset?.url || "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pipIndexPresetId]);
+
+
+  // Keep boolean flags in sync with the visible status string (best-effort).
+  useEffect(() => {
+    if (!venvStatus) return;
+    if (venvStatus.includes("venv 就绪")) setVenvReady(true);
+    if (venvStatus.includes("安装完成")) setOpenkitsuneInstalled(true);
+  }, [venvStatus]);
+
+  /**
+   * Clear all workspace-scoped React state so that stale data from the
+   * previous workspace never leaks into the new one.  Called synchronously
+   * inside confirmWorkspaceChange right after the actual switch succeeds.
+   */
+  function resetWorkspaceData() {
+    setEndpointSummary([]);
+    setEndpointHealth({});
+    setImHealth({});
+    setSavedEndpoints([]);
+    setSavedCompilerEndpoints([]);
+    setSavedSttEndpoints([]);
+    setSavedImageEndpoints([]);
+    setSkillSummary(null);
+    setSkillsDetail(null);
+    setServiceLog(null);
+    setServiceLogError(null);
+  }
+
+  /**
+   * Shared helper: show confirmation dialog before switching/creating workspace,
+   * then auto-restart the backend if it was running.
+   *
+   * Uses restartOverlay (not notifyLoading) so the heartbeat timer correctly
+   * pauses during the stop → start cycle and the UI is fully blocked.
+   */
+  function confirmWorkspaceChange(opts: {
+    targetId: string;
+    displayName: string;
+    title: string;
+    message: string;
+    performSwitch: () => Promise<void>;
+  }) {
+    const wasRunning = serviceStatus?.running;
+    const oldWsId = currentWorkspaceId || workspaces.find((w) => w.isCurrent)?.id;
+
+    let fullMessage = opts.message;
+    if (wasRunning) {
+      fullMessage += t("topbar.switchWorkspaceConfirmMsgRestart");
+    }
+
+    setConfirmDialog({
+      title: opts.title,
+      message: fullMessage,
+      destructive: false,
+      onConfirm: async () => {
+        try {
+          await opts.performSwitch();
+          resetEnvLoaded();
+          resetWorkspaceData();
+
+          // ── Web/Capacitor: the API call already triggered a backend restart ──
+          if (IS_WEB || IS_CAPACITOR) {
+            if (!wasRunning) {
+              // Service wasn't running — just refresh state (unlikely on Web, but defensive)
+              await refreshAll();
+              notifySuccess(t("topbar.switchWorkspaceDone", { id: opts.targetId }));
+              return;
+            }
+            const hint = t("topbar.switchWorkspaceRestarting");
+            setRestartOverlay({ phase: "restarting", hint });
+            const base = httpApiBase();
+            await waitForServiceDown(base, 15000);
+            setRestartOverlay({ phase: "waiting", hint });
+            const ready = await waitForServiceReady(base);
+            if (ready) {
+              setRestartOverlay({
+                phase: "done",
+                doneMessage: t("topbar.switchWorkspaceRestartSuccess", { id: opts.targetId }),
+              });
+              setServiceStatus((prev) =>
+                prev ? { ...prev, running: true } : externalRunningStatus(),
+              );
+              await refreshAll();
+              try { await refreshStatus(undefined, undefined, true); } catch { /* ignore */ }
+              autoCheckEndpoints(base);
+              setTimeout(() => setRestartOverlay(null), 1500);
+            } else {
+              setRestartOverlay({ phase: "fail" });
+              setTimeout(() => {
+                setRestartOverlay(null);
+                notifyError(t("topbar.switchWorkspaceRestartFail", { id: opts.targetId }));
+              }, 2500);
+            }
+            return;
+          }
+
+          // ── Tauri: manage process lifecycle via IPC ──
+          await refreshAll();
+
+          // ── Web/Capacitor: the API call already triggered a backend restart ──
+          if (IS_WEB || IS_CAPACITOR) {
+            if (!wasRunning) {
+              // Service wasn't running — just refresh state (unlikely on Web, but defensive)
+              await refreshAll();
+              notifySuccess(t("topbar.switchWorkspaceDone", { id: opts.targetId }));
+              return;
+            }
+            const hint = t("topbar.switchWorkspaceRestarting");
+            setRestartOverlay({ phase: "restarting", hint });
+            const base = httpApiBase();
+            await waitForServiceDown(base, 15000);
+            setRestartOverlay({ phase: "waiting", hint });
+            const ready = await waitForServiceReady(base);
+            if (ready) {
+              setRestartOverlay({
+                phase: "done",
+                doneMessage: t("topbar.switchWorkspaceRestartSuccess", { id: opts.targetId }),
+              });
+              setServiceStatus((prev) =>
+                prev ? { ...prev, running: true } : externalRunningStatus(),
+              );
+              await refreshAll();
+              try { await refreshStatus(undefined, undefined, true); } catch { /* ignore */ }
+              autoCheckEndpoints(base);
+              setTimeout(() => setRestartOverlay(null), 1500);
+            } else {
+              setRestartOverlay({ phase: "fail" });
+              setTimeout(() => {
+                setRestartOverlay(null);
+                notifyError(t("topbar.switchWorkspaceRestartFail", { id: opts.targetId }));
+              }, 2500);
+            }
+            return;
+          }
+
+          // ── Tauri: manage process lifecycle via IPC ──
+          await refreshAll();
+
+          if (!wasRunning || !venvDir) {
+            notifySuccess(t("topbar.switchWorkspaceDone", { id: opts.targetId }));
+            return;
+          }
+
+          const hint = t("topbar.switchWorkspaceRestarting");
+          setRestartOverlay({ phase: "restarting", hint });
+
+          try {
+            await doStopService(oldWsId);
+            await waitForServiceDown(apiBaseUrl, 15000);
+          } catch { /* stop errors are non-fatal */ }
+
+          setRestartOverlay({ phase: "waiting", hint });
+
+          try {
+            const ss = await invoke<ServiceStatus>(
+              "openkitsune_service_start", { venvDir, workspaceId: opts.targetId },
+            );
+            setServiceStatus(ss);
+          } catch (e) {
+            setRestartOverlay({ phase: "fail" });
+            setTimeout(() => {
+              setRestartOverlay(null);
+              notifyError(t("topbar.switchWorkspaceRestartFail", { id: opts.targetId }) + ": " + String(e));
+            }, 2500);
+            return;
+          }
+
+          const ready = await waitForServiceReady("http://127.0.0.1:18900");
+          if (ready) {
+            setRestartOverlay({
+              phase: "done",
+              doneMessage: t("topbar.switchWorkspaceRestartSuccess", { id: opts.targetId }),
+            });
+            setServiceStatus((prev) =>
+              prev ? { ...prev, running: true } : externalRunningStatus(),
+            );
+            try { await refreshStatus("local", "http://127.0.0.1:18900", true); } catch { /* ignore */ }
+            autoCheckEndpoints("http://127.0.0.1:18900");
+            setTimeout(() => setRestartOverlay(null), 1500);
+          } else {
+            setRestartOverlay({ phase: "fail" });
+            setTimeout(() => {
+              setRestartOverlay(null);
+              notifyError(t("topbar.switchWorkspaceRestartFail", { id: opts.targetId }));
+            }, 2500);
+          }
+        } catch (err: any) {
+          setRestartOverlay(null);
+          notifyError(String(err));
+        }
+      },
+    });
+  }
+
+  async function doSetCurrentWorkspace(id: string) {
+    const target = workspaces.find((w) => w.id === id);
+    const displayName = target?.name || id;
+
+    if (IS_WEB || IS_CAPACITOR) {
+      // Web/Capacitor: switch via HTTP API (triggers backend restart)
+      confirmWorkspaceChange({
+        targetId: id,
+        displayName,
+        title: t("topbar.switchWorkspaceConfirmTitle"),
+        message: t("topbar.switchWorkspaceConfirmMsg", { name: displayName }),
+        performSwitch: async () => {
+          const base = httpApiBase();
+          await safeFetch(`${base}/api/workspaces/switch`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id }),
+          });
+        },
+      });
+    } else {
+      // Tauri: switch via IPC (existing logic)
+      confirmWorkspaceChange({
+        targetId: id,
+        displayName,
+        title: t("topbar.switchWorkspaceConfirmTitle"),
+        message: t("topbar.switchWorkspaceConfirmMsg", { name: displayName }),
+        performSwitch: () => invoke("set_current_workspace", { id }),
+      });
+    }
+  }
+
+  async function doLoadProviders() {
+    const _busyId = notifyLoading("读取服务商列表...");
+    try {
+      let parsed: ProviderInfo[] = [];
+
+      if (shouldUseHttpApi()) {
+        // ── 后端运行中 → HTTP API（获取后端实时的 provider 列表）──
+        try {
+          const res = await safeFetch(`${httpApiBase()}/api/config/providers`, { signal: AbortSignal.timeout(5000) });
+          const data = await res.json();
+          parsed = Array.isArray(data.providers) ? data.providers : Array.isArray(data) ? data : [];
+        } catch {
+          parsed = BUILTIN_PROVIDERS; // 后端旧版本不支持此 API，回退
+        }
+      } else {
+        // ── 后端未运行 → Tauri invoke，失败则用内置列表 ──
+        try {
+          const raw = await invoke<string>("openkitsune_list_providers", { venvDir });
+          parsed = JSON.parse(raw) as ProviderInfo[];
+        } catch {
+          parsed = BUILTIN_PROVIDERS;
+        }
+      }
+
+      if (parsed.length === 0) {
+        parsed = BUILTIN_PROVIDERS;
+      } else {
+        // 后端返回的列表可能不完整（部分 registry 加载失败），
+        // 将 BUILTIN_PROVIDERS 中缺失的服务商补充进去
+        const slugSet = new Set(parsed.map(p => p.slug));
+        for (const bp of BUILTIN_PROVIDERS) {
+          if (!slugSet.has(bp.slug)) parsed.push(bp);
+        }
+      }
+      const bottomSlugs = new Set(["ollama", "lmstudio", "custom"]);
+      const top = parsed.filter(p => !bottomSlugs.has(p.slug));
+      const bottom = ["ollama", "lmstudio", "custom"]
+        .map(s => parsed.find(p => p.slug === s))
+        .filter(Boolean) as ProviderInfo[];
+      parsed = [...top, ...bottom];
+      setProviders(parsed);
+
+      // 非关键：获取版本号（仅后端未运行时尝试 venv 方式）
+      if (!shouldUseHttpApi()) {
+        try {
+          const v = await invoke<string>("openkitsune_version", { venvDir });
+          setOpenkitsuneVersion(v || "");
+        } catch {
+          setOpenkitsuneVersion("");
+        }
+      }
+    } catch (e) {
+      logger.warn("App", "doLoadProviders failed", { error: String(e) });
+      if (providers.length === 0) {
+        const bottomSlugs2 = new Set(["ollama", "lmstudio", "custom"]);
+        const top2 = BUILTIN_PROVIDERS.filter(p => !bottomSlugs2.has(p.slug));
+        const bottom2 = ["ollama", "lmstudio", "custom"]
+          .map(s => BUILTIN_PROVIDERS.find(p => p.slug === s))
+          .filter(Boolean) as ProviderInfo[];
+        const sorted = [...top2, ...bottom2];
+        setProviders(sorted);
+      }
+    } finally {
+      dismissLoading(_busyId);
+    }
+  }
+
+  async function loadSavedEndpoints() {
+    if (!currentWorkspaceId && dataMode !== "remote") {
+      setSavedEndpoints([]);
+      setSavedCompilerEndpoints([]);
+      setSavedSttEndpoints([]);
+      setSavedImageEndpoints([]);
+      return;
+    }
+    try {
+      const raw = await readWorkspaceFile("data/llm_endpoints.json");
+      const parsed = raw ? JSON.parse(raw) : { endpoints: [] };
+      const eps = Array.isArray(parsed?.endpoints) ? parsed.endpoints : [];
+      const list: EndpointDraft[] = eps
+        .map((e: any) => ({
+          name: String(e?.name || ""),
+          provider: String(e?.provider || ""),
+          api_type: String(e?.api_type || ""),
+          base_url: String(e?.base_url || ""),
+          api_key_env: String(e?.api_key_env || ""),
+          model: String(e?.model || ""),
+          priority: Number.isFinite(Number(e?.priority)) ? Number(e?.priority) : 999,
+          max_tokens: Number.isFinite(Number(e?.max_tokens)) ? Number(e?.max_tokens) : 0,
+          context_window: Number.isFinite(Number(e?.context_window)) ? Number(e?.context_window) : 200000,
+          timeout: Number.isFinite(Number(e?.timeout)) ? Number(e?.timeout) : 180,
+          capabilities: Array.isArray(e?.capabilities) ? e.capabilities.map((x: any) => String(x)) : [],
+          rpm_limit: Number.isFinite(Number(e?.rpm_limit)) ? Number(e?.rpm_limit) : 0,
+          note: e?.note ? String(e.note) : null,
+          pricing_tiers: Array.isArray(e?.pricing_tiers) ? e.pricing_tiers.map((t: any) => ({
+            max_input: Number.isFinite(Number(t?.max_input)) ? Number(t.max_input) : 0,
+            input_price: Number.isFinite(Number(t?.input_price)) ? Number(t.input_price) : 0,
+            output_price: Number.isFinite(Number(t?.output_price)) ? Number(t.output_price) : 0,
+          })) : undefined,
+          enabled: e?.enabled !== false,
+        }))
+        .filter((e: any) => e.name);
+      list.sort((a, b) => a.priority - b.priority);
+      setSavedEndpoints(list);
+
+      // Load compiler endpoints
+      const compilerEps: EndpointDraft[] = (Array.isArray(parsed?.compiler_endpoints) ? parsed.compiler_endpoints : [])
+        .filter((e: any) => e?.name)
+        .map((e: any) => ({
+          name: String(e.name || ""),
+          provider: String(e.provider || ""),
+          api_type: String(e.api_type || "openai"),
+          base_url: String(e.base_url || ""),
+          api_key_env: String(e.api_key_env || ""),
+          model: String(e.model || ""),
+          priority: Number.isFinite(Number(e.priority)) ? Number(e.priority) : 1,
+          max_tokens: Number.isFinite(Number(e.max_tokens)) ? Number(e.max_tokens) : 2048,
+          context_window: Number.isFinite(Number(e.context_window)) ? Number(e.context_window) : 200000,
+          timeout: Number.isFinite(Number(e.timeout)) ? Number(e.timeout) : 30,
+          capabilities: Array.isArray(e.capabilities) ? e.capabilities.map((x: any) => String(x)) : ["text"],
+          note: e.note ? String(e.note) : null,
+          enabled: e?.enabled !== false,
+        }))
+        .sort((a: EndpointDraft, b: EndpointDraft) => a.priority - b.priority);
+      setSavedCompilerEndpoints(compilerEps);
+
+      // Load STT endpoints
+      const sttEps: EndpointDraft[] = (Array.isArray(parsed?.stt_endpoints) ? parsed.stt_endpoints : [])
+        .filter((e: any) => e?.name)
+        .map((e: any) => ({
+          name: String(e.name || ""),
+          provider: String(e.provider || ""),
+          api_type: String(e.api_type || "openai"),
+          base_url: String(e.base_url || ""),
+          api_key_env: String(e.api_key_env || ""),
+          model: String(e.model || ""),
+          priority: Number.isFinite(Number(e.priority)) ? Number(e.priority) : 1,
+          max_tokens: Number.isFinite(Number(e.max_tokens)) ? Number(e.max_tokens) : 0,
+          context_window: Number.isFinite(Number(e.context_window)) ? Number(e.context_window) : 0,
+          timeout: Number.isFinite(Number(e.timeout)) ? Number(e.timeout) : 60,
+          capabilities: Array.isArray(e.capabilities) ? e.capabilities.map((x: any) => String(x)) : ["text"],
+          note: e.note ? String(e.note) : null,
+          enabled: e?.enabled !== false,
+        }))
+        .sort((a: EndpointDraft, b: EndpointDraft) => a.priority - b.priority);
+      setSavedSttEndpoints(sttEps);
+
+      const imageEps: EndpointDraft[] = (Array.isArray(parsed?.image_endpoints) ? parsed.image_endpoints : [])
+        .filter((e: any) => e?.name)
+        .map((e: any) => ({
+          name: String(e.name || ""),
+          provider: String(e.provider || "custom"),
+          api_type: String(e.api_type || "openai_images"),
+          base_url: String(e.base_url || ""),
+          api_key_env: String(e.api_key_env || ""),
+          model: String(e.model || ""),
+          priority: Number.isFinite(Number(e.priority)) ? Number(e.priority) : 1,
+          max_tokens: 0,
+          context_window: 0,
+          timeout: Number.isFinite(Number(e.timeout)) ? Number(e.timeout) : 180,
+          capabilities: Array.isArray(e.capabilities) ? e.capabilities.map((x: any) => String(x)) : ["image_generation"],
+          extra_params: e.extra_params && typeof e.extra_params === "object" ? e.extra_params : {},
+          note: e.note ? String(e.note) : null,
+          enabled: e?.enabled !== false,
+        }))
+        .sort((a: EndpointDraft, b: EndpointDraft) => a.priority - b.priority);
+      setSavedImageEndpoints(imageEps);
+    } catch {
+      setSavedEndpoints([]);
+      setSavedCompilerEndpoints([]);
+      setSavedSttEndpoints([]);
+      setSavedImageEndpoints([]);
+    }
+  }
+
+  // ── 配置读写路由 ──
+  // 路由原则：
+  //   后端运行中 (serviceStatus?.running) 或远程模式 → 必须走 HTTP API（后端负责持久化 + 热加载）
+  //   后端未运行 → 走本地 Tauri Rust 操作（直接读写工作区文件）
+  // 这样保证：
+  //   1. 后端运行时，所有读写经过后端，确保配置兼容性和即时生效
+  //   2. 后端未运行时（onboarding / 首次配置），直接操作本地文件，服务启动后自动加载
+
+  /** 判断当前是否应走后端 HTTP API */
+  function shouldUseHttpApi(): boolean {
+    return dataMode === "remote" || !!serviceStatus?.running;
+  }
+
+  function httpApiBase(): string {
+    // A browser Web session belongs to the server that served the page. Native
+    // connection state (including a desktop loopback default) must not retarget it.
+    if (IS_WEB) return window.location.origin;
+    if (IS_CAPACITOR) return apiBaseUrl || window.location.origin;
+    return dataMode === "remote" ? apiBaseUrl : "http://127.0.0.1:18900";
+  }
+
+  const refreshRuntimeDiagnostics = useCallback(async () => {
+    if (!shouldUseHttpApi()) return;
+    setRuntimeDiagChecking(true);
+    try {
+      const res = await safeFetch(`${httpApiBase()}/api/diagnostics`, {
+        signal: AbortSignal.timeout(8000),
+      });
+      if (res.ok) setRuntimeDiag(await res.json());
+    } catch (e) {
+      logger.warn("runtime diagnostics failed", String(e));
+    } finally {
+      setRuntimeDiagChecking(false);
+    }
+  }, [serviceStatus?.running, dataMode, apiBaseUrl]);
+
+  useEffect(() => {
+    if ((view === "status" || (view === "wizard" && stepId === "advanced")) && serviceStatus?.running) {
+      void refreshRuntimeDiagnostics();
+    }
+  }, [view, stepId, serviceStatus?.running, refreshRuntimeDiagnostics]);
+
+  useEffect(() => {
+    if (runtimeDialogOpen && serviceStatus?.running) {
+      void refreshRuntimeDiagnostics();
+    }
+  }, [runtimeDialogOpen, serviceStatus?.running, refreshRuntimeDiagnostics]);
+
+  // ── Disabled views management ──
+  const fetchDisabledViews = useCallback(async () => {
+    if (!shouldUseHttpApi()) return;
+    try {
+      const resp = await safeFetch(`${httpApiBase()}/api/config/disabled-views`);
+      const data = await resp.json();
+      setDisabledViews(data.disabled_views || []);
+    } catch { /* ignore */ }
+  }, [serviceStatus?.running, dataMode, apiBaseUrl]);
+
+  useEffect(() => { fetchDisabledViews(); }, [fetchDisabledViews]);
+
+  // ── Unread feedback count polling ──
+  useEffect(() => {
+    if (!serviceStatus?.running) return;
+    const poll = async () => {
+      try {
+        const res = await safeFetch(`${httpApiBase()}/api/feedback-unread-count`, { signal: AbortSignal.timeout(5000) });
+        const data = await res.json();
+        setUnreadFeedbackCount(data.unread_count ?? 0);
+      } catch { /* ignore */ }
+    };
+    poll();
+    const timer = setInterval(poll, 5 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [serviceStatus?.running, dataMode, apiBaseUrl]);
+
+  // ── Pending approvals count polling + WebSocket instant refresh ──
+  useEffect(() => {
+    if (!serviceStatus?.running) { setPendingApprovalsCount(0); return; }
+    const poll = async () => {
+      try {
+        const res = await safeFetch(`${httpApiBase()}/api/pending_approvals/stats`, { signal: AbortSignal.timeout(5000) });
+        const data = await res.json();
+        setPendingApprovalsCount(data.pending ?? 0);
+      } catch { /* ignore */ }
+    };
+    poll();
+    const timer = setInterval(poll, 60_000);
+    const unsub = IS_WEB ? onWsEvent((event) => {
+      if (event === "pending_approval_created" || event === "pending_approval_resolved") poll();
+    }) : undefined;
+    return () => { clearInterval(timer); unsub?.(); };
+  }, [serviceStatus?.running, dataMode, apiBaseUrl]);
+
+  const toggleViewDisabled = useCallback(async (viewName: string) => {
+    const next = disabledViews.includes(viewName)
+      ? disabledViews.filter((v) => v !== viewName)
+      : [...disabledViews, viewName];
+    setDisabledViews(next);
+    if (shouldUseHttpApi()) {
+      try {
+        await safeFetch(`${httpApiBase()}/api/config/disabled-views`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ views: next }),
+        });
+      } catch { /* ignore */ }
+    }
+  }, [disabledViews, serviceStatus?.running, dataMode, apiBaseUrl]);
+
+  async function readWorkspaceFile(relativePath: string): Promise<string> {
+    // ── 后端运行中 → 优先 HTTP API（读取后端内存中的实时状态）──
+    if (shouldUseHttpApi()) {
+      try {
+        const base = httpApiBase();
+        if (relativePath === "data/llm_endpoints.json") {
+          const res = await safeFetch(`${base}/api/config/endpoints`);
+          const data = await res.json();
+          const raw = data.raw;
+          const hasEndpoints = raw && typeof raw === "object" && Array.isArray(raw.endpoints) && raw.endpoints.length > 0;
+          if (hasEndpoints) return JSON.stringify(raw);
+          const fallback: {
+            endpoints: any;
+            compiler_endpoints?: any;
+            stt_endpoints?: any;
+            image_endpoints?: any;
+            relay_endpoints?: any;
+            settings?: any;
+          } = { endpoints: data.endpoints || [] };
+          if (Array.isArray(raw?.compiler_endpoints)) fallback.compiler_endpoints = raw.compiler_endpoints;
+          if (Array.isArray(raw?.stt_endpoints)) fallback.stt_endpoints = raw.stt_endpoints;
+          if (Array.isArray(raw?.image_endpoints)) fallback.image_endpoints = raw.image_endpoints;
+          if (Array.isArray(raw?.relay_endpoints)) fallback.relay_endpoints = raw.relay_endpoints;
+          if (raw?.settings) fallback.settings = raw.settings;
+          return JSON.stringify(fallback);
+        }
+        if (relativePath === "data/skills.json") {
+          const res = await safeFetch(`${base}/api/config/skills`);
+          const data = await res.json();
+          return JSON.stringify(data.skills || {});
+        }
+        if (relativePath === ".env") {
+          const res = await safeFetch(`${base}/api/config/env`);
+          const data = await res.json();
+          return data.raw || "";
+        }
+      } catch {
+        // HTTP 暂时不可用 — 回退到本地读取（比如后端正在重启、状态延迟）
+        logger.warn("App", `readWorkspaceFile: HTTP failed for ${relativePath}, falling back to Tauri`);
+      }
+    }
+    // ── 后端未运行 / HTTP 回退 → Tauri 本地读取（Web 模式无此能力） ──
+    if (IS_TAURI && currentWorkspaceId) {
+      return invoke<string>("workspace_read_file", { workspaceId: currentWorkspaceId, relativePath });
+    }
+    throw new Error(`读取配置失败：服务未运行且无本地工作区 (${relativePath})`);
+  }
+
+  async function writeWorkspaceFile(relativePath: string, content: string): Promise<void> {
+    // ── 后端运行中 → 优先 HTTP API（后端负责持久化 + 热加载）──
+    if (shouldUseHttpApi()) {
+      try {
+        const base = httpApiBase();
+        if (relativePath === "data/skills.json") {
+          await safeFetch(`${base}/api/config/skills`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: JSON.parse(content) }),
+          });
+          try {
+            await safeFetch(`${base}/api/skills/reload`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({}),
+            });
+          } catch { /* reload failure is non-blocking */ }
+          return;
+        }
+      } catch {
+        // HTTP 暂时不可用 — 回退到本地写入（比如后端正在重启）
+        logger.warn("App", `writeWorkspaceFile: HTTP failed for ${relativePath}, falling back to Tauri`);
+      }
+    }
+    // ── 后端未运行 / HTTP 回退 → Tauri 本地写入（Web 模式无此能力） ──
+    if (IS_TAURI && currentWorkspaceId) {
+      await invoke("workspace_write_file", { workspaceId: currentWorkspaceId, relativePath, content });
+      return;
+    }
+    throw new Error(`写入配置失败：服务未运行且无本地工作区 (${relativePath})`);
+  }
+
+  /**
+   * 通知运行中的后端热重载配置。
+   * 仅在后端运行时调用有意义；后端未运行时静默跳过。
+   * 返回 true 表示重载成功，false 表示失败或后端未运行。
+   */
+  /**
+   * 纯重启：安装 IM 依赖 → 检测存活 → 触发重启 → 轮询恢复。
+   * 不含 env 保存逻辑，可独立调用（如 Bot 配置保存后重启）。
+   */
+  async function restartService(): Promise<void> {
+    if (backendBootPhase === "starting" || (serviceStatus?.running && serviceStatus.heartbeatReady === false)) {
+      notifyError("后端仍在启动或初始化中，请等待运行状态稳定后再重启。");
+      return;
+    }
+
+    const base = httpApiBase();
+    setRestartOverlay({ phase: "restarting" });
+
+    try {
+      // 自动安装已启用 IM 通道缺失的依赖（非阻塞，失败不影响重启）
+      if (IS_TAURI && venvDir && currentWorkspaceId) {
+        try {
+          await invoke("openkitsune_ensure_channel_deps", {
+            venvDir,
+            workspaceId: currentWorkspaceId,
+          });
+        } catch { /* 非关键步骤，失败不影响流程 */ }
+      }
+
+      // 检测服务是否运行
+      let alive = false;
+      let liveBackendPid: number | null = null;
+      try {
+        const ping = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(2000) });
+        alive = ping.ok;
+        if (ping.ok) {
+          try {
+            const healthData = await ping.json();
+            liveBackendPid = typeof healthData?.pid === "number" ? healthData.pid : null;
+          } catch { /* health payload is best-effort for ownership checks */ }
+        }
+      } catch {
+        alive = false;
+      }
+
+      if (!alive) {
+        setRestartOverlay({ phase: "notRunning" });
+        setTimeout(() => {
+          setRestartOverlay(null);
+          notifySuccess(t("config.restartNotRunning"));
+        }, 2000);
+        return;
+      }
+
+      // 触发重启
+      setRestartOverlay({ phase: "restarting" });
+      const wsId = currentWorkspaceId || workspaces[0]?.id;
+
+      let freshServiceStatus: ServiceStatus | null = null;
+      if (IS_TAURI && wsId && dataMode === "local") {
+        try {
+          const ss = await invoke<ServiceStatus>("openkitsune_service_status", { workspaceId: wsId });
+          freshServiceStatus = ss.running ? ss : externalRunningStatus(liveBackendPid);
+          setServiceStatus(freshServiceStatus);
+        } catch {
+          freshServiceStatus = externalRunningStatus(liveBackendPid);
+        }
+      }
+      // Only the live MANAGED_CHILD handle means this Tauri instance can safely
+      // do process-level stop/start. A stale PID file may still say
+      // managedBy="tauri" from an older desktop session while the current
+      // backend was started manually from a terminal; treat that as external
+      // and let openkitsune serve restart itself via /api/config/restart.
+      // If the status command fails or cannot match a PID file, the HTTP health
+      // check above has already proved a backend exists, so default to external.
+      const tauriStatusMatchesHealthPid =
+        liveBackendPid === null || freshServiceStatus?.pid === liveBackendPid;
+      const tauriManagedBackend =
+        freshServiceStatus?.isManagedChild === true && tauriStatusMatchesHealthPid;
+
+      if (IS_TAURI && wsId && venvDir && dataMode === "local" && tauriManagedBackend) {
+        // ── Tauri 本地模式：进程级重启（杀旧进程 → 启新进程） ──
+        try {
+          const shutRes = await fetch(`${base}/api/shutdown`, { method: "POST", signal: AbortSignal.timeout(2000) });
+          if (shutRes.ok) await new Promise((r) => setTimeout(r, 1000));
+        } catch { /* 请求可能因服务关闭而失败 */ }
+
+        try {
+          await invoke("openkitsune_service_stop", { workspaceId: wsId });
+        } catch { /* PID 文件可能不存在 */ }
+
+        await waitForServiceDown(base, 15000);
+
+        setRestartOverlay({ phase: "waiting" });
+        try {
+          const ss = await invoke<ServiceStatus>(
+            "openkitsune_service_start", { venvDir, workspaceId: wsId },
+          );
+          setServiceStatus(ss);
+        } catch (e) {
+          setRestartOverlay({ phase: "fail" });
+          setTimeout(() => {
+            setRestartOverlay(null);
+            notifyError(t("config.restartFail") + ": " + String(e));
+          }, 2500);
+          return;
+        }
+      } else {
+        // ── Web / Capacitor / 外部本地后端：进程内重启 ──
+        try {
+          await fetch(`${base}/api/config/restart`, { method: "POST", signal: AbortSignal.timeout(3000) });
+        } catch { /* 请求可能因服务关闭而失败 */ }
+
+        await waitForServiceDown(base, 15000);
+      }
+
+      // 轮询等待服务恢复
+      setRestartOverlay({ phase: "waiting" });
+      const maxWait = IS_TAURI ? 60_000 : 30_000;
+      const pollInterval = 1000;
+      const startTime = Date.now();
+      let recovered = false;
+
+      while (Date.now() - startTime < maxWait) {
+        await new Promise((r) => setTimeout(r, pollInterval));
+        try {
+          const res = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(2000) });
+          if (res.ok) {
+            recovered = true;
+            try {
+              const data = await res.json();
+              if (data.version) setBackendVersion(data.version);
+            } catch { /* ignore */ }
+            break;
+          }
+        } catch { /* 还没恢复，继续等 */ }
+      }
+
+      if (recovered) {
+        setRestartOverlay({ phase: "done" });
+        setServiceStatus((prev) =>
+          prev ? { ...prev, running: true } : externalRunningStatus()
+        );
+        notifyPluginAppsReady();
+        try { await refreshStatus(undefined, undefined, true); } catch { /* ignore */ }
+        autoCheckEndpoints(apiBaseUrl);
+        setTimeout(() => {
+          setRestartOverlay(null);
+          notifySuccess(t("config.restartSuccess"));
+        }, 1200);
+      } else {
+        setRestartOverlay({ phase: "fail" });
+        setTimeout(() => {
+          setRestartOverlay(null);
+          notifyError(t("config.restartFail"));
+        }, 2500);
+      }
+    } catch (e) {
+      setRestartOverlay(null);
+      notifyError(String(e));
+    }
+  }
+
+  /** 根据当前步骤返回需要自动保存的 env key 列表 */
+  function getAutoSaveKeysForStep(sid: StepId): string[] {
+    switch (sid) {
+      case "im":
+        return [
+          "IM_CHAIN_PUSH",
+          "TELEGRAM_ENABLED", "TELEGRAM_BOT_TOKEN", "TELEGRAM_PROXY",
+          "TELEGRAM_REQUIRE_PAIRING", "TELEGRAM_PAIRING_CODE", "TELEGRAM_WEBHOOK_URL",
+          "FEISHU_ENABLED", "FEISHU_APP_ID", "FEISHU_APP_SECRET",
+          "WEWORK_ENABLED", "WEWORK_CORP_ID",
+          "WEWORK_TOKEN", "WEWORK_ENCODING_AES_KEY", "WEWORK_CALLBACK_PORT", "WEWORK_CALLBACK_HOST",
+          "WEWORK_MODE", "WEWORK_WS_ENABLED", "WEWORK_WS_BOT_ID", "WEWORK_WS_SECRET",
+          "DINGTALK_ENABLED", "DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET",
+          "ONEBOT_ENABLED", "ONEBOT_MODE", "ONEBOT_WS_URL", "ONEBOT_REVERSE_HOST", "ONEBOT_REVERSE_PORT", "ONEBOT_ACCESS_TOKEN",
+          "QQBOT_ENABLED", "QQBOT_APP_ID", "QQBOT_APP_SECRET", "QQBOT_SANDBOX", "QQBOT_MODE", "QQBOT_WEBHOOK_PORT", "QQBOT_WEBHOOK_PATH",
+          "WECHAT_ENABLED", "WECHAT_TOKEN",
+        ];
+      case "tools":
+        return [
+          "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FORCE_IPV4",
+          "TOOL_MAX_PARALLEL", "FORCE_TOOL_CALL_MAX_RETRIES", "FORCE_TOOL_CALL_IM_FLOOR", "CONFIRMATION_TEXT_MAX_RETRIES",
+          "ALLOW_PARALLEL_TOOLS_WITH_INTERRUPT_CHECKS",
+          "MCP_ENABLED", "MCP_TIMEOUT",
+          "DESKTOP_ENABLED", "DESKTOP_DEFAULT_MONITOR", "DESKTOP_COMPRESSION_QUALITY",
+          "DESKTOP_MAX_WIDTH", "DESKTOP_MAX_HEIGHT", "DESKTOP_CACHE_TTL",
+          "DESKTOP_UIA_TIMEOUT", "DESKTOP_UIA_RETRY_INTERVAL", "DESKTOP_UIA_MAX_RETRIES",
+          "DESKTOP_VISION_ENABLED", "DESKTOP_VISION_MAX_RETRIES", "DESKTOP_VISION_TIMEOUT",
+          "DESKTOP_CLICK_DELAY", "DESKTOP_TYPE_INTERVAL", "DESKTOP_MOVE_DURATION",
+          "DESKTOP_FAILSAFE", "DESKTOP_PAUSE",
+          ...WEB_SEARCH_ENV_KEYS,
+          "GITHUB_TOKEN",
+        ];
+      case "agent":
+        return [
+          "MAX_ITERATIONS", "SELFCHECK_AUTOFIX",
+          "THINKING_MODE",
+          "MEMORY_MODE",
+          "EMBEDDING_MODEL", "EMBEDDING_DEVICE", "MODEL_DOWNLOAD_SOURCE",
+          "MEMORY_HISTORY_DAYS", "MEMORY_MAX_HISTORY_FILES", "MEMORY_MAX_HISTORY_SIZE_MB",
+          "PERSONA_NAME",
+          "PROACTIVE_ENABLED", "PROACTIVE_MAX_DAILY_MESSAGES", "PROACTIVE_MIN_INTERVAL_MINUTES",
+          "PROACTIVE_QUIET_HOURS_START", "PROACTIVE_QUIET_HOURS_END", "PROACTIVE_IDLE_THRESHOLD_HOURS",
+          "STICKER_ENABLED", "STICKER_DATA_DIR",
+          "SCHEDULER_TIMEZONE", "SCHEDULER_TASK_TIMEOUT",
+        ];
+      case "advanced":
+        return [
+          "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "FORCE_IPV4",
+          "DATABASE_PATH", "LOG_LEVEL",
+          "LOG_DIR", "LOG_FILE_PREFIX", "LOG_MAX_SIZE_MB", "LOG_BACKUP_COUNT",
+          "LOG_RETENTION_DAYS", "LOG_FORMAT", "LOG_TO_CONSOLE", "LOG_TO_FILE",
+          "DESKTOP_NOTIFY_ENABLED", "DESKTOP_NOTIFY_SOUND",
+          "ORGS_SUPERVISOR_BRAIN_MODE", "ORGS_SUPERVISOR_LLM_ENDPOINT",
+          "SESSION_STORAGE_PATH",
+          "API_HOST", "TRUST_PROXY",
+          "BACKUP_ENABLED", "BACKUP_PATH", "BACKUP_CRON",
+          "BACKUP_MAX_BACKUPS", "BACKUP_INCLUDE_USERDATA", "BACKUP_INCLUDE_MEDIA",
+          "CONTEXT_MAX_WINDOW", "CONTEXT_COMPRESSION_RATIO", "CONTEXT_COMPRESSION_THRESHOLD",
+          "CONTEXT_BOUNDARY_COMPRESSION_RATIO", "CONTEXT_MIN_RECENT_TURNS",
+          "CONTEXT_ENABLE_TOOL_COMPRESSION", "CONTEXT_LARGE_TOOL_THRESHOLD",
+          "CONTEXT_HARD_TERMINATE_RATIO",
+          "CONTEXT_TOKEN_ANOMALY_THRESHOLD", "CONTEXT_TOKEN_ANOMALY_MAX_RECOVERIES",
+          "TASK_BUDGET_TOOL_CALLS", "SAME_TOOL_CALL_LIMIT",
+          "READONLY_STAGNATION_HARD_LIMIT", "READONLY_STAGNATION_LIMIT",
+          "CONTEXT_REAL_USAGE_DECAY",
+          "CONTEXT_CACHED_SUMMARY_CHARS", "CONTEXT_TOOL_RESULTS_TOTAL_CHARS",
+          "API_TOOLS_SCHEMA_BUDGET_TOKENS",
+          "TASK_BUDGET_TOKENS", "TASK_BUDGET_COST",
+          "TASK_BUDGET_DURATION", "TASK_BUDGET_ITERATIONS",
+          "PROGRESS_TIMEOUT_SECONDS", "HARD_TIMEOUT_SECONDS", "SUPERVISOR_ENABLED",
+        ];
+      default:
+        return [];
+    }
+  }
+
+  /** 返回当前步骤对应的 footer 保存按钮配置，无需按钮时返回 null */
+  function getFooterSaveConfig(): { keys: string[]; savedMsg: string } | null {
+    switch (stepId) {
+      case "llm":
+        return null;
+
+      case "im":
+        return { keys: getAutoSaveKeysForStep("im"), savedMsg: t("config.imSaved") };
+      case "tools":
+        return { keys: getAutoSaveKeysForStep("tools"), savedMsg: t("config.toolsSaved") };
+      case "agent":
+        return { keys: getAutoSaveKeysForStep("agent"), savedMsg: t("config.agentSaved") };
+      case "advanced":
+        return { keys: getAutoSaveKeysForStep("advanced"), savedMsg: t("config.advancedSaved") };
+      default:
+        return null;
+    }
+  }
+
+
+
+  // keep env draft in sync when workspace changes
+  useEffect(() => {
+    if (!currentWorkspaceId) return;
+    ensureEnvLoaded(currentWorkspaceId).catch(() => {});
+  }, [currentWorkspaceId]);
+
+  /**
+   * 后台自动检测所有 LLM 端点健康状态（fire-and-forget）。
+   * 连接成功后调用一次，不阻塞 UI。
+   */
+  function autoCheckEndpoints(baseUrl: string) {
+    (async () => {
+      try {
+        const res = await fetch(`${baseUrl}/api/health/check`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+          signal: AbortSignal.timeout(60_000),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        const results: Array<{
+          name: string; status: string; latency_ms: number | null;
+          error: string | null; error_category: string | null;
+          consecutive_failures: number; cooldown_remaining: number;
+          is_extended_cooldown: boolean; last_checked_at: string | null;
+        }> = data.results || [];
+        const h: Record<string, {
+          status: string; latencyMs: number | null; error: string | null;
+          errorCategory: string | null; consecutiveFailures: number;
+          cooldownRemaining: number; isExtendedCooldown: boolean; lastCheckedAt: string | null;
+        }> = {};
+        for (const r of results) {
+          h[r.name] = {
+            status: r.status, latencyMs: r.latency_ms, error: r.error,
+            errorCategory: r.error_category, consecutiveFailures: r.consecutive_failures,
+            cooldownRemaining: r.cooldown_remaining, isExtendedCooldown: r.is_extended_cooldown,
+            lastCheckedAt: r.last_checked_at,
+          };
+        }
+        setEndpointHealth(h);
+      } catch { /* 后台检测失败不影响用户 */ }
+    })();
+  }
+
+  async function refreshStatus(overrideDataMode?: "local" | "remote", overrideApiBaseUrl?: string, forceAliveCheck?: boolean) {
+    const effectiveDataMode = overrideDataMode || dataMode;
+    const effectiveApiBaseUrl = overrideApiBaseUrl || apiBaseUrl;
+    // forceAliveCheck bypasses the guard (used after connecting to a known-alive service)
+    if (!forceAliveCheck && !info && !serviceStatus?.running && effectiveDataMode !== "remote") return;
+    setStatusLoading(true);
+    setStatusError(null);
+    try {
+      // ── Autostart / auto-update 状态查询（不依赖后端，放在公共路径） ──
+      try {
+        const en = await invoke<boolean>("autostart_is_enabled");
+        setAutostartEnabled(en);
+      } catch {
+        setAutostartEnabled(null);
+      }
+      try {
+        const au = await invoke<boolean>("get_auto_update");
+        setAutoUpdateEnabled(au);
+      } catch {
+        setAutoUpdateEnabled(null);
+      }
+
+      // Verify the service is actually alive before trying HTTP API
+      let serviceAlive = false;
+      let healthPid: number | null | undefined;
+      if (forceAliveCheck || serviceStatus?.running || effectiveDataMode === "remote") {
+        try {
+          const ping = await fetch(`${effectiveApiBaseUrl}/api/health`, { signal: AbortSignal.timeout(HEALTH_POLL_TIMEOUT_MS) });
+          serviceAlive = ping.ok;
+          if (serviceAlive) {
+            try {
+              const healthData = await ping.json();
+              if (healthData.version) setBackendVersion(healthData.version);
+              const readiness = healthData?.readiness || {};
+              const ready = chatIsReady(readiness);
+              const phase = String(readiness.phase || healthData.startup_phase || "");
+              healthPid = typeof healthData.pid === "number" ? healthData.pid : undefined;
+              if (ready) clearBackendStartingHold();
+              setBackendBootPhase(ready ? "running" : "starting");
+              setServiceStatus((prev) => ({
+                ...(prev || { pid: healthData.pid || null, pidFile: "" }),
+                running: true,
+                pid: healthPid ?? prev?.pid ?? null,
+                managedBy: prev?.isManagedChild ? prev.managedBy : "external",
+                isManagedChild: prev?.isManagedChild === true,
+                heartbeatPhase: phase || prev?.heartbeatPhase,
+                heartbeatHttpReady: readiness.http_ready ?? prev?.heartbeatHttpReady,
+                heartbeatImReady: readiness.im_ready ?? prev?.heartbeatImReady,
+                heartbeatReady: chatIsReady(readiness),
+                lastLinkDiagnostic: healthData.last_link_diagnostic || null,
+              }));
+            } catch { /* ignore parse error */ }
+          }
+        } catch {
+          serviceAlive = false;
+          setBackendVersion(null);
+          if (effectiveDataMode !== "remote") {
+            if (isBackendStartingHeld()) {
+              setBackendBootPhase("starting");
+            }
+            setServiceStatus((prev) =>
+            prev ? { ...prev, running: false } : stoppedStatus()
+            );
+          }
+        }
+      }
+      const useHttpApi = serviceAlive;
+      if (useHttpApi) {
+        // ── Try HTTP API, fall back to Tauri on failure ──
+        let endpointSummaryResolved = false;
+        let envAlreadyLoaded = false;
+        let httpEnv: EnvMap = {};
+        try {
+          // Try new config API (may not exist in older service versions)
+          const envRes = await safeFetch(`${effectiveApiBaseUrl}/api/config/env`);
+          const envData = await envRes.json();
+          httpEnv = envData.env || {};
+          setEnvDraft((prev) => ({ ...prev, ...httpEnv }));
+          markEnvLoaded(currentWorkspaceId || "__remote__", httpEnv);
+          envAlreadyLoaded = true;
+
+          const epRes = await safeFetch(`${effectiveApiBaseUrl}/api/config/endpoints`);
+          const epData = await epRes.json();
+          const eps = Array.isArray(epData?.endpoints) ? epData.endpoints : [];
+
+          let statusMap: Record<string, boolean> = {};
+          try {
+            const statusRes = await safeFetch(`${effectiveApiBaseUrl}/api/config/endpoint-status`);
+            const statusData = await statusRes.json();
+            const statusList = Array.isArray(statusData?.endpoints) ? statusData.endpoints : [];
+            for (const s of statusList) {
+              if (s?.name) statusMap[String(s.name)] = !!s.key_present;
+            }
+          } catch { /* endpoint-status API not available, fall back to env */ }
+
+          const list = eps
+            .map((e: any) => {
+              const keyEnv = String(e?.api_key_env || "");
+              const epName = String(e?.name || "");
+              const keyPresent = epName in statusMap
+                ? statusMap[epName]
+                : !!(keyEnv && (httpEnv[keyEnv] ?? "").trim());
+              return {
+                name: String(e?.name || ""),
+                provider: String(e?.provider || ""),
+                apiType: String(e?.api_type || ""),
+                baseUrl: String(e?.base_url || ""),
+                model: String(e?.model || ""),
+                keyEnv,
+                keyPresent,
+                enabled: e?.enabled !== false,
+              };
+            })
+            .filter((e: any) => e.name);
+          setEndpointSummary(list);
+          endpointSummaryResolved = true;
+        } catch {
+          // Config API not available — will fall back below
+        }
+
+        // Fall back: try /api/models (always available in running service)
+        if (!endpointSummaryResolved) {
+          try {
+            const modelsRes = await safeFetch(`${effectiveApiBaseUrl}/api/models`);
+            const modelsData = await modelsRes.json();
+            const models = Array.isArray(modelsData?.models) ? modelsData.models : [];
+            const list = models.map((m: any) => ({
+              name: String(m?.name || m?.endpoint || ""),
+              provider: String(m?.provider || ""),
+              apiType: "",
+              baseUrl: "",
+              model: String(m?.model || ""),
+              keyEnv: "",
+              keyPresent: m?.has_api_key === true,
+              enabled: m?.enabled !== false,
+            })).filter((e: any) => e.name);
+            setEndpointSummary(list);
+            endpointSummaryResolved = true;
+            if (list.length > 0) {
+              const healthFromModels: Record<string, any> = {};
+              for (const m of models) {
+                const n = String(m?.name || m?.endpoint || "");
+                if (!n) continue;
+                const s = String(m?.status || "unknown");
+                healthFromModels[n] = { status: s, latencyMs: null, error: s === "unhealthy" ? "endpoint unhealthy" : null };
+              }
+              setEndpointHealth((prev: any) => ({ ...healthFromModels, ...prev }));
+            }
+          } catch { /* ignore */ }
+        }
+
+        // Fall back to Tauri local file system if HTTP API completely failed
+        if (!endpointSummaryResolved && currentWorkspaceId) {
+          try {
+            const env = envAlreadyLoaded ? httpEnv : await ensureEnvLoaded(currentWorkspaceId);
+            const raw = await readWorkspaceFile("data/llm_endpoints.json");
+            const parsed = JSON.parse(raw);
+            const eps = Array.isArray(parsed?.endpoints) ? parsed.endpoints : [];
+            const list = eps.map((e: any) => {
+              const keyEnv = String(e?.api_key_env || "");
+              const keyPresent = !!(keyEnv && (env[keyEnv] ?? "").trim());
+              return {
+                name: String(e?.name || ""), provider: String(e?.provider || ""),
+                apiType: String(e?.api_type || ""), baseUrl: String(e?.base_url || ""),
+                model: String(e?.model || ""), keyEnv, keyPresent,
+                enabled: e?.enabled !== false,
+              };
+            }).filter((e: any) => e.name);
+            setEndpointSummary(list);
+            endpointSummaryResolved = true;
+          } catch { /* ignore */ }
+        }
+
+        // Skills via HTTP
+        try {
+          const skRes = await safeFetch(`${effectiveApiBaseUrl}/api/skills`);
+          const skData = await skRes.json();
+          const skills = Array.isArray(skData?.skills) ? skData.skills : [];
+          const systemCount = skills.filter((s: any) => !!s.system).length;
+          const externalCount = skills.length - systemCount;
+          setSkillSummary({ count: skills.length, systemCount, externalCount });
+          setSkillsDetail(
+            skills.map((s: any) => ({
+              name: String(s?.name || ""), description: String(s?.description || ""),
+              system: !!s?.system, enabled: typeof s?.enabled === "boolean" ? s.enabled : undefined,
+              tool_name: s?.tool_name ?? null, category: s?.category ?? null, path: s?.path ?? null,
+            })),
+          );
+        } catch {
+          // Fall back to Tauri for skills (local mode only)
+          if (effectiveDataMode !== "remote" && currentWorkspaceId) {
+            try {
+              const skillsRaw = await invoke<string>("openkitsune_list_skills", { venvDir, workspaceId: currentWorkspaceId });
+              const skillsParsed = JSON.parse(skillsRaw) as { count: number; skills: any[] };
+              const skills = Array.isArray(skillsParsed.skills) ? skillsParsed.skills : [];
+              const systemCount = skills.filter((s) => !!s.system).length;
+              setSkillSummary({ count: skills.length, systemCount, externalCount: skills.length - systemCount });
+              setSkillsDetail(skills.map((s) => ({
+                skill_id: String(s?.skill_id || s?.name || ""),
+                name: String(s?.name || ""), description: String(s?.description || ""),
+                system: !!s?.system, enabled: typeof s?.enabled === "boolean" ? s.enabled : undefined,
+                tool_name: s?.tool_name ?? null, category: s?.category ?? null, path: s?.path ?? null,
+              })));
+            } catch { /* keep existing skill data on failure */ }
+          }
+        }
+
+        // Service status – enrich with PID info from Tauri, but do NOT override
+        // the running flag: the HTTP health check is the source of truth for whether
+        // the service is alive.  The Tauri PID file may not exist when the service
+        // was started externally (not via this app).
+        if (effectiveDataMode !== "remote" && currentWorkspaceId) {
+          try {
+            const ss = await invoke<ServiceStatus>("openkitsune_service_status", { workspaceId: currentWorkspaceId });
+            setServiceStatus((prev) => ({
+              running: prev?.running ?? serviceAlive,
+              pid: serviceAlive && healthPid !== undefined ? healthPid : (ss.pid ?? prev?.pid ?? null),
+              pidFile: ss.pidFile ?? prev?.pidFile ?? "",
+              managedBy: ss.managedBy ?? "external",
+              isManagedChild: ss.isManagedChild === true,
+              heartbeatPhase: ss.heartbeatPhase ?? prev?.heartbeatPhase,
+              heartbeatHttpReady: ss.heartbeatHttpReady ?? prev?.heartbeatHttpReady,
+              heartbeatImReady: ss.heartbeatImReady ?? prev?.heartbeatImReady,
+              heartbeatReady: ss.heartbeatReady ?? prev?.heartbeatReady,
+              lastLinkDiagnostic: prev?.lastLinkDiagnostic ?? null,
+            }));
+            if (ss.heartbeatReady === false && ss.heartbeatPhase) {
+              setBackendBootPhase("starting");
+            }
+          } catch { /* keep existing status */ }
+        }
+        // IM channels (HTTP API mode)
+        try {
+          const imRes = await safeFetch(`${effectiveApiBaseUrl}/api/im/channels`, { signal: AbortSignal.timeout(5000) });
+          const imData = await imRes.json();
+          const channels = imData.channels || [];
+          const h: Record<string, { status: string; error: string | null; lastCheckedAt: string | null; progress?: { percent?: number | null } | null }> = {};
+          for (const c of channels) {
+            const key = c.channel || c.name;
+            const val = { status: c.status || "unknown", error: c.error || null, lastCheckedAt: c.last_checked_at || null, progress: c.progress || null };
+            h[key] = val;
+            const ctype = c.channel_type || key;
+            if (ctype !== key) {
+              if (!h[ctype] || (val.status === "online" && h[ctype]?.status !== "online")) {
+                h[ctype] = val;
+              }
+            }
+          }
+          setImHealth(h);
+        } catch { /* IM status is optional */ }
+        return;
+      }
+
+      // ── Local mode: use Tauri commands (original logic) ──
+      if (!currentWorkspaceId) {
+        setSkillSummary(null);
+        setSkillsDetail(null);
+        return;
+      }
+      const env = await ensureEnvLoaded(currentWorkspaceId);
+
+      // endpoints
+      const raw = await readWorkspaceFile("data/llm_endpoints.json");
+      const parsed = JSON.parse(raw);
+      const eps = Array.isArray(parsed?.endpoints) ? parsed.endpoints : [];
+      const list = eps
+        .map((e: any) => {
+          const keyEnv = String(e?.api_key_env || "");
+          const keyPresent = !!(keyEnv && (env[keyEnv] ?? "").trim());
+          return {
+            name: String(e?.name || ""),
+            provider: String(e?.provider || ""),
+            apiType: String(e?.api_type || ""),
+            baseUrl: String(e?.base_url || ""),
+            model: String(e?.model || ""),
+            keyEnv,
+            keyPresent,
+            enabled: e?.enabled !== false,
+          };
+        })
+        .filter((e: any) => e.name);
+      setEndpointSummary(list);
+
+      // skills (requires openkitsune installed in venv)
+      try {
+        const skillsRaw = await invoke<string>("openkitsune_list_skills", { venvDir, workspaceId: currentWorkspaceId });
+        const skillsParsed = JSON.parse(skillsRaw) as { count: number; skills: any[] };
+        const skills = Array.isArray(skillsParsed.skills) ? skillsParsed.skills : [];
+        const systemCount = skills.filter((s) => !!s.system).length;
+        const externalCount = skills.length - systemCount;
+        setSkillSummary({ count: skills.length, systemCount, externalCount });
+        setSkillsDetail(
+          skills.map((s) => ({
+            skill_id: String(s?.skill_id || s?.name || ""),
+            name: String(s?.name || ""),
+            description: String(s?.description || ""),
+            system: !!s?.system,
+            enabled: typeof s?.enabled === "boolean" ? s.enabled : undefined,
+            tool_name: s?.tool_name ?? null,
+            category: s?.category ?? null,
+            path: s?.path ?? null,
+          })),
+        );
+      } catch {
+        /* keep existing skill data on failure */
+      }
+
+      // Local mode (HTTP not reachable): check PID-based service status
+      // This is the fallback when the HTTP API is not alive.
+      if (effectiveDataMode !== "remote") {
+        try {
+          const ss = await invoke<ServiceStatus>("openkitsune_service_status", {
+            workspaceId: currentWorkspaceId,
+          });
+          setServiceStatus(ss);
+          if (!ss.running && isBackendStartingHeld()) {
+            setBackendBootPhase("starting");
+          }
+          if (ss.running && ss.heartbeatReady === false && ss.heartbeatPhase) {
+            setBackendBootPhase("starting");
+          }
+        } catch {
+          // keep existing status rather than wiping it
+        }
+      }
+      // Auto-fetch IM channel status from running service
+      if (useHttpApi) {
+        try {
+          const imRes = await safeFetch(`${effectiveApiBaseUrl}/api/im/channels`, { signal: AbortSignal.timeout(5000) });
+          const imData = await imRes.json();
+          const channels = imData.channels || [];
+          const h: Record<string, { status: string; error: string | null; lastCheckedAt: string | null; progress?: { percent?: number | null } | null }> = {};
+          for (const c of channels) {
+            const key = c.channel || c.name;
+            const val = { status: c.status || "unknown", error: c.error || null, lastCheckedAt: c.last_checked_at || null, progress: c.progress || null };
+            h[key] = val;
+            const ctype = c.channel_type || key;
+            if (ctype !== key) {
+              if (!h[ctype] || (val.status === "online" && h[ctype]?.status !== "online")) {
+                h[ctype] = val;
+              }
+            }
+          }
+          setImHealth(h);
+        } catch { /* ignore - IM status is optional */ }
+      }
+      // ── Multi-process detection (local mode only) ──
+      if (effectiveDataMode !== "remote") {
+        try {
+          const procs = await invoke<Array<{ pid: number; cmd: string }>>("openkitsune_list_processes");
+          setDetectedProcesses(procs);
+        } catch {
+          setDetectedProcesses([]);
+        }
+      } else {
+        setDetectedProcesses([]);
+      }
+    } catch (e) {
+      setStatusError(String(e));
+    } finally {
+      setStatusLoading(false);
+    }
+  }
+
+  // 进入聊天页时，如果端点列表为空，触发一次受控自愈刷新。
+  // 这能覆盖启动竞态（服务已起但端点摘要尚未装载）的偶发场景。
+  useEffect(() => {
+    if (view !== "chat") return;
+    if (endpointSummary.length > 0) return;
+    if (dataMode !== "remote" && !serviceStatus?.running) return;
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      void refreshStatus(undefined, undefined, true).catch(() => {});
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, endpointSummary.length, dataMode, serviceStatus?.running, currentWorkspaceId, apiBaseUrl]);
+
+  /**
+   * 轮询等待后端 HTTP 服务就绪。
+   * 启动进程（PID 存活）不代表 HTTP 可达，FastAPI+uvicorn 需要额外几秒初始化。
+   * @returns true 如果在 maxWaitMs 内服务响应了 /api/health
+   */
+  async function waitForServiceReady(
+    baseUrl: string,
+    maxWaitMs = LOCAL_SERVICE_READY_TIMEOUT_MS,
+    onTick?: (elapsedMs: number) => void,
+  ): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+      try {
+        const res = await fetch(`${baseUrl}/api/health`, { signal: AbortSignal.timeout(3000) });
+        if (res.ok) return true;
+      } catch { /* not ready yet */ }
+      const elapsedMs = Date.now() - start;
+      onTick?.(elapsedMs);
+      await new Promise((r) => setTimeout(r, HTTP_READY_POLL_INTERVAL_MS));
+    }
+    return false;
+  }
+
+  /**
+   * 轮询等待后端 HTTP 服务完全关闭（端口不可达）。
+   * 用于重启场景，确保旧服务完全关闭后再启动新服务。
+   * @returns true 如果在 maxWaitMs 内服务已不可达
+   */
+  async function waitForServiceDown(baseUrl: string, maxWaitMs = 15000): Promise<boolean> {
+    const start = Date.now();
+    const interval = 500;
+    while (Date.now() - start < maxWaitMs) {
+      try {
+        await fetch(`${baseUrl}/api/health`, { signal: AbortSignal.timeout(1000) });
+        // 还能连上，继续等
+      } catch {
+        // 连接失败 = 服务已关闭
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, interval));
+    }
+    return false;
+  }
+
+  /**
+   * 启动本地服务前，检测端口 18900 是否已有服务运行。
+   * @returns null = 没有冲突可以启动，否则返回现有服务信息
+   */
+  async function detectLocalServiceConflict(): Promise<{ pid: number; version: string; service: string } | null> {
+    try {
+      const res = await fetch("http://127.0.0.1:18900/api/health", { signal: AbortSignal.timeout(2000) });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data.status === "ok") {
+        return {
+          pid: data.pid || 0,
+          version: data.version || "unknown",
+          service: data.service || "openkitsune",
+        };
+      }
+    } catch { /* service not running */ }
+    return null;
+  }
+
+  // checkVersionMismatch, compareSemver, checkForAppUpdate, doDownloadAndInstall, doRelaunchAfterUpdate
+  // -> extracted to ./hooks/useVersionCheck.ts
+
+  /**
+   * 包装本地服务启动流程：检测冲突 → 处理冲突 → 启动。
+   * 返回 true = 已处理（连接已有或启动新服务），false = 用户取消。
+   */
+  async function startLocalServiceWithConflictCheck(effectiveWsId: string): Promise<boolean> {
+    // Step 1: Detect existing service
+    const existing = await detectLocalServiceConflict();
+    if (existing) {
+      // Show conflict dialog and let user choose
+      setPendingStartWsId(effectiveWsId);
+      setConflictDialog({ pid: existing.pid, version: existing.version });
+      return false; // Will be resolved by dialog callbacks
+    }
+    // Step 2: No conflict — start normally
+    await doStartLocalService(effectiveWsId);
+    return true;
+  }
+
+  /**
+   * 实际启动本地服务（跳过冲突检测）。
+   */
+  async function doStartLocalService(effectiveWsId: string) {
+    let _busyId = notifyLoading(t("topbar.starting"));
+    holdBackendStarting();
+    try {
+      setDataMode("local");
+      setApiBaseUrl("http://127.0.0.1:18900");
+      const ss = await invoke<ServiceStatus>("openkitsune_service_start", {
+        venvDir,
+        workspaceId: effectiveWsId,
+      });
+      setServiceStatus(ss);
+      const ready = await waitForServiceReady("http://127.0.0.1:18900", LOCAL_SERVICE_READY_TIMEOUT_MS);
+      const real = await invoke<ServiceStatus>("openkitsune_service_status", {
+        workspaceId: effectiveWsId,
+      });
+      setServiceStatus(real);
+      if (ready && real.running) {
+        clearBackendStartingHold();
+        setBackendBootPhase("running");
+        notifySuccess(t("connect.success"));
+        // forceAliveCheck=true to bypass stale serviceStatus closure
+        await refreshStatus("local", "http://127.0.0.1:18900", true);
+        // 自动检测 LLM 端点健康状态
+        autoCheckEndpoints("http://127.0.0.1:18900");
+        // Check version after successful start
+        try {
+          const hRes = await fetch("http://127.0.0.1:18900/api/health", { signal: AbortSignal.timeout(2000) });
+          if (hRes.ok) {
+            const hData = await hRes.json();
+            checkVersionMismatch(hData.version || "");
+          }
+        } catch { /* ignore */ }
+      } else if (real.running) {
+        // Process is alive but HTTP API not yet reachable — keep waiting in background
+        dismissLoading(_busyId);
+        _busyId = notifyLoading(t("topbar.starting") + "…");
+        const bgReady = await waitForServiceReady("http://127.0.0.1:18900", LOCAL_SERVICE_READY_TIMEOUT_MS);
+        if (bgReady) {
+          clearBackendStartingHold();
+          setBackendBootPhase("running");
+          notifySuccess(t("connect.success"));
+          await refreshStatus("local", "http://127.0.0.1:18900", true);
+          autoCheckEndpoints("http://127.0.0.1:18900");
+          try {
+            const hRes = await fetch("http://127.0.0.1:18900/api/health", { signal: AbortSignal.timeout(2000) });
+            if (hRes.ok) {
+              const hData = await hRes.json();
+              checkVersionMismatch(hData.version || "");
+            }
+          } catch { /* ignore */ }
+        } else {
+          clearBackendStartingHold();
+          setBackendBootPhase("error");
+          notifyError(t("topbar.startFail") + " (HTTP API not reachable)");
+          await refreshStatus("local", "http://127.0.0.1:18900", true);
+        }
+      } else {
+        clearBackendStartingHold();
+        setBackendBootPhase("error");
+        notifyError(t("topbar.startFail"));
+      }
+    } catch (e) {
+      clearBackendStartingHold();
+      setBackendBootPhase("error");
+      notifyError(String(e));
+    } finally {
+      dismissLoading(_busyId);
+    }
+  }
+
+  async function repairRuntimeAndRestart() {
+    if (!currentWorkspaceId) return;
+    const repairToast = notifyLoading(t("status.runtimeRepairing"));
+    try {
+      try { await doStopService(currentWorkspaceId); } catch { /* best effort */ }
+      const report = await invoke<string>("repair_runtime_env");
+      notifySuccess(report.split("\n").slice(0, 3).join("\n"));
+      await doStartLocalService(currentWorkspaceId);
+    } catch (e) {
+      notifyError(t("status.runtimeRepairFailed", { err: String(e) }));
+    } finally {
+      dismissLoading(repairToast);
+    }
+  }
+
+  /**
+   * 连接到已有本地服务（冲突对话框的"连接已有"选项）。
+   */
+  async function connectToExistingLocalService() {
+    const ver = conflictDialog?.version || "";
+    const existingPid = conflictDialog?.pid ?? null;
+    setDataMode("local");
+    setApiBaseUrl("http://127.0.0.1:18900");
+    setServiceStatus({
+      running: true,
+      pid: existingPid,
+      pidFile: "",
+      managedBy: "external",
+      isManagedChild: false,
+    });
+    setConflictDialog(null);
+    setPendingStartWsId(null);
+    const _busyId = notifyLoading(t("connect.testing"));
+    try {
+      // IMPORTANT: pass forceAliveCheck=true because setServiceStatus is async
+      // and refreshStatus's closure still sees the old serviceStatus value
+      await refreshStatus("local", "http://127.0.0.1:18900", true);
+      autoCheckEndpoints("http://127.0.0.1:18900");
+      notifySuccess(t("connect.success"));
+      // Check version mismatch using info from conflict detection (avoids extra request)
+      if (ver && ver !== "unknown") checkVersionMismatch(ver);
+    } catch (e) {
+      notifyError(String(e));
+    } finally {
+      dismissLoading(_busyId);
+    }
+  }
+
+  /**
+   * 停止已有服务再启动新的（冲突对话框的"停止并重启"选项）。
+   */
+  async function stopAndRestartService() {
+    const wsId = pendingStartWsId;
+    setConflictDialog(null);
+    setPendingStartWsId(null);
+    if (!wsId) return;
+    const _busyId = notifyLoading(t("status.stopping"));
+    try {
+      await doStopService(wsId);
+      // 轮询等待旧服务完全关闭（端口释放），而非固定延时
+      await waitForServiceDown(apiBaseUrl, 15000);
+    } catch { /* ignore stop errors */ }
+    dismissLoading(_busyId);
+    await doStartLocalService(wsId);
+  }
+
+  // ── Check for app updates once per desktop UI launch (respects auto-update toggle) ──
+  useEffect(() => {
+    if (!IS_TAURI) return;
+    if (desktopVersion === "0.0.0") return;
+    if (autoUpdateEnabled !== true) return;
+    if (appUpdateCheckStartedRef.current) return;
+    appUpdateCheckStartedRef.current = true;
+    void checkForAppUpdate();
+  }, [desktopVersion, autoUpdateEnabled, checkForAppUpdate]);
+
+  /** Stop the running service: try API shutdown first, then PID kill, then verify. */
+  async function doStopService(wsId?: string | null) {
+    clearBackendStartingHold();
+    const id = wsId || currentWorkspaceId || workspaces[0]?.id;
+    if (!id) throw new Error("No workspace");
+    // Record user intent before the HTTP shutdown so the native watchdog cannot
+    // mistake the resulting health-check failures for a crash.
+    await invoke("prepare_backend_manual_stop", { workspaceId: id });
+    // 1. Try graceful shutdown via HTTP API (works even for externally started services)
+    let apiShutdownOk = false;
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/shutdown`, { method: "POST", signal: AbortSignal.timeout(2000) });
+      apiShutdownOk = res.ok; // true if endpoint exists and responded 200
+    } catch { /* network error or timeout — service might already be down */ }
+    if (apiShutdownOk) {
+      // Wait for the process to exit after graceful shutdown
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    // 2. PID-based kill as fallback (handles locally started services)
+    try {
+      const ss = await invoke<ServiceStatus>("openkitsune_service_stop", { workspaceId: id });
+      setServiceStatus(ss);
+    } catch { /* PID file might not exist for externally started services */ }
+    // 3. Quick verify — is the port freed?
+    await new Promise((r) => setTimeout(r, 300));
+    let stillAlive = false;
+    try {
+      await fetch(`${apiBaseUrl}/api/health`, { signal: AbortSignal.timeout(1500) });
+      stillAlive = true;
+    } catch { /* Good — service is down */ }
+    if (stillAlive) {
+      // Service stubbornly alive — show warning
+      notifyError(t("status.stopFailed"));
+    }
+    // Final status
+    try {
+      const final_ss = await invoke<ServiceStatus>("openkitsune_service_status", { workspaceId: id });
+      setServiceStatus(final_ss);
+      if (!final_ss.running) setBackendBootPhase("stopped");
+    } catch { /* ignore */ }
+  }
+
+  async function refreshServiceLog(workspaceId: string) {
+    try {
+      let chunk: { path: string; content: string; truncated: boolean };
+      if (shouldUseHttpApi()) {
+        // ── 后端运行中 → HTTP API 获取日志 ──
+        const res = await safeFetch(`${httpApiBase()}/api/logs/service?tail_bytes=60000`);
+        chunk = await res.json();
+      } else {
+        // 本地模式且服务未运行：直接读本地日志文件
+        chunk = await invoke<{ path: string; content: string; truncated: boolean }>("openkitsune_service_log", {
+          workspaceId,
+          tailBytes: 60000,
+        });
+      }
+      setServiceLog(chunk);
+      setServiceLogError(null);
+    } catch (e) {
+      setServiceLog(null);
+      setServiceLogError(String(e));
+    }
+  }
+
+  // 状态面板：服务运行时自动刷新日志（远程模式下用 "__remote__" 作为 workspaceId 占位）
+  useEffect(() => {
+    if (view !== "status") return;
+    if (!serviceStatus?.running) return;
+    const wsId = currentWorkspaceId || (dataMode === "remote" ? "__remote__" : null);
+    if (!wsId) return;
+    let cancelled = false;
+    void (async () => {
+      if (!cancelled) await refreshServiceLog(wsId);
+    })();
+    const t = window.setInterval(() => {
+      if (cancelled) return;
+      void refreshServiceLog(wsId);
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [view, currentWorkspaceId, serviceStatus?.running, dataMode]);
+
+  useEffect(() => {
+    const el = serviceLogRef.current;
+    if (el && logAtBottomRef.current) el.scrollTop = el.scrollHeight;
+  }, [serviceLog?.content]);
+
+  // 自动获取 skills：进入“工具与技能”页就拉一次（且仅在尚未拿到 skillsDetail 时）
+  useEffect(() => {
+    if (view !== "wizard") return;
+    if (stepId !== "tools") return;
+    if (!currentWorkspaceId && dataMode !== "remote") return;
+    if (!!busy) return;
+    if (skillsDetail) return;
+    if (!openkitsuneInstalled && dataMode !== "remote") return;
+    void doRefreshSkills();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, stepId, currentWorkspaceId, openkitsuneInstalled, skillsDetail, dataMode]);
+
+  async function doRefreshSkills() {
+    if (!currentWorkspaceId && dataMode !== "remote") {
+      notifyError("请先设置当前工作区");
+      return;
+    }
+    const _busyId = notifyLoading("读取 skills...");
+    try {
+      let skillsList: any[] = [];
+      // ── 后端运行中 → HTTP API ──
+      if (shouldUseHttpApi()) {
+        const res = await safeFetch(`${httpApiBase()}/api/skills`, { signal: AbortSignal.timeout(15_000) });
+        const data = await res.json();
+        skillsList = Array.isArray(data?.skills) ? data.skills : [];
+      }
+      // ── 后端未运行 → Tauri invoke（需要 venv）──
+      if (!shouldUseHttpApi() && skillsList.length === 0 && currentWorkspaceId) {
+        try {
+          const skillsRaw = await invoke<string>("openkitsune_list_skills", { venvDir, workspaceId: currentWorkspaceId });
+          const skillsParsed = JSON.parse(skillsRaw) as { count: number; skills: any[] };
+          skillsList = Array.isArray(skillsParsed.skills) ? skillsParsed.skills : [];
+        } catch (e) {
+          // 打包模式下无 venv，Tauri invoke 会失败，降级为空列表（服务启动后可通过 HTTP API 获取）
+          logger.warn("App", "openkitsune_list_skills via Tauri failed", { error: String(e) });
+        }
+      }
+      const systemCount = skillsList.filter((s: any) => !!s.system).length;
+      const externalCount = skillsList.length - systemCount;
+      setSkillSummary({ count: skillsList.length, systemCount, externalCount });
+      setSkillsDetail(
+        skillsList.map((s: any) => ({
+          skill_id: String(s?.skill_id || s?.name || ""),
+          name: String(s?.name || ""),
+          description: String(s?.description || ""),
+          system: !!s?.system,
+          enabled: typeof s?.enabled === "boolean" ? s.enabled : undefined,
+          tool_name: s?.tool_name ?? null,
+          category: s?.category ?? null,
+          path: s?.path ?? null,
+        })),
+      );
+      notifySuccess("已刷新 skills 列表");
+    } catch (e) {
+      notifyError(String(e));
+    } finally {
+      dismissLoading(_busyId);
+    }
+  }
+
+  function renderStatus() {
+    return (
+      <div className="space-y-4">
+        <StatusView
+          currentWorkspaceId={currentWorkspaceId}
+          workspaces={workspaces}
+          envDraft={envDraft}
+          serviceStatus={serviceStatus}
+          backendBootPhase={backendBootPhase}
+          heartbeatState={heartbeatState}
+          busy={busy}
+          autostartEnabled={autostartEnabled}
+          autoUpdateEnabled={autoUpdateEnabled}
+          setAutostartEnabled={setAutostartEnabled}
+          setAutoUpdateEnabled={setAutoUpdateEnabled}
+          endpointSummary={endpointSummary}
+          endpointHealth={endpointHealth}
+          setEndpointHealth={setEndpointHealth}
+          imHealth={imHealth}
+          setImHealth={setImHealth}
+          skillSummary={skillSummary}
+          serviceLog={serviceLog}
+          serviceLogRef={serviceLogRef}
+          logAtBottomRef={logAtBottomRef}
+          detectedProcesses={detectedProcesses}
+          setDetectedProcesses={setDetectedProcesses}
+          setNewRelease={setNewRelease}
+          setUpdateAvailable={setUpdateAvailable}
+          setUpdateProgress={setUpdateProgress}
+          onCheckForUpdate={handleManualUpdateCheck}
+          updateCheckPending={manualUpdateChecking}
+          shouldUseHttpApi={shouldUseHttpApi}
+          httpApiBase={httpApiBase}
+          startLocalServiceWithConflictCheck={startLocalServiceWithConflictCheck}
+          refreshStatus={refreshStatus}
+          doStopService={doStopService}
+          restartService={restartService}
+          onOpenRuntimeEnvironment={() => setRuntimeDialogOpen(true)}
+          onRepairRuntime={repairRuntimeAndRestart}
+          setView={navigateToView}
+        />
+      </div>
+    );
+  }
+
+  function renderLLM() {
+    return (
+      <LLMView
+        savedEndpoints={savedEndpoints}
+        savedCompilerEndpoints={savedCompilerEndpoints}
+        savedSttEndpoints={savedSttEndpoints}
+        savedImageEndpoints={savedImageEndpoints}
+        setSavedEndpoints={setSavedEndpoints}
+        setSavedCompilerEndpoints={setSavedCompilerEndpoints}
+        setSavedSttEndpoints={setSavedSttEndpoints}
+        setSavedImageEndpoints={setSavedImageEndpoints}
+        envDraft={envDraft}
+        setEnvDraft={setEnvDraft}
+        secretShown={secretShown}
+        setSecretShown={setSecretShown}
+        busy={busy}
+        currentWorkspaceId={currentWorkspaceId}
+        dataMode={dataMode}
+        shouldUseHttpApi={shouldUseHttpApi}
+        httpApiBase={httpApiBase}
+        askConfirm={askConfirm}
+        providers={providers}
+        doLoadProviders={doLoadProviders}
+        loadSavedEndpoints={loadSavedEndpoints}
+        onEndpointConfigChanged={async (endpointType) => {
+          await refreshStatus(undefined, undefined, true);
+          if (endpointType === "endpoints") {
+            autoCheckEndpoints(httpApiBase());
+          }
+        }}
+        readWorkspaceFile={readWorkspaceFile}
+        writeWorkspaceFile={writeWorkspaceFile}
+        venvDir={venvDir}
+        ensureEnvLoaded={ensureEnvLoaded}
+        serviceRunning={!!serviceStatus?.running}
+      />
+    );
+  }
+
+  async function renderIntegrationsSave(keys: string[], successText: string) {
+    if (!currentWorkspaceId) { notifyError(t("common.error")); return; }
+    const _busyId = notifyLoading(t("common.loading"));
+    try {
+      const result = await saveEnvKeys(keys);
+      if (result.restartRequired) {
+        toast.warning(
+          t("config.savedNeedRestart", "已保存，需要重启服务才能生效"),
+          {
+            duration: 8000,
+            action: {
+              label: t("config.restartNow", "立即重启"),
+              onClick: () => restartService(),
+            },
+          },
+        );
+      } else if (result.applyMode === "next_task") {
+        notifySuccess(
+          t("config.savedNextTask", "配置已保存，将从下一任务开始生效"),
+        );
+      } else {
+        notifySuccess(successText);
+      }
+    } finally {
+      dismissLoading(_busyId);
+    }
+  }
+
+  const _configViewProps = {
+    envDraft, setEnvDraft,
+    currentWorkspaceId,
+    disabledViews, toggleViewDisabled,
+  };
+
+  function renderIM(wizardMode?: boolean) {
+    return (
+      <IMConfigView
+        {..._configViewProps}
+        venvDir={venvDir}
+        apiBaseUrl={apiBaseUrl}
+        wizardMode={wizardMode}
+      />
+    );
+  }
+
+  function renderTools() {
+    return (
+      <ToolsView
+        envDraft={envDraft}
+        setEnvDraft={setEnvDraft}
+        busy={busy}
+        disabledViews={disabledViews}
+        toggleViewDisabled={toggleViewDisabled}
+        shouldUseHttpApi={shouldUseHttpApi}
+        httpApiBase={httpApiBase}
+        apiBaseUrl={apiBaseUrl}
+        saveEnvKeys={saveEnvKeys}
+        setView={navigateToView}
+      />
+    );
+  }
+
+  function renderAgentSystem() {
+    return <AgentSystemView envDraft={envDraft} setEnvDraft={setEnvDraft} serviceRunning={!!serviceStatus?.running} apiBaseUrl={apiBaseUrl} />;
+  }
+
+  function renderAdvanced() {
+    return (
+      <AdvancedView
+        openDiagnostics={diagnosticsRequested}
+        onDiagnosticsOpened={() => setDiagnosticsRequested(false)}
+        envDraft={envDraft}
+        setEnvDraft={setEnvDraft}
+        busy={busy}
+        workspaces={workspaces}
+        currentWorkspaceId={currentWorkspaceId}
+        serviceStatus={serviceStatus}
+        dataMode={dataMode}
+        info={info}
+        storeVisible={storeVisible}
+        setStoreVisible={setStoreVisible}
+        desktopVersion={desktopVersion}
+        endpointSummary={endpointSummary}
+        shouldUseHttpApi={shouldUseHttpApi}
+        httpApiBase={httpApiBase}
+        backendBootPhase={backendBootPhase}
+        onOpenRuntimeEnvironment={() => setRuntimeDialogOpen(true)}
+        askConfirm={askConfirm}
+        refreshAll={refreshAll}
+        restartService={restartService}
+        setView={navigateToView}
+      />
+    );
+  }
+
+
+
+  // 构造端点摘要（供 ChatView 使用，仅启用的端点）
+  const chatEndpoints: EndpointSummaryType[] = useMemo(() =>
+    endpointSummary
+      .filter((e) => e.enabled !== false)
+      .map((e) => {
+        const h = endpointHealth[e.name];
+        return {
+          name: e.name,
+          provider: e.provider,
+          apiType: e.apiType,
+          baseUrl: e.baseUrl,
+          model: e.model,
+          keyEnv: e.keyEnv,
+          keyPresent: e.keyPresent,
+          health: h ? {
+            name: e.name,
+            status: h.status as "healthy" | "degraded" | "unhealthy" | "unknown",
+            latencyMs: h.latencyMs,
+            error: h.error,
+            errorCategory: h.errorCategory,
+            consecutiveFailures: h.consecutiveFailures,
+            cooldownRemaining: h.cooldownRemaining,
+            isExtendedCooldown: h.isExtendedCooldown,
+            lastCheckedAt: h.lastCheckedAt,
+          } : undefined,
+        };
+      }),
+    [endpointSummary, endpointHealth],
+  );
+
+
+  // ── Onboarding Wizard 渲染 ──
+
+  async function obLoadEnvCheck() {
+    if (!IS_TAURI) return;
+    try {
+      const check = await invoke<typeof obEnvCheck>("check_environment");
+      setObEnvCheck(check);
+    } catch (e) {
+      logger.warn("App", "check_environment failed", { error: String(e) });
+    }
+  }
+
+
+
+  const [obFailureDetailsOpen, setObFailureDetailsOpen] = useState(false);
+  const [obLastLogPath, setObLastLogPath] = useState<string | null>(null);
+
+  // ── 结构化进度跟踪 ──
+  type TaskStatus = "pending" | "running" | "done" | "error" | "skipped";
+  type SetupTask = { id: string; label: string; status: TaskStatus; detail?: string };
+  const [obTasks, setObTasks] = useState<SetupTask[]>([]);
+  const [obDetailLog, setObDetailLog] = useState<string[]>([]);
+
+  function updateTask(id: string, update: Partial<SetupTask>) {
+    setObTasks(prev => prev.map(t => t.id === id ? { ...t, ...update } : t));
+  }
+  function addDetailLog(msg: string) {
+    setObDetailLog(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+  }
+  function setObBackendStartupPhase(phase: OnboardingBackendStartupPhase, detail?: string) {
+    setObBackendStartup((prev) => {
+      const active = ["checking", "starting", "waiting"].includes(phase);
+      const wasActive = ["checking", "starting", "waiting"].includes(prev.phase);
+      return {
+        phase,
+        detail,
+        startedAt: active ? (wasActive ? prev.startedAt : Date.now()) : prev.startedAt,
+        elapsedSec: active ? (wasActive ? prev.elapsedSec : 0) : prev.elapsedSec,
+      };
+    });
+  }
+
+  async function obRunSetup() {
+    if (!IS_TAURI) return;
+    setObInstalling(true);
+    setObInstallLog([]);
+    setObDetailLog([]);
+    setObFailureDetailsOpen(false);
+    setObLastLogPath(null);
+
+    const dateLabel = new Date().toISOString().slice(0, 19).replace("T", "_").replace(/:/g, "-");
+    let obLogPath: string | null = null;
+    try {
+      obLogPath = await invoke<string>("start_onboarding_log", { dateLabel });
+      if (obLogPath) {
+        setObLastLogPath(obLogPath);
+        const configLines: string[] = [];
+        configLines.push("");
+        configLines.push("=== LLM 配置 ===");
+        if (savedEndpoints.length === 0) {
+          configLines.push("  (无)");
+        } else {
+          for (const e of savedEndpoints) {
+            configLines.push(`  - ${e.name}: base_url=${(e as any).base_url || ""}, model=${(e as any).model || ""}, api_key_env=${(e as any).api_key_env || "(无)"}`);
+          }
+        }
+        configLines.push("");
+        configLines.push("=== IM 配置（仅键名，不记录密钥值）===");
+        const imKeys = getAutoSaveKeysForStep("im");
+        for (const k of imKeys) {
+          const set = Object.prototype.hasOwnProperty.call(envDraft, k) && envDraft[k];
+          configLines.push(`  - ${k}: ${set ? "(已设置)" : "(未设置)"}`);
+        }
+        configLines.push("");
+        configLines.push("=== 流程日志 ===");
+        invoke("append_onboarding_log_lines", { logPath: obLogPath, lines: configLines }).catch(() => {});
+      }
+    } catch {
+    }
+
+    const taskDefs: SetupTask[] = [
+      { id: "workspace", label: "准备工作区", status: "pending" },
+    ];
+    taskDefs.push({ id: "backend-check", label: "检查后端环境", status: "pending" });
+    taskDefs.push({ id: "autostart", label: t("onboarding.autostart.taskLabel"), status: "pending" });
+    taskDefs.push({ id: "service-start", label: "启动后端服务", status: "pending" });
+    taskDefs.push({ id: "http-wait", label: "等待 HTTP 服务就绪", status: "pending" });
+    taskDefs.push({ id: "llm-config", label: "保存 LLM 配置", status: (savedEndpoints.length > 0 || savedCompilerEndpoints.length > 0 || savedSttEndpoints.length > 0 || savedImageEndpoints.length > 0) ? "pending" : "skipped" });
+    taskDefs.push({ id: "env-save", label: "保存环境变量", status: "pending" });
+    setObTasks(taskDefs);
+
+    const log = (msg: string) => {
+      setObInstallLog((prev) => [...prev, msg]);
+      addDetailLog(msg);
+      const now = new Date();
+      const ts = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+      const line = `[${ts}] ${msg}`;
+      if (obLogPath) {
+        invoke("append_onboarding_log", { logPath: obLogPath, line }).catch(() => {});
+      }
+    };
+    const logTask = (label: string, status: string, detail?: string) => {
+      const msg = detail ? `[任务] ${label}: ${status} - ${detail}` : `[任务] ${label}: ${status}`;
+      const now = new Date();
+      const ts = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+      const line = `[${ts}] ${msg}`;
+      if (obLogPath) {
+        invoke("append_onboarding_log", { logPath: obLogPath, line }).catch(() => {});
+      }
+    };
+    let hasErr = false;
+
+    try {
+      // ── STEP: workspace ──
+      updateTask("workspace", { status: "running" });
+      logTask("准备工作区", "running");
+      let activeWsId = currentWorkspaceId;
+      log(t("onboarding.progress.creatingWorkspace"));
+      if (!activeWsId || !workspaces.length) {
+        const wsList = await invoke<WorkspaceSummary[]>("list_workspaces");
+        if (!wsList.length) {
+          activeWsId = "default";
+          await invoke("create_workspace", { name: t("onboarding.defaultWorkspace"), id: activeWsId, setCurrent: true });
+          await invoke("set_current_workspace", { id: activeWsId });
+          setCurrentWorkspaceId(activeWsId);
+          log(t("onboarding.progress.workspaceCreated"));
+        } else {
+          activeWsId = wsList[0].id;
+          setCurrentWorkspaceId(activeWsId);
+          log(t("onboarding.progress.workspaceExists"));
+        }
+      } else {
+        log(t("onboarding.progress.workspaceExists"));
+      }
+      updateTask("workspace", { status: "done" });
+      logTask("准备工作区", "done");
+
+      // ── STEP: backend-check ──
+      updateTask("backend-check", { status: "running" });
+      logTask("检查后端环境", "running");
+      try {
+        const effectiveVenv = venvDir || (info ? joinPath(info.openkitsuneRootDir, "venv") : "");
+        const backendInfo = await invoke<{
+          bundled: boolean;
+          venvReady: boolean;
+          exePath: string;
+          bundledChecked: string;
+          venvChecked: string;
+        }>("check_backend_availability", { venvDir: effectiveVenv });
+        if (!backendInfo.bundled && !backendInfo.venvReady) {
+          log("未找到可用后端，尝试自动创建 venv 并安装 openkitsune...");
+          logTask("检查后端环境", "running", "创建 venv...");
+          updateTask("backend-check", { detail: "创建 venv..." });
+          const detectedPy = await invoke<Array<{ command: string[]; version: string }>>("detect_python");
+          const pythonCandidate = detectedPy.find((p: any) =>
+            Array.isArray(p.command) && p.command.length > 0 && p.isUsable !== false
+          );
+          if (pythonCandidate) {
+            const installId = `onboarding-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            setPipInstallId(installId);
+            setInstallLiveLog("");
+            setInstallProgress({ stage: "创建 venv...", percent: 0 });
+            setPipInstallPolling(true);
+            await invoke<string>("create_venv", {
+              pythonCommand: pythonCandidate.command,
+              venvDir: effectiveVenv,
+              installId,
+            });
+            updateTask("backend-check", { detail: "安装 openkitsune..." });
+            logTask("检查后端环境", "running", "安装 openkitsune...");
+            setInstallProgress({ stage: "安装 openkitsune...", percent: 0 });
+            try {
+              await invoke<string>("pip_install", {
+                venvDir: effectiveVenv,
+                packageSpec: "openkitsune",
+                installId,
+              });
+            } finally {
+              setPipInstallPolling(false);
+            }
+            log("[OK] 已自动安装后端环境");
+          } else {
+            log("[!] 未检测到 Python 3.11+，无法自动创建后端环境");
+            log(`  已检查路径: bundled=${backendInfo.bundledChecked} venv=${backendInfo.venvChecked}`);
+            updateTask("backend-check", { status: "error", detail: "未找到 Python 3.11+" });
+            logTask("检查后端环境", "error", "未找到 Python 3.11+");
+            hasErr = true;
+          }
+        } else {
+          log(backendInfo.bundled ? "[OK] 使用内置后端" : "[OK] 使用 venv 后端");
+        }
+        if (!hasErr) {
+          updateTask("backend-check", { status: "done" });
+          logTask("检查后端环境", "done");
+        }
+      } catch (e) {
+        setPipInstallPolling(false);
+        log(`[!] 后端环境检查失败: ${String(e)}`);
+        updateTask("backend-check", { status: "error", detail: String(e).slice(0, 120) });
+        logTask("检查后端环境", "error", String(e));
+        if (String(e).length > 200) {
+          log("--- 详细错误信息 ---");
+          log(String(e));
+        }
+        hasErr = true;
+      }
+
+      if (hasErr) {
+        updateTask("autostart", { status: "skipped", detail: "后端环境检查失败" });
+        logTask(t("onboarding.autostart.taskLabel"), "skipped", "后端环境检查失败");
+        updateTask("service-start", { status: "skipped", detail: "后端环境检查失败" });
+        logTask("启动后端服务", "skipped", "后端环境检查失败");
+        updateTask("http-wait", { status: "skipped", detail: "后端环境检查失败" });
+        logTask("等待 HTTP 服务就绪", "skipped", "后端环境检查失败");
+        throw new Error("后端环境检查失败，已跳过后续启动步骤");
+      }
+
+      // ── STEP: autostart ──
+      // Apply both choices so opting out also clears existing OS and saved state.
+      updateTask("autostart", { status: "running" });
+      logTask(t("onboarding.autostart.taskLabel"), "running");
+      try {
+        await invoke("autostart_set_enabled", { enabled: obAutostart });
+        setAutostartEnabled(obAutostart);
+        log(t(obAutostart ? "onboarding.autostart.success" : "onboarding.autostart.disabled"));
+        updateTask("autostart", { status: "done" });
+        logTask(t("onboarding.autostart.taskLabel"), "done");
+      } catch (e) {
+        log(t("onboarding.autostart.fail") + ": " + String(e));
+        updateTask("autostart", { status: "error", detail: String(e).slice(0, 120) });
+        logTask(t("onboarding.autostart.taskLabel"), "error", String(e));
+        hasErr = true;
+      }
+
+      // ── STEP: service-start ──
+      // The early-start in ob-welcome may have already launched the backend.
+      // Probe first to avoid a redundant start (which is harmless but slow).
+      updateTask("service-start", { status: "running" });
+      logTask("启动后端服务", "running");
+      const effectiveVenv = venvDir || (info ? joinPath(info.openkitsuneRootDir, "venv") : "");
+      let httpReady = false;
+      try {
+        setObBackendStartupPhase("checking", t("onboarding.backendStartup.checking"));
+        const earlyProbe = await fetch("http://127.0.0.1:18900/api/health", { signal: AbortSignal.timeout(3000) }).then(r => r.ok).catch(() => false);
+        const backendStartInFlight = ["checking", "starting", "waiting"].includes(obBackendStartup.phase);
+        if (earlyProbe) {
+          log("[OK] 后端已在运行（由 ob-welcome 提前启动）");
+          setServiceStatus({
+            running: true,
+            pid: null,
+            pidFile: "",
+            managedBy: "external",
+            isManagedChild: false,
+          });
+          setObBackendStartupPhase("ready", t("onboarding.backendStartup.ready"));
+          httpReady = true;
+          updateTask("service-start", { status: "done", detail: "已在运行" });
+          logTask("启动后端服务", "done", "已在运行");
+          updateTask("http-wait", { status: "done", detail: "已就绪" });
+          logTask("等待 HTTP 服务就绪", "done", "已就绪");
+        } else {
+          if (backendStartInFlight) {
+            log("后端启动已在后台进行，继续等待 HTTP 服务就绪...");
+            updateTask("service-start", { status: "done", detail: "已在后台启动" });
+            logTask("启动后端服务", "done", "已在后台启动");
+          } else {
+            log(t("onboarding.progress.startingService"));
+            setObBackendStartupPhase("starting", t("onboarding.backendStartup.starting"));
+            const ss = await invoke<ServiceStatus>("openkitsune_service_start", { venvDir: effectiveVenv, workspaceId: activeWsId });
+            setServiceStatus(ss);
+            log(t("onboarding.progress.serviceStarted"));
+            updateTask("service-start", { status: "done" });
+            logTask("启动后端服务", "done");
+          }
+
+          // ── STEP: http-wait ──
+          updateTask("http-wait", { status: "running" });
+          logTask("等待 HTTP 服务就绪", "running");
+          log("等待 HTTP 服务就绪...");
+          setObBackendStartupPhase("waiting", t("onboarding.backendStartup.waiting"));
+          const maxHttpWaitTicks = Math.ceil(ONBOARDING_HTTP_READY_TIMEOUT_MS / HTTP_READY_POLL_INTERVAL_MS);
+          for (let i = 0; i < maxHttpWaitTicks; i++) {
+            await new Promise(r => setTimeout(r, HTTP_READY_POLL_INTERVAL_MS));
+            const waitedSec = Math.round(((i + 1) * HTTP_READY_POLL_INTERVAL_MS) / 1000);
+            updateTask("http-wait", { detail: `已等待 ${waitedSec}s...` });
+            setObBackendStartup((prev) => ({
+              ...prev,
+              phase: "waiting",
+              detail: t("onboarding.backendStartup.waitingDetail", { seconds: waitedSec }),
+            }));
+            if (i > 0 && obLogPath) {
+              const now = new Date();
+              const ts = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+              invoke("append_onboarding_log", { logPath: obLogPath, line: `[${ts}] [任务] 等待 HTTP 服务就绪: 已等待 ${waitedSec}s...` }).catch(() => {});
+            }
+            try {
+              const res = await fetch("http://127.0.0.1:18900/api/health", { signal: AbortSignal.timeout(3000) });
+              if (res.ok) {
+                log("[OK] HTTP 服务已就绪");
+                setServiceStatus((prev) => (
+                  prev
+                    ? { ...prev, running: true }
+                    : {
+                        running: true,
+                        pid: null,
+                        pidFile: "",
+                        managedBy: "external",
+                        isManagedChild: false,
+                      }
+                ));
+                setObBackendStartupPhase("ready", t("onboarding.backendStartup.ready"));
+                httpReady = true;
+                updateTask("http-wait", { status: "done", detail: `${waitedSec}s` });
+                logTask("等待 HTTP 服务就绪", "done", `${waitedSec}s`);
+                break;
+              }
+            } catch { /* not ready yet */ }
+            if (i % 5 === 4) log(`仍在等待 HTTP 服务启动... (${waitedSec}s)`);
+          }
+          if (!httpReady) {
+            log("[!] HTTP 服务尚未就绪，可进入主页面后手动刷新");
+            setObBackendStartupPhase("error", t("onboarding.backendStartup.timeout"));
+            updateTask("http-wait", { status: "error", detail: "超时" });
+            logTask("等待 HTTP 服务就绪", "error", "超时");
+            hasErr = true;
+          }
+        }
+      } catch (e) {
+        const errStr = String(e);
+        setObBackendStartupPhase("error", errStr.slice(0, 160));
+        log(t("onboarding.progress.serviceStartFailed", { error: errStr }));
+        updateTask("service-start", { status: "error", detail: errStr.slice(0, 120) });
+        logTask("启动后端服务", "error", errStr.slice(0, 200));
+        updateTask("http-wait", { status: "skipped" });
+        logTask("等待 HTTP 服务就绪", "skipped", "服务启动失败");
+        if (errStr.length > 200) {
+          log('--- 详细错误信息 ---');
+          log(errStr);
+        }
+        hasErr = true;
+      }
+
+      // ── STEP: llm-config (via HTTP API, after backend is ready) ──
+      if (savedEndpoints.length > 0 || savedCompilerEndpoints.length > 0 || savedSttEndpoints.length > 0 || savedImageEndpoints.length > 0) {
+        updateTask("llm-config", { status: "running" });
+        logTask("保存 LLM 配置", "running");
+        if (!httpReady) {
+          const msg = "HTTP 服务未就绪，无法保存 LLM 配置。请确保后端已启动。";
+          log(`⚠ ${msg}`);
+          updateTask("llm-config", { status: "error", detail: msg });
+          logTask("保存 LLM 配置", "error", msg);
+          hasErr = true;
+        } else {
+          try {
+            const base = httpApiBase();
+            let epErrors: string[] = [];
+            const allBatches: Array<{ eps: typeof savedEndpoints; type: string }> = [
+              { eps: savedEndpoints, type: "endpoints" },
+              { eps: savedCompilerEndpoints, type: "compiler_endpoints" },
+              { eps: savedSttEndpoints, type: "stt_endpoints" },
+              { eps: savedImageEndpoints, type: "image_endpoints" },
+            ];
+            for (const { eps, type } of allBatches) {
+              for (const ep of eps) {
+                const apiKey = envDraft[(ep as any).api_key_env] || "";
+                const res = await safeFetch(`${base}/api/config/save-endpoint`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    endpoint: ep,
+                    api_key: apiKey || null,
+                    endpoint_type: type,
+                  }),
+                });
+                const data = await res.json();
+                if (data.status === "error" || data.status === "conflict") {
+                  epErrors.push(`${(ep as any).name || type}: ${data.error || "unknown error"}`);
+                }
+              }
+            }
+            if (epErrors.length > 0) {
+              const detail = epErrors.join("; ");
+              log(`⚠ 部分端点保存失败: ${detail}`);
+              updateTask("llm-config", { status: "error", detail: detail.slice(0, 120) });
+              logTask("保存 LLM 配置", "error", detail);
+              hasErr = true;
+            } else {
+              const total = savedEndpoints.length + savedCompilerEndpoints.length + savedSttEndpoints.length + savedImageEndpoints.length;
+              log(t("onboarding.progress.llmConfigSaved"));
+              updateTask("llm-config", { status: "done", detail: `${total} 个端点` });
+              logTask("保存 LLM 配置", "done", `${total} 个端点`);
+            }
+          } catch (e) {
+            log(`[!] LLM 配置保存失败: ${String(e)}`);
+            updateTask("llm-config", { status: "error", detail: String(e).slice(0, 120) });
+            logTask("保存 LLM 配置", "error", String(e));
+            hasErr = true;
+          }
+        }
+      }
+
+      // ── STEP: env-save (IM and other non-LLM env vars) ──
+      updateTask("env-save", { status: "running" });
+      logTask("保存环境变量", "running");
+      try {
+        const imKeys = getAutoSaveKeysForStep("im");
+        const entries: Record<string, string> = {};
+        for (const k of imKeys) {
+          if (Object.prototype.hasOwnProperty.call(envDraft, k) && envDraft[k]) {
+            entries[k] = envDraft[k];
+          }
+        }
+        if (!httpReady) {
+          for (const ep of [...savedEndpoints, ...savedCompilerEndpoints, ...savedSttEndpoints, ...savedImageEndpoints]) {
+            const keyName = (ep as any).api_key_env;
+            if (keyName && Object.prototype.hasOwnProperty.call(envDraft, keyName) && envDraft[keyName]) {
+              entries[keyName] = envDraft[keyName];
+            }
+          }
+        }
+        if (Object.keys(entries).length > 0) {
+          if (httpReady) {
+            await safeFetch(`${httpApiBase()}/api/config/env`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ entries }),
+            });
+          } else if (IS_TAURI && activeWsId) {
+            const tauriEntries = Object.entries(entries).map(([key, value]) => ({ key, value }));
+            await invoke("workspace_update_env", { workspaceId: activeWsId, entries: tauriEntries });
+          }
+          log(t("onboarding.progress.envSaved") || "[OK] 环境变量已保存");
+        }
+        updateTask("env-save", { status: "done", detail: `${Object.keys(entries).length} 项` });
+        logTask("保存环境变量", "done", `${Object.keys(entries).length} 项`);
+      } catch (e) {
+        log(`[!] 保存环境变量失败: ${String(e)}`);
+        updateTask("env-save", { status: "error", detail: String(e) });
+        logTask("保存环境变量", "error", String(e));
+        hasErr = true;
+      }
+
+      log(t("onboarding.progress.done"));
+    } catch (e) {
+      log(t("onboarding.progress.error", { error: String(e) }));
+      hasErr = true;
+    } finally {
+      if (obLogPath) {
+        log(t("onboarding.installLogSaved", { path: obLogPath }) || `安装日志已保存至: ${obLogPath}`);
+      }
+      if (!hasErr) {
+        try {
+          await invoke("set_onboarding_completed", { completed: true });
+        } catch (e) {
+          log(t("onboarding.progress.error", { error: String(e) }));
+          hasErr = true;
+        }
+      }
+      setObInstalling(false);
+      setObStep(resolveOnboardingCompletionStep(hasErr));
+    }
+  }
+
+  async function enterApplicationAfterOnboarding(confirmIncomplete = false) {
+    if (confirmIncomplete) {
+      try {
+        await invoke("set_onboarding_completed", { completed: true });
+      } catch (e) {
+        notifyError(String(e));
+        return;
+      }
+    }
+    // Onboarding 结束后 HTTP 服务可能仍在启动，短暂抑制不可达闪烁。
+    visibilityGraceRef.current = true;
+    heartbeatFailCount.current = 0;
+    setTimeout(() => { visibilityGraceRef.current = false; }, 15000);
+    navigateToView("status");
+    await refreshAll();
+    try { await refreshStatus("local", "http://127.0.0.1:18900", true); } catch { /* ignore */ }
+    autoCheckEndpoints("http://127.0.0.1:18900");
+    setTimeout(async () => {
+      try { await refreshStatus("local", "http://127.0.0.1:18900", true); } catch { /* ignore */ }
+    }, 3000);
+    setTimeout(async () => {
+      try { await refreshStatus("local", "http://127.0.0.1:18900", true); } catch { /* ignore */ }
+    }, 8000);
+  }
+
+  function renderOnboarding() {
+    // Progress/done are transitional states and should not create extra indicator dots.
+    const obStepDots = ["ob-welcome", "ob-agreement", "ob-llm", "ob-im", "ob-finish"] as OnboardingStep[];
+    const obCurrentIdxRaw = obStepDots.indexOf(obStep);
+    const obCurrentIdx = obCurrentIdxRaw >= 0 ? obCurrentIdxRaw : obStepDots.length - 1;
+
+    const obStepLabels: Record<string, string> = {
+      "ob-welcome": t("onboarding.step.welcome", "欢迎"),
+      "ob-agreement": t("onboarding.step.agreement", "协议"),
+      "ob-llm": t("onboarding.step.llm", "模型"),
+      "ob-im": t("onboarding.step.im", "通讯"),
+      "ob-finish": t("onboarding.step.finish", "完成"),
+    };
+
+    const stepIndicator = (
+      <div className="flex flex-col items-center gap-1 py-4">
+        <div className="flex items-center gap-3">
+          {obCurrentIdx > 0 && (
+            <button
+              onClick={() => setObStep(obStepDots[obCurrentIdx - 1])}
+              className="text-xs text-muted-foreground hover:text-foreground transition-colors px-2 py-0.5 rounded"
+              style={{ cursor: "pointer", background: "transparent", border: "none" }}
+            >
+              ← {t("common.back", "返回")}
+            </button>
+          )}
+        {obStepDots.map((s, i) => (
+            <div key={s} className="flex flex-col items-center gap-1" style={{ minWidth: 40 }}>
+          <div
+            className={`size-2 rounded-full transition-all duration-200 ${
+              i === obCurrentIdx
+                ? "bg-primary scale-[1.3]"
+                : i < obCurrentIdx
+                  ? "bg-emerald-500"
+                  : "bg-muted-foreground/25"
+            }`}
+          />
+              <span className={`text-[10px] transition-opacity ${i === obCurrentIdx ? "text-foreground font-medium" : "text-muted-foreground/50"}`}>
+                {obStepLabels[s] || ""}
+              </span>
+            </div>
+        ))}
+        </div>
+      </div>
+    );
+    const backendStartupVisible = obBackendStartup.phase !== "idle"
+      && obStep !== "ob-progress"
+      && obStep !== "ob-failed"
+      && obStep !== "ob-done";
+    const backendStartupNotice = backendStartupVisible ? (
+      <div className={`mb-4 w-full rounded-xl border px-3.5 py-2 text-left text-[12px] shadow-sm ${
+        obBackendStartup.phase === "error"
+          ? "border-amber-300 bg-amber-50/60 dark:border-amber-500/40 dark:bg-amber-950/30"
+          : obBackendStartup.phase === "ready"
+            ? "border-emerald-300 bg-emerald-50/60 dark:border-emerald-500/40 dark:bg-emerald-950/30"
+            : "border-blue-300 bg-blue-50/60 dark:border-blue-500/40 dark:bg-blue-950/30"
+      }`}>
+        <div className="flex items-start gap-2">
+          {["checking", "starting", "waiting"].includes(obBackendStartup.phase)
+            ? <Loader2 className="mt-0.5 size-3.5 text-blue-500 shrink-0 animate-spin" />
+            : obBackendStartup.phase === "ready"
+              ? <CheckCircle2 className="mt-0.5 size-3.5 text-emerald-500 shrink-0" />
+              : <AlertTriangle className="mt-0.5 size-3.5 text-amber-500 shrink-0" />}
+          <div className="min-w-0">
+            <div className="font-semibold leading-5">
+              {obBackendStartup.phase === "ready"
+                ? t("onboarding.backendStartup.ready")
+                : obBackendStartup.phase === "error"
+                  ? t("onboarding.backendStartup.error")
+                  : t("onboarding.backendStartup.title")}
+            </div>
+            <p className="leading-5 text-muted-foreground">
+              {obBackendStartup.detail || t("onboarding.backendStartup.desc")}
+              {["checking", "starting", "waiting"].includes(obBackendStartup.phase) && obBackendStartup.elapsedSec > 0
+                ? ` ${t("onboarding.backendStartup.elapsed", { seconds: obBackendStartup.elapsedSec })}`
+                : ""}
+            </p>
+          </div>
+        </div>
+      </div>
+    ) : null;
+
+    switch (obStep) {
+      case "ob-welcome":
+        return (
+          <div className="obPage">
+            <div className="flex flex-col items-center text-center max-w-[520px] gap-5">
+              <img src={logoUrl} alt="OpenKitsune" className="w-40 h-40 rounded-3xl shadow-lg mb-1" />
+              <div className="space-y-2">
+                <h1 className="text-[28px] font-bold tracking-tight text-foreground">{t("onboarding.welcome.title")}</h1>
+                <p className="text-sm text-muted-foreground leading-relaxed">{t("onboarding.welcome.desc")}</p>
+              </div>
+
+              {obEnvCheck && (
+                <>
+                  {obEnvCheck.conflicts.length > 0 && (
+                    <Card className={`w-full border text-left text-[13px] ${
+                      obEnvCheck.conflicts.some(c => c.includes("失败") || c.includes("进程"))
+                        ? "border-amber-300 bg-amber-50/60 dark:border-amber-500/40 dark:bg-amber-950/30"
+                        : "border-emerald-300 bg-emerald-50/60 dark:border-emerald-500/40 dark:bg-emerald-950/30"
+                    }`}>
+                      <CardContent className="py-3 px-4 space-y-2">
+                        <div className="flex items-center gap-2 font-semibold">
+                          {obEnvCheck.conflicts.some(c => c.includes("失败") || c.includes("进程"))
+                            ? <AlertTriangle className="size-4 text-amber-500 shrink-0" />
+                            : <CheckCircle2 className="size-4 text-emerald-500 shrink-0" />}
+                          {obEnvCheck.conflicts.some(c => c.includes("失败") || c.includes("进程"))
+                            ? t("onboarding.welcome.envWarning")
+                            : t("onboarding.welcome.envCleaned")}
+                        </div>
+                        <ul className="ml-5 list-disc space-y-0.5">
+                          {obEnvCheck.conflicts.map((c, i) => <li key={i}>{c}</li>)}
+                        </ul>
+                        <p className="text-xs text-muted-foreground">
+                          检查路径: {obEnvCheck.openkitsuneRoot ?? "(未知)"}
+                        </p>
+                        <Button variant="secondary" size="sm" onClick={() => obLoadEnvCheck()}>
+                          重新检测环境
+                        </Button>
+                      </CardContent>
+                    </Card>
+                  )}
+                  {obEnvCheck.conflicts.length === 0 && (
+                    <p className="text-xs text-muted-foreground/75">
+                      检查路径: {obEnvCheck.openkitsuneRoot ?? "(未知)"}
+                    </p>
+                  )}
+                </>
+              )}
+
+              {obDetectedService && (
+                <Card className="w-full border border-emerald-300 bg-emerald-50/60 dark:border-emerald-500/40 dark:bg-emerald-950/30 text-left text-[13px]">
+                  <CardContent className="py-3 px-4 space-y-2">
+                    <div className="flex items-center gap-2 font-semibold">
+                      <CheckCircle2 className="size-4 text-emerald-500 shrink-0" />
+                      {t("onboarding.welcome.serviceDetected")}
+                    </div>
+                    <p className="text-muted-foreground">
+                      {t("onboarding.welcome.serviceDetectedDesc", { version: obDetectedService.version })}
+                    </p>
+                    <Button size="sm" onClick={() => obConnectExistingService()}>
+                      {t("onboarding.welcome.connectExisting")}
+                    </Button>
+                  </CardContent>
+                </Card>
+              )}
+              {backendStartupNotice}
+
+              <div className="w-full max-w-[460px] mt-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="gap-1.5 text-xs text-muted-foreground px-2 h-7"
+                  onClick={async () => {
+                    if (!obShowCustomRoot) {
+                      try {
+                        const info = await invoke<{ defaultRoot: string; currentRoot: string; customRoot: string | null }>("get_root_dir_info");
+                        setObCurrentRoot(info.currentRoot);
+                        if (info.customRoot) {
+                          setObCustomRootInput(info.customRoot);
+                          setObCustomRootApplied(true);
+                        }
+                      } catch {}
+                    }
+                    setObShowCustomRoot((v) => !v);
+                  }}
+                >
+                  <ChevronRight className={`size-3.5 transition-transform duration-200 ${obShowCustomRoot ? "rotate-90" : ""}`} />
+                  {t("onboarding.welcome.customRootToggle")}
+                </Button>
+
+                {obShowCustomRoot && (
+                  <Card className="mt-2 shadow-sm">
+                    <CardContent className="py-4 px-4 space-y-3">
+                      <p className="text-xs text-muted-foreground leading-relaxed">{t("onboarding.welcome.customRootHint")}</p>
+                      {obCurrentRoot && (
+                        <p className="text-[11px] text-muted-foreground/60 break-all">
+                          {t("onboarding.welcome.customRootCurrent", { path: obCurrentRoot })}
+                        </p>
+                      )}
+                      <div className="flex gap-2 items-center">
+                        <Input
+                          className="flex-1 h-8 text-[13px]"
+                          value={obCustomRootInput}
+                          onChange={(e) => { setObCustomRootInput(e.target.value); setObCustomRootApplied(false); }}
+                          placeholder={t("onboarding.welcome.customRootPlaceholder")}
+                        />
+                        <Button
+                          size="sm"
+                          className="h-8 shrink-0"
+                          disabled={!obCustomRootInput.trim() || obCustomRootApplied || obCustomRootBusy}
+                          onClick={async () => {
+                            if (obCustomRootBusy) return;
+                            setObCustomRootBusy(true);
+                            try {
+                              const info = await invoke<{ defaultRoot: string; currentRoot: string; customRoot: string | null }>(
+                                "set_custom_root_dir", { path: obCustomRootInput.trim(), migrate: obCustomRootMigrate }
+                              );
+                              setObCurrentRoot(info.currentRoot);
+                              setObCustomRootApplied(true);
+                              // Root 切换后立即刷新 PlatformInfo，否则后续
+                              // joinPath(info.openkitsuneRootDir, "venv") / "runtime"
+                              // 等仍指向旧 root，后端会拿到错的 venvDir。
+                              try {
+                                const plat = await invoke<PlatformInfo>("get_platform_info");
+                                setInfo(plat);
+                              } catch { /* ignore: refreshAll will catch up later */ }
+                              notifySuccess(t("onboarding.welcome.customRootApplied", { path: info.currentRoot }));
+                              obLoadEnvCheck();
+                            } catch (e: any) {
+                              notifyError(String(e));
+                            } finally {
+                              setObCustomRootBusy(false);
+                            }
+                          }}
+                        >
+                          {obCustomRootBusy ? <Loader2 className="size-3.5 animate-spin" /> : t("onboarding.welcome.customRootApply")}
+                        </Button>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Checkbox
+                          id="ob-migrate"
+                          checked={obCustomRootMigrate}
+                          onCheckedChange={(v) => setObCustomRootMigrate(!!v)}
+                        />
+                        <Label htmlFor="ob-migrate" className="text-xs cursor-pointer font-normal">
+                          {t("onboarding.welcome.customRootMigrate")}
+                        </Label>
+                      </div>
+                      {obCustomRootApplied && obCustomRootInput.trim() && (
+                        <Button
+                          variant="link"
+                          className="h-auto p-0 text-[11px] text-muted-foreground"
+                          onClick={async () => {
+                            try {
+                              const info = await invoke<{ defaultRoot: string; currentRoot: string; customRoot: string | null }>(
+                                "set_custom_root_dir", { path: null, migrate: false }
+                              );
+                              setObCurrentRoot(info.currentRoot);
+                              setObCustomRootInput("");
+                              setObCustomRootApplied(false);
+                              // 与 apply 分支同理：root 切回默认值后必须刷新
+                              // PlatformInfo，否则 info.openkitsuneRootDir 仍是旧 root。
+                              try {
+                                const plat = await invoke<PlatformInfo>("get_platform_info");
+                                setInfo(plat);
+                              } catch { /* ignore */ }
+                              notifySuccess(t("onboarding.welcome.customRootDefault") + ": " + info.currentRoot);
+                              obLoadEnvCheck();
+                            } catch (e: any) {
+                              notifyError(String(e));
+                            }
+                          }}
+                        >
+                          {t("onboarding.welcome.customRootDefault")}
+                        </Button>
+                      )}
+                    </CardContent>
+                  </Card>
+                )}
+              </div>
+
+              <Button
+                size="lg"
+                className="mt-2 px-10 rounded-xl text-[15px]"
+                disabled={["checking", "starting", "waiting"].includes(obBackendStartup.phase)}
+                onClick={async () => {
+                  let earlyStartWsId = currentWorkspaceId || "";
+                  setObBackendStartupPhase("checking", t("onboarding.backendStartup.preparing"));
+                  try {
+                    const wsList = await invoke<WorkspaceSummary[]>("list_workspaces");
+                    if (!wsList.length) {
+                      const wsId = "default";
+                      await invoke("create_workspace", { name: t("onboarding.defaultWorkspace"), id: wsId, setCurrent: true });
+                      await invoke("set_current_workspace", { id: wsId });
+                      setCurrentWorkspaceId(wsId);
+                      setWorkspaces([{ id: wsId, name: t("onboarding.defaultWorkspace"), path: "", isCurrent: true }]);
+                      earlyStartWsId = wsId;
+                    } else {
+                      setWorkspaces(wsList);
+                      if (!currentWorkspaceId && wsList.length > 0) {
+                        setCurrentWorkspaceId(wsList[0].id);
+                      }
+                      earlyStartWsId = currentWorkspaceId || wsList[0]?.id || "";
+                    }
+                  } catch (e) {
+                    logger.warn("App", "ob: create default workspace failed", { error: String(e) });
+                  }
+
+                  // Kick off backend startup in background so HTTP API is
+                  // likely ready by the time the user reaches ob-llm.
+                  if (IS_TAURI && earlyStartWsId) {
+                    const wsId = earlyStartWsId;
+                    const effectiveVenv = venvDir || (info ? joinPath(info.openkitsuneRootDir, "venv") : "");
+                    (async () => {
+                      try {
+                        setObBackendStartupPhase("checking", t("onboarding.backendStartup.checking"));
+                        const backendInfo = await invoke<{
+                          bundled: boolean; venvReady: boolean; exePath: string;
+                          bundledChecked: string; venvChecked: string;
+                        }>("check_backend_availability", { venvDir: effectiveVenv });
+                        if (!backendInfo.bundled && !backendInfo.venvReady) {
+                          setObBackendStartupPhase("idle");
+                          return;
+                        }
+                        setObBackendStartupPhase("starting", t("onboarding.backendStartup.starting"));
+                        const ss = await invoke<ServiceStatus>("openkitsune_service_start", { venvDir: effectiveVenv, workspaceId: wsId });
+                        setServiceStatus(ss);
+                        setObBackendStartupPhase("waiting", t("onboarding.backendStartup.waiting"));
+                        let earlyHttpReady = false;
+                        const maxEarlyHttpWaitTicks = Math.ceil(ONBOARDING_HTTP_READY_TIMEOUT_MS / HTTP_READY_POLL_INTERVAL_MS);
+                        for (let i = 0; i < maxEarlyHttpWaitTicks; i++) {
+                          await new Promise(r => setTimeout(r, HTTP_READY_POLL_INTERVAL_MS));
+                          const waitedSec = Math.round(((i + 1) * HTTP_READY_POLL_INTERVAL_MS) / 1000);
+                          setObBackendStartup((prev) => ({
+                            ...prev,
+                            phase: "waiting",
+                            detail: t("onboarding.backendStartup.waitingDetail", { seconds: waitedSec }),
+                          }));
+                          try {
+                          const res = await fetch("http://127.0.0.1:18900/api/health", { signal: AbortSignal.timeout(3000) });
+                          if (res.ok) {
+                              setServiceStatus((prev) => (
+                                prev
+                                  ? { ...prev, running: true }
+                                  : {
+                                      running: true,
+                                      pid: null,
+                                      pidFile: "",
+                                      managedBy: "external",
+                                      isManagedChild: false,
+                                    }
+                              ));
+                              setObBackendStartupPhase("ready", t("onboarding.backendStartup.ready"));
+                              earlyHttpReady = true;
+                              break;
+                            }
+                          } catch { /* not ready yet */ }
+                        }
+                        if (!earlyHttpReady) {
+                          setObBackendStartupPhase("error", t("onboarding.backendStartup.timeout"));
+                        }
+                      } catch (e) {
+                        setObBackendStartupPhase("error", String(e).slice(0, 160));
+                        logger.warn("App", "ob: early backend start failed, will retry in ob-progress", { error: String(e) });
+                      }
+                    })();
+                  }
+
+                  setObStep("ob-agreement");
+                }}
+              >
+                {["checking", "starting", "waiting"].includes(obBackendStartup.phase)
+                  ? <><Loader2 className="size-4 animate-spin mr-2" />{t("onboarding.backendStartup.buttonStarting")}</>
+                  : t("onboarding.welcome.start")}
+              </Button>
+            </div>
+            {stepIndicator}
+          </div>
+        );
+
+      case "ob-agreement":
+        return (
+          <div className="obPage">
+            <div className="obContent">
+              <h2 className="obStepTitle">{t("onboarding.agreement.title")}</h2>
+              <p className="obStepDesc">{t("onboarding.agreement.subtitle")}</p>
+              {backendStartupNotice}
+              <Card className="text-left">
+                <CardContent className="py-5 px-5 space-y-4">
+                  <div className="whitespace-pre-wrap text-[13px] leading-[1.7] max-h-[240px] overflow-y-auto rounded-lg border bg-muted/40 p-4 text-foreground">
+                    {t("onboarding.agreement.content")}
+                  </div>
+                  <div className="space-y-2">
+                    <Label className="text-sm font-semibold">{t("onboarding.agreement.confirmLabel")}</Label>
+                    <Input
+                      value={obAgreementInput}
+                      onChange={(e) => { setObAgreementInput(e.target.value); setObAgreementError(false); }}
+                      placeholder={t("onboarding.agreement.confirmPlaceholder")}
+                      aria-invalid={obAgreementError || undefined}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          if (obAgreementInput.trim() === t("onboarding.agreement.confirmText")) {
+                            setObAgreementError(false);
+                            setObStep("ob-llm");
+                          } else {
+                            setObAgreementError(true);
+                          }
+                        }
+                      }}
+                    />
+                    {obAgreementError && (
+                      <p className="text-[13px] text-destructive">{t("onboarding.agreement.errorMismatch")}</p>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+            <div className="obFooter">
+              {stepIndicator}
+              <div className="obFooterBtns">
+                <Button variant="outline" onClick={() => setObStep("ob-welcome")}>{t("config.prev")}</Button>
+                <Button
+                  onClick={() => {
+                    if (obAgreementInput.trim() === t("onboarding.agreement.confirmText")) {
+                      setObAgreementError(false);
+                      setObStep("ob-llm");
+                    } else {
+                      setObAgreementError(true);
+                    }
+                  }}
+                >
+                  {t("onboarding.agreement.proceed")}
+                </Button>
+              </div>
+            </div>
+          </div>
+        );
+
+      case "ob-llm":
+        return (
+          <div className="obPage">
+            <div className="obContent">
+              <h2 className="obStepTitle">{t("onboarding.llm.title")}</h2>
+              <p className="obStepDesc">{t("onboarding.llm.desc")}</p>
+              {backendStartupNotice}
+              <div className="obFormArea">{renderLLM()}</div>
+              <p className="obSkipHint">{t("onboarding.skipHint")}</p>
+            </div>
+            <div className="obFooter">
+              {stepIndicator}
+              <div className="obFooterBtns">
+                <Button variant="outline" onClick={() => setObStep("ob-agreement")}>{t("config.prev")}</Button>
+                {savedEndpoints.length > 0 ? (
+                  <Button onClick={() => setObStep("ob-im")}>{t("config.next")}</Button>
+                ) : (
+                  <Button variant="secondary" onClick={() => setObStep("ob-im")}>{t("onboarding.llm.skip")}</Button>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+
+      case "ob-im":
+        return (
+          <div className="obPage">
+            <div className="obContent">
+              <h2 className="obStepTitle">{t("onboarding.im.title")}</h2>
+              <p className="obStepDesc">{t("onboarding.im.desc")}</p>
+              {backendStartupNotice}
+              <div className="obFormArea">{renderIM(true)}</div>
+              <p className="obSkipHint">{t("onboarding.skipHint")}</p>
+            </div>
+            <div className="obFooter">
+              {stepIndicator}
+              <div className="obFooterBtns">
+                <Button variant="outline" onClick={() => setObStep("ob-llm")}>{t("config.prev")}</Button>
+                <Button onClick={() => setObStep("ob-finish")}>{t("config.next")}</Button>
+              </div>
+            </div>
+          </div>
+        );
+
+      case "ob-finish":
+        return (
+          <div className="obPage">
+            <div className="obContent">
+              <h2 className="obStepTitle">{t("onboarding.system.title")}</h2>
+              <p className="obStepDesc">
+                {t("onboarding.system.desc")}
+              </p>
+              {backendStartupNotice}
+
+              <div className="flex flex-col gap-2">
+                <label className="obModuleItem" data-checked={obAutostart || undefined}>
+                  <Checkbox checked={obAutostart} onCheckedChange={(checked) => setObAutostart(checked === true)} />
+                  <div className="obModuleInfo">
+                    <strong>{t("onboarding.autostart.label")}</strong>
+                    <span className="obModuleDesc">{t("onboarding.autostart.desc")}</span>
+                  </div>
+                  <Badge variant="secondary" className="obModuleBadge obModuleBadgeRec">{t("onboarding.autostart.recommended")}</Badge>
+                </label>
+              </div>
+            </div>
+            <div className="obFooter">
+              {stepIndicator}
+              <div className="obFooterBtns">
+                <Button variant="outline" onClick={() => setObStep("ob-im")}>{t("config.prev")}</Button>
+                <Button onClick={() => { setObStep("ob-progress"); obRunSetup(); }}>
+                  {t("onboarding.system.startInstall")}
+                </Button>
+              </div>
+            </div>
+          </div>
+        );
+
+      case "ob-progress": {
+        const installLogLines = installLiveLog ? installLiveLog.split(/\r?\n/) : [];
+        const taskStatusIcon = (status: TaskStatus) => {
+          switch (status) {
+            case "done": return <span style={{ color: "#22c55e", fontSize: 18 }}>&#x2714;</span>;
+            case "running": return <span className="obProgressSpinnerIcon" />;
+            case "error": return <span style={{ color: "#ef4444", fontSize: 18 }}>&#x2716;</span>;
+            case "skipped": return <span style={{ color: "#9ca3af", fontSize: 14 }}>&#x2014;</span>;
+            default: return <span style={{ color: "#d1d5db", fontSize: 14 }}>&#x25CB;</span>;
+          }
+        };
+        const taskStatusColor: Record<TaskStatus, string> = {
+          done: "#22c55e", running: "#3b82f6", error: "#ef4444", skipped: "#9ca3af", pending: "#9ca3af",
+        };
+        return (
+          <div className="obPage">
+            <div className="obContent" style={{ display: "flex", flexDirection: "column", gap: 0, flex: 1, minHeight: 0 }}>
+              <h2 className="obStepTitle">{t("onboarding.progress.title")}</h2>
+              <p style={{ fontSize: 12, color: "var(--muted)", margin: "0 0 12px", lineHeight: 1.5 }}>
+                {t("onboarding.progress.patience")}
+              </p>
+
+              {/* ── 任务进度列表 ── */}
+              <div style={{
+                background: "#f8fafc", borderRadius: 12, border: "1px solid #e2e8f0",
+                padding: "16px 20px", marginBottom: 12,
+              }}>
+                {obTasks.map((task, idx) => (
+                  <div key={task.id} style={{
+                    display: "flex", alignItems: "center", gap: 12,
+                    padding: "8px 0",
+                    borderBottom: idx < obTasks.length - 1 ? "1px solid #f1f5f9" : "none",
+                    opacity: task.status === "pending" ? 0.5 : 1,
+                  }}>
+                    <div style={{ width: 24, textAlign: "center", flexShrink: 0 }}>
+                      {taskStatusIcon(task.status)}
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{
+                        fontSize: 14, fontWeight: task.status === "running" ? 600 : 400,
+                        color: taskStatusColor[task.status] ?? "#475569",
+                      }}>
+                        {task.label}
+                      </div>
+                      {task.detail && (
+                        <div style={{
+                          fontSize: 12, color: task.status === "error" ? "#ef4444" : "#94a3b8",
+                          marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                        }}>
+                          {task.detail}
+                        </div>
+                      )}
+                    </div>
+                    {task.status === "running" && (
+                      <span style={{ fontSize: 12, color: "#3b82f6", flexShrink: 0, fontWeight: 500 }}>{t("onboarding.progress.inProgress")}</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {installProgress && (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 6 }}>
+                    <span style={{ fontSize: 12, color: "#475569", fontWeight: 600, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {installProgress.stage}
+                    </span>
+                    <span style={{ fontSize: 12, color: "#64748b", flexShrink: 0 }}>
+                      {Math.max(0, Math.min(100, Math.round(installProgress.percent)))}%
+                    </span>
+                  </div>
+                  <div style={{ height: 6, borderRadius: 999, background: "#e2e8f0", overflow: "hidden" }}>
+                    <div
+                      style={{
+                        height: "100%",
+                        width: `${Math.max(0, Math.min(100, installProgress.percent))}%`,
+                        borderRadius: 999,
+                        background: "#2563eb",
+                        transition: "width 160ms ease",
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* ── 实时日志窗口 ── */}
+              <div style={{
+                flex: 1, minHeight: 120, maxHeight: 200,
+                background: "#1e293b", borderRadius: 10, padding: "12px 16px",
+                overflowY: "auto", overflowX: "hidden",
+                fontFamily: "'Cascadia Code', 'Fira Code', Consolas, monospace",
+                fontSize: 12, lineHeight: 1.7, color: "#cbd5e1",
+              }}
+                ref={(el) => { if (el) el.scrollTop = el.scrollHeight; }}
+              >
+                {obDetailLog.length === 0 && installLogLines.length === 0 && (
+                  <div style={{ color: "#64748b" }}>{t("onboarding.progress.waitingStart")}</div>
+                )}
+                {obDetailLog.map((line, i) => (
+                  <div key={i} style={{
+                    color: line.includes("[!]") || line.includes("失败") ? "#fbbf24"
+                         : line.includes("[OK]") ? "#4ade80"
+                         : line.includes("---") ? "#64748b"
+                         : "#cbd5e1",
+                  }}>{line}</div>
+                ))}
+                {installLogLines.length > 0 && (
+                  <div style={{ color: "#94a3b8", marginTop: obDetailLog.length > 0 ? 8 : 0 }}>
+                    --- runtime install log ---
+                  </div>
+                )}
+                {installLogLines.slice(-220).map((line, i) => (
+                  <div key={`pip-${i}`} style={{
+                    color: line.includes("ERROR") || line.includes("failed") || line.includes("失败")
+                      ? "#fca5a5"
+                      : line.startsWith("===") || line.startsWith("[")
+                        ? "#93c5fd"
+                        : "#cbd5e1",
+                    whiteSpace: "pre-wrap",
+                    overflowWrap: "anywhere",
+                  }}>
+                    {line || " "}
+                  </div>
+                ))}
+                {obInstalling && (
+                  <div style={{ color: "#60a5fa" }}>
+                    <span className="obProgressSpinnerIcon" style={{ display: "inline-block", marginRight: 8 }} />
+                    {t("onboarding.progress.working")}
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="obFooter">
+              {stepIndicator}
+            </div>
+          </div>
+        );
+      }
+
+      case "ob-failed": {
+        const failedTasks = obTasks.filter((task) => task.status === "error");
+        return (
+          <div className="obPage">
+            <div className="flex flex-col items-center text-center w-full max-w-[620px] gap-4">
+              <div className="flex items-center justify-center size-16 rounded-full bg-red-500 text-white shadow-lg shadow-red-500/25">
+                <IconXCircle size={34} />
+              </div>
+              <div className="space-y-2">
+                <h1 className="text-[28px] font-bold tracking-tight text-foreground">
+                  {t("onboarding.failed.title")}
+                </h1>
+                <p className="text-sm text-muted-foreground leading-relaxed">
+                  {t("onboarding.failed.desc")}
+                </p>
+              </div>
+
+              <div className="w-full rounded-lg border border-red-200 bg-red-50/70 px-4 py-3 text-left dark:border-red-500/40 dark:bg-red-950/25">
+                <div className="mb-2 text-sm font-semibold text-red-700 dark:text-red-300">
+                  {t("onboarding.failed.failedSteps")}
+                </div>
+                <div className="space-y-2">
+                  {failedTasks.length > 0 ? failedTasks.map((task) => (
+                    <div key={task.id} className="flex items-start gap-2 text-[13px]">
+                      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-red-500" />
+                      <div className="min-w-0">
+                        <div className="font-medium text-foreground">{task.label}</div>
+                        {task.detail && (
+                          <div className="mt-0.5 break-words text-muted-foreground">{task.detail}</div>
+                        )}
+                      </div>
+                    </div>
+                  )) : (
+                    <div className="flex items-start gap-2 text-[13px] text-muted-foreground">
+                      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-red-500" />
+                      <span>{t("onboarding.failed.unknownError")}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {obFailureDetailsOpen && (
+                <div className="w-full text-left">
+                  {obLastLogPath && (
+                    <div className="mb-2 break-all text-xs text-muted-foreground">
+                      {t("onboarding.failed.logPath", { path: obLastLogPath })}
+                    </div>
+                  )}
+                  <div className="max-h-[220px] overflow-auto rounded-lg bg-slate-900 px-4 py-3 font-mono text-xs leading-relaxed text-slate-200">
+                    {obDetailLog.map((line, index) => (
+                      <div key={index} className="break-words whitespace-pre-wrap">{line}</div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                <Button onClick={() => { setObStep("ob-progress"); void obRunSetup(); }}>
+                  <RefreshCw className="mr-2 size-4" />
+                  {t("onboarding.failed.retry")}
+                </Button>
+                <Button variant="outline" onClick={() => setObFailureDetailsOpen((open) => !open)}>
+                  <ScrollText className="mr-2 size-4" />
+                  {obFailureDetailsOpen
+                    ? t("onboarding.failed.hideLogs")
+                    : t("onboarding.failed.viewLogs")}
+                </Button>
+                <Button variant="ghost" onClick={() => void enterApplicationAfterOnboarding(true)}>
+                  {t("onboarding.failed.continueAnyway")}
+                  <ArrowRight className="ml-2 size-4" />
+                </Button>
+              </div>
+              <p className="max-w-[520px] text-xs leading-relaxed text-muted-foreground">
+                {t("onboarding.failed.continueHint")}
+              </p>
+            </div>
+            {stepIndicator}
+          </div>
+        );
+      }
+
+      case "ob-done":
+        return (
+          <div className="obPage">
+            <div className="flex flex-col items-center text-center max-w-[520px] gap-5">
+              <div className="flex items-center justify-center size-16 rounded-full bg-emerald-500 text-white text-[32px] shadow-lg shadow-emerald-500/30"><IconCheck size={32} /></div>
+              <h1 className="text-[28px] font-bold tracking-tight text-foreground">{t("onboarding.done.title")}</h1>
+              <p className="text-sm text-muted-foreground leading-relaxed">{t("onboarding.done.desc")}</p>
+              <Button
+                size="lg"
+                className="mt-2 px-10 rounded-xl text-[15px]"
+                onClick={() => void enterApplicationAfterOnboarding()}
+              >
+                {t("onboarding.done.enter")}
+              </Button>
+            </div>
+            {stepIndicator}
+          </div>
+        );
+
+      default:
+        return null;
+    }
+  }
+
+  function renderStepContent() {
+    if (!info) return <div className="card">{t("common.loading")}</div>;
+    if (view === "status") return renderStatus();
+    if (view === "chat") return null;  // ChatView 始终挂载，不在此渲染
+
+    if (view === "skills") {
+      return disabledViews.includes("skills") ? (
+        <div className="card" style={{ opacity: 0.65, textAlign: "center", padding: 28 }}>
+          <p style={{ color: "#94a3b8", fontSize: 13 }}>此模块已禁用，请在「工具与技能」配置中启用</p>
+        </div>
+      ) : (
+        <SkillManager
+          desktopVersion={desktopVersion}
+          venvDir={venvDir}
+          currentWorkspaceId={currentWorkspaceId}
+          envDraft={envDraft}
+          onEnvChange={setEnvDraft}
+              onSaveEnvKeys={async (keys) => {
+                await saveEnvKeys(keys);
+              }}
+          apiBaseUrl={apiBaseUrl}
+          serviceRunning={!!serviceStatus?.running}
+          dataMode={dataMode}
+        />
+      );
+    }
+    if (view === "im") {
+      return disabledViews.includes("im") ? (
+        <div className="card" style={{ opacity: 0.65, textAlign: "center", padding: 28 }}>
+          <p style={{ color: "#94a3b8", fontSize: 13 }}>此模块已禁用，请在「配置 → IM 通道」中启用</p>
+        </div>
+      ) : (
+        <IMView serviceRunning={serviceStatus?.running ?? false} apiBaseUrl={apiBaseUrl} />
+      );
+    }
+    if (view === "token_stats") {
+      return (
+        <TokenStatsView
+          serviceRunning={serviceStatus?.running ?? false}
+          apiBaseUrl={apiBaseUrl}
+          disabled={disabledViews.includes("token_stats")}
+          onToggleDisabled={() => toggleViewDisabled("token_stats")}
+        />
+      );
+    }
+    if (view === "skill_usage") {
+      return (
+        <SkillUsageView
+          serviceRunning={serviceStatus?.running ?? false}
+          apiBaseUrl={apiBaseUrl}
+        />
+      );
+    }
+    if (view === "mcp") {
+      return disabledViews.includes("mcp") ? (
+        <div className="card" style={{ opacity: 0.65, textAlign: "center", padding: 28 }}>
+          <p style={{ color: "#94a3b8", fontSize: 13 }}>此模块已禁用，请在「工具与技能」配置中启用</p>
+        </div>
+      ) : (
+            <MCPView
+              serviceRunning={serviceStatus?.running ?? false}
+              apiBaseUrl={apiBaseUrl}
+              envDraft={envDraft}
+              onEnvChange={setEnvDraft}
+              onSaveEnvKeys={async (keys) => { await saveEnvKeys(keys); }}
+            />
+      );
+    }
+    if (view === "plugins") {
+      return <PluginManagerView visible={true} httpApiBase={httpApiBase} desktopVersion={desktopVersion} />;
+    }
+    if (view === "knowledge") {
+      return <KnowledgeBaseView serviceRunning={serviceStatus?.running ?? false} apiBaseUrl={httpApiBase()} />;
+    }
+    if (view === "scheduler") {
+      return <SchedulerView serviceRunning={serviceStatus?.running ?? false} apiBaseUrl={apiBaseUrl} />;
+    }
+    if (view === "memory") {
+      return <MemoryView serviceRunning={serviceStatus?.running ?? false} apiBaseUrl={apiBaseUrl} />;
+    }
+    if (view === "identity") {
+      return (
+        <IdentityView serviceRunning={serviceStatus?.running ?? false} apiBaseUrl={apiBaseUrl} />
+      );
+    }
+    if (view === "dashboard") {
+      return (
+        <AgentDashboardView
+          apiBaseUrl={apiBaseUrl}
+          visible={view === "dashboard"}
+        />
+      );
+    }
+    if (view === "org_editor") {
+      return null;
+    }
+    if (view === "pixel_office") {
+      return (
+        <PixelOfficeView
+          apiBaseUrl={apiBaseUrl}
+          visible={view === "pixel_office"}
+        />
+      );
+    }
+    if (view === "agent_manager") {
+      return (
+        <AgentManagerView
+          apiBaseUrl={apiBaseUrl}
+          visible={view === "agent_manager"}
+        />
+      );
+    }
+    if (view === "agent_store") {
+      return (
+        <AgentStoreView
+          apiBaseUrl={apiBaseUrl}
+          visible={view === "agent_store"}
+        />
+      );
+    }
+    if (view === "skill_store") {
+      return (
+        <SkillStoreView
+          apiBaseUrl={apiBaseUrl}
+          visible={view === "skill_store"}
+        />
+      );
+    }
+    if (view === "security") {
+      return (
+        <ErrorBoundary>
+          <SecurityView
+            apiBaseUrl={apiBaseUrl}
+            serviceRunning={serviceStatus?.running ?? false}
+          />
+        </ErrorBoundary>
+      );
+    }
+    if (view === "pending_approvals") {
+      return (
+        <ErrorBoundary>
+          <PendingApprovalsView
+            apiBaseUrl={apiBaseUrl}
+            serviceRunning={serviceStatus?.running ?? false}
+          />
+        </ErrorBoundary>
+      );
+    }
+    if (view.startsWith("plugin_app:")) {
+      const pluginId = view.slice("plugin_app:".length);
+      return (
+        <PluginAppHost
+          key={pluginId}
+          pluginId={pluginId}
+          apiBase={httpApiBase()}
+          onViewChange={(v) => navigateToView(v)}
+        />
+      );
+    }
+    if (view === "docs") {
+      const docsBase = httpApiBase();
+      return (
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+          <UserDocsFrame docsBase={docsBase} docsVersion={backendVersion} title={t("sidebar.docs")} />
+        </div>
+      );
+    }
+    if (view === "my_feedback") {
+      return (
+        <MyFeedbackView
+          apiBaseUrl={httpApiBase()}
+          serviceRunning={serviceStatus?.running ?? false}
+          refreshTrigger={feedbackRefreshKey}
+          onOpenFeedbackModal={(prefill) => {
+            setFeedbackPrefill(prefill ?? null);
+            setBugReportOpen(true);
+          }}
+        />
+      );
+    }
+    switch (stepId) {
+      case "llm":
+        return renderLLM();
+      case "im":
+        return renderIM();
+      case "tools":
+        return renderTools();
+      case "agent":
+        return renderAgentSystem();
+      case "advanced":
+        return renderAdvanced();
+      default:
+        return renderLLM();
+    }
+  }
+
+  // ── 初始化加载中：检测是否首次运行，防止先闪主页面再跳 onboarding ──
+  if (appInitializing) {
+    return (
+      <div className="onboardingShell" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <div style={{ textAlign: "center", opacity: 0.6 }}>
+          <div className="spinner" style={{ margin: "0 auto 16px" }} />
+          <div style={{ fontSize: 14 }}>Loading...</div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Onboarding 全屏模式 (隐藏侧边栏和顶部状态栏) ──
+  if (view === "onboarding") {
+    return (
+      <EnvFieldContext.Provider value={envFieldCtx}>
+      <div className="onboardingShell">
+        {renderOnboarding()}
+
+        <ConfirmDialog dialog={confirmDialog} onClose={() => setConfirmDialog(null)} />
+        <Toaster position="top-right" richColors closeButton />
+        <MarketplaceInstallDialog
+          discoverTasks
+          apiBaseUrl={IS_TAURI ? DEFAULT_LOCAL_API_BASE : httpApiBase()}
+          desktopVersion={desktopVersion}
+          onManageServers={() => setShowServerManager(true)}
+        />
+      </div>
+      </EnvFieldContext.Provider>
+    );
+  }
+
+  // ── Capacitor: server config gate ──
+  if (IS_CAPACITOR && (needServerConfig || showServerManager)) {
+    return <ServerManagerView
+      activeServerId={getActiveServerId()}
+      manageModeInit={showServerManager && !needServerConfig}
+      onConnect={(url) => {
+        clearAccessToken();
+        setApiBaseUrl(url);
+        setNeedServerConfig(false);
+        setShowServerManager(false);
+        setWebAuthed(false);
+        setAuthChecking(true);
+        checkAuth(url).then((ok) => {
+          if (ok) {
+            installFetchInterceptor();
+            // Password banner disabled — remote access dialog handles this.
+          }
+          setWebAuthed(ok);
+          setAuthChecking(false);
+          webInitDone.current = false;
+        });
+      }}
+      onDone={needServerConfig ? undefined : () => setShowServerManager(false)}
+    />;
+  }
+
+  // ── First-run setup gate: show SetupView before LoginView ──
+  // Triggered either by the startup setup-status probe or by a 428 from any
+  // subsequent fetch. Loopback callers never reach this branch because the
+  // backend's setup_state.should_require_setup returns False for them; the
+  // gate is for non-trusted-local sessions (Capacitor / LAN browser).
+  if (setupRequired) {
+    return (
+      <SetupView
+        apiBaseUrl={IS_CAPACITOR ? apiBaseUrl : ""}
+        onSetupSuccess={() => {
+          installFetchInterceptor();
+          webInitDone.current = false;
+          setSetupRequired(false);
+          setWebAuthed(true);
+        }}
+      />
+    );
+  }
+
+  // ── Web / Capacitor auth gate: show login page if not authenticated ──
+  if (needsRemoteAuth && !webAuthed) {
+    if (authChecking) {
+      return <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", color: "var(--text3, #94a3b8)" }}>Loading...</div>;
+    }
+    return <LoginView
+      apiBaseUrl={IS_CAPACITOR ? apiBaseUrl : ""}
+      onLoginSuccess={() => {
+        installFetchInterceptor();
+        webInitDone.current = false;
+        setWebAuthed(true);
+      }}
+      onSwitchServer={IS_CAPACITOR ? () => setShowServerManager(true) : undefined}
+      onPreview={() => {
+        setPreviewMode(true);
+        setWebAuthed(true);
+      }}
+    />;
+  }
+
+  // ── Tauri remote auth gate: remote backend requires login ──
+  if (IS_TAURI && tauriRemoteLoginUrl) {
+    return <LoginView
+      apiBaseUrl={tauriRemoteLoginUrl}
+      onLoginSuccess={() => {
+        installFetchInterceptor();
+        setTauriRemoteLoginUrl(null);
+        setDataMode("remote");
+        setServiceStatus({
+          running: true,
+          pid: null,
+          pidFile: "",
+          managedBy: "external",
+          isManagedChild: false,
+        });
+        notifySuccess(t("connect.success"));
+        void refreshStatus("remote", tauriRemoteLoginUrl, true).then(() => {
+          autoCheckEndpoints(tauriRemoteLoginUrl);
+        });
+      }}
+      onSwitchServer={() => {
+        setTauriRemoteMode(false);
+        setDataMode("local");
+        setApiBaseUrl(DEFAULT_LOCAL_API_BASE);
+        setTauriRemoteLoginUrl(null);
+      }}
+    />;
+  }
+
+  return (
+    <EnvFieldContext.Provider value={envFieldCtx}>
+    <div className={`appShell ${sidebarCollapsed ? "appShellCollapsed" : ""}${isMobile ? " appShellMobile" : ""}`} style={previewMode ? { paddingTop: IS_CAPACITOR ? "calc(32px + env(safe-area-inset-top))" : 32 } : undefined}>
+      <DegradedBanner apiBase={httpApiBase()} />
+      {previewMode && (
+        <div style={{
+          position: "fixed", top: 0, left: 0, right: 0, zIndex: 9999,
+          background: "linear-gradient(135deg, #2563eb, #6366f1)",
+          color: "#fff", textAlign: "center",
+          padding: "6px 16px",
+          paddingTop: IS_CAPACITOR ? "max(6px, env(safe-area-inset-top))" : "6px",
+          fontSize: 13, fontWeight: 600,
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 12,
+        }}>
+          <span>{t("preview.banner", { defaultValue: "预览模式 — 连接服务器后可使用完整功能" })}</span>
+          <button
+            onClick={() => { setPreviewMode(false); setWebAuthed(false); }}
+            style={{
+              background: "rgba(255,255,255,0.2)", border: "1px solid rgba(255,255,255,0.4)",
+              color: "#fff", borderRadius: 6, padding: "2px 10px", fontSize: 12,
+              fontWeight: 600, cursor: "pointer",
+            }}
+          >
+            {t("preview.connect", { defaultValue: "去连接" })}
+          </button>
+        </div>
+      )}
+      {isMobile && mobileSidebarOpen && (
+        <div className="sidebarOverlay" onClick={() => setMobileSidebarOpen(false)} />
+      )}
+      <Sidebar
+        collapsed={isMobile ? false : sidebarCollapsed}
+        onToggleCollapsed={() => { if (!isMobile) setSidebarCollapsed((v) => !v); }}
+        view={view}
+        onViewChange={(v) => navigateToView(v)}
+        mobileOpen={mobileSidebarOpen}
+        onCloseMobile={() => setMobileSidebarOpen(false)}
+        configMode={configMode}
+        onEnterConfig={() => {
+          if (view !== "wizard" && view !== "identity") lastAppViewRef.current = view;
+          setSidebarCollapsed(false);
+          setConfigMode(true);
+          navigateToView("wizard", stepId);
+        }}
+        onExitConfig={() => {
+          setConfigMode(false);
+          navigateToView(lastAppViewRef.current);
+        }}
+        steps={steps}
+        stepId={stepId}
+        onStepChange={(s: StepId) => {
+          setStepId(s);
+          navigateToView("wizard", s);
+        }}
+        disabledViews={disabledViews}
+        storeVisible={storeVisible}
+        serviceRunning={serviceStatus?.running ?? false}
+        onRefreshStatus={async () => { await refreshStatus(undefined, undefined, true); }}
+        httpApiBase={httpApiBase()}
+        unreadFeedbackCount={unreadFeedbackCount}
+        pendingApprovalsCount={pendingApprovalsCount}
+        onCheckForUpdate={IS_TAURI ? handleManualUpdateCheck : undefined}
+        updateCheckPending={manualUpdateChecking}
+        desktopVersion={desktopVersion}
+      />
+
+      <main className="main">
+        <Topbar
+          wsDropdownOpen={wsDropdownOpen}
+          setWsDropdownOpen={setWsDropdownOpen}
+          currentWorkspaceId={currentWorkspaceId}
+          workspaces={workspaces}
+          onSwitchWorkspace={doSetCurrentWorkspace}
+          wsQuickCreateOpen={wsQuickCreateOpen}
+          setWsQuickCreateOpen={setWsQuickCreateOpen}
+          wsQuickName={wsQuickName}
+          setWsQuickName={setWsQuickName}
+          onCreateWorkspace={async (id, name) => {
+            if (IS_WEB || IS_CAPACITOR) {
+              // Web/Capacitor: create workspace via HTTP, then switch
+              confirmWorkspaceChange({
+                targetId: id,
+                displayName: name,
+                title: t("topbar.createWorkspaceConfirmTitle"),
+                message: t("topbar.createWorkspaceConfirmMsg", { name }),
+                performSwitch: async () => {
+                  const base = httpApiBase();
+                  const res = await safeFetch(`${base}/api/workspaces`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ id, name, set_current: true }),
+                  });
+                  const data = await res.json();
+                  if (data.status === "error") throw new Error(data.message);
+                  setCurrentWorkspaceId(id);
+                  // Trigger restart to apply the new workspace
+                  await safeFetch(`${base}/api/workspaces/switch`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ id }),
+                  });
+                },
+              });
+            } else {
+              // Tauri: create via IPC (existing logic)
+              confirmWorkspaceChange({
+                targetId: id,
+                displayName: name,
+                title: t("topbar.createWorkspaceConfirmTitle"),
+                message: t("topbar.createWorkspaceConfirmMsg", { name }),
+                performSwitch: async () => {
+                  await invoke("create_workspace", { id, name, setCurrent: true });
+                  setCurrentWorkspaceId(id);
+                },
+              });
+            }
+          }}
+          serviceRunning={serviceStatus?.running ?? false}
+          endpointCount={endpointSummary.length}
+          dataMode={dataMode}
+          busy={busy}
+          onDisconnect={async () => {
+            if (dataMode === "remote") {
+              clearBackendStartingHold();
+              setTauriRemoteMode(false);
+              setDataMode("local");
+              setApiBaseUrl(DEFAULT_LOCAL_API_BASE);
+              setServiceStatus(stoppedStatus());
+              resetEnvLoaded();
+              notifySuccess(t("topbar.disconnected"));
+            } else {
+              const wsId = currentWorkspaceId || workspaces[0]?.id || null;
+              if (!wsId) return;
+              const _busyId = notifyLoading(t("topbar.stopping"));
+              stopInProgressRef.current = true;
+              try {
+                await doStopService(wsId);
+                notifySuccess(t("topbar.stopped_toast"));
+              } catch (e) {
+                notifyError(String(e));
+              } finally {
+                stopInProgressRef.current = false;
+                dismissLoading(_busyId);
+              }
+            }
+          }}
+          onConnect={() => {
+            setConnectAddress(apiBaseUrl.replace(/^https?:\/\//, ""));
+            setConnectDialogOpen(true);
+          }}
+          onStart={async () => {
+            const effectiveWsId = currentWorkspaceId || workspaces[0]?.id || null;
+            if (!effectiveWsId) { notifyError(t("common.error")); return; }
+            await startLocalServiceWithConflictCheck(effectiveWsId);
+          }}
+          onRefreshAll={async () => { await refreshAll(); try { await refreshStatus(undefined, undefined, true); } catch {} }}
+          onSetTheme={(theme) => setThemePref(theme)}
+          themePrefState={themePrefState}
+          desktopVersion={desktopVersion}
+          isWeb={IS_WEB || IS_CAPACITOR}
+          onLogout={(IS_WEB || IS_CAPACITOR) ? async () => {
+            const { logout } = await import("./platform/auth");
+            await logout(IS_CAPACITOR ? apiBaseUrl : "");
+            setWebAuthed(false);
+          } : undefined}
+          webAccessUrl={IS_TAURI && (serviceStatus?.running ?? false) ? `${apiBaseUrl || "http://127.0.0.1:18900"}/web` : undefined}
+          apiBaseUrl={httpApiBase()}
+          onToggleMobileSidebar={isMobile ? () => setMobileSidebarOpen((v) => !v) : undefined}
+          serverName={IS_CAPACITOR ? (getActiveServer()?.name || undefined) : undefined}
+          onServerManager={IS_CAPACITOR ? () => setShowServerManager(true) : undefined}
+          envDraft={envDraft}
+          setEnvDraft={setEnvDraft}
+          saveEnvKeys={saveEnvKeys}
+          restartService={restartService}
+          askConfirm={askConfirm}
+          setView={navigateToView}
+          inboxUnreadCount={inboxUnreadCount}
+          onOpenInbox={() => setInboxDialogOpen(true)}
+        />
+
+        {showPwBanner && (
+          <div style={{
+            display: "flex", alignItems: "center", gap: isMobile ? 6 : 10,
+            padding: isMobile ? "6px 10px" : "8px 16px",
+            background: "var(--warning-bg, #fef3c7)", borderBottom: "1px solid var(--warning-border, #f59e0b)",
+            color: "var(--warning-text, #92400e)", fontSize: isMobile ? 12 : 13,
+          }}>
+            <span style={{ flex: 1 }}>
+              {isMobile
+                ? t("web.passwordBannerShort", { defaultValue: "访问密码为自动生成，建议设置自定义密码。" })
+                : t("web.passwordBanner", { defaultValue: "当前 Web 访问密码为系统自动生成，建议前往设置页面配置自定义密码以保障远程访问安全。" })}
+            </span>
+            <button className="btnSmall" style={{ whiteSpace: "nowrap", fontWeight: 500, fontSize: isMobile ? 11 : undefined, padding: isMobile ? "2px 8px" : undefined }} onClick={() => {
+              navigateToView("wizard", "advanced");
+              setShowPwBanner(false);
+              localStorage.setItem("openkitsune_pw_banner_dismissed", "1");
+            }}>{t("web.passwordBannerAction", { defaultValue: "去设置" })}</button>
+            <button style={{
+              background: "none", border: "none", cursor: "pointer", padding: 2,
+              color: "var(--warning-text, #92400e)", fontSize: 16, lineHeight: 1, opacity: 0.6,
+            }} onClick={() => {
+              setShowPwBanner(false);
+              localStorage.setItem("openkitsune_pw_banner_dismissed", "1");
+            }} title={t("common.close", { defaultValue: "关闭" })}>×</button>
+          </div>
+        )}
+
+        <div style={{ gridRow: 3, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 }}>
+          {/* ChatView 始终挂载，切走时隐藏以保留聊天记录 */}
+          <div className="contentChat" style={{ display: view === "chat" ? undefined : "none", flex: 1, minHeight: 0 }}>
+            <ChatView
+              serviceRunning={serviceStatus?.running ?? false} apiBaseUrl={apiBaseUrl}
+              endpoints={chatEndpoints}
+              visible={view === "chat"}
+              multiAgentEnabled={multiAgentEnabled}
+              currentWorkspaceId={currentWorkspaceId}
+              feedbackModalOpen={bugReportOpen}
+              onOpenFeedback={(prefill) => {
+                setFeedbackPrefill(prefill);
+                setBugReportOpen(true);
+              }}
+              envDraft={envDraft}
+              setEnvDraft={setEnvDraft}
+              onStartService={async () => {
+                const effectiveWsId = currentWorkspaceId || workspaces[0]?.id || null;
+                if (!effectiveWsId) {
+                  notifyError("未找到工作区（请先创建/选择一个工作区）");
+                  return;
+                }
+                await startLocalServiceWithConflictCheck(effectiveWsId);
+              }}
+            />
+          </div>
+          <div style={{ display: view === "org_editor" ? undefined : "none", flex: 1, minHeight: 0 }}>
+            <ErrorBoundary>
+              <Suspense fallback={<div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", opacity: 0.5 }}><div className="spinner" style={{ width: 24, height: 24 }} /></div>}>
+                <OrgEditorView apiBaseUrl={apiBaseUrl} visible={view === "org_editor"} />
+              </Suspense>
+            </ErrorBoundary>
+          </div>
+          <div
+            className="content"
+            style={{
+              display: view !== "chat" && view !== "org_editor" ? undefined : "none",
+              flex: 1,
+              minHeight: 0,
+            }}
+          >
+            <Suspense fallback={<div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", opacity: 0.5 }}><div className="spinner" style={{ width: 24, height: 24 }} /></div>}>
+            {renderStepContent()}
+            </Suspense>
+          </div>
+        </div>
+
+        {/* ── Connect Dialog ── */}
+        {connectDialogOpen && (
+          <ModalOverlay onClose={() => setConnectDialogOpen(false)}>
+            <div className="modalContent" style={{ maxWidth: 420 }}>
+              <div className="dialogHeader">
+                <span className="cardTitle">{t("connect.title")}</span>
+                <button className="dialogCloseBtn" onClick={() => setConnectDialogOpen(false)}>&times;</button>
+              </div>
+              <div className="dialogSection">
+                <p style={{ color: "var(--muted)", fontSize: 13, margin: "0 0 16px" }}>{t("connect.hint")}</p>
+                <div className="dialogLabel">{t("connect.address")}</div>
+                <input
+                  value={connectAddress}
+                  onChange={(e) => setConnectAddress(e.target.value)}
+                  placeholder="127.0.0.1:18900"
+                  autoFocus
+                  style={{ width: "100%", padding: "8px 12px", borderRadius: 8, border: "1px solid var(--line)", fontSize: 14, background: "var(--panel2)", color: "var(--text)" }}
+                />
+              </div>
+              <div className="dialogFooter">
+                <button className="btnSmall" onClick={() => setConnectDialogOpen(false)}>{t("common.cancel")}</button>
+                <button className="btnPrimary" disabled={!!busy} onClick={async () => {
+                  const addr = connectAddress.trim();
+                  if (!addr) return;
+                  const url = addr.startsWith("http") ? addr : `http://${addr}`;
+                  const _b = notifyLoading(t("connect.testing"));
+                  let connected = false;
+                  try {
+                    const res = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(5000) });
+                    const data = await res.json();
+                    if (data.status === "ok") {
+                      if (IS_TAURI) setTauriRemoteMode(true);
+                      const authOk = IS_TAURI ? await checkAuth(url) : true;
+                      if (!authOk) {
+                        setApiBaseUrl(url);
+                        localStorage.setItem("openkitsune_apiBaseUrl", url);
+                        setConnectDialogOpen(false);
+                        setTauriRemoteLoginUrl(url);
+                        if (data.version) checkVersionMismatch(data.version);
+                        return;
+                      }
+                      setApiBaseUrl(url);
+                      localStorage.setItem("openkitsune_apiBaseUrl", url);
+                      setDataMode("remote");
+                      setServiceStatus({
+                        running: true,
+                        pid: null,
+                        pidFile: "",
+                        managedBy: "external",
+                        isManagedChild: false,
+                      });
+                      setConnectDialogOpen(false);
+                      connected = true;
+                      notifySuccess(t("connect.success"));
+                      if (data.version) checkVersionMismatch(data.version);
+                      await refreshStatus("remote", url, true);
+                      autoCheckEndpoints(url);
+                    } else {
+                      notifyError(t("connect.fail"));
+                    }
+                  } catch {
+                    if (IS_TAURI && !connected) setTauriRemoteMode(false);
+                    notifyError(t("connect.fail"));
+                  } finally { dismissLoading(_b); }
+                }}>{t("connect.confirm")}</button>
+              </div>
+            </div>
+          </ModalOverlay>
+        )}
+
+        {/* ── Restart overlay ── */}
+        {restartOverlay && (
+          <div className="modalOverlay" style={{ zIndex: 10000, background: "rgba(0,0,0,0.5)" }}>
+            <div className="modalContent" style={{ maxWidth: 360, padding: "32px 28px", textAlign: "center", borderRadius: 16 }}>
+              {(restartOverlay.phase === "saving" || restartOverlay.phase === "restarting" || restartOverlay.phase === "waiting") && (
+                <>
+                  <div style={{ marginBottom: 16, display: "flex", justifyContent: "center", paddingLeft: 0, paddingRight: 0 }}>
+                    <svg width="40" height="40" viewBox="0 0 40 40" style={{ animation: "spin 1s linear infinite" }}>
+                      <circle cx="20" cy="20" r="16" fill="none" stroke="#2563eb" strokeWidth="3" strokeDasharray="80" strokeDashoffset="20" strokeLinecap="round" />
+                    </svg>
+                  </div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: "#0e7490" }}>
+                    {restartOverlay.hint
+                      ? restartOverlay.hint
+                      : <>
+                          {restartOverlay.phase === "saving" && t("common.loading")}
+                          {restartOverlay.phase === "restarting" && t("config.restarting")}
+                          {restartOverlay.phase === "waiting" && t("config.restartWaiting")}
+                        </>}
+                  </div>
+                  <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 8 }}>
+                    {!restartOverlay.hint && t("config.applyRestartHint")}
+                  </div>
+                </>
+              )}
+              {restartOverlay.phase === "done" && (
+                <>
+                  <div style={{ display: "flex", justifyContent: "center", marginBottom: 8 }}><IconCheckCircle size={40} /></div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: "#059669" }}>{restartOverlay.doneMessage || t("config.restartSuccess")}</div>
+                </>
+              )}
+              {restartOverlay.phase === "fail" && (
+                <>
+                  <div style={{ display: "flex", justifyContent: "center", marginBottom: 8 }}><IconXCircle size={40} /></div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: "#dc2626" }}>{t("config.restartFail")}</div>
+                </>
+              )}
+              {restartOverlay.phase === "notRunning" && (
+                <>
+                  <div style={{ display: "flex", justifyContent: "center", marginBottom: 8 }}><IconInfo size={40} /></div>
+                  <div style={{ fontSize: 14, fontWeight: 500, color: "#64748b" }}>{t("config.restartNotRunning")}</div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+        <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+
+
+        {/* ── Service conflict dialog ── */}
+        {conflictDialog && (
+          <ModalOverlay onClose={() => { setConflictDialog(null); setPendingStartWsId(null); }}>
+            <div className="modalContent" style={{ maxWidth: 440, padding: 24 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                <IconAlertCircle size={20} />
+                <span style={{ fontWeight: 600, fontSize: 15 }}>{t("conflict.title")}</span>
+              </div>
+              <div style={{ fontSize: 14, lineHeight: 1.7, marginBottom: 8 }}>{t("conflict.message")}</div>
+              <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 20 }}>
+                {t("conflict.detail", { pid: conflictDialog.pid, version: conflictDialog.version })}
+              </div>
+              <div className="dialogFooter" style={{ justifyContent: "flex-end", gap: 8 }}>
+                <button className="btnSmall" onClick={() => { setConflictDialog(null); setPendingStartWsId(null); }}>{t("conflict.cancel")}</button>
+                <button className="btnSmall" style={{ background: "#e53935", color: "#fff", border: "none" }}
+                  onClick={() => stopAndRestartService()} disabled={!!busy}>{t("conflict.stopAndRestart")}</button>
+                <button className="btnPrimary" style={{ padding: "6px 16px", borderRadius: 8 }}
+                  onClick={() => connectToExistingLocalService()}>{t("conflict.connectExisting")}</button>
+              </div>
+            </div>
+          </ModalOverlay>
+        )}
+
+        {/* ── Version mismatch banner ── */}
+        {versionMismatch && (
+          <div style={{ position: "fixed", top: 48, left: "50%", transform: "translateX(-50%)", zIndex: 9999, background: "var(--panel2)", backdropFilter: "blur(16px)", WebkitBackdropFilter: "blur(16px)", border: "1px solid var(--warning)", borderRadius: 10, padding: "12px 20px", maxWidth: 500, boxShadow: "var(--shadow)", display: "flex", flexDirection: "column", gap: 8, color: "var(--warning)" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <IconAlertCircle size={16} />
+              <span style={{ fontWeight: 600, fontSize: 13 }}>{t("version.mismatch")}</span>
+              <button style={{ marginLeft: "auto", background: "none", border: "none", cursor: "pointer", fontSize: 16, color: "var(--muted)" }} onClick={() => setVersionMismatch(null)}>&times;</button>
+            </div>
+            <div style={{ fontSize: 12, lineHeight: 1.6 }}>
+              {t("version.mismatchDetail", { backend: versionMismatch.backend, desktop: versionMismatch.desktop })}
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button className="btnSmall" style={{ fontSize: 11 }} onClick={async () => { const ok = await copyToClipboard(t("version.pipCommand")); if (ok) notifySuccess(t("version.copied")); }}>{t("version.updatePip")}</button>
+              <code style={{ fontSize: 11, background: "var(--nav-hover)", padding: "2px 8px", borderRadius: 4, color: "var(--text)" }}>{t("version.pipCommand")}</code>
+            </div>
+          </div>
+        )}
+
+        {newRelease && updateProgress.status === "idle" && (
+          <AppUpdateDialog
+            release={newRelease}
+            updateAvailable={updateAvailable}
+            onUpdate={doDownloadAndInstall}
+            onSkipVersion={() => skipReleaseVersion(newRelease.latest)}
+            onRemindLater={() => remindReleaseLater(newRelease.latest)}
+          />
+        )}
+        <UpdateProgressToast
+          release={newRelease}
+          updateProgress={updateProgress}
+          onRelaunch={doRelaunchAfterUpdate}
+          onRetry={doDownloadAndInstall}
+        />
+
+        <ConfirmDialog dialog={confirmDialog} onClose={() => setConfirmDialog(null)} />
+        <Dialog open={inboxDialogOpen} onOpenChange={setInboxDialogOpen}>
+          <DialogContent className="inboxDialogContent">
+            <DialogHeader className="sr-only">
+              <DialogTitle>{t("inbox.title")}</DialogTitle>
+              <DialogDescription>{t("inbox.description")}</DialogDescription>
+            </DialogHeader>
+            <Suspense fallback={<div className="inboxDialogFallback"><div className="spinner" style={{ width: 24, height: 24 }} /></div>}>
+              <InboxView
+                serviceRunning={serviceStatus?.running ?? false}
+                apiBaseUrl={httpApiBase()}
+                refreshKey={inboxRefreshKey}
+                onUnreadChange={setInboxUnreadCount}
+              />
+            </Suspense>
+          </DialogContent>
+        </Dialog>
+        <RuntimeEnvironmentDialog
+          open={runtimeDialogOpen}
+          onOpenChange={setRuntimeDialogOpen}
+          serviceStatus={serviceStatus}
+          backendBootPhase={backendBootPhase}
+          installProgress={installProgress}
+          info={info}
+          runtimeDiag={runtimeDiag}
+          runtimeDiagChecking={runtimeDiagChecking}
+          venvStatus={venvStatus}
+          indexUrl={indexUrl}
+          installLiveLog={installLiveLog}
+          busy={busy}
+          currentWorkspaceId={currentWorkspaceId}
+          refreshRuntimeDiagnostics={refreshRuntimeDiagnostics}
+          doStartLocalService={doStartLocalService}
+          onRepairRuntime={repairRuntimeAndRestart}
+        />
+        <Toaster position="top-right" richColors closeButton />
+        <MarketplaceInstallDialog
+          discoverTasks
+          apiBaseUrl={IS_TAURI ? DEFAULT_LOCAL_API_BASE : httpApiBase()}
+          desktopVersion={desktopVersion}
+          onManageServers={() => setShowServerManager(true)}
+        />
+
+        {view === "wizard" ? (() => {
+          const saveConfig = footerSaveConfig;
+          return saveConfig ? (
+            <div className="footer" style={{ gridRow: 4, justifyContent: "flex-end" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <TooltipProvider delayDuration={180}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span className="inline-flex">
+                        <Button
+                          onClick={() => renderIntegrationsSave(configApplyPreview.dirtyKeys, saveConfig.savedMsg)}
+                          disabled={
+                            !currentWorkspaceId
+                            || !!busy
+                            || !!restartOverlay
+                            || configApplyPreview.dirtyKeys.length === 0
+                          }>
+                          {t("config.apply", "应用")}
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent side="top" align="end" className="max-w-xs text-left">
+                      <div className="space-y-1">
+                        {configApplyPreview.dirtyKeys.length === 0 ? (
+                          <div>{t("config.applyNoChanges", "没有待应用的修改")}</div>
+                        ) : (
+                          <>
+                            <div className="font-medium">
+                              {t("config.applyPendingCount", "待应用 {{count}} 项修改", {
+                                count: configApplyPreview.dirtyKeys.length,
+                              })}
+                            </div>
+                            {configApplyPreview.counts.immediate > 0 && (
+                              <div>{t("config.applyImmediateCount", "{{count}} 项立即生效", { count: configApplyPreview.counts.immediate })}</div>
+                            )}
+                            {configApplyPreview.counts.next_task > 0 && (
+                              <div>{t("config.applyNextTaskCount", "{{count}} 项从下一任务开始生效", { count: configApplyPreview.counts.next_task })}</div>
+                            )}
+                            {configApplyPreview.counts.component_reload > 0 && (
+                              <div>{t("config.applyComponentCount", "{{count}} 项需要重载组件", { count: configApplyPreview.counts.component_reload })}</div>
+                            )}
+                            {configApplyPreview.counts.process_restart > 0 && (
+                              <div>{t("config.applyRestartCount", "{{count}} 项需要重启后端", { count: configApplyPreview.counts.process_restart })}</div>
+                            )}
+                            {configApplyPreview.pendingCount > 0 && (
+                              <div>{t("config.applyCheckingCount", "正在判断 {{count}} 项修改…", { count: configApplyPreview.pendingCount })}</div>
+                            )}
+                            {configApplyPreview.unknownCount > 0 && (
+                              <div>{t("config.applyUnknownCount", "{{count}} 项暂时无法判断生效方式", { count: configApplyPreview.unknownCount })}</div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
+            </div>
+          ) : null;
+        })() : null}
+      </main>
+
+      {/* Feedback Modal (Bug Report + Feature Request) */}
+      <FeedbackModal
+        open={bugReportOpen}
+        onClose={() => { setBugReportOpen(false); setFeedbackPrefill(null); }}
+        apiBase={httpApiBase()}
+        prefill={feedbackPrefill}
+        onNavigateToMyFeedback={() => {
+          setFeedbackRefreshKey((key) => key + 1);
+          navigateToView("my_feedback");
+        }}
+        serviceRunning={serviceStatus?.running ?? false}
+        currentWorkspaceId={currentWorkspaceId}
+      />
+    </div>
+    </EnvFieldContext.Provider>
+  );
+}

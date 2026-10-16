@@ -1,0 +1,20 @@
+{
+  "id": "github-mcp",
+  "name": "GitHub MCP",
+  "version": "1.0.0",
+  "description": "MCP wrapper demo: wraps GitHub MCP server as a unified plugin",
+  "author": "OpenKitsune Team",
+  "license": "MIT",
+  "type": "mcp",
+  "entry": "mcp_config.json",
+  "permissions": ["tools.register"],
+  "requires": {
+    "openkitsune": ">=1.5.0",
+    "plugin_api": "~1",
+    "python": ">=3.11"
+  },
+  "provides": {"tools": ["github"]},
+  "category": "mcp",
+  "tags": ["demo", "mcp", "github"]
+}
+

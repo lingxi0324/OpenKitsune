@@ -1,0 +1,8324 @@
+"""
+推理-行动引擎 (ReAct Pattern)
+
+从 agent.py 的 _chat_with_tools_and_context 重构为显式的
+Reason -> Act -> Observe 三阶段循环。
+
+核心职责:
+- 显式推理循环管理（Reason / Act / Observe）
+- LLM 响应解析与 Decision 分类
+- 工具调用编排（委托给 ToolExecutor）
+- 上下文压缩触发（委托给 ContextManager）
+- 循环检测（签名重复、自检间隔、安全阈值）
+- 模型切换逻辑
+- 任务完成度验证（委托给 ResponseHandler）
+"""
+
+import asyncio
+import contextlib
+import copy
+import hashlib
+import json
+import logging
+import re
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from openkitsune.agent.errors import UserCancelledError
+from openkitsune.agent.loop_budget import READONLY_EXPLORATION_TOOLS, LoopBudgetGuard
+from openkitsune.agent.resource_budget import (
+    BudgetAction,
+    ResourceBudget,
+    create_budget_from_settings,
+)
+
+from ..api.routes.websocket import broadcast_event
+from ..config import settings
+from ..llm.converters.tools import PARSE_ERROR_KEY
+from ..prompt.turn_context import extract_context
+from ..sessions.model_transcript import (
+    active_transcript,
+    commit_model_messages,
+    is_human_message,
+    record_model_tool_result,
+)
+from ..tools.tool_hints import ConfigHint
+from ..tools.tool_result import split_tool_result_payload
+from ..tracing.tracer import get_tracer
+from ._context_runtime import ContextManager
+from ._context_runtime import _CancelledError as _CtxCancelledError
+from ._supervisor_runtime import TOKEN_ANOMALY_THRESHOLD, RuntimeSupervisor
+from .abort_scope import current_abort_scope
+from .agent_state import AgentState, IllegalReasoningEntry, TaskState, TaskStatus
+from .cancel_cleanup import (
+    DEFAULT_TTL_SECONDS,
+    RESUME_HINT_FRESHNESS_SECONDS,
+    clear_persisted_working_messages,
+    has_tool_blocks,
+    load_persisted_working_messages,
+    persist_working_messages,
+    persisted_age_seconds,
+    synthesize_tool_results_for_orphans,
+)
+from .policy_v2.exceptions import DeferredApprovalRequired
+from .response_handler import (
+    ResponseHandler,
+    clean_llm_response,
+    parse_intent_tag,
+    request_expects_artifact,
+    strip_internal_trace_markers,
+    strip_thinking_tags,
+)
+from .risk_gate_tools import execute_after_riskgate_tool_prompt, prepare_riskgate_tool_prompt
+from .security_confirm_channel import ALLOW_SECURITY_CONFIRM_DECISIONS, register_policy_confirm
+
+# 不产出"最终交付物"的管理类工具集合 —— 用于：
+#   1) ``tools_executed_in_task`` 标记（仅这些工具被调用 → 视为本轮无实质执行）
+#   2) "全是 admin 工具+文本回复 → 任务完成 fast-path"（跳过 ForceToolCall）
+#
+# 与 ``supervisor.UNPRODUCTIVE_ADMIN_TOOLS``（"零产出空转"判定）刻意解耦：
+#   * supervisor 只关心**纯查询/读取**类（连续 5 次都在 list/search/get → 空转）
+#   * reasoning_engine 关心"未产出 artifact"，自然包含 todo 推进和 memory 写入
+#     （这些工具产生的是"内部状态变化"而非"用户可见交付物"，所以仍算 admin）
+_ADMIN_TOOL_NAMES = frozenset(
+    {
+        "create_todo",
+        "update_todo_step",
+        "get_todo_status",
+        "complete_todo",
+        "search_memory",
+        "add_memory",
+        "list_directory",
+    }
+)
+
+
+def _tool_rate_limit_key(tool_name: str, tool_args: Any) -> str:
+    """Key repeated-tool throttling by the actual invocation, not just tool name."""
+    try:
+        param_str = json.dumps(tool_args or {}, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        param_str = str(tool_args)
+    return f"{tool_name}:{hashlib.md5(param_str.encode()).hexdigest()}"
+
+
+# 同名工具在单轮任务内的硬上限（防止 LLM 把记忆/搜索工具用成循环）。
+# 这里只覆盖"写多了会污染或浪费 token"的工具；read-only 工具仍由
+# _MAX_SAME_TOOL_PER_TASK（同参数）+ readonly_stagnation_limit 控制。
+# 注意：这个限制是按 *同名工具* 计数，无论参数是否不同——
+# 单轮内 9 次 add_memory 即便每次内容不同也几乎肯定是 LLM 失控。
+_PER_TOOL_NAME_TASK_LIMITS: dict[str, int] = {
+    "add_memory": 5,
+    "consolidate_memories": 1,
+    "memory_delete_by_query": 2,
+}
+
+
+from ._tool_runtime import ToolExecutor
+from .token_tracking import TokenTrackingContext, reset_tracking_context, set_tracking_context
+
+logger = logging.getLogger(__name__)
+
+_SSE_RESULT_PREVIEW_CHARS = 32000
+_TOOL_RESULT_ERROR_PREFIXES = (
+    "❌",
+    "⚠️ 工具执行错误",
+    "错误类型:",
+)
+
+_GENERIC_TASK_COMPLETION_MARKERS = (
+    "任务已完成",
+    "已完成任务",
+    "执行完成",
+    "已整理完毕",
+    "呈现如上",
+    "输出如上",
+    "系统会自动",
+    "自动推送",
+    "无需额外操作",
+    "如需调整",
+    "如需其他",
+    "随时告诉我",
+    "the task is complete",
+    "task has completed",
+    "completed successfully",
+    "shown above",
+    "already presented",
+    "automatically send",
+)
+
+
+def _looks_like_generic_task_completion(text: str) -> bool:
+    """Return whether a short response only reports completion instead of the result."""
+    normalized = (text or "").strip()
+    if not normalized or len(normalized) > 240:
+        return False
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    if any(line.startswith(("#", "-", "*", "1.", "2.", "3.")) for line in lines):
+        return False
+    lower = normalized.lower()
+    matched = [marker for marker in _GENERIC_TASK_COMPLETION_MARKERS if marker in lower]
+    if not matched:
+        return False
+    residual = lower
+    for marker in matched:
+        residual = residual.replace(marker, "")
+    residual = re.sub(r"[^\w]+", "", residual, flags=re.UNICODE)
+    return not any(char.isdigit() for char in residual) and len(residual) < 32
+
+
+def _task_final_response_score(text: str) -> int:
+    """Score visible task results so a retry cannot replace a substantive report."""
+    normalized = (text or "").strip()
+    if not normalized:
+        return -10_000
+
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    score = min(len(normalized), 6000) // 20
+    score += sum(1 for line in lines if line.startswith(("#", "##", "###"))) * 18
+    score += sum(1 for line in lines if line.startswith(("-", "*", "1.", "2.", "3."))) * 8
+    score += sum(1 for line in lines if "|" in line) * 5
+    if _looks_like_generic_task_completion(normalized):
+        score -= 90
+    return score
+
+
+def _select_task_final_response(current: str, candidates: list[str]) -> str:
+    """Prefer an earlier substantive result only when the current text is generic."""
+    current = (current or "").strip()
+    if not _looks_like_generic_task_completion(current):
+        return current
+
+    substantive = [
+        candidate.strip()
+        for candidate in candidates
+        if candidate.strip() and not _looks_like_generic_task_completion(candidate)
+    ]
+    if not substantive:
+        return current
+    best = max(substantive, key=_task_final_response_score)
+    return (
+        best if _task_final_response_score(best) > _task_final_response_score(current) else current
+    )
+
+
+def _unpack_tool_result_payload(value: Any) -> tuple[str, ConfigHint | None, dict[str, Any]]:
+    raw_payload, hint = value
+    content, metadata = split_tool_result_payload(raw_payload)
+    text = "" if content is None else str(content)
+    return text, hint, metadata
+
+
+def _make_tool_result_msg(
+    *,
+    tool_use_id: str,
+    content: str,
+    tool_name: str,
+    is_error: bool = False,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    msg: dict[str, Any] = {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": content,
+        "is_error": is_error,
+        "tool_name": tool_name,
+    }
+    if metadata:
+        msg["metadata"] = dict(metadata)
+    return msg
+
+
+def _tool_result_looks_error(result_text: Any) -> bool:
+    return str(result_text or "").lstrip().startswith(_TOOL_RESULT_ERROR_PREFIXES)
+
+
+def _unpack_tool_result(value: Any) -> tuple[str, ConfigHint | None]:
+    """Defensively unpack a value returned by ``execute_tool*``.
+
+    All ``ToolExecutor`` paths are supposed to return ``(text, hint)`` after
+    the type sweep. This helper accepts both the new tuple shape and the
+    previous plain-string shape (in case any callsite outside this module
+    hasn't migrated yet) and normalizes to ``(str, ConfigHint | None)``.
+    Centralizing the unwrap keeps the 5+ tool-call sites in this file short
+    and consistent.
+    """
+    text, hint, _metadata = _unpack_tool_result_payload(value)
+    return text, hint
+
+
+def _build_tool_end_events(
+    *,
+    tool_name: str,
+    tool_id: str,
+    result_text: str,
+    hint: ConfigHint | None,
+    is_error: bool,
+    result_summary: str = "",
+    extra: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build the SSE event sequence for a finished tool call.
+
+    Always emits a ``tool_call_end``. When ``hint`` is non-None, also emits a
+    ``config_hint`` event carrying the structured payload that ``ChatView``
+    accumulates into ``currentConfigHints[tool_use_id]`` for ``ConfigHintCard``
+    rendering. ``hint`` is intentionally NOT serialized into the
+    ``tool_result_msg`` content — the LLM never sees it.
+
+    The two-event sequence is required (not a single combined event) so
+    existing frontend code that only knows ``tool_call_end`` keeps working;
+    UIs that opt into the hint just listen for the new event type.
+    """
+    end_event: dict[str, Any] = {
+        "type": "tool_call_end",
+        "tool": tool_name,
+        "result": result_text[:_SSE_RESULT_PREVIEW_CHARS],
+        "id": tool_id,
+        "is_error": is_error,
+        "result_summary": result_summary,
+    }
+    if extra:
+        end_event.update(extra)
+    events: list[dict[str, Any]] = [end_event]
+    if hint is not None:
+        events.append(
+            {
+                "type": "config_hint",
+                "tool_use_id": tool_id,
+                "scope": hint.scope,
+                "error_code": hint.error_code,
+                "title": hint.title,
+                "message": hint.message,
+                # Copy actions to plain dicts so downstream JSON serializers don't
+                # have to special-case the dataclass; ConfigHint.actions is already
+                # a list[dict] but we re-shallow-copy each entry to be safe against
+                # callers that mutate.
+                "actions": [dict(a) for a in hint.actions],
+            }
+        )
+    return events
+
+
+@dataclass(slots=True)
+class _OpenRiskGateToolConfirmation:
+    prompt_event: dict[str, Any]
+    confirmation_id: str
+    timeout_seconds: float
+    tool_name: str
+    tool_input: dict[str, Any]
+    session_id: str
+    tool_id: str
+
+
+@dataclass(slots=True)
+class _RiskGateToolConfirmationResult:
+    result_text: str
+    hint: ConfigHint | None
+    is_error: bool
+    result_summary: str
+    end_events: list[dict[str, Any]]
+    tool_result: dict[str, Any]
+
+
+def _open_riskgate_tool_confirmation(
+    *,
+    conversation_id: str | None,
+    tool_name: str,
+    tool_input: dict[str, Any],
+    policy_result: Any,
+    tool_id: str,
+    timeout_seconds: float,
+    channel: str,
+    delegate_chain: list[str],
+    root_user_id: str | None,
+) -> _OpenRiskGateToolConfirmation:
+    session_id = conversation_id or ""
+    prompt = prepare_riskgate_tool_prompt(
+        conversation_id=session_id,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        policy_result=policy_result,
+        request_id=tool_id,
+        timeout_seconds=timeout_seconds,
+        channel=channel,
+        delegate_chain=delegate_chain,
+        root_user_id=root_user_id,
+    )
+    return _OpenRiskGateToolConfirmation(
+        prompt_event=prompt.event,
+        confirmation_id=prompt.pending.confirmation_id,
+        timeout_seconds=timeout_seconds,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        session_id=session_id,
+        tool_id=tool_id,
+    )
+
+
+async def _execute_riskgate_tool_confirmation(
+    executor: Any,
+    *,
+    confirmation: _OpenRiskGateToolConfirmation,
+    detect_result_errors: bool,
+    summarize_tool_result: Callable[[str, str], str | None],
+) -> _RiskGateToolConfirmationResult:
+    outcome = await execute_after_riskgate_tool_prompt(
+        executor,
+        confirmation_id=confirmation.confirmation_id,
+        timeout_seconds=confirmation.timeout_seconds,
+        tool_name=confirmation.tool_name,
+        tool_input=confirmation.tool_input,
+        session_id=confirmation.session_id,
+        detect_result_errors=detect_result_errors,
+        unpack_tool_result=_unpack_tool_result_payload,
+        tool_result_looks_error=_tool_result_looks_error,
+    )
+    await record_model_tool_result(confirmation.tool_id, outcome.result_text, outcome.is_error)
+    result_summary = summarize_tool_result(confirmation.tool_name, outcome.result_text) or ""
+    end_events = _build_tool_end_events(
+        tool_name=confirmation.tool_name,
+        tool_id=confirmation.tool_id,
+        result_text=outcome.result_text,
+        hint=outcome.hint,
+        is_error=outcome.is_error,
+        result_summary=result_summary,
+    )
+    return _RiskGateToolConfirmationResult(
+        result_text=outcome.result_text,
+        hint=outcome.hint,
+        is_error=outcome.is_error,
+        result_summary=result_summary,
+        end_events=end_events,
+        tool_result={
+            **_make_tool_result_msg(
+                tool_use_id=confirmation.tool_id,
+                content=outcome.result_text,
+                is_error=outcome.is_error,
+                tool_name=confirmation.tool_name,
+                metadata=outcome.metadata,
+            ),
+        },
+    )
+
+
+_CACHEABLE_READONLY_TOOLS = frozenset({"web_fetch", "web_search", "news_search"})
+_READONLY_EXPLORATION_TOOLS = READONLY_EXPLORATION_TOOLS
+_READONLY_STAGNATION_LIMIT = 3
+
+
+_IM_CONVERSATION_PREFIXES = (
+    "qqbot:",
+    "feishu:",
+    "dingtalk:",
+    "wework_ws:",
+    "telegram:",
+    "onebot:",
+)
+
+
+def _is_im_conversation(conversation_id: str | None) -> bool:
+    """Best-effort detection for IM sessions where there is no reliable UI confirm surface."""
+    if not conversation_id:
+        return False
+    return str(conversation_id).startswith(_IM_CONVERSATION_PREFIXES)
+
+
+def _compute_confirm_dedup_key(tool_name: str, params: Any) -> str:
+    """C13 §15.5: compute a stable dedup fingerprint for CONFIRM coalescing.
+
+    delegate_parallel siblings often issue identical (tool_name, params),
+    causing the UI to receive N redundant confirm cards. We hash
+    ``(tool_name, json(params, sort_keys=True))`` so the same operation
+    deterministically maps to one key — first sub-agent becomes the leader,
+    later siblings detect the leader via ``UIConfirmBus.find_dedup_leader``
+    and wait on the leader's event instead of emitting their own SSE.
+
+    Returns ``""`` (falsy → opts out of dedup) when params can't be hashed
+    safely; the caller falls back to the normal per-call confirm path.
+    """
+    if not tool_name:
+        return ""
+    try:
+        if isinstance(params, dict):
+            normalized = json.dumps(params, sort_keys=True, default=str)
+        else:
+            normalized = str(params)
+    except Exception:
+        return ""
+    payload = f"{tool_name}|{normalized}".encode("utf-8", errors="ignore")
+    return hashlib.md5(payload).hexdigest()
+
+
+def _tool_result_fingerprint(tool_results: list[dict]) -> str:
+    parts: list[str] = []
+    for result in tool_results:
+        if not isinstance(result, dict):
+            continue
+        content = str(result.get("content", ""))
+        parts.append(hashlib.md5(content[:4000].encode("utf-8", errors="ignore")).hexdigest()[:10])
+    return "|".join(parts)
+
+
+def _is_readonly_exploration_round(tool_calls: list[dict]) -> bool:
+    if not tool_calls:
+        return False
+    names = {str(tc.get("name", "")) for tc in tool_calls if isinstance(tc, dict)}
+    return bool(names) and names.issubset(_READONLY_EXPLORATION_TOOLS)
+
+
+def _build_task_checkpoint_event(
+    *,
+    session: Any,
+    conversation_id: str | None,
+    task_id: str,
+    iteration: int,
+    exit_reason: str,
+    summary: str = "",
+    next_step_hint: str = "",
+    artifacts: list[str] | None = None,
+) -> dict:
+    """构造一个 task_checkpoint SSE event payload，并尽力写入 session.context。
+
+    设计要点（与 sessions.TaskCheckpoint 对齐）：
+    * summary / next_step_hint 单行截断到 200 字符，避免 SSE 包过大；
+    * 容错：session 缺失或老版本未实现 append_task_checkpoint 时，仅返回 SSE event；
+    * 不抛异常 — 检查点是观测特性，不能影响主推理路径。
+    """
+    from ..sessions.session import TaskCheckpoint  # 局部导入，避免顶层循环依赖
+
+    def _trim(text: str, limit: int = 200) -> str:
+        text = (text or "").strip().replace("\n", " ")
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
+    messages_offset = 0
+    ctx = getattr(session, "context", None) if session is not None else None
+    if ctx is not None:
+        try:
+            messages_offset = len(getattr(ctx, "messages", []) or [])
+        except Exception:
+            messages_offset = 0
+
+    checkpoint = TaskCheckpoint(
+        checkpoint_id=uuid.uuid4().hex[:12],
+        task_id=task_id or "",
+        conversation_id=conversation_id or "",
+        iteration=int(iteration or 0),
+        created_at=time.time(),
+        summary=_trim(summary),
+        next_step_hint=_trim(next_step_hint),
+        exit_reason=exit_reason or "running",
+        artifacts=list(artifacts or []),
+        messages_offset=messages_offset,
+    )
+
+    written: dict | None = None
+    if ctx is not None and hasattr(ctx, "append_task_checkpoint"):
+        try:
+            written = ctx.append_task_checkpoint(checkpoint)
+        except Exception:
+            logger.debug("append_task_checkpoint failed", exc_info=True)
+
+    return {"type": "task_checkpoint", **(written or checkpoint.to_dict())}
+
+
+def _format_budget_pause_message(status: Any) -> str:
+    """统一的预算耗尽 PAUSE 文案。
+
+    旧文案 "请调整预算后继续" 误导用户去翻 .env，但实测打"继续"两个字
+    就能续上（系统会以新任务接力）；同时 duration 维度真正命中 PAUSE 时
+    意味着近 60s 没有工具调用 / token 产出（被 ResourceBudget._check_dimension
+    豁免逻辑过滤掉了"有进展"场景），可能已陷入循环——告知用户具体处理方式。
+    """
+    dim = getattr(status, "dimension", "") or "unknown"
+    pct = getattr(status, "usage_ratio", 0.0) or 0.0
+    suffix = "（近 60s 无新工具调用或 token 产出，可能已陷入循环）" if dim == "duration" else ""
+    return (
+        f"⚠️ 任务暂停（{dim}: {pct:.0%}{suffix}）\n\n"
+        f'▸ 直接回复"继续"即可让我接力完成（系统会以新任务接力，'
+        f"对话历史和已有进展都已保留）\n"
+        f"▸ 如果你预期任务时间确实较长，到【配置 → 高级配置 → 长任务与上下文保护 → 任务预算】"
+        f"把对应预算调高并保存（TASK_BUDGET_DURATION 设为 0 = 不限时长，"
+        f"系统会在没有工具调用进展时才暂停）"
+    )
+
+
+def _apply_tool_result_budget(
+    tool_results: list[dict],
+    max_total: int | None = None,
+) -> list[dict]:
+    """Proportionally truncate tool results if total exceeds budget."""
+    from ._tool_runtime import OVERFLOW_MARKER, save_overflow
+
+    if max_total is None:
+        max_total = int(getattr(settings, "context_tool_results_total_chars", 80_000) or 80_000)
+    total = sum(len(str(r.get("content", ""))) for r in tool_results)
+    if total <= max_total:
+        return tool_results
+
+    ratio = max_total / total
+    for r in tool_results:
+        content = str(r.get("content", ""))
+        if OVERFLOW_MARKER in content:
+            continue
+        if len(content) > 1000:
+            budget = max(500, int(len(content) * ratio))
+            if len(content) > budget:
+                half = budget // 2
+                overflow_path = save_overflow("tool_result_budget", content)
+                r["content"] = (
+                    content[:half]
+                    + f"\n\n{OVERFLOW_MARKER} 本轮工具结果合计 {total} 字符，"
+                    + f"超过上下文预算 {max_total} 字符；已压缩此结果。"
+                    + f"\n完整内容已保存到: {overflow_path}\n\n"
+                    + content[-half:]
+                )
+    return tool_results
+
+
+def _readonly_tool_cache_key(tool_name: str, tool_args: Any) -> str | None:
+    """Stable cache key for repeatable read-only network tools."""
+    if tool_name not in _CACHEABLE_READONLY_TOOLS:
+        return None
+    try:
+        param_str = json.dumps(tool_args or {}, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        param_str = str(tool_args)
+    return f"{tool_name}:{hashlib.md5(param_str.encode()).hexdigest()}"
+
+
+def _compact_cached_tool_content(tool_name: str, content: str) -> str:
+    """Create a compact cache summary so repeated network reads do not bloat context."""
+    text = str(content or "").strip()
+    summary_chars = int(getattr(settings, "context_cached_summary_chars", 2400) or 2400)
+    if len(text) <= summary_chars:
+        summary = text
+    else:
+        head = summary_chars // 2
+        tail = summary_chars - head
+        summary = (
+            text[:head]
+            + f"\n\n... [cached summary truncated {len(text) - summary_chars} chars] ...\n\n"
+            + text[-tail:]
+        )
+    return (
+        f"[系统缓存] {tool_name} 已用相同参数获取过，未再次发起外部请求。\n"
+        f"以下是上次结果摘要，请基于已有内容继续分析；如信息不足，请换查询角度或向用户说明需要更具体的目标。\n\n"
+        f"{summary}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mode-based tool filtering
+# ---------------------------------------------------------------------------
+
+# --- mode/intent/shell-write guards extracted to runtime.state_graph.guards.tool_filters ---
+# Previous private aliases kept for backward compatibility with downstream
+# code that still touches the private spellings (incl. reasoning_engine
+# internals patched in P-RC-5). See runtime/state_graph/guards/tool_filters.py
+# for the canonical implementations.
+from ..runtime.state_graph.guards.tool_filters import (
+    filter_tools_by_mode as _filter_tools_by_mode,
+)
+from ..runtime.state_graph.guards.tool_filters import (
+    should_block_tool as _should_block_tool,
+)
+
+
+class DecisionType(Enum):
+    """LLM 决策类型"""
+
+    FINAL_ANSWER = "final_answer"  # 纯文本响应
+    TOOL_CALLS = "tool_calls"  # 需要工具调用
+
+
+@dataclass
+class Decision:
+    """LLM 推理决策"""
+
+    type: DecisionType
+    text_content: str = ""
+    tool_calls: list[dict] = field(default_factory=list)
+    thinking_content: str = ""
+    raw_response: Any = None
+    stop_reason: str = ""
+    # 完整的 assistant_content（保留 thinking 块等）
+    assistant_content: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class Checkpoint:
+    """
+    决策检查点，用于多路径探索和回滚。
+
+    在关键决策点保存消息历史和任务状态的快照，
+    当检测到循环、连续失败等问题时可回滚到之前的检查点，
+    附加失败经验提示后重新推理。
+    """
+
+    id: str
+    messages_snapshot: list[dict]  # 深拷贝消息历史
+    state_snapshot: dict  # 序列化的 TaskState 关键字段
+    decision_summary: str  # 做出的决策摘要
+    iteration: int  # 保存时的迭代次数
+    timestamp: float = field(default_factory=time.time)
+    tool_names: list[str] = field(default_factory=list)  # 该决策调用的工具
+
+
+# Compatibility aliases for guards whose implementations live in the state graph runtime.
+from openkitsune.runtime.state_graph.guards.conversation_state import (
+    has_recoverable_tool_issue as _has_recoverable_tool_issue,
+)
+from openkitsune.runtime.state_graph.guards.conversation_state import (
+    looks_like_waiting_for_user_response as _looks_like_waiting_for_user_response,
+)
+from openkitsune.runtime.state_graph.guards.tool_failure_ack import (  # noqa: E402
+    check_tool_failure_acknowledgement as _check_tool_failure_acknowledgement,
+)
+# [整改 2026-10-10 对标 OpenAkita P-RC-5] 无工具完成声明防护（unbacked-action claim）：
+# OpenAkita 在 _handle_final_answer 用 action_claim_re + done 短语 + 文本化工具执行
+# 轨迹三路检测"已保存/已删除/调用X完成"类声明，零工具调用时强制有界重试，耗尽后
+# 返回非欺骗性失败文本，杜绝"报文本即停"。OpenKitsune 此前仅认 [ACTION] 标签，
+# 导致多轮后模型以完成态措辞收尾时任务静默失败，现恢复该防护。
+from openkitsune.runtime.state_graph.guards._text_patterns import (  # noqa: E402
+    action_done_re as _get_action_done_re,
+)
+from openkitsune.runtime.state_graph.guards.unbacked_action import (  # noqa: E402
+    action_claim_re as _get_action_claim_re,
+    looks_like_no_tool_completion_claim as _looks_like_no_tool_completion_claim,
+)
+
+# ----------------------------------------------------------------------------
+# 伪工具调用检测（对标 OpenAkita legacy _reasoning_engine_legacy.py）
+#
+# 当 LLM 在 final_answer 文本里写出形如
+#   ```tool_call
+#   org_accept_deliverable(...)
+#   ```
+# 或裸的 `org_submit_deliverable(...)` 字面量时，模型不会真正调用工具，
+# 但上层（producer / 组织编排）会误以为工具已执行，导致编排链路被卡死。
+# 这里提供轻量检测器，供 _handle_final_answer 等路径用于「补救式重试」。
+# ----------------------------------------------------------------------------
+
+_TOOL_CALL_FENCE_RE = re.compile(
+    r"```\s*tool[_-]?call\s*\n(.+?)```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# 已知会触发「写文本而非调工具」的工具名前缀。保留前缀化匹配可避免把普通函数
+# 名误判（例如 "list(...)"、"int(...)" 不会命中）。
+_TEXT_TOOL_CALL_PATTERNS: tuple[str, ...] = (
+    "org_",
+    "seedance_",
+    "tongyi_",
+    "clip_",
+    "ppt_",
+    "avatar_",
+    "memory_",
+    "mcp_",
+    "schedule_",
+)
+
+_INLINE_TOOL_CALL_RE = re.compile(
+    r"\b((?:" + "|".join(re.escape(p) for p in _TEXT_TOOL_CALL_PATTERNS) + r")[a-z0-9_]+)\s*\(",
+)
+
+
+def _detect_text_toolcall_block(text: str) -> list[str]:
+    """返回以纯文本伪调用形式出现的工具名（去重、排序）。
+
+    检测两种常见的 LLM 回退模式：
+
+    1. ```tool_call ... ``` 围栏块，块体里含 Markdown 文本形式的工具调用
+       （例如 ``org_accept_deliverable(task_chain_id=..., ...)``）。
+    2. 裸的 ``func_name(arg=...)`` 内联调用，且函数名匹配已知插件/运行时工具前缀。
+
+    返回空列表表示「未检测到伪工具调用」。调用方仅应在本轮没有发生真实工具
+    调用时才依据该结果采取行动。
+    """
+    if not text:
+        return []
+    found: set[str] = set()
+    fenced_hit = False
+    for m in _TOOL_CALL_FENCE_RE.finditer(text):
+        fenced_hit = True
+        body = m.group(1) or ""
+        for nm in _INLINE_TOOL_CALL_RE.findall(body):
+            found.add(nm)
+    if not fenced_hit:
+        for nm in _INLINE_TOOL_CALL_RE.findall(text):
+            found.add(nm)
+    return sorted(found)
+
+
+def _guard_text_toolcall_block(
+    text: str,
+    executed_tool_names: list[str],
+    intent: str | None,
+) -> list[str]:
+    """判断 LLM 是否把工具调用写成了文本却没有真正发起调用。
+
+    返回检测到的工具名，供调用方构造纠正消息。以下情况返回 ``[]``：
+
+    - 本轮实际执行了至少一个工具；
+    - LLM 把回复标注为 ``[REPLY]``（是在有意讨论工具，而非承诺执行动作）；
+    - 未出现任何伪调用模式。
+    """
+    if executed_tool_names:
+        return []
+    if intent == "REPLY":
+        return []
+    return _detect_text_toolcall_block(text or "")
+
+
+class ReasoningEngine:
+    """
+    显式推理-行动引擎。
+
+    替代 agent.py 中的 _chat_with_tools_and_context()，
+    将隐式循环重构为清晰的 Reason -> Act -> Observe 三阶段。
+    支持 Checkpoint + Rollback 多路径探索。
+    """
+
+    # 检查点配置
+    MAX_CHECKPOINTS = 5  # 保留最近 N 个检查点
+    CONSECUTIVE_FAIL_THRESHOLD = 3  # 同一工具连续失败 N 次触发回滚
+
+    # Plan / todo 家族工具：它们的 ❌ 输出通常是给 LLM 的 **入参校验反馈**
+    # （例如 "❌ steps 不能为空"、"❌ todo_id 不存在"），属于 schema 提示
+    # 而不是真正的执行失败，不应计入 rollback / 持久失败计数器。
+    # 否则模型在 plan 推进过程中调错一次参数就会反复触发回滚，把任务卡死。
+    _PLAN_TOOL_NAMES = frozenset(
+        {
+            "create_todo",
+            "update_todo_step",
+            "get_todo_status",
+            "complete_todo",
+            "create_plan_file",
+            "exit_plan_mode",
+        }
+    )
+    _RECOVERABLE_RESUME_EXIT_REASONS = frozenset(
+        {
+            "budget_exceeded",
+            "budget_paused",
+            "loop_terminated",
+            "max_iterations",
+            "reason_error",
+            "run_error",
+            "stream_error",
+            "stream_incomplete",
+            "verify_incomplete",
+            "illegal_state",
+        }
+    )
+
+    def __init__(
+        self,
+        brain: Any,
+        tool_executor: ToolExecutor,
+        context_manager: ContextManager,
+        response_handler: ResponseHandler,
+        agent_state: AgentState,
+        memory_manager: Any = None,
+        plan_exit_pending: dict | None = None,
+    ) -> None:
+        self._brain = brain
+        self._tool_executor = tool_executor
+        self._context_manager = context_manager
+        self._response_handler = response_handler
+        self._state = agent_state
+        self._memory_manager = memory_manager
+        self._plan_exit_pending = plan_exit_pending
+        self._plugin_hooks = None
+
+        # Agent Harness: Runtime Supervisor + Resource Budget
+        self._supervisor = RuntimeSupervisor(
+            enabled=getattr(settings, "supervisor_enabled", False),
+            token_anomaly_threshold=int(
+                getattr(settings, "context_token_anomaly_threshold", TOKEN_ANOMALY_THRESHOLD)
+                or TOKEN_ANOMALY_THRESHOLD
+            ),
+        )
+        self._budget: ResourceBudget = create_budget_from_settings()
+
+        # Checkpoint 管理
+        self._checkpoints: list[Checkpoint] = []
+        self._tool_failure_counter: dict[
+            str, int
+        ] = {}  # tool_name(args_hash) -> consecutive_failures
+        self._consecutive_truncation_count: int = 0  # 连续截断计数（防止截断→回滚死循环）
+
+        # 跨 rollback 的持久性失败计数器（rollback 不会清除）
+        # 用于检测 "write_file 因截断反复失败" 等跨 rollback 循环
+        self._persistent_tool_failures: dict[str, int] = {}
+        self.PERSISTENT_FAIL_LIMIT = 5  # 同一工具跨 rollback 累计失败 N 次强制终止
+
+        # 思维链: 暂存最近一次推理的 react_trace，供 agent_handler 读取
+        self._last_react_trace: list[dict] = []
+
+        # 暂存最近一次推理结束时的 working_messages，供 token 统计读取
+        self._last_working_messages: list[dict] = []
+
+        # 暂存最近一轮的上下文压力快照（messages/system/tools tokens、soft/hard limit、
+        # context_safe），由 calculate_context_pressure 调用点同步更新；
+        # api/routes/chat.py 在组装 done event 时读取并塞进 usage.context_pressure，
+        # 给前端"上下文健康度"展示用，避免重新计算。
+        self._last_context_pressure: dict | None = None
+
+        # 上一次推理的退出原因：normal / ask_user / loop_terminated / max_iterations / verify_incomplete
+        # _finalize_session 据此决定是否自动关闭 Plan；OrgRuntime 据此区分
+        # task_completed / task_failed / task_terminated 三种事件
+        self._last_exit_reason: str = "normal"
+
+        # 上一次推理中 deliver_artifacts 的交付回执
+        self._last_delivery_receipts: list[dict] = []
+
+        # Checkpoint 数据中 messages_snapshot 可含大量工具结果，
+        # 在 session 结束时清理以释放内存
+        self._max_working_messages_kept = 0  # 清理时保留的条数（0=全部释放）
+
+        # 浏览器"读页面状态"工具
+        self._browser_page_read_tools = frozenset(
+            {
+                "browser_get_content",
+                "browser_screenshot",
+            }
+        )
+        self._readonly_tool_cache: dict[str, dict[str, str]] = {}
+
+    def _cached_readonly_tool_result(
+        self,
+        tool_name: str,
+        tool_args: Any,
+        tool_id: str,
+    ) -> dict | None:
+        key = _readonly_tool_cache_key(tool_name, tool_args)
+        if not key or key not in self._readonly_tool_cache:
+            return None
+        cached = self._readonly_tool_cache[key]
+        first_id = cached.get("first_tool_use_id", "")
+        summary = cached.get("summary", "")
+        pointer = key.split(":", 1)[-1][:10]
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": (
+                f"[系统缓存:{pointer}] {tool_name} 相同参数结果已在本任务中获取过，"
+                f"引用首次结果 {first_id or 'unknown'}；未再次发起外部请求。\n"
+                f"{summary[:600]}"
+            ),
+            "cached": True,
+            "tool_name": tool_name,
+            "cache_key": key,
+            "first_tool_use_id": first_id,
+        }
+
+    def _remember_readonly_tool_result(
+        self,
+        tool_name: str,
+        tool_args: Any,
+        result_text: str,
+        tool_id: str = "",
+    ) -> None:
+        key = _readonly_tool_cache_key(tool_name, tool_args)
+        if not key or not result_text:
+            return
+        if key not in self._readonly_tool_cache:
+            self._readonly_tool_cache[key] = {
+                "summary": _compact_cached_tool_content(tool_name, result_text),
+                "first_tool_use_id": tool_id,
+            }
+
+    # ==================== Failure Analysis (Agent Harness) ====================
+
+    def _run_failure_analysis(
+        self,
+        react_trace: list[dict],
+        exit_reason: str,
+        task_description: str = "",
+        task_id: str = "",
+    ) -> None:
+        """在任务失败时运行失败分析管线"""
+        try:
+            from ..config import settings
+            from ..evolution.failure_analysis import FailureAnalyzer
+
+            analyzer = FailureAnalyzer(output_dir=settings.data_dir / "failure_analysis")
+            analyzer.analyze_task(
+                task_id=task_id or "unknown",
+                react_trace=react_trace,
+                supervisor_events=[
+                    {
+                        "pattern": e.pattern.value,
+                        "level": e.level.name,
+                        "detail": e.detail,
+                        "iteration": e.iteration,
+                    }
+                    for e in self._supervisor.events
+                ],
+                budget_summary=self._budget.get_summary(),
+                exit_reason=exit_reason,
+                task_description=task_description,
+            )
+        except Exception as e:
+            logger.debug(f"[FailureAnalysis] Analysis error: {e}")
+
+    # ==================== 内存管理 ====================
+
+    def release_large_buffers(self) -> None:
+        """释放推理结束后残留的大对象，防止内存泄漏。
+
+        在 _cleanup_session_state 中调用。
+        _last_working_messages 持有完整的 LLM 上下文（含 base64 截图、
+        网页内容等工具结果），是最大的内存占用者，必须主动释放。
+        _checkpoints 含 messages_snapshot 深拷贝，同样需要释放。
+
+        注意：不清理 _last_react_trace — 它已被复制到 agent._last_finalized_trace，
+        而 _last_finalized_trace 由 orchestrator / SSE 使用，需等到下次会话自然覆盖。
+        """
+        self._last_working_messages = []
+        self._checkpoints.clear()
+        self._tool_failure_counter.clear()
+        self._supervisor.reset()
+
+    # ==================== ask_user 等待用户回复 ====================
+
+    async def _wait_for_user_reply(
+        self,
+        question: str,
+        state: TaskState,
+        *,
+        timeout_seconds: int = 60,
+        max_reminders: int = 1,
+        poll_interval: float = 2.0,
+    ) -> str | None:
+        """
+        等待用户回复 ask_user 的问题（仅 IM 模式生效）。
+
+        利用 Gateway 的中断队列机制：IM 用户在 Agent 处理中发送的消息
+        会被 Gateway 放入 interrupt_queue，本方法轮询该队列获取回复。
+
+        流程:
+        1. 通过 Gateway 发送问题给用户
+        2. 轮询 interrupt_queue 等待回复（timeout_seconds 超时）
+        3. 第一次超时 → 发送提醒，再等一轮
+        4. 第二次超时 → 返回 None，由调用方注入系统消息让 LLM 自行决策
+
+        Args:
+            question: 要发送给用户的问题文本
+            state: 当前任务状态（用于取消检查）
+            timeout_seconds: 每轮等待超时（秒）
+            max_reminders: 最大追问提醒次数
+            poll_interval: 轮询间隔（秒）
+
+        Returns:
+            用户回复文本，或 None（超时/无 gateway/被取消）
+        """
+        # 获取 gateway 和 session 引用
+        session = self._state.current_session
+        if not session:
+            return None
+
+        gateway = session.get_metadata("_gateway") if hasattr(session, "get_metadata") else None
+        session_key = session.get_metadata("_session_key") if gateway else None
+
+        if not gateway or not session_key:
+            # CLI 模式或无 gateway，不做等待
+            return None
+
+        # 先 flush 进度缓冲区，确保思考/工具进度在问题之前送达
+        if hasattr(gateway, "flush_progress"):
+            try:
+                await gateway.flush_progress(session)
+            except Exception:
+                pass
+
+        # 发送问题到用户
+        try:
+            await gateway.send_to_session(session, question, role="assistant")
+            logger.info(
+                f"[ask_user] Question sent to user, waiting for reply (timeout={timeout_seconds}s)"
+            )
+        except Exception as e:
+            logger.warning(f"[ask_user] Failed to send question via gateway: {e}")
+            return None
+
+        reminders_sent = 0
+
+        while reminders_sent <= max_reminders:
+            # 轮询等待用户回复
+            elapsed = 0.0
+
+            while elapsed < timeout_seconds:
+                # 检查任务是否被取消
+                if state.cancelled:
+                    logger.info("[ask_user] Task cancelled while waiting for reply")
+                    return None
+
+                # 检查中断队列
+                try:
+                    reply_msg = await gateway.check_interrupt(session_key)
+                except Exception as e:
+                    logger.warning(f"[ask_user] check_interrupt error: {e}")
+                    reply_msg = None
+
+                if reply_msg:
+                    # 从 UnifiedMessage 提取文本
+                    reply_text = (
+                        reply_msg.plain_text.strip()
+                        if hasattr(reply_msg, "plain_text") and reply_msg.plain_text
+                        else str(reply_msg).strip()
+                    )
+                    if reply_text:
+                        logger.info(f"[ask_user] User replied: {reply_text[:80]}")
+                        # 记录到 session 历史
+                        try:
+                            session.add_message(
+                                role="user", content=reply_text, source="ask_user_reply"
+                            )
+                        except Exception:
+                            pass
+                        return reply_text
+
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+
+            # 本轮超时
+            if reminders_sent < max_reminders:
+                # 发送追问提醒
+                reminders_sent += 1
+                reminder = "⏰ 我在等你回复上面的问题哦，看到的话回复一下~"
+                try:
+                    await gateway.send_to_session(session, reminder, role="assistant")
+                    logger.info(f"[ask_user] Timeout #{reminders_sent}, reminder sent")
+                except Exception as e:
+                    logger.warning(f"[ask_user] Failed to send reminder: {e}")
+            else:
+                # 追问次数用尽，返回 None
+                logger.info(
+                    f"[ask_user] Final timeout after {reminders_sent} reminder(s), "
+                    f"total wait ~{timeout_seconds * (max_reminders + 1)}s"
+                )
+                return None
+
+        return None
+
+    # ==================== Checkpoint / Rollback ====================
+
+    def _save_checkpoint(
+        self,
+        messages: list[dict],
+        state: TaskState,
+        decision: Decision,
+        iteration: int,
+    ) -> None:
+        """
+        在关键决策点保存检查点。
+
+        仅在工具调用决策时保存（纯文本响应不需要回滚）。
+        保留最近 MAX_CHECKPOINTS 个检查点以控制内存。
+        """
+        tool_names = [tc.get("name", "") for tc in decision.tool_calls]
+        summary = f"iteration={iteration}, tools=[{', '.join(tool_names)}]"
+
+        cp = Checkpoint(
+            id=str(uuid.uuid4())[:8],
+            messages_snapshot=copy.deepcopy(messages),
+            state_snapshot={
+                "iteration": state.iteration,
+                "status": state.status.value,
+                "executed_tools": list(state.tools_executed),
+            },
+            decision_summary=summary,
+            iteration=iteration,
+            tool_names=tool_names,
+        )
+        self._checkpoints.append(cp)
+
+        # 保留最近 N 个
+        if len(self._checkpoints) > self.MAX_CHECKPOINTS:
+            self._checkpoints = self._checkpoints[-self.MAX_CHECKPOINTS :]
+
+        logger.debug(f"[Checkpoint] Saved: {cp.id} at iteration {iteration}")
+
+    def _record_tool_result(
+        self,
+        tool_name: str,
+        success: bool,
+        tool_args: Any | None = None,
+    ) -> None:
+        """记录工具执行结果，用于连续失败检测。
+
+        Plan/todo 家族工具的 ❌ 输出多为入参校验反馈而非真正的执行失败，
+        不参与 ``_tool_failure_counter`` / ``_persistent_tool_failures``
+        统计——既不计失败，也不重置。否则任何一次 update_todo_step 校验
+        提示都会被算成"失败"，连续 3 次就会触发回滚把 plan 推进截断。
+        """
+        if tool_name in self._PLAN_TOOL_NAMES:
+            return
+        key = _tool_rate_limit_key(tool_name, tool_args or {})
+        if success:
+            self._tool_failure_counter[key] = 0
+            # 成功时也重置持久计数器
+            self._persistent_tool_failures.pop(key, None)
+        else:
+            self._tool_failure_counter[key] = self._tool_failure_counter.get(key, 0) + 1
+            self._persistent_tool_failures[key] = self._persistent_tool_failures.get(key, 0) + 1
+
+    def _compact_after_token_anomaly(
+        self,
+        working_messages: list[dict],
+        react_trace: list[dict],
+        tokens: int,
+    ) -> None:
+        """Shrink large tool payloads after a token spike to avoid replay storms."""
+        if active_transcript.get() is not None:
+            # Durable history changes only through the validated compression pipeline.
+            return
+        anomaly_threshold = int(
+            getattr(settings, "context_token_anomaly_threshold", TOKEN_ANOMALY_THRESHOLD)
+            or TOKEN_ANOMALY_THRESHOLD
+        )
+        if tokens <= anomaly_threshold:
+            return
+
+        summary_chars = int(getattr(settings, "context_cached_summary_chars", 2400) or 2400)
+
+        for msg in working_messages:
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "tool_result":
+                    continue
+                text = str(item.get("content", ""))
+                if len(text) > summary_chars:
+                    item["content"] = _compact_cached_tool_content(
+                        str(item.get("tool_name") or "tool_result"),
+                        text,
+                    )
+                    item["compacted_after_token_anomaly"] = True
+
+        for trace in react_trace[-3:]:
+            results = trace.get("tool_results") if isinstance(trace, dict) else None
+            if not isinstance(results, list):
+                continue
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("result_content", ""))
+                if len(text) > summary_chars:
+                    item["result_content"] = _compact_cached_tool_content(
+                        str(item.get("tool_name") or "tool_result"),
+                        text,
+                    )
+                    item["compacted_after_token_anomaly"] = True
+
+    @staticmethod
+    def _is_pending_confirm_result(result: Any) -> bool:
+        """True when a tool_result represents a CONFIRM placeholder.
+
+        PolicyEngineV2 → ToolExecutor 拦截到 CONFIRM 决策时会返回一个
+        ``is_error=True`` 的占位 tool_result。两条等价路径：
+
+        * 有人值守 / 兜底 confirm：dict 带 ``_security_confirm`` metadata，
+          body 是"⚠️ 需要用户确认 …"。
+        * 无人值守 unattended_strategy（``ask_owner`` / ``defer_to_inbox`` /
+          ``defer_to_owner``）：dict 带 ``_deferred_approval_id``，body 是
+          "⏸️ 工具调用 ... 需要 owner 批准 ..."。
+
+        从 ReAct 的角度，这不是"工具失败"，而是"工具被推迟到用户/owner
+        决策之后"，不应被记入 ``_tool_failure_counter`` 或触发
+        ``本轮所有工具调用均失败`` 的回滚——否则 LLM 会反复重试同一条
+        调用、被 Supervisor 当成死循环终止，或者整个组织 chain 被回滚到
+        不可恢复的位置。
+        """
+        if not isinstance(result, dict):
+            return False
+        if result.get("_security_confirm"):
+            return True
+        if result.get("_deferred_approval_id"):
+            return True
+        content = str(result.get("content", ""))
+        return (
+            "⚠️ 需要用户确认" in content
+            or "已向用户发送确认请求" in content
+            or "需要 owner 批准" in content
+            or content.startswith("⏸️")
+        )
+
+    def _should_rollback(
+        self,
+        tool_results: list[dict],
+        tool_calls: list[dict] | None = None,
+    ) -> tuple[bool, str]:
+        """
+        检查是否应该触发回滚。
+
+        触发条件:
+        1. 同一工具连续失败 >= CONSECUTIVE_FAIL_THRESHOLD 次
+        2. 整批工具全部失败
+
+        ``tool_calls`` 为可选的 decision.tool_calls 列表（按索引与
+        ``tool_results`` 对齐），用于把 plan/todo 家族工具的 ❌ 入参校验
+        反馈从"批失败"中剔除——否则只调用了一个 update_todo_step 又恰好
+        触发了字段校验提示，就会被算作"本轮所有工具调用均失败"而触发回滚。
+
+        CONFIRM 占位（``_security_confirm`` metadata）也跳过批失败统计：
+        这类结果代表"等用户/owner 决策"，不是工具失败本身。
+
+        Returns:
+            (should_rollback, reason)
+        """
+        if not self._checkpoints:
+            return False, ""
+
+        # 检查本批次工具执行结果
+        batch_failures = []
+        for i, result in enumerate(tool_results):
+            content = ""
+            # 主信号: tool_result 的结构化 is_error 标志
+            is_error_flag = False
+            if isinstance(result, dict):
+                content = str(result.get("content", ""))
+                is_error_flag = result.get("is_error", False)
+            elif isinstance(result, str):
+                content = result
+
+            # 工具自带行为指引时，跳过回滚——让工具返回的约束直接作用于模型，
+            # 避免回滚注入"请尝试完全不同的方法"覆盖工具的"禁止替代"指引
+            if "[行为指引]" in content:
+                return False, ""
+
+            # CONFIRM 占位不是失败，是"等用户决策"。从批失败统计里剔除。
+            if self._is_pending_confirm_result(result):
+                continue
+
+            # Plan/todo 家族工具的 ❌ 是 schema 校验提示，不计入批失败
+            if tool_calls and i < len(tool_calls):
+                _name = tool_calls[i].get("name", "") if isinstance(tool_calls[i], dict) else ""
+                if _name in self._PLAN_TOOL_NAMES:
+                    continue
+
+            # 兜底: 字符串标记匹配（handler 返回的错误字符串）
+            has_error = is_error_flag or any(
+                marker in content
+                for marker in [
+                    "❌",
+                    "⚠️ 工具执行错误",
+                    "错误类型:",
+                    "ToolError",
+                    "⚠️ 策略拒绝:",
+                ]
+            )
+            has_success = any(
+                marker in content
+                for marker in [
+                    "✅",
+                    '"status": "delivered"',
+                    '"ok": true',
+                ]
+            )
+
+            # 部分成功（如 deliver_artifacts 2张图发了1张）不算失败，
+            # 避免回滚已经发出的不可撤回内容
+            is_failed = has_error and not has_success
+            batch_failures.append(is_failed)
+
+        # 整批全部失败（注意：plan 工具已被 continue 跳过，不参与判定，
+        # 因此一个 batch 中只有 plan 工具时 batch_failures 为空 → 不触发）
+        if batch_failures and all(batch_failures):
+            return True, "本轮所有工具调用均失败"
+
+        # 单工具连续失败
+        for tool_name, count in self._tool_failure_counter.items():
+            if count >= self.CONSECUTIVE_FAIL_THRESHOLD:
+                return True, f"工具 '{tool_name}' 连续失败 {count} 次"
+
+        return False, ""
+
+    def _rollback(self, reason: str) -> tuple[list[dict], int] | None:
+        """
+        执行回滚: 恢复到上一个检查点。
+
+        在恢复的消息历史末尾附加失败经验提示，
+        帮助 LLM 避免重蹈覆辙。
+
+        Returns:
+            (restored_messages, checkpoint_iteration) or None if no checkpoints
+        """
+        if not self._checkpoints:
+            return None
+
+        # 弹出最近的检查点（避免回滚到同一个点）
+        cp = self._checkpoints.pop()
+        restored_messages = copy.deepcopy(cp.messages_snapshot)
+
+        # 附加失败经验
+        failure_hint = (
+            f"[系统提示] 之前的方案失败了（原因: {reason}）。"
+            f"失败的决策: {cp.decision_summary}。"
+            f"请尝试完全不同的方法来完成任务。"
+            f"避免使用与之前相同的工具参数组合。"
+            f"如果是因为工具参数被 API 截断（如 write_file 内容过长），"
+            f"请将内容拆分为多次小写入。"
+        )
+        restored_messages.append(
+            {
+                "role": "user",
+                "content": failure_hint,
+            }
+        )
+
+        # 重置失败计数器
+        self._tool_failure_counter.clear()
+
+        logger.info(
+            f"[Rollback] Rolled back to checkpoint {cp.id} "
+            f"(iteration {cp.iteration}). Reason: {reason}"
+        )
+
+        return restored_messages, cp.iteration
+
+    def _apply_endpoint_override(
+        self,
+        endpoint_override: str | None,
+        *,
+        conversation_id: str | None,
+        reason: str,
+        endpoint_policy: str = "prefer",
+    ) -> bool:
+        """Apply an endpoint preference without making it a hard blocker."""
+        if not endpoint_override:
+            return False
+
+        llm_client = getattr(self._brain, "_llm_client", None)
+        if not llm_client or not hasattr(llm_client, "switch_model"):
+            logger.warning(
+                "[EndpointOverride] Ignoring %s because no switch-capable LLM client is available",
+                endpoint_override,
+            )
+            return False
+
+        ok, msg = llm_client.switch_model(
+            endpoint_name=endpoint_override,
+            hours=0.05,
+            reason=reason,
+            conversation_id=conversation_id,
+            policy=endpoint_policy,
+        )
+        if ok:
+            logger.info(
+                "[EndpointOverride] Switched to %s for %s",
+                endpoint_override,
+                conversation_id or "global",
+            )
+            return True
+
+        logger.warning(
+            "[EndpointOverride] Ignoring unavailable endpoint %s: %s; using auto selection",
+            endpoint_override,
+            msg,
+        )
+        return False
+
+    async def run(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict],
+        system_prompt: str = "",
+        base_system_prompt: str = "",
+        task_description: str = "",
+        task_monitor: Any = None,
+        session_type: str = "cli",
+        interrupt_check_fn: Any = None,
+        conversation_id: str | None = None,
+        thinking_mode: str | None = None,
+        thinking_depth: str | None = None,
+        progress_callback: Any = None,
+        agent_profile_id: str = "default",
+        endpoint_override: str | None = None,
+        endpoint_policy: str = "prefer",
+        force_tool_retries: int | None = None,
+        tool_evidence_required: bool = False,
+        is_sub_agent: bool = False,
+        mode: str = "agent",
+        agent_voice: str = "",
+        session: Any = None,
+        request_id: str = "",
+        turn_id: str = "",
+    ) -> str:
+        """Consume the canonical event-stream loop and aggregate its final text."""
+        del interrupt_check_fn  # Kept in the public signature for compatibility.
+
+        response_text = ""
+        chain_text = ""
+        error_message = ""
+        async for event in self.reason_stream(
+            messages,
+            tools=tools,
+            system_prompt=system_prompt,
+            base_system_prompt=base_system_prompt,
+            task_description=task_description,
+            task_monitor=task_monitor,
+            session_type=session_type,
+            mode=mode,
+            endpoint_override=endpoint_override,
+            endpoint_policy=endpoint_policy,
+            conversation_id=conversation_id,
+            thinking_mode=thinking_mode,
+            thinking_depth=thinking_depth,
+            agent_profile_id=agent_profile_id,
+            force_tool_retries=force_tool_retries,
+            tool_evidence_required=tool_evidence_required,
+            is_sub_agent=is_sub_agent,
+            agent_voice=agent_voice,
+            session=session,
+            request_id=request_id,
+            turn_id=turn_id,
+            review_at_exit=False,  # 聚合路径：终审交由调用方出口钩子，防双重审查
+        ):
+            event_type = event.get("type")
+            content = str(event.get("content") or "")
+            if event_type == "text_delta":
+                response_text += content
+            elif event_type == "text_replace":
+                response_text = content
+            elif event_type == "ask_user" and not response_text:
+                response_text = str(event.get("question") or "")
+            elif event_type == "chain_text":
+                chain_text += content
+                if progress_callback and content:
+                    try:
+                        await progress_callback(content)
+                    except Exception:
+                        pass
+            elif event_type == "error":
+                error_message = str(event.get("message") or "reasoning stream failed")
+
+        if error_message:
+            raise RuntimeError(error_message)
+        cleaned = clean_llm_response(response_text)
+        if cleaned:
+            return cleaned
+        cleaned_chain = clean_llm_response(chain_text)
+        if cleaned_chain:
+            return cleaned_chain
+        return ""
+
+    # ==================== 流式输出 (SSE) ====================
+
+    async def _sync_plan_context(self, messages: list[dict], conversation_id: str | None) -> None:
+        """Sample plan state at a safe tool-batch boundary, never rewrite system/history."""
+        if not conversation_id:
+            return
+        from ..tools.handlers.plan import get_active_todo_prompt
+
+        try:
+            payload = get_active_todo_prompt(conversation_id)
+        except Exception:
+            logger.warning("Plan state is temporarily unavailable", exc_info=True)
+            payload = None
+        transcript = active_transcript.get()
+        if transcript is not None:
+            await transcript.update_context(messages, "active_plan", payload)
+            return
+        # Compatibility for direct engine callers without a durable session.
+        from ..sessions.model_transcript import _context_message
+
+        old = next(
+            (
+                m.get("_model_context", {})
+                for m in reversed(messages)
+                if m.get("_model_context", {}).get("key") == "active_plan"
+            ),
+            {},
+        )
+        if old.get("payload", "") != payload:
+            messages.append(
+                _context_message("active_plan", payload, "session", old.get("version", 0) + 1)
+            )
+
+    async def reason_stream(self, messages: list[dict], **kwargs):
+        """Admit once, then replay committed model messages across normal turns and restarts."""
+        conversation_id = kwargs.get("conversation_id")
+        session = kwargs.get("session")
+        if session is None:
+            agent = getattr(getattr(self, "_tool_executor", None), "_agent_ref", None)
+            session = getattr(agent, "_current_session", None)
+        from ..sessions.manager import SessionManager
+
+        transcript = await SessionManager.open_model_transcript(
+            data_dir=settings.data_dir,
+            conversation_id=conversation_id,
+            profile=kwargs.get("agent_profile_id", "default"),
+            session=session,
+            sub_agent=kwargs.get("is_sub_agent", False),
+        )
+        token = active_transcript.set(transcript)
+        self._last_working_messages = []
+        driver = None
+        try:
+            system, sections, sampled_time = extract_context(
+                kwargs.get("base_system_prompt") or kwargs.get("system_prompt", "")
+            )
+            kwargs["base_system_prompt"] = system
+            kwargs["system_prompt"] = extract_context(kwargs.get("system_prompt", ""))[0]
+            turn_id = kwargs.get("turn_id") or kwargs.get("request_id") or uuid.uuid4().hex
+            kwargs["turn_id"] = turn_id
+            resumed = None
+            if transcript.revision == 0:
+                resumed = self._maybe_load_resume_working_messages(
+                    messages, conversation_id, kwargs.get("is_sub_agent", False), consume=False
+                )
+                if resumed is not None:
+                    messages = resumed
+            admitted = await transcript.admit(messages, sections, sampled_time, turn_id)
+            if resumed is not None:
+                # Keep the legacy snapshot until its replacement is durably committed.
+                clear_persisted_working_messages(conversation_id, base_dir=settings.data_dir)
+            if turn_id in transcript.completed_turns:
+                self._last_working_messages = copy.deepcopy(admitted)
+                self._last_exit_reason = transcript.completed_exit_reasons[turn_id]
+                self._last_react_trace = []
+                self._last_delivery_receipts = []
+                for event in transcript.completed_turns[turn_id]:
+                    yield copy.deepcopy(event)
+                return
+            displayed = ""
+            question_event = None
+            failed = False
+            driver = self._reason_stream_with_state(admitted, **kwargs)
+            async for event in driver:
+                if event.get("type") not in (
+                    "text_delta",
+                    "thinking_delta",
+                    "reasoning_delta",
+                    "heartbeat",
+                ):
+                    working = transcript.working_messages or self._last_working_messages
+                    if working:
+                        await transcript.sync(working)
+                event_type = event.get("type")
+                if event_type == "text_delta":
+                    displayed += event.get("content", "")
+                elif event_type == "text_replace":
+                    displayed = event.get("content", "")
+                elif event_type == "ask_user":
+                    question_event = copy.deepcopy(event)
+                elif event_type == "error":
+                    failed = True
+                elif event_type == "done" and not failed:
+                    replay = [{"type": "text_delta", "content": displayed}] if displayed else []
+                    if question_event:
+                        replay.append(question_event)
+                    await transcript.complete_turn(
+                        [*replay, {"type": "done"}],
+                        exit_reason=getattr(self, "_last_exit_reason", "normal"),
+                    )
+                yield event
+        finally:
+            try:
+                if driver is not None:
+                    await driver.aclose()
+                working = transcript.working_messages or self._last_working_messages
+                if working:
+                    await transcript.sync(working)
+            finally:
+                active_transcript.reset(token)
+                transcript.close()
+
+    async def _reason_stream_with_state(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        system_prompt: str = "",
+        base_system_prompt: str = "",
+        task_description: str = "",
+        task_monitor: Any = None,
+        session_type: str = "desktop",
+        plan_mode: bool = False,
+        mode: str = "agent",
+        endpoint_override: str | None = None,
+        endpoint_policy: str = "prefer",
+        conversation_id: str | None = None,
+        thinking_mode: str | None = None,
+        thinking_depth: str | None = None,
+        agent_profile_id: str = "default",
+        session: Any = None,
+        force_tool_retries: int | None = None,
+        tool_evidence_required: bool = False,
+        is_sub_agent: bool = False,
+        request_id: str = "",
+        turn_id: str = "",
+        agent_voice: str = "",
+        review_at_exit: bool = True,
+    ):
+        """Outer wrapper for the streaming ReAct loop."""
+        captured_state_ref: dict[str, Any] = {"state": None}
+        _scope_attach: dict[str, Any] = {"parent": None, "attached": False}
+        _stream_done_seen = False
+        _stream_error_seen = False
+        _stream_exit_reason = ""
+
+        def _on_state_resolved(st: Any) -> None:
+            captured_state_ref["state"] = st
+            try:
+                _parent = current_abort_scope.get()
+                if (
+                    _parent is not None
+                    and _parent is not st.abort_root
+                    and st.abort_root.parent is None
+                ):
+                    _parent.children.append(st.abort_root)
+                    st.abort_root.parent = _parent
+                    _scope_attach["parent"] = _parent
+                    _scope_attach["attached"] = True
+                    if _parent.event.is_set() and not st.abort_root.event.is_set():
+                        st.abort_root.abort(_parent.reason, _from=_parent.name)
+            except Exception:
+                logger.debug("[ReAct-Stream] sub-agent AbortScope attach failed", exc_info=True)
+
+        impl_stream = None
+        try:
+            impl_stream = self._reason_stream_impl(
+                messages,
+                tools=tools,
+                system_prompt=system_prompt,
+                base_system_prompt=base_system_prompt,
+                task_description=task_description,
+                task_monitor=task_monitor,
+                session_type=session_type,
+                plan_mode=plan_mode,
+                mode=mode,
+                endpoint_override=endpoint_override,
+                endpoint_policy=endpoint_policy,
+                conversation_id=conversation_id,
+                thinking_mode=thinking_mode,
+                thinking_depth=thinking_depth,
+                agent_profile_id=agent_profile_id,
+                session=session,
+                force_tool_retries=force_tool_retries,
+                tool_evidence_required=tool_evidence_required,
+                is_sub_agent=is_sub_agent,
+                request_id=request_id,
+                turn_id=turn_id,
+                agent_voice=agent_voice,
+                review_at_exit=review_at_exit,
+                _on_state_resolved=_on_state_resolved,
+            )
+            async for event in impl_stream:
+                _event_type = event.get("type") if isinstance(event, dict) else ""
+                if _event_type == "done":
+                    _stream_done_seen = True
+                elif _event_type == "error":
+                    _stream_error_seen = True
+                    _stream_exit_reason = str(event.get("code") or "stream_error")
+                elif _event_type == "task_checkpoint":
+                    _checkpoint_exit = str(event.get("exit_reason") or "").strip()
+                    if _checkpoint_exit:
+                        _stream_exit_reason = _checkpoint_exit
+
+                _st = captured_state_ref.get("state")
+                if _st is not None:
+                    _et = event.get("type")
+                    if _et in ("text_delta", "chain_text"):
+                        _content = event.get("content", "")
+                        if isinstance(_content, str) and _content:
+                            try:
+                                _st.append_partial_text(_content)
+                            except Exception:  # pragma: no cover
+                                logger.debug(
+                                    "[ReAct-Stream] append_partial_text failed",
+                                    exc_info=True,
+                                )
+                    elif _et in ("thinking_delta", "reasoning_delta"):
+                        _content = event.get("content", "")
+                        if isinstance(_content, str) and _content:
+                            try:
+                                _st.append_partial_thinking(_content)
+                            except Exception:  # pragma: no cover
+                                logger.debug(
+                                    "[ReAct-Stream] append_partial_thinking failed",
+                                    exc_info=True,
+                                )
+                yield event
+        finally:
+            if impl_stream is not None:
+                await impl_stream.aclose()
+            st = captured_state_ref.get("state")
+            _exit_reason = _stream_exit_reason or getattr(self, "_last_exit_reason", "") or ""
+            if not _stream_done_seen and _exit_reason in ("", "normal"):
+                _exit_reason = "stream_incomplete"
+            elif _stream_error_seen and _exit_reason in ("", "normal"):
+                _exit_reason = "stream_error"
+            self._maybe_persist_recoverable_exit_working_messages(
+                getattr(self, "_last_working_messages", []),
+                st,
+                getattr(st, "current_model", "")
+                or getattr(getattr(self, "_brain", None), "model", ""),
+                exit_reason=_exit_reason,
+                done_seen=_stream_done_seen,
+                error_seen=_stream_error_seen,
+            )
+            if st is not None and not st.settled_event.is_set():
+                try:
+                    st.mark_settled()
+                except Exception:
+                    logger.debug(
+                        "[ReAct-Stream] mark_settled failed in outer wrapper finally",
+                        exc_info=True,
+                    )
+            if _scope_attach.get("attached"):
+                _parent = _scope_attach.get("parent")
+                if _parent is not None and st is not None:
+                    try:
+                        _parent.remove_child(st.abort_root)
+                    except Exception:
+                        pass
+                    if st.abort_root.parent is _parent:
+                        st.abort_root.parent = None
+
+            self._maybe_clear_resume_state(conversation_id, is_sub_agent, st)
+
+    def _get_plan_section_with_hydration(
+        self, conversation_id: str | None, messages: list[dict]
+    ) -> str:
+        """获取活跃 Todo 段落；无活跃 Todo 时先从消息历史水合
+        （对标 Hermes ``_hydrate_todo_store``），再取段落。
+
+        覆盖：进程重启 / store 清空 / 压缩后内存态丢失但消息历史仍含
+        create_todo 工具调用的场景，避免多轮任务"任务链断裂"
+        （2026-10-11 V2 整改：restore_from_messages 此前为死代码，
+        压缩后 plan_section 为空会导致模型丢失任务清单）。
+        """
+        if not conversation_id or not messages:
+            return ""
+        from ..tools.handlers.plan import get_active_todo_prompt
+
+        _sec = get_active_todo_prompt(conversation_id) or ""
+        if _sec:
+            return _sec
+        try:
+            from ..tools.handlers.plan import create_todo_handler
+            from ..tools.handlers.todo_state import hydrate_todo_from_messages
+
+            _agent_ref = getattr(getattr(self, "_tool_executor", None), "_agent_ref", None)
+            _factory = (
+                (lambda: create_todo_handler(_agent_ref)) if _agent_ref is not None else None
+            )
+            hydrate_todo_from_messages(conversation_id, messages, handler_factory=_factory)
+        except Exception:
+            pass
+        return get_active_todo_prompt(conversation_id) or ""
+
+    async def _reason_stream_impl(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        system_prompt: str = "",
+        base_system_prompt: str = "",
+        task_description: str = "",
+        task_monitor: Any = None,
+        session_type: str = "desktop",
+        plan_mode: bool = False,
+        mode: str = "agent",
+        endpoint_override: str | None = None,
+        endpoint_policy: str = "prefer",
+        conversation_id: str | None = None,
+        thinking_mode: str | None = None,
+        thinking_depth: str | None = None,
+        agent_profile_id: str = "default",
+        session: Any = None,
+        force_tool_retries: int | None = None,
+        tool_evidence_required: bool = False,
+        is_sub_agent: bool = False,
+        request_id: str = "",
+        turn_id: str = "",
+        agent_voice: str = "",
+        review_at_exit: bool = True,
+        _on_state_resolved: Any = None,
+    ):
+        """
+        流式推理循环，为 HTTP API (SSE) 设计。
+
+        与 run() 保持特性对齐：TaskMonitor、循环检测、模型切换、
+        LLM 错误重试、任务完成度验证、Rollback 等。
+
+        调用方（如 Agent.chat_with_session_stream）需传入 tools 和 system_prompt，
+        新增参数均 optional，向后兼容老的调用方式。
+
+        Yields dict events:
+        - {"type": "iteration_start", "iteration": N}
+        - {"type": "context_compressed", "before_tokens": N, "after_tokens": M}
+        - {"type": "thinking_start"} / {"type": "thinking_delta"} / {"type": "thinking_end"}
+        - {"type": "text_delta", "content": "..."}
+        - {"type": "text_replace", "content": "..."}  # PR-G1: reset 前端 buffer，
+                                                       # 用于 ForceToolCall / Supervisor /
+                                                       # tool_evidence_required 等需要"撤回
+                                                       # 已发出文本，重新生成"的场景。
+                                                       # 前端 ChatView 已支持该 case。
+        - {"type": "tool_call_start"} / {"type": "tool_call_end"}
+        - {"type": "todo_created"} / {"type": "todo_step_updated"}
+        - {"type": "ask_user", "question": "..."}
+        - {"type": "error", "message": "..."}
+        - {"type": "done"}
+        """
+        tools = tools or []
+        self._last_exit_reason = "normal"
+        self._last_react_trace = []
+        self._last_delivery_receipts = []
+        self._supervisor.reset()
+        self._readonly_tool_cache.clear()
+        self._budget = create_budget_from_settings()
+        self._budget.start()
+        react_trace: list[dict] = []
+        _request_id = request_id or f"{conversation_id or 'unknown'}:stream"
+        _turn_id = turn_id or f"{conversation_id or 'unknown'}:{int(time.time() * 1000)}"
+        all_tool_results: list[dict] = []
+        _trace_started_at = datetime.now().isoformat()
+        _endpoint_switched = False
+
+        _session_key = conversation_id or ""
+        state = (
+            self._state.get_task_for_session(_session_key)
+            if _session_key
+            else self._state.current_task
+        )
+
+        if not state or not state.is_active:
+            state = self._state.begin_task(session_id=_session_key)
+        elif state.status == TaskStatus.ACTING:
+            logger.warning(
+                f"[State] Previous task stuck in {state.status.value}, force resetting for new message"
+            )
+            state = self._state.begin_task(session_id=_session_key)
+
+        if state.cancelled:
+            logger.error(
+                f"[State] CRITICAL: fresh task {state.task_id[:8]} has cancelled=True, "
+                f"reason={state.cancel_reason!r}. Force clearing."
+            )
+            state.cancelled = False
+            state.cancel_reason = ""
+            state.cancel_event = asyncio.Event()
+
+        # Issue #608: tag the task so resume persistence can skip writing a
+        # resumable snapshot for delegated sub-agents (they share the parent
+        # conversation_id and would otherwise clobber the parent's resume state).
+        state.is_sub_agent = is_sub_agent
+
+        if _on_state_resolved is not None:
+            try:
+                _on_state_resolved(state)
+            except Exception:
+                logger.debug("[ReAct-Stream] _on_state_resolved callback failed", exc_info=True)
+
+        self._context_manager.set_cancel_event(state.cancel_event)
+        current_abort_scope.set(state.abort_root)
+
+        try:
+            # === 动态 System Prompt（追加活跃 Plan） ===
+            _base_sp = base_system_prompt or system_prompt
+
+            _content_safety_name = agent_voice.strip() if isinstance(agent_voice, str) else ""
+            _content_safety_identity = _content_safety_name or "一个 AI 助手"
+            _CONTENT_SAFETY_MINIMAL_PROMPT_STREAM = (
+                f"你是 {_content_safety_identity}。始终使用与用户当前消息相同的语言回复。"
+            )
+
+            def _build_effective_prompt() -> str:
+                if getattr(state, "_content_safety_minimal_prompt", False):
+                    return _CONTENT_SAFETY_MINIMAL_PROMPT_STREAM
+                return _base_sp
+
+            effective_prompt = _build_effective_prompt()
+
+            # Backward compat: plan_mode bool → mode string
+            _effective_mode = mode
+            if plan_mode and _effective_mode == "agent":
+                _effective_mode = "plan"
+
+            # Mode-specific prompt injection
+            if _effective_mode == "plan":
+                from ..prompt.builder import build_mode_rules
+
+                _plan_rules = build_mode_rules("plan")
+                if _plan_rules:
+                    effective_prompt += f"\n\n{_plan_rules}"
+            elif _effective_mode == "ask":
+                from ..prompt.builder import build_mode_rules
+
+                _ask_rules = build_mode_rules("ask")
+                if _ask_rules:
+                    effective_prompt += f"\n\n{_ask_rules}"
+            elif _effective_mode == "coordinator":
+                from ..prompt.builder import build_mode_rules
+
+                _coordinator_rules = build_mode_rules("coordinator")
+                if _coordinator_rules:
+                    effective_prompt += f"\n\n{_coordinator_rules}"
+
+            # Tool filtering by mode — restrict available tools based on current mode
+            _pre_filter_tool_count = len(tools)
+            tools = _filter_tools_by_mode(tools, _effective_mode)
+            _hidden_tool_count = max(0, _pre_filter_tool_count - len(tools))
+            _allowed_tool_names = (
+                {t.get("name", "") for t in tools} if _effective_mode != "agent" else None
+            )
+            self._tool_executor._current_mode = _effective_mode
+            _agent_ref = getattr(self._tool_executor, "_agent_ref", None)
+            if _agent_ref is not None:
+                with contextlib.suppress(Exception):
+                    _agent_ref._last_effective_mode = _effective_mode
+                    _agent_ref._last_tool_policy_source = "reason_stream_mode_filter"
+
+            # === 端点覆盖 ===
+            if endpoint_override:
+                if not conversation_id:
+                    conversation_id = f"_stream_{uuid.uuid4().hex[:12]}"
+                self._apply_endpoint_override(
+                    endpoint_override,
+                    conversation_id=conversation_id,
+                    reason=f"chat endpoint override: {endpoint_override}",
+                    endpoint_policy=endpoint_policy,
+                )
+
+            current_model = getattr(self._brain, "model", "")
+            try:
+                current_info = self._brain.get_current_model_info(conversation_id=conversation_id)
+                if isinstance(current_info, dict) and current_info.get("model"):
+                    current_model = str(current_info["model"])
+            except Exception:
+                pass
+            state.current_model = current_model
+
+            # === 与 run() 一致的循环控制变量 ===
+            state.original_user_messages = [
+                msg for msg in messages if self._is_human_user_message(msg)
+            ]
+            _configured_max_iterations = int(getattr(settings, "max_iterations", 100) or 100)
+            _task_budget_iterations = int(getattr(settings, "task_budget_iterations", 0) or 0)
+            if _task_budget_iterations > 0:
+                _configured_max_iterations = min(
+                    _configured_max_iterations, _task_budget_iterations
+                )
+            max_iterations = (
+                getattr(self, "_max_iterations_override", None) or _configured_max_iterations
+            )
+            self._max_iterations_override = None  # consume once
+            self._empty_content_retries = 0
+
+            # Issue #608: resume the previous cancelled turn's persisted
+            # structured working_messages instead of replaying flattened text
+            # history; falls back to text history when nothing was persisted.
+            _resumed_wm_s = (
+                None
+                if active_transcript.get() is not None
+                else self._maybe_load_resume_working_messages(
+                    messages, conversation_id, is_sub_agent
+                )
+            )
+            working_messages = _resumed_wm_s if _resumed_wm_s is not None else list(messages)
+            await commit_model_messages(working_messages)
+
+            # Repair orphan ``tool_use`` blocks at turn start (cancelled mid-tool
+            # snapshots) so the next LLM call is Anthropic-well-formed.
+            _n_synth_s = synthesize_tool_results_for_orphans(working_messages)
+            if _n_synth_s > 0:
+                logger.info(
+                    "[ReAct-Stream] Repaired %d orphan tool_use block(s) at turn "
+                    "start (conversation_id=%s, task=%s)",
+                    _n_synth_s,
+                    conversation_id or "?",
+                    state.task_id[:8] if state else "?",
+                )
+
+            # ForceToolCall 配置
+            im_floor = max(0, int(getattr(settings, "force_tool_call_im_floor", 2)))
+            _override = getattr(self, "_force_tool_override", None)
+            configured = int(
+                _override
+                if _override is not None
+                else getattr(settings, "force_tool_call_max_retries", 2)
+            )
+            if session_type == "im":
+                base_force_retries = max(im_floor, configured)
+            else:
+                base_force_retries = max(0, configured)
+
+            max_no_tool_retries = self._effective_force_retries(base_force_retries, conversation_id)
+
+            # Intent-driven override (from IntentAnalyzer)
+            if force_tool_retries is not None:
+                max_no_tool_retries = force_tool_retries
+                logger.info(
+                    f"[ForceToolCall/Stream] Intent override: max_retries={force_tool_retries}"
+                )
+
+            max_verify_retries = 1
+            max_confirmation_text_retries = max(
+                0, int(getattr(settings, "confirmation_text_max_retries", 2))
+            )
+
+            executed_tool_names: list[str] = []
+            delivery_receipts: list[dict] = []
+            _last_browser_url = ""
+            _last_chain_text: str = ""
+            consecutive_tool_rounds = 0
+            no_tool_call_count = 0
+            verify_incomplete_count = 0
+            no_confirmation_text_count = 0
+            tools_executed_in_task = False
+            task_final_candidates: list[str] = []
+            _supervisor_intervened = False
+            _tool_call_counter: dict[str, int] = {}
+            _tool_name_counter: dict[str, int] = {}
+            # same_tool_call_limit=0（默认）= 不限同工具同参数重复，调用处需先判 > 0
+            _MAX_SAME_TOOL_PER_TASK = max(0, int(getattr(settings, "same_tool_call_limit", 0) or 0))
+            # 0=不限/禁用对应检测；LoopBudgetGuard 内部已处理 0 短路
+            _loop_budget_guard = LoopBudgetGuard(
+                max_total_tool_calls=max(
+                    0, int(getattr(settings, "task_budget_tool_calls", 0) or 0)
+                ),
+                readonly_stagnation_limit=max(
+                    0, int(getattr(settings, "readonly_stagnation_limit", 0) or 0)
+                ),
+                readonly_stagnation_hard_limit=max(
+                    0, int(getattr(settings, "readonly_stagnation_hard_limit", 0) or 0)
+                ),
+                token_anomaly_threshold=int(
+                    getattr(settings, "context_token_anomaly_threshold", TOKEN_ANOMALY_THRESHOLD)
+                    or TOKEN_ANOMALY_THRESHOLD
+                ),
+                near_context_ratio=float(
+                    getattr(settings, "context_hard_terminate_ratio", 0.98) or 0.98
+                ),
+            )
+            # 计划先行软提醒：todo_required 会话若尚未创建 todo，向模型注入一次
+            # "先建计划、逐步执行、随时更新"提示（只提醒一次，避免刷屏）。
+            _plan_hint_emitted = False
+            # 迭代结论锚点：每轮工具调用后提炼一行中文结论，累积为结论链，
+            # 以单条 _model_source="iteration_conclusions" 消息保留在上下文中
+            # （压缩前置保护，不驱逐）；工具调用细节可被压缩/驱逐。
+            _iteration_conclusions: list[str] = []
+            # 探索停滞检测：连续只读探索轮数（换着查 get_tool_info/list_directory/
+            # get_skill_info 等也算停滞——指纹机制按轮集合变化漏检，这里按
+            # "工具类别连续纯探索"计数，兜住"换汤不换药"的重复探索）。
+            _consecutive_explore_rounds = 0
+            _explore_stall_hinted = False
+            # 工具结果校验：已注入过反馈的 (工具名, 问题类型) 集合，防止重复轰炸
+            _validated_issue_keys: set[str] = set()
+
+            def _make_tool_sig(tc: dict) -> str:
+                nonlocal _last_browser_url
+                name = tc.get("name", "")
+                inp = tc.get("input", tc.get("arguments", {}))
+                if name == "browser_navigate":
+                    _last_browser_url = inp.get("url", "")
+                try:
+                    param_str = json.dumps(inp, sort_keys=True, ensure_ascii=False)
+                except Exception:
+                    param_str = str(inp)
+                if name == "read_file":
+                    path = str(inp.get("path", "") or inp.get("file_path", ""))
+                    normalized_path = path.replace("\\", "/").lower()
+                    if "/terminals/" in normalized_path and normalized_path.endswith(".txt"):
+                        name = "read_file_terminal"
+                if (
+                    name in self._browser_page_read_tools
+                    and len(param_str) <= 20
+                    and _last_browser_url
+                ):
+                    param_str = f"{param_str}|url={_last_browser_url}"
+                param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
+                return f"{name}({param_hash})"
+
+            # --- Thinking 静默失败降级通知节流 (#415 #416 #403) ---
+            _thinking_notice_emitted = False
+            # --- Vision 降级通知节流（一次会话只发一次） ---
+            _vision_notice_emitted = False
+            # --- Prefer 模式端点自动切换通知节流 ---
+            _endpoint_switch_notice_emitted = False
+            _last_real_input_tokens: int | None = None
+
+            # --- 恢复的 Todo：补发 SSE 事件让前端重建 FloatingPlanBar ---
+            if conversation_id:
+                try:
+                    from ..tools.handlers.plan import get_todo_handler_for_session, has_active_todo
+
+                    if has_active_todo(conversation_id):
+                        _rh = get_todo_handler_for_session(conversation_id)
+                        _rp = _rh.get_plan_for(conversation_id) if _rh else None
+                        if _rp and _rp.get("status") == "in_progress":
+                            yield {
+                                "type": "todo_created",
+                                "restored": True,
+                                "plan": {
+                                    "id": _rp.get("id", ""),
+                                    "taskSummary": _rp.get("task_summary", ""),
+                                    "steps": [
+                                        {
+                                            "id": s.get("id", ""),
+                                            "description": s.get("description", ""),
+                                            "status": s.get("status", "pending"),
+                                        }
+                                        for s in _rp.get("steps", [])
+                                    ],
+                                    "status": "in_progress",
+                                },
+                            }
+                except Exception:
+                    pass
+
+            # ==================== 主循环 ====================
+            logger.info(
+                f"[ReAct-Stream] === Loop started (max_iterations={max_iterations}, model={current_model}) ==="
+            )
+
+            _last_discovered_snapshot: frozenset = frozenset()
+            _death_switch_notified = False
+
+            for _iteration in range(max_iterations):
+                self._last_working_messages = working_messages
+                state.iteration = _iteration
+
+                # --- 取消检查 ---
+                if state.cancelled:
+                    logger.info(
+                        f"[ReAct-Stream] Task cancelled at iteration start: {state.cancel_reason}"
+                    )
+                    self._save_react_trace(
+                        react_trace, conversation_id, session_type, "cancelled", _trace_started_at
+                    )
+                    yield _build_task_checkpoint_event(
+                        session=session,
+                        conversation_id=conversation_id,
+                        task_id=state.task_id,
+                        iteration=_iteration,
+                        exit_reason="user_cancelled",
+                        summary=str(state.cancel_reason or "用户主动停止"),
+                        next_step_hint='如需重启，发送新的指令或回复"继续"',
+                    )
+                    yield {"type": "text_delta", "content": "✅ 任务已停止。"}
+                    yield {"type": "done"}
+                    return
+
+                # --- Resource Budget 检查（与 run() 一致） ---
+                self._budget.record_iteration()
+                budget_status = self._budget.check()
+                if budget_status.action == BudgetAction.PAUSE:
+                    logger.warning(f"[Budget-Stream] PAUSE: {budget_status.message}")
+                    # 让 DelegationResult.exit_reason 反映"预算暂停"而非误显示 completed
+                    self._last_exit_reason = "budget_paused"
+                    self._save_react_trace(
+                        react_trace,
+                        conversation_id,
+                        session_type,
+                        "budget_exceeded",
+                        _trace_started_at,
+                    )
+                    self._run_failure_analysis(
+                        react_trace,
+                        "budget_exceeded",
+                        task_description=task_description,
+                        task_id=state.task_id,
+                    )
+                    msg = _format_budget_pause_message(budget_status)
+                    yield _build_task_checkpoint_event(
+                        session=session,
+                        conversation_id=conversation_id,
+                        task_id=state.task_id,
+                        iteration=_iteration,
+                        exit_reason="budget_paused",
+                        summary=str(budget_status.message or "预算耗尽，任务暂停"),
+                        next_step_hint='回复"继续"即可让系统接力完成；或在配置中调高任务预算',
+                    )
+                    yield {"type": "text_delta", "content": msg}
+                    yield {"type": "done"}
+                    return
+                elif budget_status.action in (BudgetAction.WARNING, BudgetAction.DOWNGRADE):
+                    # 软提示路径：发 SSE 事件给前端 UI（用户能看到 banner），
+                    # 但**不**写入 LLM 上下文（避免污染 / 让 LLM 提前缩手）。
+                    # 阈值去抖：每个 (dimension, threshold) 仅触发一次 emit。
+                    threshold_name = (
+                        "downgrade" if budget_status.action == BudgetAction.DOWNGRADE else "warning"
+                    )
+                    if self._budget.should_emit_threshold(budget_status.dimension, threshold_name):
+                        logger.info(
+                            "[Budget-Stream] %s reached %s threshold: %s",
+                            budget_status.dimension,
+                            threshold_name,
+                            budget_status.message,
+                        )
+                        # 详情由前端按 dimension + level 自行 i18n 展示。
+                        yield {
+                            "type": "budget_warning",
+                            "dimension": budget_status.dimension,
+                            "level": threshold_name,
+                            "usage_ratio": budget_status.usage_ratio,
+                            "renewed": bool(budget_status.details.get("renewed", False))
+                            if isinstance(budget_status.details, dict)
+                            else False,
+                            "message": budget_status.message,
+                        }
+
+                # --- TaskMonitor: 迭代开始 + 模型切换检查 ---
+                if task_monitor:
+                    task_monitor.begin_iteration(_iteration + 1, current_model)
+                    switch_result = self._check_model_switch(
+                        task_monitor, state, working_messages, current_model
+                    )
+                    if switch_result:
+                        current_model, working_messages = switch_result
+                        state.current_model = current_model
+                        no_tool_call_count = 0
+                        tools_executed_in_task = False
+                        _supervisor_intervened = False
+                        verify_incomplete_count = 0
+                        executed_tool_names = []
+                        consecutive_tool_rounds = 0
+                        no_confirmation_text_count = 0
+
+                logger.info(
+                    f"[ReAct-Stream] Iter {_iteration + 1}/{max_iterations} — REASON (model={current_model})"
+                )
+
+                # --- 状态转换: REASONING（与 run() 一致） ---
+                # v1.28.3 S5-A: 用 ensure_ready_for_reasoning() idempotent
+                # helper 替换原 hotfix 06c67221 的 try/transition 块。
+                # terminal 路径现在抛 IllegalReasoningEntry 走显式 telemetry +
+                # 友好 error code; 其他非法转换的 belt-and-suspenders force-
+                # write 仍保留。
+                if state.status != TaskStatus.REASONING:
+                    try:
+                        state.ensure_ready_for_reasoning()
+                    except IllegalReasoningEntry as _illegal_entry:
+                        logger.warning(
+                            "[ReAct-Stream] IllegalReasoningEntry on iter %d (session=%r): %s",
+                            _iteration + 1,
+                            _session_key,
+                            _illegal_entry,
+                        )
+                        try:
+                            from .conversation_metrics import (
+                                inc_illegal_reasoning_entry,
+                            )
+
+                            inc_illegal_reasoning_entry(source="reason_stream_iter")
+                        except Exception:
+                            pass
+                        yield {
+                            "type": "error",
+                            "code": "illegal_state",
+                            "message": "上一条消息正在收尾，请稍候再试或新建会话。",
+                        }
+                        yield {"type": "done"}
+                        return
+                    except ValueError:  # s5b-allow-force-write
+                        # Belt-and-suspenders: 保留 force-write 避免任何未识别的
+                        # race 路径让 SSE 流硬崩。
+                        logger.error(
+                            "[ReAct-Stream] Illegal transition %s -> REASONING "
+                            "(non-terminal) on iter %d; forcing status overwrite.",
+                            state.status.value,
+                            _iteration + 1,
+                        )
+                        state.status = TaskStatus.REASONING
+
+                _ctx_compressed_info: dict | None = None
+                effective_prompt = _build_effective_prompt()
+                # 上下文准备恢复：KV 间隙清理（gap stop）后，下次请求注入
+                # 任务恢复卡（P0 目标 + 最近进程原文备份），重建任务上下文，
+                # 防"上下文失忆"（对标豆包客户端会话续传逻辑）。
+                if getattr(self._context_manager, "context_preparation_pending", False):
+                    _restore_block = self._context_manager.restore_task_context(
+                        conversation_id or ""
+                    )
+                    if _restore_block is not None:
+                        _insert_at = (
+                            1
+                            if working_messages
+                            and working_messages[0].get("role") == "system"
+                            else 0
+                        )
+                        working_messages.insert(_insert_at, _restore_block)
+                        logger.info("[ContextPrep] injected task restore card")
+                    self._context_manager.context_preparation_pending = False
+                # 计划先行软提醒（对标 Hermes）：todo_required 会话尚未创建计划时，
+                # 在首轮向模型注入一次"先建 todo、逐步执行、随时更新进度"的引导，
+                # 让模型一开始就想清楚步骤与目标，避免想到哪做到哪、重复调用工具。
+                if not _plan_hint_emitted:
+                    try:
+                        from ..tools.handlers.plan import (
+                            get_active_todo_prompt,
+                            is_todo_required,
+                        )
+
+                        if is_todo_required(conversation_id) and not get_active_todo_prompt(
+                            conversation_id or ""
+                        ):
+                            working_messages.append(
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "[计划提示] 当前任务需要多步骤执行。请先调用 "
+                                        "create_todo 建立任务计划，明确每一步的步骤与目标；"
+                                        "随后逐步执行，并用 update_todo_step 更新进度。"
+                                        "已完成步骤不要重复执行。"
+                                    ),
+                                }
+                            )
+                            _plan_hint_emitted = True
+                            logger.info(
+                                "[ReAct-Stream] injected one-shot plan hint "
+                                "(todo_required, no active todo)"
+                            )
+                    except Exception as _plan_hint_err:
+                        logger.debug(
+                            "[ReAct-Stream] plan hint skipped: %s", _plan_hint_err
+                        )
+                await self._sync_plan_context(working_messages, conversation_id)
+                if len(working_messages) > 2:
+                    if active_transcript.get() is None:
+                        working_messages = self._context_manager.pre_request_cleanup(
+                            working_messages
+                        )
+                    _before_tokens = self._context_manager.estimate_messages_tokens(
+                        working_messages
+                    )
+                    # 压缩前原文快照：压缩后若无真实用户消息存活，用于恢复
+                    # 最新真实用户消息锚点（对标 Hermes _ensure_compressed_has_user_turn）
+                    _pre_compress_messages = list(working_messages)
+                    try:
+                        working_messages = await self._context_manager.compress_if_needed(
+                            working_messages,
+                            system_prompt=effective_prompt,
+                            tools=tools,
+                            memory_manager=self._memory_manager,
+                            conversation_id=conversation_id,
+                            last_real_input_tokens=_last_real_input_tokens,
+                        )
+                    except _CtxCancelledError:
+                        # 与 run() 保持一致：只在明确用户取消时终止。
+                        if state.cancelled or bool((state.cancel_reason or "").strip()):
+                            async for ev in self._stream_cancel_farewell(
+                                working_messages, effective_prompt, current_model, state
+                            ):
+                                yield ev
+                            yield {"type": "done"}
+                            return
+                        logger.warning(
+                            "[ReAct-Stream] Context compression cancelled without task cancellation "
+                            "(session=%s). Fallback to uncompressed context.",
+                            conversation_id or state.session_id,
+                        )
+                        state.cancel_event = asyncio.Event()
+                        self._context_manager.set_cancel_event(state.cancel_event)
+                    _after_tokens = self._context_manager.estimate_messages_tokens(working_messages)
+                    if _after_tokens < _before_tokens:
+                        _plan_sec = self._get_plan_section_with_hydration(
+                            conversation_id, _pre_compress_messages
+                        )
+                        _scratchpad = ""
+                        if self._memory_manager:
+                            try:
+                                _sp = getattr(self._memory_manager, "get_scratchpad_summary", None)
+                                if _sp:
+                                    _scratchpad = _sp() or ""
+                            except Exception:
+                                pass
+                        working_messages = ContextManager.rewrite_after_compression(
+                            working_messages,
+                            plan_section=_plan_sec,
+                            scratchpad_summary=_scratchpad,
+                            completed_tools=executed_tool_names,
+                            task_description=task_description,
+                            source_messages=_pre_compress_messages,
+                        )
+                        transcript = active_transcript.get()
+                        if transcript is not None:
+                            working_messages = transcript.retain_context(working_messages)
+                        self._context_manager.validate_projection(
+                            working_messages,
+                            system_prompt=effective_prompt,
+                            tools=tools,
+                            conversation_id=conversation_id,
+                        )
+                        _after_tokens = self._context_manager.estimate_messages_tokens(
+                            working_messages
+                        )
+                        _ctx_compressed_info = {
+                            "before_tokens": _before_tokens,
+                            "after_tokens": _after_tokens,
+                        }
+                        logger.info(
+                            f"[ReAct-Stream] Context compressed: {_before_tokens} → {_after_tokens} tokens"
+                        )
+                        yield {
+                            "type": "context_compressed",
+                            "before_tokens": _before_tokens,
+                            "after_tokens": _after_tokens,
+                        }
+
+                # Publish context occupancy before the provider starts and keep
+                # updating it while output streams. Provider usage later
+                # calibrates this estimate with the exact input/output counts.
+                try:
+                    _stream_context_base = ContextManager.static_estimate_tokens(
+                        effective_prompt or ""
+                    )
+                    _stream_context_base += self._context_manager.estimate_messages_tokens(
+                        working_messages
+                    )
+                    _stream_context_base += self._context_manager.estimate_tools_tokens(tools)
+                except Exception:
+                    _stream_context_base = 0
+                try:
+                    _stream_context_limit = self._context_manager.get_max_context_tokens(
+                        conversation_id=conversation_id
+                    )
+                except Exception:
+                    _stream_context_limit = 0
+                _stream_context_output_tokens = 0
+                _stream_context_last_tokens = _stream_context_base
+                _stream_context_last_emit = time.monotonic()
+
+                def _context_usage_event(
+                    tokens: int,
+                    *,
+                    source: str,
+                    usage_estimated: bool,
+                    context_limit: int = _stream_context_limit,
+                    model: str = current_model,
+                    iteration: int = _iteration + 1,
+                ) -> dict:
+                    _tokens = max(int(tokens or 0), 0)
+                    _limit = max(int(context_limit or 0), 0)
+                    _ep_info = self._brain.get_current_endpoint_info() or {}
+                    return {
+                        "type": "context_usage",
+                        "conversation_id": conversation_id,
+                        "context_scope_id": f"{state.task_id}:{iteration}",
+                        "iteration": iteration,
+                        "context_tokens": _tokens,
+                        "history_context_tokens": _tokens,
+                        "context_limit": _limit,
+                        "history_context_limit": _limit,
+                        "remaining_tokens": max(_limit - _tokens, 0),
+                        "percent": round((_tokens / _limit) * 100, 1) if _limit else 0,
+                        "updated_at": time.time(),
+                        "source": source,
+                        "usage_estimated": usage_estimated,
+                        "endpoint_name": _ep_info.get("name", ""),
+                        "model": model or _ep_info.get("model", ""),
+                    }
+
+                if _stream_context_limit > 0:
+                    yield _context_usage_event(
+                        _stream_context_base,
+                        source="stream_estimate",
+                        usage_estimated=True,
+                    )
+
+                # --- 思维链: 迭代开始事件 ---
+                yield {"type": "iteration_start", "iteration": _iteration + 1}
+
+                # Refresh tools only when _discovered_tools actually changes
+                # (not every iteration — otherwise Supervisor NUDGE that strips
+                # tools to [] gets immediately overridden; see issue #443)
+                _agent = getattr(self._tool_executor, "_agent_ref", None)
+                if _iteration > 0 and _agent and getattr(_agent, "_discovered_tools", None):
+                    _current_discovered = frozenset(getattr(_agent, "_discovered_tools", ()))
+                    if _current_discovered != _last_discovered_snapshot:
+                        _last_discovered_snapshot = _current_discovered
+                        refreshed = _filter_tools_by_mode(_agent._effective_tools, _effective_mode)
+                        # Discovery changes schema visibility (_deferred), not
+                        # necessarily tool names: deferred tools remain in both lists.
+                        if refreshed != tools:
+                            tools = refreshed
+                            _allowed_tool_names = (
+                                {t.get("name", "") for t in tools}
+                                if _effective_mode != "agent"
+                                else None
+                            )
+                            logger.info(
+                                "[ReAct-Stream] tools refreshed after tool_search discovery (now %d tools)",
+                                len(tools),
+                            )
+
+                # [整改 2026-10-10] 上下文角色纪律：把运行期上下文块/压缩摘要从
+                # user 角色流中抽出合并为前置块，保证模型能识别"最后一条 user =
+                # 当前请求（[最新消息]）"，防多轮上下文污染导致意图偏离。
+                working_messages = self._context_manager.normalize_turn_roles(working_messages)
+                await commit_model_messages(working_messages)
+                # --- Reason phase (真流式) ---
+                _thinking_t0 = time.time()
+                yield {"type": "thinking_start"}
+                await broadcast_event("pet-status-update", {"status": "thinking"})
+                _streamed_text = False
+                _streamed_thinking = False
+                _stream_usage: dict | None = None
+                _raw_streamed_text: str = ""
+
+                try:
+                    decision = None
+                    async for stream_event in self._reason_stream_iter(
+                        working_messages,
+                        system_prompt=effective_prompt,
+                        tools=tools,
+                        current_model=current_model,
+                        conversation_id=conversation_id,
+                        thinking_mode=thinking_mode,
+                        thinking_depth=thinking_depth,
+                        iteration=_iteration,
+                        agent_profile_id=agent_profile_id,
+                    ):
+                        _evt_type = stream_event.get("type")
+                        if _evt_type == "heartbeat":
+                            yield {"type": "heartbeat"}
+                        elif _evt_type == "text_delta":
+                            yield stream_event
+                            _streamed_text = True
+                            _stream_context_output_tokens += ContextManager.static_estimate_tokens(
+                                str(stream_event.get("content") or "")
+                            )
+                            _current_context_tokens = (
+                                _stream_context_base + _stream_context_output_tokens
+                            )
+                            _now = time.monotonic()
+                            if (
+                                _current_context_tokens - _stream_context_last_tokens >= 16
+                                or _now - _stream_context_last_emit >= 0.25
+                            ):
+                                _stream_context_last_tokens = _current_context_tokens
+                                _stream_context_last_emit = _now
+                                yield _context_usage_event(
+                                    _current_context_tokens,
+                                    source="stream_estimate",
+                                    usage_estimated=True,
+                                )
+                        elif _evt_type == "thinking_delta":
+                            yield stream_event
+                            _streamed_thinking = True
+                            _stream_context_output_tokens += ContextManager.static_estimate_tokens(
+                                str(stream_event.get("content") or "")
+                            )
+                            _current_context_tokens = (
+                                _stream_context_base + _stream_context_output_tokens
+                            )
+                            _now = time.monotonic()
+                            if (
+                                _current_context_tokens - _stream_context_last_tokens >= 16
+                                or _now - _stream_context_last_emit >= 0.25
+                            ):
+                                _stream_context_last_tokens = _current_context_tokens
+                                _stream_context_last_emit = _now
+                                yield _context_usage_event(
+                                    _current_context_tokens,
+                                    source="stream_estimate",
+                                    usage_estimated=True,
+                                )
+                        elif _evt_type == "endpoint_meta":
+                            # 由 LLMClient 注入的端点元信息（vision_degraded 等）
+                            # 转换成前端协议一致的 endpoint_notice。
+                            if (
+                                stream_event.get("prefer_switched")
+                                and not _endpoint_switch_notice_emitted
+                            ):
+                                _endpoint_switch_notice_emitted = True
+                                yield {
+                                    "type": "endpoint_notice",
+                                    "notice_type": "auto_switch",
+                                    "endpoint": stream_event.get("endpoint_name", ""),
+                                    "from_endpoint": stream_event.get("selected_endpoint", ""),
+                                    "reason_code": "endpoint_prefer_switch",
+                                    "switch_reason": stream_event.get("switch_reason", ""),
+                                    "missing_capabilities": stream_event.get(
+                                        "missing_capabilities", []
+                                    ),
+                                }
+                            if stream_event.get("failover_from"):
+                                yield {
+                                    "type": "endpoint_notice",
+                                    "notice_type": "failover",
+                                    "endpoint": stream_event.get("endpoint_name", ""),
+                                    "from_endpoint": stream_event.get("failover_from", ""),
+                                    "reason_code": "endpoint_failover",
+                                }
+                            if stream_event.get("vision_degraded") and not _vision_notice_emitted:
+                                _vision_notice_emitted = True
+                                yield {
+                                    "type": "endpoint_notice",
+                                    "notice_type": "degraded",
+                                    "endpoint": stream_event.get("endpoint_name", ""),
+                                    "reason_code": "vision_degraded",
+                                }
+                        elif _evt_type == "decision":
+                            decision = stream_event["decision"]
+                            _stream_usage = stream_event.get("usage")
+                            _raw_streamed_text = stream_event.get("raw_streamed_text", "")
+                    if decision is None:
+                        raise RuntimeError("_reason_stream returned no decision")
+
+                    # --- Thinking 降级通知 ---
+                    if not _thinking_notice_emitted and decision:
+                        _resp = getattr(decision, "raw_response", None)
+                        if _resp and getattr(_resp, "_thinking_fallback", False):
+                            _thinking_notice_emitted = True
+                            yield {
+                                "type": "endpoint_notice",
+                                "notice_type": "degraded",
+                                "endpoint": getattr(_resp, "endpoint_name", ""),
+                                "reason_code": "thinking_degraded",
+                            }
+
+                    if task_monitor:
+                        task_monitor.reset_retry_count()
+
+                except UserCancelledError as uce:
+                    # --- 用户取消中断：发起轻量 LLM 收尾 ---
+                    logger.info(f"[ReAct-Stream] LLM call interrupted by user cancel: {uce.reason}")
+                    _thinking_duration = int((time.time() - _thinking_t0) * 1000)
+                    yield {"type": "thinking_end", "duration_ms": _thinking_duration}
+
+                    self._save_react_trace(
+                        react_trace, conversation_id, session_type, "cancelled", _trace_started_at
+                    )
+                    async for ev in self._stream_cancel_farewell(
+                        working_messages, effective_prompt, current_model, state
+                    ):
+                        yield ev
+                    yield {"type": "done"}
+                    return
+
+                except Exception as e:
+                    # --- LLM Error Handling（与 run() 一致） ---
+                    retry_result = await self._handle_llm_error(
+                        e, task_monitor, state, working_messages, current_model
+                    )
+                    _thinking_duration = int((time.time() - _thinking_t0) * 1000)
+                    yield {"type": "thinking_end", "duration_ms": _thinking_duration}
+
+                    if retry_result == "retry":
+                        _total_r = getattr(state, "_total_llm_retries", 1)
+                        yield {
+                            "type": "chain_text",
+                            "content": self._retry_progress_message(
+                                e, _total_r, self.MAX_TOTAL_LLM_RETRIES
+                            ),
+                            "icon": "clock" if self._is_llm_timeout_error(e) else "alert",
+                        }
+                        _retry_sleep = min(2 * _total_r, 15)
+                        _sleep = asyncio.create_task(asyncio.sleep(_retry_sleep))
+                        _cw = asyncio.create_task(state.cancel_event.wait())
+                        _done, _pend = await asyncio.wait(
+                            {_sleep, _cw}, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        for _t in _pend:
+                            _t.cancel()
+                            try:
+                                await _t
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                        if _cw in _done:
+                            async for ev in self._stream_cancel_farewell(
+                                working_messages, effective_prompt, current_model, state
+                            ):
+                                yield ev
+                            yield {"type": "done"}
+                            return
+                        continue
+                    elif isinstance(retry_result, tuple):
+                        current_model, working_messages = retry_result
+                        state.current_model = current_model
+                        # PR-G1: 切换模型属于 reasoning restart，前一段 text_delta
+                        # 多半是不完整的报错或被截断的回复——必须清前端 buffer，
+                        # 否则用户会看到「半截错误信息 + 新模型完整回答」拼成的诡异内容。
+                        if _streamed_text:
+                            yield {"type": "text_replace", "content": ""}
+                        yield {
+                            "type": "chain_text",
+                            "content": "当前模型不可用，正在切换到备用模型...",
+                            "icon": "refresh",
+                        }
+                        no_tool_call_count = 0
+                        tools_executed_in_task = False
+                        _supervisor_intervened = False
+                        verify_incomplete_count = 0
+                        executed_tool_names = []
+                        consecutive_tool_rounds = 0
+                        no_confirmation_text_count = 0
+                        continue
+                    else:
+                        self._save_react_trace(
+                            react_trace,
+                            conversation_id,
+                            session_type,
+                            f"reason_error: {str(e)[:100]}",
+                            _trace_started_at,
+                        )
+                        err_msg = str(e)[:500]
+                        user_msg = f"推理失败: {err_msg[:300]}"
+                        err_lower = err_msg.lower()
+                        if "image" in err_lower and (
+                            "width" in err_lower
+                            or "height" in err_lower
+                            or "size" in err_lower
+                            or "dimension" in err_lower
+                            or "larger than" in err_lower
+                        ):
+                            user_msg = (
+                                "图片处理失败：图片尺寸不符合模型要求。"
+                                "请使用宽高均大于 10 像素的图片重试。"
+                            )
+                        yield {"type": "error", "message": user_msg}
+                        yield {"type": "done"}
+                        return
+
+                # Emit thinking content (已在流式过程中逐步发出; 兜底: 非流式 fallback)
+                _thinking_duration = int((time.time() - _thinking_t0) * 1000)
+                _has_thinking = bool(decision.thinking_content)
+                if _has_thinking and not _streamed_thinking:
+                    yield {"type": "thinking_delta", "content": decision.thinking_content}
+                yield {
+                    "type": "thinking_end",
+                    "duration_ms": _thinking_duration,
+                    "has_thinking": _has_thinking,
+                }
+
+                # chain_text: 文本已通过 text_delta 实时推送; 仅在未流式时 fallback
+                if not _streamed_text:
+                    _decision_text = (decision.text_content or "").strip()
+                    if _decision_text and decision.type == DecisionType.TOOL_CALLS:
+                        if _decision_text != _last_chain_text:
+                            yield {"type": "chain_text", "content": _decision_text[:2000]}
+                            _last_chain_text = _decision_text
+                        else:
+                            logger.info(
+                                f"[ReAct-Stream] Iter {_iteration + 1} — suppressed duplicate chain_text "
+                                f"({len(_decision_text)} chars)"
+                            )
+                elif decision.type == DecisionType.TOOL_CALLS:
+                    yield {"type": "text_replace", "content": ""}
+                    _decision_text = (decision.text_content or "").strip()
+                    if _decision_text:
+                        if _decision_text != _last_chain_text:
+                            yield {"type": "chain_text", "content": _decision_text[:2000]}
+                            _last_chain_text = _decision_text
+                        else:
+                            logger.info(
+                                f"[ReAct-Stream] Iter {_iteration + 1} — suppressed duplicate chain_text "
+                                f"({len(_decision_text)} chars)"
+                            )
+                elif _raw_streamed_text != (decision.text_content or ""):
+                    yield {
+                        "type": "text_replace",
+                        "content": decision.text_content or "",
+                    }
+
+                if task_monitor:
+                    task_monitor.end_iteration(decision.text_content or "")
+
+                # -- 收集 ReAct trace + Budget 记录 token --
+                # 流式模式: usage 来自 StreamAccumulator (_stream_usage dict)
+                # 非流式 fallback: usage 来自 decision.raw_response
+                _raw = decision.raw_response
+                _usage = getattr(_raw, "usage", None) if _raw else None
+                _in_tokens = getattr(_usage, "input_tokens", 0) if _usage else 0
+                _out_tokens = getattr(_usage, "output_tokens", 0) if _usage else 0
+                _cache_read = 0
+                _cache_create = 0
+                if not (_in_tokens or _out_tokens) and _stream_usage:
+                    _in_tokens = _stream_usage.get("input_tokens", 0)
+                    _out_tokens = _stream_usage.get("output_tokens", 0)
+                if _stream_usage:
+                    _cache_read = int(_stream_usage.get("cache_read_input_tokens", 0) or 0)
+                    _cache_create = int(_stream_usage.get("cache_creation_input_tokens", 0) or 0)
+                if _usage:
+                    _cache_read = _cache_read or getattr(_usage, "cache_read_input_tokens", 0)
+                    _cache_create = _cache_create or getattr(
+                        _usage, "cache_creation_input_tokens", 0
+                    )
+                _usage_source = "provider" if (_in_tokens or _out_tokens) else ""
+                _usage_estimated = False
+                if not (_in_tokens or _out_tokens):
+                    try:
+                        _est_input = ContextManager.static_estimate_tokens(effective_prompt or "")
+                        _est_input += self._context_manager.estimate_messages_tokens(
+                            working_messages
+                        )
+                        _est_input += self._context_manager.estimate_tools_tokens(tools)
+                        _est_output_payload = {
+                            "thinking": decision.thinking_content or "",
+                            "text": decision.text_content or "",
+                            "tool_calls": decision.tool_calls or [],
+                        }
+                        _est_output = ContextManager.static_estimate_tokens(
+                            json.dumps(_est_output_payload, ensure_ascii=False, default=str)
+                        )
+                        if _est_input or _est_output:
+                            _in_tokens = _est_input
+                            _out_tokens = _est_output
+                            _usage_source = "estimate"
+                            _usage_estimated = True
+                    except Exception as _est_err:
+                        logger.debug(
+                            f"[ReAct-Stream] token estimate failed (non-fatal): {_est_err}"
+                        )
+                if _in_tokens or _out_tokens:
+                    self._budget.record_tokens(_in_tokens, _out_tokens)
+                    if _in_tokens and not _usage_estimated:
+                        _last_real_input_tokens = _in_tokens
+                if _stream_context_limit > 0:
+                    _final_context_tokens = (
+                        _in_tokens + _out_tokens
+                        if (_in_tokens or _out_tokens)
+                        else _stream_context_last_tokens
+                    )
+                    yield _context_usage_event(
+                        _final_context_tokens,
+                        source=_usage_source or "stream_estimate",
+                        usage_estimated=_usage_estimated or not bool(_usage_source),
+                    )
+                # 流式路径下 brain 不落 token_tracking（详见 brain.messages_create_stream
+                # 注释），需在此显式落库以保留 cache_read/cache_create 命中统计。
+                if _in_tokens or _out_tokens or _cache_read or _cache_create:
+                    try:
+                        from .token_tracking import record_usage as _tt_record_usage
+
+                        _ep_info = self._brain.get_current_endpoint_info() or {}
+                        _ep_name = _ep_info.get("name", "")
+                        _cost = 0.0
+                        _input_includes_cache = False
+                        for _ep in self._brain._llm_client.endpoints:
+                            if _ep.name == _ep_name:
+                                _input_includes_cache = _ep.api_type in {
+                                    "openai",
+                                    "openai_responses",
+                                }
+                                _cost = _ep.calculate_cost(
+                                    input_tokens=_in_tokens,
+                                    output_tokens=_out_tokens,
+                                    cache_read_tokens=_cache_read,
+                                )
+                                break
+                        _tt = set_tracking_context(
+                            TokenTrackingContext(
+                                session_id=conversation_id or "",
+                                request_id=_request_id,
+                                turn_id=_turn_id,
+                                operation_type="chat_react_iteration_stream",
+                                operation_detail=_usage_source,
+                                channel="api",
+                                iteration=_iteration + 1,
+                                agent_profile_id=agent_profile_id,
+                            )
+                        )
+                        try:
+                            _tt_record_usage(
+                                model=current_model or "",
+                                endpoint_name=_ep_name,
+                                input_tokens=_in_tokens,
+                                output_tokens=_out_tokens,
+                                cache_creation_tokens=_cache_create,
+                                cache_read_tokens=_cache_read,
+                                input_tokens_include_cache=_input_includes_cache,
+                                estimated_cost=_cost,
+                            )
+                        finally:
+                            reset_tracking_context(_tt)
+                    except Exception as _tt_err:
+                        logger.debug(
+                            f"[ReAct-Stream] token_tracking record failed (non-fatal): {_tt_err}"
+                        )
+                _iter_trace: dict = {
+                    "iteration": _iteration + 1,
+                    "timestamp": datetime.now().isoformat(),
+                    "decision_type": decision.type.value
+                    if hasattr(decision.type, "value")
+                    else str(decision.type),
+                    "model": current_model,
+                    "request_id": _request_id,
+                    "turn_id": _turn_id,
+                    "tool_policy": {
+                        "mode": _effective_mode,
+                        "visible_count": len(tools),
+                        "hidden_count": _hidden_tool_count,
+                        "source": "reason_stream_mode_filter",
+                        "visible_tools": sorted(t.get("name", "") for t in tools if t.get("name")),
+                    },
+                    "thinking": decision.thinking_content,
+                    "thinking_duration_ms": _thinking_duration,
+                    "text": decision.text_content,
+                    "tool_calls": [
+                        {
+                            "name": tc.get("name"),
+                            "id": tc.get("id"),
+                            "input": tc.get("input", tc.get("arguments", {})),
+                        }
+                        for tc in (decision.tool_calls or [])
+                    ],
+                    "tool_results": [],
+                    "tokens": {"input": _in_tokens, "output": _out_tokens},
+                    "usage_source": _usage_source,
+                    "usage_estimated": _usage_estimated,
+                    "context_compressed": _ctx_compressed_info,
+                }
+                tool_names_log = [tc.get("name", "?") for tc in (decision.tool_calls or [])]
+                logger.info(
+                    f"[ReAct-Stream] Iter {_iteration + 1} — decision={_iter_trace['decision_type']}, "
+                    f"tools={tool_names_log}, tokens_in={_in_tokens}, tokens_out={_out_tokens}"
+                )
+
+                # ==================== stop_reason=max_tokens 检测（与 run() 一致）====================
+                if decision.stop_reason == "max_tokens":
+                    logger.warning(
+                        f"[ReAct-Stream] Iter {_iteration + 1} — ⚠️ LLM output truncated (stop_reason=max_tokens). "
+                        f"The response hit the max_tokens limit ({self._brain.max_tokens}). "
+                        f"Tool calls may have incomplete JSON arguments."
+                    )
+                    _iter_trace["truncated"] = True
+
+                    # 自动扩容 max_tokens 并重试（与 run() 一致）
+                    if decision.type == DecisionType.TOOL_CALLS:
+                        truncated_calls = [
+                            tc
+                            for tc in decision.tool_calls
+                            if isinstance(tc.get("input"), dict) and PARSE_ERROR_KEY in tc["input"]
+                        ]
+                        _current_max = self._brain.max_tokens or 16384
+                        _max_ceiling = min(_current_max * 3, 65536)
+                        if truncated_calls and len(truncated_calls) == len(decision.tool_calls):
+                            _new_max = min(_current_max * 2, _max_ceiling)
+                            if _new_max > _current_max:
+                                logger.warning(
+                                    f"[ReAct-Stream] Iter {_iteration + 1} — All "
+                                    f"{len(truncated_calls)} tool calls truncated. "
+                                    f"Auto-increasing max_tokens: "
+                                    f"{_current_max} → {_new_max} and retrying"
+                                )
+                                self._brain.max_tokens = _new_max
+                                react_trace.append(_iter_trace)
+                                continue
+                        elif truncated_calls:
+                            _new_max = min(int(_current_max * 1.5), _max_ceiling)
+                            if _new_max > _current_max:
+                                logger.warning(
+                                    f"[ReAct-Stream] Iter {_iteration + 1} — "
+                                    f"{len(truncated_calls)}/{len(decision.tool_calls)} tool "
+                                    f"calls truncated. Increasing max_tokens for next "
+                                    f"iteration: {_current_max} → {_new_max}"
+                                )
+                                self._brain.max_tokens = _new_max
+
+                # ==================== FINAL_ANSWER ====================
+                if decision.type == DecisionType.FINAL_ANSWER:
+                    # FINAL_ANSWER 被 max_tokens 截断时自动续接（最多 2 次）
+                    if (
+                        decision.stop_reason == "max_tokens"
+                        and getattr(state, "_text_continuation_count", 0) < 2
+                    ):
+                        state._text_continuation_count = (
+                            getattr(state, "_text_continuation_count", 0) + 1
+                        )
+                        logger.info(
+                            f"[ReAct-Stream] FINAL_ANSWER truncated by max_tokens, "
+                            f"auto-continuation #{state._text_continuation_count}"
+                        )
+                        working_messages.append(
+                            {
+                                "role": "assistant",
+                                "content": decision.assistant_content
+                                or [{"type": "text", "text": decision.text_content or ""}],
+                                **(
+                                    {"reasoning_content": decision.thinking_content}
+                                    if decision.thinking_content
+                                    else {}
+                                ),
+                            }
+                        )
+                        working_messages.append(
+                            {
+                                "role": "user",
+                                "content": "你的回答被截断了。请直接从断点处继续输出，不要重复已说过的内容，不要道歉。",
+                            }
+                        )
+                        react_trace.append(_iter_trace)
+                        continue
+
+                    consecutive_tool_rounds = 0
+
+                    # 任务完成度验证（与 run() 一致）
+                    result = await self._handle_final_answer(
+                        decision=decision,
+                        working_messages=working_messages,
+                        original_messages=messages,
+                        tools_executed_in_task=tools_executed_in_task,
+                        executed_tool_names=executed_tool_names,
+                        delivery_receipts=delivery_receipts,
+                        all_tool_results=all_tool_results,
+                        no_tool_call_count=no_tool_call_count,
+                        verify_incomplete_count=verify_incomplete_count,
+                        no_confirmation_text_count=no_confirmation_text_count,
+                        max_no_tool_retries=max_no_tool_retries,
+                        max_verify_retries=max_verify_retries,
+                        max_confirmation_text_retries=max_confirmation_text_retries,
+                        base_force_retries=base_force_retries,
+                        conversation_id=conversation_id,
+                        supervisor_intervened=_supervisor_intervened,
+                        tool_evidence_required=tool_evidence_required,
+                        mode=_effective_mode,
+                        final_response_candidates=task_final_candidates,
+                    )
+
+                    if isinstance(result, str):
+                        # === Steer done-drain ===
+                        # The model produced a final answer with no tool calls,
+                        # so process_post_tool_signals did NOT drain inserts this
+                        # round. A message steered in (insert_user_message) while
+                        # this answer was being generated would otherwise be lost
+                        # the instant we terminate. Address it now: fold the
+                        # finished answer into context, inject the steered
+                        # message, and loop once more. Bounded by max_iterations
+                        # inside the helper, so it can never run away.
+                        _steered = await self._drain_steer_before_finish(
+                            state=state,
+                            working_messages=working_messages,
+                            final_text=result,
+                            iteration=_iteration,
+                            max_iterations=max_iterations,
+                        )
+                        if _steered:
+                            # Surface the answer the model just finished so the
+                            # user still sees it before the follow-up is handled.
+                            if _streamed_text:
+                                if result != _raw_streamed_text:
+                                    yield {"type": "text_replace", "content": result}
+                            else:
+                                _chunk = 20
+                                for _ci in range(0, len(result), _chunk):
+                                    yield {
+                                        "type": "text_delta",
+                                        "content": result[_ci : _ci + _chunk],
+                                    }
+                                    await asyncio.sleep(0.01)
+                            for _ins_text in _steered:
+                                yield {
+                                    "type": "chain_text",
+                                    "content": f"用户插入消息: {_ins_text[:60]}",
+                                }
+                            # Fresh per-answer budget: the steered message is a
+                            # new user ask, don't penalise it with the previous
+                            # answer's retry/verify counters.
+                            no_tool_call_count = 0
+                            verify_incomplete_count = 0
+                            no_confirmation_text_count = 0
+                            task_final_candidates.clear()
+                            logger.info(
+                                "[ReAct-Stream][DoneDrain] %d steered message(s) "
+                                "arrived during final-answer generation; folding "
+                                "answer into context and continuing (iter=%d/%d)",
+                                len(_steered),
+                                _iteration + 1,
+                                max_iterations,
+                            )
+                            react_trace.append(_iter_trace)
+                            continue
+                        working_messages.append(
+                            {
+                                "role": "assistant",
+                                "content": decision.assistant_content
+                                or decision.text_content
+                                or result,
+                                "reasoning_content": decision.thinking_content or None,
+                            }
+                        )
+                        await commit_model_messages(working_messages)
+                        react_trace.append(_iter_trace)
+                        final_exit_reason = self._last_exit_reason
+                        is_verify_incomplete = final_exit_reason == "verify_incomplete"
+                        trace_result = "verify_incomplete" if is_verify_incomplete else "completed"
+                        self._save_react_trace(
+                            react_trace,
+                            conversation_id,
+                            session_type,
+                            trace_result,
+                            _trace_started_at,
+                        )
+                        try:
+                            state.transition(
+                                TaskStatus.FAILED if is_verify_incomplete else TaskStatus.COMPLETED
+                            )
+                        except ValueError:  # s5b-allow-force-write
+                            state.status = (
+                                TaskStatus.FAILED if is_verify_incomplete else TaskStatus.COMPLETED
+                            )
+                        logger.info(
+                            f"[ReAct-Stream] === {trace_result.upper()} after "
+                            f"{_iteration + 1} iterations ==="
+                        )
+                        # === 视角切换审查点（流式 · 交付前终审，配置门控 + 全程兜底）===
+                        # 热路径最小侵入：只在"正常终局"分支审查（result 为最终文本、
+                        # react_trace 含 pass1 已读证据、final_exit_reason 与 CLI 版同语义）；
+                        # 失败/取消/预算等其它 done 出口一律不碰。审查替换 result 后，
+                        # 下方既有 text_replace/text_delta 逻辑自然把修正版发给前端。
+                        # review_at_exit=False（run() 聚合路径）时跳过：由出口钩子
+                        # （CLI 任务 L8522 / IM chat_with_session 收尾前）统一终审，
+                        # 避免"流式段 + 出口钩子"双重审查、每条链路只审一次。
+                        if review_at_exit and getattr(
+                            settings, "view_switch_review_enabled", False
+                        ):
+                            try:
+                                from openkitsune.evolution.view_switch_review import (
+                                    config_from_settings,
+                                    view_switch_review,
+                                )
+
+                                _vs_repaired, _vs_report = await view_switch_review(
+                                    self._brain,
+                                    final_text=result,
+                                    exit_reason=final_exit_reason or "normal",
+                                    trace=react_trace,
+                                    task_description=task_description or "",
+                                    config=config_from_settings(),
+                                )
+                                if _vs_report.get("triggered"):
+                                    logger.info(
+                                        "[view_switch][stream] %s verdict=%s verified=%s "
+                                        "repaired=%s (%dms)",
+                                        _vs_report.get("trigger_reason", ""),
+                                        _vs_report.get("verdict"),
+                                        _vs_report.get("verified"),
+                                        _vs_report.get("repaired"),
+                                        int(_vs_report.get("review_ms", 0))
+                                        + int(_vs_report.get("repair_ms", 0)),
+                                    )
+                                if _vs_repaired and _vs_repaired != result:
+                                    result = _vs_repaired
+                                    logger.info(
+                                        "[view_switch][stream] 终审替换最终文本 "
+                                        "(text_replace 生效)"
+                                    )
+                            except Exception as _vs_exc:  # 兜底：任何异常不阻断原流程
+                                logger.warning(
+                                    "[view_switch][stream] 出口审查异常，维持原响应: %s",
+                                    _vs_exc,
+                                )
+                        if _streamed_text:
+                            if result != _raw_streamed_text:
+                                yield {"type": "text_replace", "content": result}
+                        else:
+                            chunk_size = 20
+                            for i in range(0, len(result), chunk_size):
+                                yield {"type": "text_delta", "content": result[i : i + chunk_size]}
+                                await asyncio.sleep(0.01)
+                        await broadcast_event(
+                            "pet-status-update",
+                            {"status": "error" if is_verify_incomplete else "success"},
+                        )
+                        # 终态检查点：summary 取最终回答前 200 字，便于"任务时间线"
+                        # 直接显示"已完成什么"。
+                        yield _build_task_checkpoint_event(
+                            session=session,
+                            conversation_id=conversation_id,
+                            task_id=state.task_id,
+                            iteration=_iteration,
+                            exit_reason=trace_result,
+                            summary=str(result or ""),
+                        )
+                        yield {"type": "done"}
+                        return
+                    else:
+                        # 验证不通过 → 继续循环; 清除前端已展示的流式文本
+                        logger.info(
+                            f"[ReAct-Stream] Iter {_iteration + 1} — VERIFY: incomplete, continuing loop"
+                        )
+                        if _streamed_text:
+                            yield {"type": "text_replace", "content": ""}
+                        yield {"type": "chain_text", "content": "任务尚未完成，继续处理..."}
+                        react_trace.append(_iter_trace)
+                        try:
+                            state.transition(TaskStatus.VERIFYING)
+                        except ValueError:  # s5b-allow-force-write
+                            state.status = TaskStatus.VERIFYING
+                        (
+                            working_messages,
+                            no_tool_call_count,
+                            verify_incomplete_count,
+                            no_confirmation_text_count,
+                            max_no_tool_retries,
+                        ) = result
+                        continue
+
+                # ==================== TOOL_CALLS ====================
+                elif decision.type == DecisionType.TOOL_CALLS and decision.tool_calls:
+                    # A new tool round can invalidate an earlier report candidate.
+                    task_final_candidates.clear()
+                    try:
+                        state.transition(TaskStatus.ACTING)
+                    except ValueError:  # s5b-allow-force-write
+                        state.status = TaskStatus.ACTING
+
+                    working_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": decision.assistant_content or [{"type": "text", "text": ""}],
+                            "reasoning_content": decision.thinking_content or None,
+                        }
+                    )
+
+                    await commit_model_messages(working_messages)
+
+                    # ---- ask_user 拦截 ----
+                    ask_user_calls = [
+                        tc for tc in decision.tool_calls if tc.get("name") == "ask_user"
+                    ]
+                    other_tool_calls = [
+                        tc for tc in decision.tool_calls if tc.get("name") != "ask_user"
+                    ]
+
+                    if ask_user_calls:
+                        # 先执行非 ask_user 工具
+                        tool_results_for_msg: list[dict] = []
+                        _security_confirm_interrupted_ask = False
+                        for tc in other_tool_calls:
+                            t_name = self._tool_executor.canonicalize_tool_name(
+                                tc.get("name", "unknown")
+                            )
+                            t_args = tc.get("input", tc.get("arguments", {}))
+                            t_id = tc.get("id", str(uuid.uuid4()))
+                            # Runtime mode guard — no tool_call events for blocked tools
+                            _blocked_msg = _should_block_tool(
+                                t_name, t_args, _allowed_tool_names, _effective_mode
+                            )
+                            if _blocked_msg:
+                                logger.warning(
+                                    f"[ModeGuard] Blocked '{t_name}' in {_effective_mode} mode"
+                                )
+                                yield {"type": "chain_text", "content": f"\n{_blocked_msg}\n"}
+                                tool_results_for_msg.append(
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": t_id,
+                                        "content": _blocked_msg,
+                                        "is_error": True,
+                                    }
+                                )
+                                continue
+                            # chain_text: 工具描述
+                            _ask_tool_desc = self._describe_tool_call(t_name, t_args)
+                            yield {
+                                "type": "chain_text",
+                                "content": _ask_tool_desc,
+                            }
+                            # [Hermes 对标 2026-10-16] 过程可见化：同普通路径。
+                            yield {"type": "text_delta", "content": f"\n> {_ask_tool_desc}\n"}
+                            yield {
+                                "type": "tool_call_start",
+                                "tool": t_name,
+                                "name": t_name,
+                                "args": t_args,
+                                "id": t_id,
+                                "friendly_message": _ask_tool_desc,
+                            }
+                            await broadcast_event(
+                                "pet-status-update",
+                                {"status": "tool_execution", "tool_name": t_name},
+                            )
+                            # 决策走 v2（C6 起），UI 状态机 C9b 后走独立 ui_confirm_bus，
+                            # C8b-3 后 resolve 路径也完全脱离 v1（IM/web/CLI 都直接调
+                            # ``policy_v2.apply_resolution`` 写 SessionAllowlistManager
+                            # + UserAllowlistManager，bus 只负责唤醒 waiter）。
+                            # C8b-6a: 直接消费 v2 ``PolicyDecisionV2`` + ``DecisionAction``，
+                            # 不再过 v1 PolicyResult/PolicyDecision shim；config 读 v2
+                            # ``get_config_v2().confirmation``。
+                            from openkitsune.agent.ui_confirm_bus import get_ui_confirm_bus
+
+                            from .policy_v2 import get_config_v2
+                            from .policy_v2.adapter import evaluate_via_v2
+                            from .policy_v2.enums import DecisionAction
+
+                            _v2_conf = get_config_v2().confirmation
+                            _bus = get_ui_confirm_bus()
+                            _pr = evaluate_via_v2(
+                                t_name, t_args if isinstance(t_args, dict) else {}
+                            )
+                            _deferred_tool_result = None
+                            if _pr.action == DecisionAction.DENY:
+                                r = f"⚠️ 策略拒绝: {_pr.reason}"
+                                _tool_is_error = True
+                            elif _pr.action == DecisionAction.DEFER:
+                                from types import SimpleNamespace
+
+                                _state_task_id = state.task_id
+                                if _state_task_id is None:
+                                    try:
+                                        from ..scheduler.locks import (
+                                            get_current_scheduled_task_id,
+                                        )
+
+                                        _state_task_id = get_current_scheduled_task_id()
+                                    except Exception:
+                                        _state_task_id = None
+                                _deferred_tool_result = (
+                                    await self._tool_executor._defer_unattended_confirm(
+                                        tool_use_id=t_id,
+                                        tool_name=t_name,
+                                        tool_input=t_args if isinstance(t_args, dict) else {},
+                                        perm_decision=SimpleNamespace(
+                                            metadata=dict(_pr.metadata),
+                                            decision_chain=_pr.to_ui_chain(),
+                                            reason=_pr.reason,
+                                        ),
+                                        session_id=conversation_id or "",
+                                        task_id=_state_task_id,
+                                    )
+                                )
+                                r = str(_deferred_tool_result.get("content", ""))
+                                _tool_is_error = True
+                                _security_confirm_interrupted_ask = True
+                            elif _pr.action == DecisionAction.CONFIRM:
+                                # C8 §2.3 fix：取消 IM 渠道早退。reasoning_engine 永远 yield
+                                # ``security_confirm`` SSE，让 gateway._consume_stream 把事件
+                                # 路由到 ``_handle_im_security_confirm``：桌面端走 SecurityView
+                                # 弹窗，IM 端走卡片 / 文本回退。两条路径最终都会调
+                                # ``policy_v2.apply_resolution``，唤醒此处的 bus.wait_for_resolution。
+                                # 旧实现在 IM CONFIRM 时直接 abort（伪装成"请到桌面确认"），
+                                # 让 gateway 的 IM 卡片链路成为永远不会触发的死代码。
+                                _is_im = _is_im_conversation(conversation_id)
+                                _risk = _pr.metadata.get("risk_level") or "medium"
+                                _needs_sb = _pr.metadata.get("needs_sandbox", False)
+                                # C9a §1: v2 字段（approval_class / policy_version）随 SSE
+                                # 一起下发。SecurityConfirmModal / SecurityView 用 approval_class
+                                # 渲染语义 badge（DESTRUCTIVE/CONTROL_PLANE/...），policy_version=2
+                                # 让前端能区分 v1 兜底事件 vs v2 主决策事件。
+                                # 字段缺失时前端兜回旧路径（risk_level）—— 完全向后兼容。
+                                _approval_class = _pr.metadata.get("approval_class")
+                                # C13 §15.4: 多 agent confirm 冒泡链路 — payload
+                                # 携带 delegate_chain + root_user_id，让 UI 渲染
+                                # "specialist_a (via root) 请求执行 ..."。顶层
+                                # agent 时 chain 空、root_user_id=None，UI 兜回
+                                # 原有行为（无 chain badge）。
+                                from .policy_v2 import (
+                                    get_current_context as _pv2_get_ctx_for_emit,
+                                )
+
+                                _emit_ctx = _pv2_get_ctx_for_emit()
+                                _delegate_chain = (
+                                    list(_emit_ctx.delegate_chain) if _emit_ctx else []
+                                )
+                                _root_user_id = _emit_ctx.root_user_id if _emit_ctx else None
+                                # C13 §15.5: dedup — when delegate_parallel
+                                # siblings issue the same (tool, params), only
+                                # the first emits the SSE; siblings attach as
+                                # followers on the leader's confirm event.
+                                _dedup_key = _compute_confirm_dedup_key(t_name, t_args)
+                                _leader_id = (
+                                    _bus.find_dedup_leader(
+                                        session_id=conversation_id or "",
+                                        dedup_key=_dedup_key,
+                                    )
+                                    if _dedup_key
+                                    else None
+                                )
+                                _confirm_timeout = float(_v2_conf.timeout_seconds)
+                                if _is_im:
+                                    _confirm_timeout = max(_confirm_timeout * 4, 180.0)
+                                if _leader_id:
+                                    # Follower path: skip SSE emission, share
+                                    # the leader's event. cleanup() on the
+                                    # leader is deferred until all followers
+                                    # deregister, so we still read _decisions
+                                    # safely.
+                                    logger.info(
+                                        "[C13 dedup] tool=%s session=%s join leader confirm_id=%s",
+                                        t_name,
+                                        (conversation_id or "")[:12],
+                                        _leader_id[:8],
+                                    )
+                                    _bus.register_follower(_leader_id)
+                                    try:
+                                        _decision = await _bus.wait_for_resolution(
+                                            _leader_id, _confirm_timeout
+                                        )
+                                    finally:
+                                        _bus.deregister_follower(_leader_id)
+                                    # Don't call cleanup on the leader from
+                                    # follower path — leader's caller owns it.
+                                else:
+                                    if _pr.metadata.get("riskgate_required"):
+                                        _tool_args_dict = t_args if isinstance(t_args, dict) else {}
+                                        _risk_confirmation = _open_riskgate_tool_confirmation(
+                                            conversation_id=conversation_id,
+                                            tool_name=t_name,
+                                            tool_input=_tool_args_dict,
+                                            policy_result=_pr,
+                                            tool_id=t_id,
+                                            timeout_seconds=_confirm_timeout,
+                                            channel="im" if _is_im else "desktop",
+                                            delegate_chain=_delegate_chain,
+                                            root_user_id=_root_user_id,
+                                        )
+                                        yield _risk_confirmation.prompt_event
+                                        _risk_result = await _execute_riskgate_tool_confirmation(
+                                            self._tool_executor,
+                                            confirmation=_risk_confirmation,
+                                            detect_result_errors=False,
+                                            summarize_tool_result=self._summarize_tool_result,
+                                        )
+                                        for _evt in _risk_result.end_events:
+                                            yield _evt
+                                        if _risk_result.result_summary:
+                                            yield {
+                                                "type": "chain_text",
+                                                "content": _risk_result.result_summary,
+                                            }
+                                        tool_results_for_msg.append(_risk_result.tool_result)
+                                        _security_confirm_interrupted_ask = True
+                                        break
+                                    _confirm_event = register_policy_confirm(
+                                        confirm_id=t_id,
+                                        conversation_id=conversation_id or "",
+                                        tool_name=t_name,
+                                        tool_args=t_args if isinstance(t_args, dict) else {},
+                                        reason=_pr.reason,
+                                        risk_level=str(_risk),
+                                        needs_sandbox=bool(_needs_sb),
+                                        timeout_seconds=_v2_conf.timeout_seconds,
+                                        default_on_timeout=_v2_conf.default_on_timeout,
+                                        channel="im" if _is_im else "desktop",
+                                        approval_class=_approval_class,
+                                        policy_version=2,
+                                        decision_chain=_pr.to_ui_chain(),
+                                        delegate_chain=_delegate_chain,
+                                        root_user_id=_root_user_id,
+                                        policy_metadata=dict(_pr.metadata or {}),
+                                        dedup_key=_dedup_key or None,
+                                    )
+                                    yield _confirm_event
+                                    _decision = await _bus.wait_for_resolution(
+                                        t_id,
+                                        _confirm_timeout,
+                                    )
+                                    _bus.cleanup(t_id)
+                                _hint: ConfigHint | None = None
+                                if _decision in ALLOW_SECURITY_CONFIRM_DECISIONS:
+                                    try:
+                                        # C8b-6a: pass v2 PolicyDecisionV2 directly;
+                                        # ``execute_tool_with_policy`` only reads ``.metadata``
+                                        # via ``getattr``——duck-typed across v1/v2.
+                                        from .policy_v2.models import PolicyDecisionV2 as _PD2
+
+                                        _raw = await self._tool_executor.execute_tool_with_policy(
+                                            tool_name=t_name,
+                                            tool_input=t_args if isinstance(t_args, dict) else {},
+                                            policy_result=_PD2(
+                                                action=DecisionAction.ALLOW,
+                                                reason=f"用户已允许安全确认: {_decision}",
+                                                metadata={
+                                                    "confirmed_bypass": True,
+                                                    "needs_sandbox": _decision == "sandbox"
+                                                    or _needs_sb,
+                                                },
+                                            ),
+                                            session_id=conversation_id,
+                                        )
+                                        r, _hint = _unpack_tool_result(_raw)
+                                        _tool_is_error = False
+                                    except Exception as exc:
+                                        r = f"Tool error after security confirmation: {exc}"
+                                        _tool_is_error = True
+                                else:
+                                    r = (
+                                        f"用户已拒绝安全确认: {_decision}。"
+                                        "不要再执行该操作，请选择安全替代方案或说明无法继续。"
+                                    )
+                                    _tool_is_error = True
+                                _security_confirm_interrupted_ask = True
+                            else:
+                                _tool_is_error = False
+                                _hint = None
+                                # KV 间隙驱逐：模型已交棒给工具、引擎空闲
+                                # （is_processing=false）——在工具执行阶段执行
+                                # 「暂停 → 清理 → 恢复」；未 pending 时零开销，
+                                # 忙碌时自动顺延到下一间隙窗口。
+                                try:
+                                    await self._context_manager.drain_gap_kv_evict()
+                                except Exception:
+                                    pass
+                                try:
+                                    _raw = await self._tool_executor.execute_tool_with_policy(
+                                        tool_name=t_name,
+                                        tool_input=t_args if isinstance(t_args, dict) else {},
+                                        policy_result=_pr,
+                                        session_id=conversation_id,
+                                    )
+                                    r, _hint = _unpack_tool_result(_raw)
+                                except Exception as exc:
+                                    r = f"Tool error: {exc}"
+                                    _tool_is_error = True
+                            _ask_result_summary = self._summarize_tool_result(t_name, r)
+                            for _evt in _build_tool_end_events(
+                                tool_name=t_name,
+                                tool_id=t_id,
+                                result_text=r,
+                                hint=_hint,
+                                is_error=_tool_is_error,
+                                result_summary=_ask_result_summary or "",
+                            ):
+                                yield _evt
+                            # chain_text: 结果摘要
+                            if _ask_result_summary:
+                                yield {"type": "chain_text", "content": _ask_result_summary}
+                            _tool_result_msg = {
+                                "type": "tool_result",
+                                "tool_use_id": t_id,
+                                "content": r,
+                                "is_error": _tool_is_error,
+                            }
+                            if _deferred_tool_result:
+                                _tool_result_msg.update(
+                                    {
+                                        "_deferred_approval_id": _deferred_tool_result.get(
+                                            "_deferred_approval_id"
+                                        ),
+                                        "_deferred_approval_strategy": _deferred_tool_result.get(
+                                            "_deferred_approval_strategy"
+                                        ),
+                                    }
+                                )
+                            await record_model_tool_result(t_id, r, _tool_is_error)
+                            tool_results_for_msg.append(_tool_result_msg)
+                            if _deferred_tool_result:
+                                raise DeferredApprovalRequired(
+                                    message=r,
+                                    pending_id=_deferred_tool_result.get("_deferred_approval_id"),
+                                    unattended_strategy=_deferred_tool_result.get(
+                                        "_deferred_approval_strategy"
+                                    ),
+                                )
+                            if _security_confirm_interrupted_ask:
+                                break
+
+                        all_tool_results.extend(tool_results_for_msg)
+                        if _security_confirm_interrupted_ask:
+                            continue
+
+                        # ask_user 事件
+                        ask_raw = ask_user_calls[0].get("input")
+                        if not ask_raw:
+                            ask_raw = ask_user_calls[0].get("arguments", {})
+                        ask_input = ask_raw
+                        if isinstance(ask_input, str):
+                            try:
+                                ask_input = json.loads(ask_input)
+                            except Exception:
+                                ask_input = {}
+                        if not isinstance(ask_input, dict):
+                            ask_input = {}
+                        ask_q = ask_input.get("question", "")
+                        ask_options = ask_input.get("options")
+                        ask_allow_multiple = ask_input.get("allow_multiple", False)
+                        ask_questions = ask_input.get("questions")
+                        text_part = decision.text_content or ""
+                        question_text = f"{text_part}\n\n{ask_q}".strip() if text_part else ask_q
+                        event: dict = {
+                            "type": "ask_user",
+                            "question": question_text,
+                            "conversation_id": conversation_id,
+                        }
+                        if ask_options and isinstance(ask_options, list):
+                            event["options"] = [
+                                {"id": str(o.get("id", "")), "label": str(o.get("label", ""))}
+                                for o in ask_options
+                                if isinstance(o, dict) and o.get("id") and o.get("label")
+                            ]
+                        if ask_allow_multiple:
+                            event["allow_multiple"] = True
+                        if ask_questions and isinstance(ask_questions, list):
+                            parsed_questions = []
+                            for q in ask_questions:
+                                if (
+                                    not isinstance(q, dict)
+                                    or not q.get("id")
+                                    or not q.get("prompt")
+                                ):
+                                    continue
+                                pq: dict = {"id": str(q["id"]), "prompt": str(q["prompt"])}
+                                q_options = q.get("options")
+                                if q_options and isinstance(q_options, list):
+                                    pq["options"] = [
+                                        {
+                                            "id": str(o.get("id", "")),
+                                            "label": str(o.get("label", "")),
+                                        }
+                                        for o in q_options
+                                        if isinstance(o, dict) and o.get("id") and o.get("label")
+                                    ]
+                                if q.get("allow_multiple"):
+                                    pq["allow_multiple"] = True
+                                parsed_questions.append(pq)
+                            if parsed_questions:
+                                event["questions"] = parsed_questions
+
+                        await broadcast_event("pet-status-update", {"status": "idle"})
+                        yield event
+                        react_trace.append(_iter_trace)
+                        self._save_react_trace(
+                            react_trace,
+                            conversation_id,
+                            session_type,
+                            "ask_user",
+                            _trace_started_at,
+                        )
+                        self._last_exit_reason = "ask_user"
+                        try:
+                            state.transition(TaskStatus.WAITING_USER)
+                        except ValueError:  # s5b-allow-force-write
+                            state.status = TaskStatus.WAITING_USER
+                        yield {"type": "done"}
+                        return
+
+                    # ---- 正常工具执行（支持 cancel_event / skip_event 三路竞速中断） ----
+                    tool_results_for_msg: list[dict] = []
+                    _non_denied_tool_names: list[str] = []
+                    _actual_tool_calls_for_budget: list[dict] = []
+                    _stream_cancelled = False
+                    _stream_skipped = False
+                    cancel_event = state.cancel_event if state else asyncio.Event()
+                    skip_event = state.skip_event if state else asyncio.Event()
+                    _executed_tool_calls_for_budget: list[dict] = []
+                    for tc in decision.tool_calls:
+                        # 每个工具执行前检查取消
+                        if state and state.cancelled:
+                            _stream_cancelled = True
+                            break
+
+                        tool_name = self._tool_executor.canonicalize_tool_name(
+                            tc.get("name", "unknown")
+                        )
+                        tool_args = tc.get("input", tc.get("arguments", {}))
+                        tool_id = tc.get("id", str(uuid.uuid4()))
+
+                        # Exact invocation frequency limit: same tool with different
+                        # arguments is valid progress, especially for todo step updates.
+                        _tool_key = _tool_rate_limit_key(tool_name, tool_args)
+                        _tool_call_counter[_tool_key] = _tool_call_counter.get(_tool_key, 0) + 1
+                        _tool_name_counter[tool_name] = _tool_name_counter.get(tool_name, 0) + 1
+                        _per_name_limit = _PER_TOOL_NAME_TASK_LIMITS.get(tool_name, 0)
+                        _rl_msg = ""
+                        if _per_name_limit > 0 and _tool_name_counter[tool_name] > _per_name_limit:
+                            logger.warning(
+                                f"[RateLimit] Tool '{tool_name}' called "
+                                f"{_tool_name_counter[tool_name]} times in this task "
+                                f"(per-name limit={_per_name_limit}), skipping"
+                            )
+                            _rl_msg = (
+                                f"[系统] 工具 {tool_name} 在本任务已调用 "
+                                f"{_tool_name_counter[tool_name] - 1} 次，"
+                                f"已达单轮上限 {_per_name_limit}。"
+                                f"请把剩余信息合并到现有调用，或推迟到下一轮。"
+                            )
+                        elif (
+                            _MAX_SAME_TOOL_PER_TASK > 0
+                            and _tool_call_counter[_tool_key] > _MAX_SAME_TOOL_PER_TASK
+                        ):
+                            logger.warning(
+                                f"[RateLimit] Tool invocation '{_tool_key}' called "
+                                f"{_tool_call_counter[_tool_key]} times "
+                                f"(limit={_MAX_SAME_TOOL_PER_TASK}), skipping"
+                            )
+                            _rl_msg = (
+                                f"[系统] 工具 {tool_name} 已在本任务中调用 "
+                                f"{_tool_call_counter[_tool_key] - 1} 次，已达上限。"
+                                f"请整合操作或继续下一步。"
+                            )
+                        if _rl_msg:
+                            yield {
+                                "type": "tool_call_start",
+                                "tool": tool_name,
+                                "name": tool_name,
+                                "args": tool_args,
+                                "id": tool_id,
+                                "friendly_message": self._describe_tool_call(tool_name, tool_args),
+                            }
+                            yield {
+                                "type": "tool_call_end",
+                                "tool": tool_name,
+                                "result": _rl_msg[:_SSE_RESULT_PREVIEW_CHARS],
+                                "id": tool_id,
+                                "is_error": False,
+                                "result_summary": _rl_msg,
+                            }
+                            tool_results_for_msg.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": _rl_msg,
+                                }
+                            )
+                            continue
+
+                        # Runtime mode guard — blocked tools do NOT emit
+                        # tool_call_start/end to avoid leaking events to the frontend
+                        _blocked_msg = _should_block_tool(
+                            tool_name, tool_args, _allowed_tool_names, _effective_mode
+                        )
+                        if _blocked_msg:
+                            logger.warning(
+                                f"[ModeGuard] Blocked '{tool_name}' in {_effective_mode} mode"
+                            )
+                            yield {"type": "chain_text", "content": f"\n{_blocked_msg}\n"}
+                            tool_results_for_msg.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": _blocked_msg,
+                                    "is_error": True,
+                                }
+                            )
+                            continue
+
+                        _cached_result = self._cached_readonly_tool_result(
+                            tool_name,
+                            tool_args,
+                            tool_id,
+                        )
+                        if _cached_result is not None:
+                            _cached_text = str(_cached_result.get("content", ""))
+                            yield {"type": "chain_text", "content": f"{tool_name} 使用缓存结果"}
+                            # [Hermes 对标 2026-10-16] 同步到正文流。
+                            yield {"type": "text_delta", "content": f"\n> {tool_name} 使用缓存结果\n"}
+                            yield {
+                                "type": "tool_call_start",
+                                "tool": tool_name,
+                                "name": tool_name,
+                                "args": tool_args,
+                                "id": tool_id,
+                                "friendly_message": self._describe_tool_call(tool_name, tool_args),
+                                "cached": True,
+                            }
+                            yield {
+                                "type": "tool_call_end",
+                                "tool": tool_name,
+                                "result": _cached_text[:_SSE_RESULT_PREVIEW_CHARS],
+                                "id": tool_id,
+                                "is_error": False,
+                                "result_summary": self._summarize_tool_result(
+                                    tool_name, _cached_text
+                                )
+                                or "",
+                                "cached": True,
+                            }
+                            tool_results_for_msg.append(_cached_result)
+                            continue
+
+                        _tool_desc = self._describe_tool_call(tool_name, tool_args)
+                        yield {"type": "chain_text", "content": _tool_desc}
+                        # [Hermes 对标 2026-10-16] 过程可见化：工具描述同时通过
+                        # text_delta 流式发到正文流，用户在等待时能看到"正在做什么"，
+                        # 而不是只盯着"本地模型还在生成…"。用 > 前缀让它在
+                        # Markdown 里渲染为引用块，和模型正文自然区分。
+                        yield {"type": "text_delta", "content": f"\n> {_tool_desc}\n"}
+
+                        yield {
+                            "type": "tool_call_start",
+                            "tool": tool_name,
+                            "name": tool_name,
+                            "args": tool_args,
+                            "id": tool_id,
+                            "friendly_message": _tool_desc,
+                        }
+                        await broadcast_event(
+                            "pet-status-update",
+                            {"status": "tool_execution", "tool_name": tool_name},
+                        )
+
+                        # PolicyEngine 检查（与 execute_batch 一致）—— C6 起决策走 v2，
+                        # C9b 起 UI confirm 走独立 ui_confirm_bus；C8b-1 起 readonly
+                        # 由 ``DeathSwitchTracker`` 承载（process-wide singleton），与
+                        # v1 ``pe.readonly_mode`` 同源。
+                        # C8b-6a: 直接消费 v2 ``PolicyDecisionV2`` + ``DecisionAction``。
+                        from openkitsune.agent.ui_confirm_bus import get_ui_confirm_bus
+
+                        from .policy_v2 import (
+                            get_config_v2,
+                            get_death_switch_tracker,
+                        )
+                        from .policy_v2.adapter import evaluate_via_v2
+                        from .policy_v2.enums import DecisionAction
+
+                        _v2_conf = get_config_v2().confirmation
+                        _ds_tracker = get_death_switch_tracker()
+                        _bus = get_ui_confirm_bus()
+                        _tool_args_dict = tool_args if isinstance(tool_args, dict) else {}
+                        _pr = evaluate_via_v2(tool_name, _tool_args_dict)
+                        if _pr.action == DecisionAction.DENY:
+                            result_text = f"⚠️ 策略拒绝: {_pr.reason}"
+                            _deny_summary = self._summarize_tool_result(tool_name, result_text)
+                            yield {
+                                "type": "tool_call_end",
+                                "tool": tool_name,
+                                "result": result_text[:_SSE_RESULT_PREVIEW_CHARS],
+                                "id": tool_id,
+                                "is_error": True,
+                                "result_summary": _deny_summary or "",
+                            }
+                            if _deny_summary:
+                                yield {"type": "chain_text", "content": _deny_summary}
+                            _readonly_now = _ds_tracker.is_readonly_mode()
+                            if _readonly_now and not _death_switch_notified:
+                                yield {"type": "death_switch", "active": True, "reason": _pr.reason}
+                                _death_switch_notified = True
+                            if _readonly_now:
+                                result_text = (
+                                    f"{result_text}\n\n"
+                                    "[DEATH SWITCH] Agent 已进入只读模式，所有非只读操作将被拒绝。"
+                                    "请立即停止尝试修改/写入/执行操作，仅使用读取类工具。"
+                                    "等待用户手动解除只读模式后再继续。"
+                                )
+                            tool_results_for_msg.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": result_text,
+                                    "is_error": True,
+                                }
+                            )
+                            continue
+
+                        if _pr.action == DecisionAction.DEFER:
+                            from types import SimpleNamespace
+
+                            _state_task_id = state.task_id
+                            if _state_task_id is None:
+                                try:
+                                    from ..scheduler.locks import (
+                                        get_current_scheduled_task_id,
+                                    )
+
+                                    _state_task_id = get_current_scheduled_task_id()
+                                except Exception:
+                                    _state_task_id = None
+                            _deferred_tool_result = (
+                                await self._tool_executor._defer_unattended_confirm(
+                                    tool_use_id=tool_id,
+                                    tool_name=tool_name,
+                                    tool_input=_tool_args_dict,
+                                    perm_decision=SimpleNamespace(
+                                        metadata=dict(_pr.metadata),
+                                        decision_chain=_pr.to_ui_chain(),
+                                        reason=_pr.reason,
+                                    ),
+                                    session_id=conversation_id or "",
+                                    task_id=_state_task_id,
+                                )
+                            )
+                            result_text = str(_deferred_tool_result.get("content", ""))
+                            result_summary = (
+                                self._summarize_tool_result(tool_name, result_text) or ""
+                            )
+                            yield {
+                                "type": "tool_call_end",
+                                "tool": tool_name,
+                                "result": result_text[:_SSE_RESULT_PREVIEW_CHARS],
+                                "id": tool_id,
+                                "is_error": True,
+                                "result_summary": result_summary,
+                            }
+                            if result_summary:
+                                yield {"type": "chain_text", "content": result_summary}
+                            raise DeferredApprovalRequired(
+                                message=result_text,
+                                pending_id=_deferred_tool_result.get("_deferred_approval_id"),
+                                unattended_strategy=_deferred_tool_result.get(
+                                    "_deferred_approval_strategy"
+                                ),
+                            )
+
+                        _executed_tool_calls_for_budget.append(tc)
+
+                        if _pr.action == DecisionAction.CONFIRM:
+                            _actual_tool_calls_for_budget.append(tc)
+                            # C8 §2.3 fix：取消 IM 渠道早退（同上方 hotspot），让 IM 走
+                            # gateway 卡片确认链路。timeout 对 IM 放宽 4×（最少 180s）。
+                            _is_im = _is_im_conversation(conversation_id)
+                            _risk = _pr.metadata.get("risk_level") or "medium"
+                            _needs_sb = _pr.metadata.get("needs_sandbox", False)
+                            # C9a §1: 见上方 hotspot 同款注释（v2 字段向后兼容下发）
+                            _approval_class = _pr.metadata.get("approval_class")
+                            # C13 §15.4: 见上方 hotspot 同款注释 — 多 agent
+                            # confirm 冒泡 payload。
+                            from .policy_v2 import (
+                                get_current_context as _pv2_get_ctx_for_emit,
+                            )
+
+                            _emit_ctx = _pv2_get_ctx_for_emit()
+                            _delegate_chain = list(_emit_ctx.delegate_chain) if _emit_ctx else []
+                            _root_user_id = _emit_ctx.root_user_id if _emit_ctx else None
+                            # C13 §15.5: dedup — 见上方 hotspot 同款注释。
+                            _dedup_key = _compute_confirm_dedup_key(tool_name, _tool_args_dict)
+                            _leader_id = (
+                                _bus.find_dedup_leader(
+                                    session_id=conversation_id or "",
+                                    dedup_key=_dedup_key,
+                                )
+                                if _dedup_key
+                                else None
+                            )
+                            _confirm_timeout = float(_v2_conf.timeout_seconds)
+                            if _is_im:
+                                _confirm_timeout = max(_confirm_timeout * 4, 180.0)
+                            if _leader_id:
+                                logger.info(
+                                    "[C13 dedup] tool=%s session=%s join leader confirm_id=%s",
+                                    tool_name,
+                                    (conversation_id or "")[:12],
+                                    _leader_id[:8],
+                                )
+                                _bus.register_follower(_leader_id)
+                                try:
+                                    _decision = await _bus.wait_for_resolution(
+                                        _leader_id, _confirm_timeout
+                                    )
+                                finally:
+                                    _bus.deregister_follower(_leader_id)
+                            else:
+                                if _pr.metadata.get("riskgate_required"):
+                                    _risk_confirmation = _open_riskgate_tool_confirmation(
+                                        conversation_id=conversation_id,
+                                        tool_name=tool_name,
+                                        tool_input=_tool_args_dict,
+                                        policy_result=_pr,
+                                        tool_id=tool_id,
+                                        timeout_seconds=_confirm_timeout,
+                                        channel="im" if _is_im else "desktop",
+                                        delegate_chain=_delegate_chain,
+                                        root_user_id=_root_user_id,
+                                    )
+                                    yield _risk_confirmation.prompt_event
+                                    _risk_result = await _execute_riskgate_tool_confirmation(
+                                        self._tool_executor,
+                                        confirmation=_risk_confirmation,
+                                        detect_result_errors=False,
+                                        summarize_tool_result=self._summarize_tool_result,
+                                    )
+                                    for _evt in _risk_result.end_events:
+                                        yield _evt
+                                    if _risk_result.result_summary:
+                                        yield {
+                                            "type": "chain_text",
+                                            "content": _risk_result.result_summary,
+                                        }
+                                    result_text = _risk_result.result_text
+                                    _confirm_hint = _risk_result.hint
+                                    _confirm_is_error = _risk_result.is_error
+                                    for _evt in _build_tool_end_events(
+                                        tool_name=tool_name,
+                                        tool_id=tool_id,
+                                        result_text=result_text,
+                                        hint=_confirm_hint,
+                                        is_error=_confirm_is_error,
+                                        result_summary=_risk_result.result_summary,
+                                    ):
+                                        yield _evt
+                                    continue
+                                _confirm_event = register_policy_confirm(
+                                    confirm_id=tool_id,
+                                    conversation_id=conversation_id or "",
+                                    tool_name=tool_name,
+                                    tool_args=_tool_args_dict,
+                                    reason=_pr.reason,
+                                    risk_level=str(_risk),
+                                    needs_sandbox=bool(_needs_sb),
+                                    timeout_seconds=_v2_conf.timeout_seconds,
+                                    default_on_timeout=_v2_conf.default_on_timeout,
+                                    channel="im" if _is_im else "desktop",
+                                    approval_class=_approval_class,
+                                    policy_version=2,
+                                    decision_chain=_pr.to_ui_chain(),
+                                    delegate_chain=_delegate_chain,
+                                    root_user_id=_root_user_id,
+                                    policy_metadata=dict(_pr.metadata or {}),
+                                    dedup_key=_dedup_key or None,
+                                )
+                                yield _confirm_event
+                                _decision = await _bus.wait_for_resolution(
+                                    tool_id,
+                                    _confirm_timeout,
+                                )
+                                _bus.cleanup(tool_id)
+                            _confirmed_allowed = _decision in ALLOW_SECURITY_CONFIRM_DECISIONS
+                            _confirm_hint: ConfigHint | None = None
+                            if _confirmed_allowed:
+                                try:
+                                    # C8b-6a: pass v2 PolicyDecisionV2 directly (duck-typed
+                                    # with v1 PolicyResult on ``.metadata``).
+                                    from .policy_v2.models import PolicyDecisionV2 as _PD2
+
+                                    _raw = await self._tool_executor.execute_tool_with_policy(
+                                        tool_name=tool_name,
+                                        tool_input=_tool_args_dict,
+                                        policy_result=_PD2(
+                                            action=DecisionAction.ALLOW,
+                                            reason=f"用户已允许安全确认: {_decision}",
+                                            metadata={
+                                                "confirmed_bypass": True,
+                                                "needs_sandbox": _decision == "sandbox"
+                                                or _needs_sb,
+                                            },
+                                        ),
+                                        session_id=conversation_id,
+                                    )
+                                    result_text, _confirm_hint = _unpack_tool_result(_raw)
+                                    _confirm_is_error = False
+                                except Exception as exc:
+                                    result_text = f"Tool error after security confirmation: {exc}"
+                                    _confirm_is_error = True
+                            else:
+                                result_text = (
+                                    f"用户已拒绝安全确认: {_decision}。"
+                                    "不要再执行该操作，请选择安全替代方案或说明无法继续。"
+                                )
+                                _confirm_is_error = True
+                            await record_model_tool_result(tool_id, result_text, _confirm_is_error)
+                            for _evt in _build_tool_end_events(
+                                tool_name=tool_name,
+                                tool_id=tool_id,
+                                result_text=result_text,
+                                hint=_confirm_hint,
+                                is_error=_confirm_is_error,
+                                result_summary=self._summarize_tool_result(tool_name, result_text)
+                                or "",
+                            ):
+                                yield _evt
+                            tool_results_for_msg.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": result_text,
+                                    "is_error": _confirm_is_error,
+                                }
+                            )
+                            continue
+
+                        _non_denied_tool_names.append(tool_name)
+                        _actual_tool_calls_for_budget.append(tc)
+
+                        # 将工具执行与 cancel_event / skip_event 三路竞速
+                        # 注意: 不在此处 clear_skip()，让已到达的 skip 信号自然被竞速消费
+                        # ``_stream_hint`` 仅在 tool_exec_task 自然完成且 handler
+                        # 抛 ToolConfigError 时非 None；cancel/skip/timeout 路径
+                        # 显式置 None（policy: side-channel hint 只反映 handler
+                        # 内部产生的可纠正配置问题，不污染 user-initiated 中断）。
+                        _stream_hint: ConfigHint | None = None
+                        _active_plan_id_before_tool = ""
+                        if tool_name in {"update_todo_step", "complete_todo"}:
+                            try:
+                                from ..tools.handlers.plan import get_active_plan_id
+
+                                _active_plan_id_before_tool = (
+                                    get_active_plan_id(conversation_id) or ""
+                                )
+                            except Exception:
+                                _active_plan_id_before_tool = ""
+                        try:
+                            tool_exec_task = asyncio.create_task(
+                                self._tool_executor.execute_tool_with_policy(
+                                    tool_name=tool_name,
+                                    tool_input=tool_args if isinstance(tool_args, dict) else {},
+                                    policy_result=_pr,
+                                    session_id=conversation_id,
+                                )
+                            )
+                            cancel_waiter = asyncio.create_task(cancel_event.wait())
+                            skip_waiter = asyncio.create_task(skip_event.wait())
+
+                            pending_set = {tool_exec_task, cancel_waiter, skip_waiter}
+                            done_set: set[asyncio.Task] = set()
+                            while not done_set:
+                                done_set, pending_set = await asyncio.wait(
+                                    pending_set,
+                                    timeout=self._HEARTBEAT_INTERVAL,
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                if not done_set:
+                                    yield {"type": "heartbeat"}
+
+                            for t in pending_set:
+                                t.cancel()
+                                try:
+                                    await t
+                                except (asyncio.CancelledError, Exception):
+                                    pass
+
+                            if cancel_waiter in done_set and tool_exec_task not in done_set:
+                                result_text = f"[工具 {tool_name} 被用户中断]"
+                                _stream_cancelled = True
+                            elif skip_waiter in done_set and tool_exec_task not in done_set:
+                                _skip_reason = state.skip_reason if state else "用户请求跳过"
+                                if state:
+                                    state.clear_skip()
+                                result_text = f"[用户跳过了此步骤: {_skip_reason}]"
+                                _stream_skipped = True
+                                logger.info(
+                                    f"[SkipStep-Stream] Tool {tool_name} skipped: {_skip_reason}"
+                                )
+                            elif tool_exec_task in done_set:
+                                # task.result() 现在是 (text, hint) 元组
+                                result_text, _stream_hint = _unpack_tool_result(
+                                    tool_exec_task.result()
+                                )
+                                self._remember_readonly_tool_result(
+                                    tool_name,
+                                    tool_args,
+                                    result_text,
+                                    tool_id,
+                                )
+                            else:
+                                result_text = f"[工具 {tool_name} 被用户中断]"
+                                _stream_cancelled = True
+                        except Exception as exc:
+                            result_text = f"Tool error: {exc}"
+
+                        _tool_is_error = result_text.startswith("Tool error:")
+                        await record_model_tool_result(tool_id, result_text, _tool_is_error)
+                        # Emit agent_handoff events from session.context.handoff_events (set by orchestrator.delegate)
+                        if (
+                            session
+                            and hasattr(session, "context")
+                            and hasattr(session.context, "handoff_events")
+                        ):
+                            for h in session.context.handoff_events:
+                                yield {
+                                    "type": "agent_handoff",
+                                    "from_agent": h.get("from_agent", ""),
+                                    "to_agent": h.get("to_agent", ""),
+                                    "reason": h.get("reason", ""),
+                                }
+                            session.context.handoff_events.clear()
+                        _end_result_summary = (
+                            self._summarize_tool_result(tool_name, result_text) or ""
+                        )
+                        # 跳过 / 取消 / 超时 路径 hint 已显式置 None；只有正常完成
+                        # 路径才会带着 _stream_hint（由 ToolConfigError 触发）。
+                        if _stream_skipped:
+                            for _evt in _build_tool_end_events(
+                                tool_name=tool_name,
+                                tool_id=tool_id,
+                                result_text=result_text,
+                                hint=None,
+                                is_error=False,
+                                result_summary=_end_result_summary,
+                                extra={"skipped": True},
+                            ):
+                                yield _evt
+                        else:
+                            for _evt in _build_tool_end_events(
+                                tool_name=tool_name,
+                                tool_id=tool_id,
+                                result_text=result_text,
+                                hint=_stream_hint if not _stream_cancelled else None,
+                                is_error=_tool_is_error,
+                                result_summary=_end_result_summary,
+                            ):
+                                yield _evt
+
+                        if _stream_cancelled:
+                            tool_results_for_msg.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": result_text,
+                                    "is_error": True,
+                                }
+                            )
+                            break
+
+                        if _stream_skipped:
+                            tool_results_for_msg.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": result_text,
+                                }
+                            )
+                            _stream_skipped = False
+                            continue
+
+                        # === chain_text: 简述工具返回结果 ===
+                        _result_summary = self._summarize_tool_result(tool_name, result_text)
+                        if _result_summary:
+                            yield {"type": "chain_text", "content": _result_summary}
+                            # [Hermes 对标 2026-10-16] 结果摘要同时通过 text_delta
+                            # 发到正文流，让用户看到"每一步做完了什么"。
+                            yield {"type": "text_delta", "content": f"> {_result_summary}\n"}
+
+                        # 交付回执收集（与 run() 一致）：直接交付、子节点提交、
+                        # 父节点验收中继交付，三种 receipts 都算 TaskVerify
+                        # 眼里的有效交付证据。
+                        if (
+                            tool_name
+                            in (
+                                "deliver_artifacts",
+                                "org_submit_deliverable",
+                                "org_accept_deliverable",
+                            )
+                            and result_text
+                        ):
+                            try:
+                                _rt = result_text
+                                _lm = "\n\n[执行日志]"
+                                if _lm in _rt:
+                                    _rt = _rt[: _rt.index(_lm)]
+                                _receipts_data = json.loads(_rt)
+                                if (
+                                    isinstance(_receipts_data, dict)
+                                    and "receipts" in _receipts_data
+                                    and isinstance(_receipts_data["receipts"], list)
+                                    and _receipts_data["receipts"]
+                                ):
+                                    delivery_receipts = _receipts_data["receipts"]
+                                    self._last_delivery_receipts = delivery_receipts
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
+                        # Plan 事件
+                        if tool_name == "create_todo" and isinstance(tool_args, dict):
+                            raw_steps = tool_args.get("steps", [])
+                            plan_steps = []
+                            for idx, s in enumerate(raw_steps):
+                                if isinstance(s, dict):
+                                    plan_steps.append(
+                                        {
+                                            "id": str(s.get("id", f"step_{idx + 1}")),
+                                            "description": str(
+                                                s.get("description", s.get("id", ""))
+                                            ),
+                                            "status": "pending",
+                                        }
+                                    )
+                                else:
+                                    plan_steps.append(
+                                        {
+                                            "id": f"step_{idx + 1}",
+                                            "description": str(s),
+                                            "status": "pending",
+                                        }
+                                    )
+                            # 从后端获取真实 plan_id，保持前后端 ID 一致
+                            _sse_plan_id = str(uuid.uuid4())
+                            try:
+                                from ..tools.handlers.plan import get_active_plan_id
+
+                                _real_id = get_active_plan_id(conversation_id)
+                                if _real_id:
+                                    _sse_plan_id = _real_id
+                            except Exception:
+                                pass
+                            yield {
+                                "type": "todo_created",
+                                "plan": {
+                                    "id": _sse_plan_id,
+                                    "taskSummary": tool_args.get("task_summary", ""),
+                                    "steps": plan_steps,
+                                    "status": "in_progress",
+                                },
+                            }
+                        elif tool_name == "create_plan_file" and isinstance(tool_args, dict):
+                            pf_todos = tool_args.get("todos", [])
+                            pf_steps = []
+                            for idx, t in enumerate(pf_todos):
+                                if isinstance(t, dict):
+                                    pf_steps.append(
+                                        {
+                                            "id": str(t.get("id", f"step_{idx + 1}")),
+                                            "description": str(t.get("content", t.get("id", ""))),
+                                            "status": "pending",
+                                        }
+                                    )
+                            if pf_steps:
+                                _pf_plan_id = ""
+                                try:
+                                    from ..tools.handlers.plan import get_active_plan_id
+
+                                    _pf_plan_id = get_active_plan_id(conversation_id) or ""
+                                except Exception:
+                                    pass
+                                yield {
+                                    "type": "todo_created",
+                                    "plan": {
+                                        "id": _pf_plan_id or str(uuid.uuid4()),
+                                        "taskSummary": tool_args.get("name", ""),
+                                        "steps": pf_steps,
+                                        "status": "in_progress",
+                                    },
+                                }
+                        elif tool_name == "update_todo_step" and isinstance(tool_args, dict):
+                            step_id = tool_args.get("step_id", "")
+                            _todo_step_event = {
+                                "type": "todo_step_updated",
+                                "stepId": step_id,
+                                "status": tool_args.get("status", "completed"),
+                            }
+                            if _active_plan_id_before_tool:
+                                _todo_step_event["planId"] = _active_plan_id_before_tool
+                            yield _todo_step_event
+                        elif tool_name == "complete_todo":
+                            _complete_succeeded = False
+                            if _active_plan_id_before_tool:
+                                try:
+                                    from ..tools.handlers.plan import has_active_todo
+
+                                    _complete_succeeded = not has_active_todo(conversation_id)
+                                except Exception:
+                                    _complete_succeeded = result_text.startswith("✅ 计划")
+                            if _complete_succeeded:
+                                _todo_done_event = {"type": "todo_completed"}
+                                if _active_plan_id_before_tool:
+                                    _todo_done_event["planId"] = _active_plan_id_before_tool
+                                yield _todo_done_event
+
+                        _tr_entry: dict = {
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": result_text,
+                        }
+                        if _tool_is_error:
+                            _tr_entry["is_error"] = True
+                        tool_results_for_msg.append(_tr_entry)
+
+                        # exit_plan_mode: stop the loop after this tool
+                        if tool_name == "exit_plan_mode" and not _tool_is_error:
+                            _plan_exit_stop = True
+                            break
+
+                    _budget_decision = _loop_budget_guard.record_tool_calls(
+                        _actual_tool_calls_for_budget
+                    )
+                    if _budget_decision.should_stop:
+                        msg = _budget_decision.message
+                        react_trace.append(_iter_trace)
+                        self._save_react_trace(
+                            react_trace,
+                            conversation_id,
+                            session_type,
+                            _budget_decision.exit_reason,
+                            _trace_started_at,
+                        )
+                        self._last_exit_reason = "loop_terminated"
+                        # P5.3: surface a checkpoint with the loop-budget reason so
+                        # the chat UI can render a failure card instead of going
+                        # silent after the text_delta.
+                        yield _build_task_checkpoint_event(
+                            session=session,
+                            conversation_id=conversation_id,
+                            task_id=state.task_id,
+                            iteration=_iteration,
+                            exit_reason="loop_terminated",
+                            summary=str(_budget_decision.exit_reason or "loop budget exhausted"),
+                            next_step_hint="如需继续，请换一个查询目标或基于已有摘要给出结论",
+                        )
+                        yield {"type": "text_delta", "content": msg}
+                        yield {"type": "done"}
+                        return
+
+                    # exit_plan_mode was called → end the turn
+                    if locals().get("_plan_exit_stop"):
+                        logger.info(
+                            "[ReAct-Stream] exit_plan_mode called — ending turn, "
+                            "waiting for user review"
+                        )
+                        working_messages.append({"role": "user", "content": tool_results_for_msg})
+                        _summary_text = (
+                            "Plan completed and waiting for user review. "
+                            "The user can approve the plan to switch to Agent mode, "
+                            "or request changes to continue refining."
+                        )
+
+                        # SSE: 通知前端显示审批面板（通过 SSE 而非 WS，确保 Tauri 本地模式可用）
+                        _pending = self._plan_exit_pending or {}
+                        _pending_data = (
+                            _pending.get(conversation_id, {}) if isinstance(_pending, dict) else {}
+                        )
+                        if _pending_data:
+                            yield {
+                                "type": "plan_ready_for_approval",
+                                "data": {
+                                    "conversation_id": conversation_id,
+                                    "summary": _pending_data.get("summary", ""),
+                                    "plan_id": _pending_data.get("plan_id", ""),
+                                    "plan_file": _pending_data.get("plan_file", ""),
+                                },
+                            }
+
+                        yield {"type": "text_delta", "content": _summary_text}
+                        self._save_react_trace(
+                            react_trace,
+                            conversation_id,
+                            session_type,
+                            "plan_exit",
+                            _trace_started_at,
+                        )
+                        yield {"type": "done"}
+                        return
+
+                    if decision.tool_calls:
+                        all_tool_results.extend(tool_results_for_msg)
+
+                        if _non_denied_tool_names:
+                            if any(t not in _ADMIN_TOOL_NAMES for t in _non_denied_tool_names):
+                                tools_executed_in_task = True
+                            executed_tool_names.extend(_non_denied_tool_names)
+                            state.record_tool_execution(_non_denied_tool_names)
+                            self._budget.record_tool_calls(len(_non_denied_tool_names))
+
+                        # 记录工具成功/失败状态（遍历 decision.tool_calls 保持索引对齐，
+                        # 包含策略拒绝的工具，与 run() 一致）。
+                        # CONFIRM 占位（``_security_confirm`` metadata）跳过统计，
+                        # 不计入失败计数器，避免后续被错误判定为"连续失败"或
+                        # "本轮全失败"触发回滚。
+                        for i, tc_rec in enumerate(decision.tool_calls):
+                            _tc_name = tc_rec.get("name", "")
+                            r_content = ""
+                            raw_r: Any = None
+                            if i < len(tool_results_for_msg):
+                                raw_r = tool_results_for_msg[i]
+                                r_content = (
+                                    str(raw_r.get("content", ""))
+                                    if isinstance(raw_r, dict)
+                                    else str(raw_r)
+                                )
+                            if self._is_pending_confirm_result(raw_r):
+                                continue
+                            is_error = any(
+                                m in r_content
+                                for m in ["❌", "⚠️ 工具执行错误", "错误类型:", "⚠️ 策略拒绝:"]
+                            )
+                            self._record_tool_result(
+                                _tc_name,
+                                success=not is_error,
+                                tool_args=tc_rec.get("input", tc_rec.get("arguments", {})),
+                            )
+
+                    # 收集工具结果到 trace（保存完整内容，不截断）
+                    _s_error_markers = ("❌", "⚠️ 工具执行错误", "错误类型:", "⚠️ 策略拒绝:")
+                    _iter_trace["tool_results"] = []
+                    for tr in tool_results_for_msg:
+                        _rc = str(tr.get("content", ""))
+                        _is_err = tr.get("is_error", False) or any(
+                            m in _rc for m in _s_error_markers
+                        )
+                        _iter_trace["tool_results"].append(
+                            {
+                                "tool_use_id": tr.get("tool_use_id", ""),
+                                "result_content": _rc,
+                                "is_error": _is_err,
+                            }
+                        )
+                    react_trace.append(_iter_trace)
+
+                    _budget_decision = _loop_budget_guard.record_tool_results(
+                        list(decision.tool_calls or []),
+                        tool_results_for_msg,
+                    )
+                    if _budget_decision.should_stop:
+                        msg = _budget_decision.message
+                        self._save_react_trace(
+                            react_trace,
+                            conversation_id,
+                            session_type,
+                            _budget_decision.exit_reason,
+                            _trace_started_at,
+                        )
+                        self._last_exit_reason = "loop_terminated"
+                        # P5.3: see comment above — emit checkpoint so UI can
+                        # render a failure-attribution card.
+                        yield _build_task_checkpoint_event(
+                            session=session,
+                            conversation_id=conversation_id,
+                            task_id=state.task_id,
+                            iteration=_iteration,
+                            exit_reason="loop_terminated",
+                            summary=str(_budget_decision.exit_reason or "loop budget exhausted"),
+                            next_step_hint="任务被工具调用预算守卫切断；可调高 LOOP_BUDGET 或换种问法重试",
+                        )
+                        yield {"type": "text_delta", "content": msg}
+                        yield {"type": "done"}
+                        return
+                    if _budget_decision.should_warn:
+                        logger.info(
+                            "[LoopBudget] warning for model only (%s): %s",
+                            _budget_decision.exit_reason,
+                            _budget_decision.message,
+                        )
+                        _iter_trace.setdefault("loop_budget_warnings", []).append(
+                            _budget_decision.exit_reason
+                        )
+
+                    try:
+                        state.transition(TaskStatus.OBSERVING)
+                    except ValueError:  # s5b-allow-force-write
+                        state.status = TaskStatus.OBSERVING
+
+                    # --- 截断检测（与 run() 一致）---
+                    _has_truncation = any(
+                        isinstance(tc.get("input"), dict) and PARSE_ERROR_KEY in tc["input"]
+                        for tc in decision.tool_calls
+                    )
+                    if _has_truncation:
+                        self._consecutive_truncation_count += 1
+                        for tc in decision.tool_calls:
+                            _tc_input = tc.get("input", tc.get("arguments", {}))
+                            if isinstance(_tc_input, dict) and PARSE_ERROR_KEY in _tc_input:
+                                self._tool_failure_counter.pop(
+                                    _tool_rate_limit_key(tc.get("name", ""), _tc_input),
+                                    None,
+                                )
+                        logger.info(
+                            f"[ReAct-Stream] Iter {_iteration + 1} — Tool args truncated "
+                            f"(count: {self._consecutive_truncation_count}), "
+                            f"skipping rollback"
+                        )
+                    else:
+                        self._consecutive_truncation_count = 0
+
+                    # --- Rollback 检查（与 run() 一致）— 截断错误不回滚 ---
+                    should_rb, rb_reason = self._should_rollback(
+                        tool_results_for_msg, decision.tool_calls
+                    )
+                    if should_rb and not _has_truncation:
+                        rollback_result = self._rollback(rb_reason)
+                        if rollback_result:
+                            working_messages, _ = rollback_result
+                            logger.info("[ReAct-Stream][Rollback] 回滚成功，将用不同方法重新推理")
+                            continue
+
+                    # 取消检查（升级为带 LLM 收尾的取消处理）
+                    if state.cancelled or _stream_cancelled:
+                        # 将工具结果添加到上下文
+                        working_messages.append({"role": "user", "content": tool_results_for_msg})
+                        self._save_react_trace(
+                            react_trace,
+                            conversation_id,
+                            session_type,
+                            "cancelled",
+                            _trace_started_at,
+                        )
+                        async for ev in self._stream_cancel_farewell(
+                            working_messages, effective_prompt, current_model, state
+                        ):
+                            yield ev
+                        yield {"type": "done"}
+                        return
+
+                    tool_results_for_msg = _apply_tool_result_budget(tool_results_for_msg)
+                    working_messages.append(
+                        {
+                            "role": "user",
+                            "content": tool_results_for_msg,
+                        }
+                    )
+
+                    # === 工具结果校验：空结果 / 无信息 / DEFERRED 占位检测 ===
+                    # 模型在"结果看似成功实则无数据"时会反复重试同一调用
+                    # （如 run_shell 探针静默失败、get_tool_info 返回 DEFERRED），
+                    # 现有失败统计只认显式错误，抓不住这类结果——这里对每轮
+                    # 结果做规则校验，发现问题即注入"原因 + 建议"反馈（去重）。
+                    try:
+                        from ._tool_result_validation import validate_tool_results
+
+                        _val_issues = validate_tool_results(
+                            list(decision.tool_calls or []), tool_results_for_msg
+                        )
+                        for _vk, _vmsg in _val_issues:
+                            if _vk not in _validated_issue_keys:
+                                working_messages.append(
+                                    {
+                                        "role": "user",
+                                        "_model_source": "tool_result_validation",
+                                        "content": "⚠️ 结果校验：" + _vmsg,
+                                    }
+                                )
+                                _validated_issue_keys.add(_vk)
+                                logger.info(
+                                    "[ReAct-Stream] tool-result validation hint (%s): %s",
+                                    _vk,
+                                    _vmsg[:120],
+                                )
+                    except Exception as _val_err:
+                        logger.debug(
+                            "[ReAct-Stream] tool-result validation skipped: %s", _val_err
+                        )
+
+                    # === 迭代结论锚点：本轮工作结果提炼一行中文结论，累积为结论链 ===
+                    # 工具调用的原始细节可被压缩/驱逐，结论链始终保留在上下文中，
+                    # 模型任意时刻可见任务进展，避免"没有记忆 / 上下文太复杂"两难。
+                    try:
+                        from ._iteration_conclusions import (
+                            extract_conclusion_line,
+                            render_conclusions,
+                        )
+
+                        if getattr(settings, "context_iteration_conclusions_enabled", True):
+                            _concl_line = extract_conclusion_line(
+                                _iteration + 1,
+                                list(decision.tool_calls or []),
+                                tool_results_for_msg,
+                            )
+                            if _concl_line:
+                                _iteration_conclusions.append(_concl_line)
+                                _concl_msg = {
+                                    "role": "user",
+                                    "_model_source": "iteration_conclusions",
+                                    "_model_context": {
+                                        "key": "iteration_conclusions",
+                                        "merged": False,
+                                        "count": 1,
+                                    },
+                                    "content": render_conclusions(_iteration_conclusions),
+                                }
+                                _concl_replaced = False
+                                for _ci in range(len(working_messages) - 1, -1, -1):
+                                    if (
+                                        working_messages[_ci].get("_model_source")
+                                        == "iteration_conclusions"
+                                    ):
+                                        working_messages[_ci] = _concl_msg
+                                        _concl_replaced = True
+                                        break
+                                if not _concl_replaced:
+                                    working_messages.append(_concl_msg)
+                                logger.debug(
+                                    "[ReAct-Stream] iteration conclusion: %s", _concl_line
+                                )
+                    except Exception as _concl_err:
+                        logger.debug(
+                            "[ReAct-Stream] iteration conclusion skipped: %s", _concl_err
+                        )
+
+                    # === 探索停滞检测：连续纯只读探索轮数过多时提醒收敛 ===
+                    # 指纹机制按"轮结果集合"判停滞，模型换着查不同只读工具时
+                    # 集合总在变化、永远不触发；这里按"工具类别连续纯探索"计数，
+                    # 一旦连续 3+ 轮全是只读探索（get_tool_info/get_skill_info/
+                    # list_directory/search_memory/tool_search 等）即注入收敛提醒。
+                    try:
+                        from ..agent.loop_budget import READONLY_EXPLORATION_TOOLS
+
+                        _this_round_names = [
+                            str(tc.get("name", "")) for tc in (decision.tool_calls or [])
+                        ]
+                        if _this_round_names and all(
+                            n in READONLY_EXPLORATION_TOOLS for n in _this_round_names
+                        ):
+                            _consecutive_explore_rounds += 1
+                        else:
+                            _consecutive_explore_rounds = 0
+                        if (
+                            _consecutive_explore_rounds >= 3
+                            and not _explore_stall_hinted
+                        ):
+                            working_messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "⚠️ 停滞提示：你已连续 "
+                                        f"{_consecutive_explore_rounds} 轮只读探索"
+                                        "（查询工具信息/技能/目录/记忆），尚未取得实质"
+                                        "推进。请立即收敛：直接调用目标工具完成操作，"
+                                        "或在已有信息上给出结论，不要再重复查询状态。"
+                                    ),
+                                }
+                            )
+                            _explore_stall_hinted = True
+                            logger.info(
+                                "[ReAct-Stream] explore-stall hint injected after %d "
+                                "readonly rounds",
+                                _consecutive_explore_rounds,
+                            )
+                        elif _consecutive_explore_rounds >= 6:
+                            working_messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "⚠️ 严重停滞：已连续 "
+                                        f"{_consecutive_explore_rounds} 轮只读探索仍无实质"
+                                        "推进。必须停止查询类工具，基于已有信息直接回答"
+                                        "用户问题或调用目标工具完成任务。"
+                                    ),
+                                }
+                            )
+                            logger.info(
+                                "[ReAct-Stream] explore-stall severe hint (rounds=%d)",
+                                _consecutive_explore_rounds,
+                            )
+                    except Exception as _stall_err:
+                        logger.debug(
+                            "[ReAct-Stream] explore-stall check skipped: %s", _stall_err
+                        )
+
+                    # === 上一轮审视（模拟用户反馈）：已完成 + 自我审视 → 下一轮锚点 ===
+                    # 把本轮（模型眼中"上一轮"）的工具结论与问题，以 role="user"
+                    # 的"用户反馈"形式注入：模型天然更重视用户消息，审视结果
+                    # 成为下一轮工具调用的约束与锚点（重复调用/无效结果/停滞）。
+                    try:
+                        from ._iteration_review import build_review_message
+
+                        _review_text = build_review_message(
+                            conclusion_line=_iteration_conclusions[-1]
+                            if _iteration_conclusions
+                            else f"迭代{_iteration + 1}：本轮已执行工具调用",
+                            issues=_val_issues,  # 上一块校验结果（本轮）
+                            explore_rounds=_consecutive_explore_rounds,
+                            tool_name_counts=_tool_name_counter,
+                            tool_argv_counts=_tool_call_counter,
+                        )
+                        _review_msg = {
+                            "role": "user",
+                            "_model_source": "iteration_review",
+                            "_model_context": {
+                                "key": "iteration_review",
+                                "merged": False,
+                                "count": 1,
+                            },
+                            "content": _review_text,
+                        }
+                        _review_replaced = False
+                        for _ri in range(len(working_messages) - 1, -1, -1):
+                            if (
+                                working_messages[_ri].get("_model_source")
+                                == "iteration_review"
+                            ):
+                                working_messages[_ri] = _review_msg
+                                _review_replaced = True
+                                break
+                        if not _review_replaced:
+                            working_messages.append(_review_msg)
+                        logger.debug(
+                            "[ReAct-Stream] iteration review injected: %s",
+                            _review_text[:160].replace("\n", " "),
+                        )
+                    except Exception as _review_err:
+                        logger.debug(
+                            "[ReAct-Stream] iteration review skipped: %s", _review_err
+                        )
+
+                    # 连续截断 >= 2 次：注入强制分拆指导（与 run() 一致）
+                    if _has_truncation and self._consecutive_truncation_count >= 2:
+                        _split_guidance = (
+                            "⚠️ 你的工具调用参数因内容过长被 API 反复截断（已连续 "
+                            f"{self._consecutive_truncation_count} 次）。你必须立即改变策略：\n"
+                            "1. 将大文件拆分为多次 write_file 调用（每次不超过 2000 行）\n"
+                            "2. 先创建文件框架，再用 edit_file 逐段补充内容\n"
+                            "3. 减少内联 CSS/JS，使用简洁实现\n"
+                            "4. 如果内容确实很长，考虑用 Markdown 替代 HTML"
+                        )
+                        working_messages.append({"role": "user", "content": _split_guidance})
+                        logger.warning(
+                            f"[ReAct-Stream] Injected split guidance after "
+                            f"{self._consecutive_truncation_count} consecutive truncations"
+                        )
+
+                    # === 统一处理 skip 反思 + 用户插入消息 ===
+                    if state:
+                        _msg_count_before = len(working_messages)
+                        await state.process_post_tool_signals(working_messages)
+                        for _new_msg in working_messages[_msg_count_before:]:
+                            _content = _new_msg.get("content", "")
+                            if "[系统提示-用户跳过步骤]" in _content:
+                                yield {"type": "chain_text", "content": "用户跳过了当前步骤"}
+                            elif "[用户插入消息]" in _content:
+                                _preview = (
+                                    _content.split("]")[1].split("\n")[0].strip()
+                                    if "]" in _content
+                                    else _content[:60]
+                                )
+                                yield {
+                                    "type": "chain_text",
+                                    "content": f"用户插入消息: {_preview[:60]}",
+                                }
+
+                    # --- Supervisor: 记录工具数据（遍历 decision.tool_calls 保持索引对齐，与 run() 一致） ---
+                    for _si, _stc in enumerate(decision.tool_calls or []):
+                        _stn = _stc.get("name", "")
+                        _sr_content = ""
+                        if _si < len(tool_results_for_msg):
+                            _sr = tool_results_for_msg[_si]
+                            _sr_content = (
+                                str(_sr.get("content", "")) if isinstance(_sr, dict) else str(_sr)
+                            )
+                            _sr_err = (
+                                bool(_sr.get("is_error", False)) if isinstance(_sr, dict) else False
+                            )
+                        else:
+                            _sr_err = False
+                        if not _sr_err and _sr_content:
+                            _stripped_sr = _sr_content.lstrip()
+                            _sr_err = _stripped_sr.startswith(
+                                ("❌", "⚠️ 工具执行错误", "错误类型:", "⚠️ 策略拒绝:")
+                            )
+                        self._supervisor.record_tool_call(
+                            tool_name=_stn,
+                            params=_stc.get("input", _stc.get("arguments", {})),
+                            success=not _sr_err,
+                            iteration=_iteration,
+                            result_text=_sr_content if _sr_err else None,
+                        )
+                    self._supervisor.record_response(decision.text_content or "")
+                    if _in_tokens or _out_tokens:
+                        self._supervisor.record_token_usage(_in_tokens + _out_tokens)
+                        self._compact_after_token_anomaly(
+                            working_messages,
+                            react_trace,
+                            _in_tokens + _out_tokens,
+                        )
+                        _pressure = self._context_manager.calculate_context_pressure(
+                            working_messages,
+                            system_prompt=effective_prompt,
+                            tools=tools,
+                            conversation_id=conversation_id,
+                            last_real_input_tokens=_last_real_input_tokens,
+                        )
+                        _context_safe = _pressure.trigger_tokens <= _pressure.soft_limit
+                        _iter_trace["context_pressure"] = {
+                            "messages_tokens": _pressure.messages_tokens,
+                            "system_tokens": _pressure.system_tokens,
+                            "tools_tokens": _pressure.tools_tokens,
+                            "soft_limit": _pressure.soft_limit,
+                            "hard_limit": _pressure.hard_limit,
+                            "trigger_tokens": _pressure.trigger_tokens,
+                            "max_tokens": _pressure.max_tokens,
+                            "context_safe": _context_safe,
+                            "input_tokens": _in_tokens,
+                            "output_tokens": _out_tokens,
+                        }
+                        self._last_context_pressure = _iter_trace["context_pressure"]
+
+                        # [Handoff 2026-10-16] 90% 水位主动收尾交接：
+                        # 当 trigger_tokens/hard_limit >= context_handoff_ratio 时，
+                        # 不再走 LLM 摘要压缩续命（避免 85%~98% 区间反复糊化），
+                        # 而是写结构化交接快照并结束本轮；新会话启动时自动加载即删。
+                        _handoff_enabled = bool(
+                            getattr(settings, "context_handoff_enabled", True)
+                        )
+                        if (
+                            _handoff_enabled
+                            and _pressure.hard_limit > 0
+                            and _pressure.trigger_tokens
+                            >= _pressure.hard_limit
+                            * float(getattr(settings, "context_handoff_ratio", 0.90) or 0.90)
+                        ):
+                            _handoff = None
+                            try:
+                                from ._handoff_snapshot import emit_handoff
+                                _handoff = emit_handoff(
+                                    working_messages,
+                                    data_dir=str(getattr(settings, "data_dir", "data") or "data"),
+                                    handoff_dir=str(
+                                        getattr(
+                                            settings,
+                                            "context_handoff_dir",
+                                            "data/handoff",
+                                        )
+                                        or "data/handoff"
+                                    ),
+                                    session_id=str(session_id or conversation_id or ""),
+                                    task_goal=str(task_description or ""),
+                                    trigger_ratio=float(
+                                        _pressure.trigger_tokens
+                                        / max(1, _pressure.hard_limit)
+                                    ),
+                                    tokens_at_handoff=int(_pressure.trigger_tokens),
+                                    estimate_tokens=self._context_manager.estimate_messages_tokens,
+                                    ttl_hours=float(
+                                        getattr(settings, "context_handoff_ttl_hours", 168.0)
+                                        or 168.0
+                                    ),
+                                )
+                            except Exception as _he:
+                                logger.warning("[Handoff] emit failed: %s", _he)
+                            _iter_trace["handoff_emitted"] = {
+                                "trigger_ratio": float(
+                                    _pressure.trigger_tokens / max(1, _pressure.hard_limit)
+                                ),
+                                "handoff_id": getattr(_handoff, "handoff_id", None),
+                            }
+                            self._save_react_trace(
+                                react_trace,
+                                conversation_id,
+                                session_type,
+                                "handoff_ended",
+                                _trace_started_at,
+                            )
+                            self._last_exit_reason = "context_handoff"
+                            yield _build_task_checkpoint_event(
+                                session=session,
+                                conversation_id=conversation_id,
+                                task_id=state.task_id,
+                                iteration=_iteration,
+                                exit_reason="context_handoff",
+                                summary="上下文已达 90% 水位，任务状态已保存为交接快照",
+                                next_step_hint="发送「继续」开启新对话，系统会自动加载交接快照并接续",
+                            )
+                            yield {
+                                "type": "text_delta",
+                                "content": (
+                                    "（上下文已接近窗口上限，我已把当前任务状态保存为"
+                                    "交接快照。请发送「继续」或任意消息开启新对话，"
+                                    "我会自动加载快照无缝接续。）"
+                                ),
+                            }
+                            yield {"type": "done"}
+                            return
+
+                        _budget_decision = _loop_budget_guard.check_token_growth(
+                            _in_tokens,
+                            _out_tokens,
+                            max_recoveries=int(
+                                getattr(settings, "context_token_anomaly_max_recoveries", 1) or 1
+                            ),
+                            context_safe=_context_safe,
+                            max_context_tokens=_pressure.max_tokens,
+                        )
+                        if _budget_decision.should_warn:
+                            before = self._context_manager.estimate_messages_tokens(
+                                working_messages
+                            )
+                            try:
+                                # 压缩前原文快照：应急压缩后若已无真实用户消息，
+                                # 用于恢复最新真实用户锚点（对标 Hermes
+                                # _ensure_compressed_has_user_turn，主压缩路径
+                                # rewrite_after_compression 同款逻辑）。
+                                _recovery_source = list(working_messages)
+                                compacted = await self._context_manager.reactive_compact(
+                                    working_messages,
+                                    system_prompt=effective_prompt,
+                                    tools=tools,
+                                    memory_manager=self._memory_manager,
+                                    conversation_id=conversation_id,
+                                    last_real_input_tokens=_last_real_input_tokens,
+                                )
+                                working_messages = compacted
+                                # 应急压缩后防失忆：注入方向提示 + 必要时恢复
+                                # 真实用户锚点（对齐主压缩路径行为，避免压缩后
+                                # 模型读不到"用户最近到底要求什么"而泛化收尾）。
+                                _plan_sec_r = self._get_plan_section_with_hydration(
+                                    conversation_id, _recovery_source
+                                )
+                                working_messages = ContextManager.rewrite_after_compression(
+                                    working_messages,
+                                    plan_section=_plan_sec_r,
+                                    completed_tools=executed_tool_names,
+                                    task_description=task_description or "",
+                                    source_messages=_recovery_source,
+                                )
+                                after = self._context_manager.estimate_messages_tokens(
+                                    working_messages
+                                )
+                                _recovered_pressure = (
+                                    self._context_manager.calculate_context_pressure(
+                                        working_messages,
+                                        system_prompt=effective_prompt,
+                                        tools=tools,
+                                        conversation_id=conversation_id,
+                                        last_real_input_tokens=_last_real_input_tokens,
+                                    )
+                                )
+                                _loop_budget_guard.check_token_growth(
+                                    _in_tokens,
+                                    _out_tokens,
+                                    recovered=True,
+                                    context_safe=(
+                                        _recovered_pressure.trigger_tokens
+                                        <= _recovered_pressure.soft_limit
+                                    ),
+                                    max_context_tokens=_recovered_pressure.max_tokens,
+                                )
+                                _iter_trace["token_anomaly_recovered"] = {
+                                    "before_tokens": before,
+                                    "after_tokens": after,
+                                    "after_trigger_tokens": _recovered_pressure.trigger_tokens,
+                                    "after_soft_limit": _recovered_pressure.soft_limit,
+                                }
+                                continue
+                            except Exception as exc:
+                                logger.warning(
+                                    "[ReAct-Stream] Token anomaly recovery compact failed: %s",
+                                    exc,
+                                )
+                        if _budget_decision.should_stop:
+                            msg = _budget_decision.message
+                            _iter_trace["token_anomaly_terminated"] = {
+                                "exit_reason": _budget_decision.exit_reason,
+                                "input_tokens": _in_tokens,
+                                "output_tokens": _out_tokens,
+                                "max_tokens": _pressure.max_tokens,
+                                "hard_terminate_ratio": float(
+                                    getattr(settings, "context_hard_terminate_ratio", 0.98) or 0.98
+                                ),
+                                "anomaly_threshold": _loop_budget_guard.token_anomaly_threshold,
+                                "tool_calls_seen": _loop_budget_guard.total_tool_calls_seen,
+                            }
+                            self._save_react_trace(
+                                react_trace,
+                                conversation_id,
+                                session_type,
+                                _budget_decision.exit_reason,
+                                _trace_started_at,
+                            )
+                            self._last_exit_reason = "loop_terminated"
+                            # P5.3: token-anomaly termination — surface a checkpoint
+                            # so the chat UI can render a failure card instead of
+                            # leaving the user staring at the truncated text_delta.
+                            yield _build_task_checkpoint_event(
+                                session=session,
+                                conversation_id=conversation_id,
+                                task_id=state.task_id,
+                                iteration=_iteration,
+                                exit_reason="loop_terminated",
+                                summary="工具响应膨胀触发上下文硬限位，任务自动止损",
+                                next_step_hint="缩小工具结果范围或拆分子问题后重试，必要时清空会话",
+                            )
+                            yield {"type": "text_delta", "content": msg}
+                            yield {"type": "done"}
+                            return
+
+                    # --- 循环检测（Supervisor-based, 与 run() 一致） ---
+                    consecutive_tool_rounds += 1
+                    self._supervisor.record_consecutive_tool_rounds(consecutive_tool_rounds)
+
+                    # stop_reason 检查
+                    if decision.stop_reason == "end_turn":
+                        cleaned_text = strip_thinking_tags(decision.text_content)
+                        _, cleaned_text = parse_intent_tag(cleaned_text)
+                        if cleaned_text and cleaned_text.strip():
+                            # Plan-mode 守卫：plan 仍有未完成步骤时不结束本轮，
+                            # 强制走 ForceToolCall 推进剩余步骤。
+                            if _effective_mode == "plan" and self._has_active_todo_pending(
+                                conversation_id
+                            ):
+                                logger.info(
+                                    "[ReAct-Stream][PlanGuard] stop_reason=end_turn ignored — "
+                                    "plan_mode active with pending steps; continuing loop"
+                                )
+                                working_messages.append(
+                                    {
+                                        "role": "assistant",
+                                        "content": [
+                                            {"type": "text", "text": decision.text_content}
+                                        ],
+                                        **(
+                                            {"reasoning_content": decision.thinking_content}
+                                            if decision.thinking_content
+                                            else {}
+                                        ),
+                                    }
+                                )
+                                working_messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            "[系统] Plan 模式仍有未完成步骤，请立即继续执行下一个 "
+                                            "pending 步骤的工具调用，不要在此处提前结束本轮。"
+                                        ),
+                                    }
+                                )
+                                continue
+                            logger.info(
+                                f"[ReAct-Stream][LoopGuard] stop_reason=end_turn after {consecutive_tool_rounds} rounds"
+                            )
+                            self._save_react_trace(
+                                react_trace,
+                                conversation_id,
+                                session_type,
+                                "completed_end_turn",
+                                _trace_started_at,
+                            )
+                            if _streamed_text:
+                                if cleaned_text != _raw_streamed_text:
+                                    yield {"type": "text_replace", "content": cleaned_text}
+                            else:
+                                chunk_size = 20
+                                for i in range(0, len(cleaned_text), chunk_size):
+                                    yield {
+                                        "type": "text_delta",
+                                        "content": cleaned_text[i : i + chunk_size],
+                                    }
+                                    await asyncio.sleep(0.01)
+                            yield {"type": "done"}
+                            return
+
+                    # Supervisor 综合评估
+                    round_signatures = [_make_tool_sig(tc) for tc in decision.tool_calls]
+                    round_sig_str = "+".join(sorted(round_signatures))
+                    self._supervisor.record_tool_signature(round_sig_str)
+
+                    _has_todo_s = self._has_active_todo_pending(conversation_id)
+                    _todo_step_s = ""
+                    try:
+                        from ..tools.handlers.plan import get_active_todo_prompt
+
+                        if conversation_id:
+                            _todo_step_s = get_active_todo_prompt(conversation_id) or ""
+                    except Exception:
+                        pass
+                    intervention = self._supervisor.evaluate(
+                        _iteration,
+                        has_active_todo=_has_todo_s,
+                        plan_current_step=_todo_step_s,
+                    )
+
+                    if intervention:
+                        _supervisor_intervened = True
+                        max_no_tool_retries = 0
+
+                        if intervention.should_terminate:
+                            cleaned = strip_thinking_tags(decision.text_content)
+                            self._save_react_trace(
+                                react_trace,
+                                conversation_id,
+                                session_type,
+                                "loop_terminated",
+                                _trace_started_at,
+                            )
+                            try:
+                                state.transition(TaskStatus.FAILED)
+                            except ValueError:  # s5b-allow-force-write
+                                state.status = TaskStatus.FAILED
+                            self._run_failure_analysis(
+                                react_trace,
+                                "loop_terminated",
+                                task_description=task_description,
+                                task_id=state.task_id,
+                            )
+                            msg = cleaned or (
+                                "⚠️ 检测到同一工具参数反复调用，任务已自动终止以避免继续消耗 token。\n"
+                                "已获取的工具结果已保留在本轮上下文摘要中；请基于已有摘要给出结论，"
+                                "或换一个查询目标继续。"
+                                if intervention.pattern.value == "signature_repeat"
+                                else "⚠️ 检测到工具调用陷入死循环，任务已自动终止。请重新描述您的需求。"
+                            )
+                            self._last_exit_reason = "loop_terminated"
+                            # P5.3: supervisor termination — emit a checkpoint with
+                            # the actual loop-pattern as summary so the failure card
+                            # tells the user *why* we stopped.
+                            _pattern_label = (
+                                "同一工具参数反复调用"
+                                if intervention.pattern.value == "signature_repeat"
+                                else f"工具调用陷入死循环（{intervention.pattern.value}）"
+                            )
+                            yield _build_task_checkpoint_event(
+                                session=session,
+                                conversation_id=conversation_id,
+                                task_id=state.task_id,
+                                iteration=_iteration,
+                                exit_reason="loop_terminated",
+                                summary=_pattern_label,
+                                next_step_hint="基于本轮已获取的摘要给结论，或换种问法/工具重试",
+                            )
+                            yield {"type": "text_delta", "content": msg}
+                            yield {"type": "done"}
+                            return
+
+                        if intervention.should_rollback:
+                            rollback_result = self._rollback(intervention.message)
+                            if rollback_result:
+                                working_messages, _ = rollback_result
+
+                        if intervention.should_inject_prompt and intervention.prompt_injection:
+                            working_messages.append(
+                                {
+                                    "role": "user",
+                                    "content": intervention.prompt_injection,
+                                }
+                            )
+                            if intervention.throttled_tool_names:
+                                _blocked = set(intervention.throttled_tool_names)
+                                tools = [t for t in tools if t.get("name") not in _blocked]
+                                logger.info(
+                                    f"[Supervisor] NUDGE: removed throttled tools {_blocked}, "
+                                    f"{len(tools)} tools remain "
+                                    f"(iter={_iteration}, pattern={intervention.pattern.value})"
+                                )
+                            else:
+                                logger.info(
+                                    f"[Supervisor] NUDGE: prompt injected; tools left available "
+                                    f"(iter={_iteration}, pattern={intervention.pattern.value})"
+                                )
+                            max_no_tool_retries = 0
+                            # PR-G1: supervisor 注入新 prompt 后下一轮 LLM 会重新生成，
+                            # 已发的 text_delta 多半是被 supervisor 判定有问题的输出，
+                            # 必须先 reset 前端 buffer，避免新旧文字拼在一起。
+                            try:
+                                if _streamed_text:
+                                    yield {"type": "text_replace", "content": ""}
+                            except NameError:
+                                pass
+
+                    continue  # Next iteration
+
+            # max_iterations
+            self._last_working_messages = working_messages
+            self._save_react_trace(
+                react_trace, conversation_id, session_type, "max_iterations", _trace_started_at
+            )
+            try:
+                state.transition(TaskStatus.FAILED)
+            except ValueError:  # s5b-allow-force-write
+                state.status = TaskStatus.FAILED
+            logger.info(f"[ReAct-Stream] === MAX_ITERATIONS reached ({max_iterations}) ===")
+            self._run_failure_analysis(
+                react_trace,
+                "max_iterations",
+                task_description=task_description,
+                task_id=state.task_id,
+            )
+            if max_iterations < 30:
+                hint = (
+                    f"\n\n（已达到最大迭代次数 {max_iterations}。"
+                    f"当前 MAX_ITERATIONS={max_iterations} 设置过低，"
+                    f"建议在设置中调整为 100~300 以支持复杂任务）"
+                )
+            else:
+                hint = (
+                    "\n\n（已达到最大迭代次数，请基于当前进展重新描述需求或缩小任务范围后继续。）"
+                )
+            self._last_exit_reason = "max_iterations"
+            # P5.3: max-iterations termination — surface a checkpoint with the
+            # iteration cap and a config-adjustment hint so the failure card has
+            # actionable guidance.
+            yield _build_task_checkpoint_event(
+                session=session,
+                conversation_id=conversation_id,
+                task_id=state.task_id,
+                iteration=max_iterations,
+                exit_reason="max_iterations",
+                summary=f"已达到最大迭代次数 {max_iterations}",
+                next_step_hint=(
+                    "调高 MAX_ITERATIONS（建议 100~300）"
+                    if max_iterations < 30
+                    else "缩小任务范围或基于当前进展重新描述需求"
+                ),
+            )
+            yield {"type": "text_delta", "content": hint}
+            yield {"type": "done"}
+
+        except DeferredApprovalRequired:
+            raise
+
+        except IllegalReasoningEntry as _illegal_entry:
+            # FIX-S5A-1: defensive net for any future
+            # ensure_ready_for_reasoning() callsite added outside the inner
+            # try/except in the main loop. Without this branch the exception
+            # would fall into the generic ``except Exception`` below and lose
+            # the stable ``code`` field + the inc_illegal_reasoning_entry
+            # counter that ops alert on.
+            logger.error(
+                "[ReAct-Stream] IllegalReasoningEntry escaped to outer catch (session=%r): %s",
+                _session_key,
+                _illegal_entry,
+                extra={"alarm": "pager"},
+            )
+            try:
+                from .conversation_metrics import inc_illegal_reasoning_entry
+
+                inc_illegal_reasoning_entry(source="reason_stream_outer")
+            except Exception:
+                pass
+            self._last_working_messages = working_messages
+            self._save_react_trace(
+                react_trace,
+                conversation_id,
+                session_type,
+                "error: illegal_state",
+                _trace_started_at,
+            )
+            yield {
+                "type": "error",
+                "code": "illegal_state",
+                "message": "上一条消息正在收尾，请稍候再试或新建会话。",
+            }
+            with contextlib.suppress(Exception):
+                await broadcast_event("pet-status-update", {"status": "error"})
+            yield {"type": "done"}
+
+        except Exception as e:
+            logger.error(f"reason_stream error: {e}", exc_info=True)
+            self._last_working_messages = working_messages
+            self._save_react_trace(
+                react_trace,
+                conversation_id,
+                session_type,
+                f"error: {str(e)[:100]}",
+                _trace_started_at,
+            )
+            yield {"type": "error", "message": str(e)[:500]}
+            await broadcast_event("pet-status-update", {"status": "error"})
+            yield {"type": "done"}
+
+        finally:
+            # 清理 per-conversation endpoint override
+            if _endpoint_switched and conversation_id:
+                llm_client = getattr(self._brain, "_llm_client", None)
+                if llm_client and hasattr(llm_client, "restore_default"):
+                    try:
+                        llm_client.restore_default(conversation_id=conversation_id)
+                    except Exception:
+                        pass
+
+    # ==================== Unified Async Generator Interface ====================
+
+    @staticmethod
+    def _describe_tool_call(tool_name: str, tool_args: dict) -> str:
+        """为工具调用生成人类可读的叙事描述。"""
+        args = tool_args if isinstance(tool_args, dict) else {}
+        match tool_name:
+            case "read_file":
+                path = args.get("path") or args.get("file") or ""
+                fname = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if path else "文件"
+                return f"正在读取 {fname}..."
+            case "write_file":
+                path = args.get("path") or ""
+                fname = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if path else "文件"
+                return f"正在写入 {fname}..."
+            case "edit_file":
+                path = args.get("path") or ""
+                fname = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if path else "文件"
+                return f"正在编辑 {fname}..."
+            case "grep" | "search" | "ripgrep" | "search_files":
+                pattern = str(args.get("pattern") or args.get("query") or "")[:50]
+                return f'搜索 "{pattern}"...'
+            case "web_search":
+                query = str(args.get("query") or "")[:50]
+                return f'在网上搜索 "{query}"...'
+            case "execute_code" | "run_code" | "run_command":
+                cmd = str(args.get("command") or args.get("code") or "")[:60]
+                return f"执行命令: {cmd}..." if cmd else "执行代码..."
+            case "browser_navigate":
+                url = str(args.get("url") or "")[:60]
+                return f"访问 {url}..."
+            case "browser_screenshot":
+                return "截取页面截图..."
+            case "create_todo":
+                summary = str(args.get("task_summary") or "")[:40]
+                return f"制定计划: {summary}..."
+            case "update_todo_step":
+                idx = args.get("step_index", "")
+                status = args.get("status", "")
+                return f"更新计划步骤 {idx} → {status}"
+            case "switch_persona":
+                preset = args.get("preset_name", "")
+                return f"切换角色: {preset}..."
+            case "get_persona_profile":
+                return "获取当前人格配置..."
+            case "ask_user":
+                q = str(args.get("question") or "")[:40]
+                return f'向用户提问: "{q}"...'
+            case "list_files" | "list_dir":
+                path = str(args.get("path") or args.get("directory") or ".")
+                return f"列出目录 {path}..."
+            case "deliver_artifacts":
+                return "交付文件..."
+            case _:
+                params = ", ".join(f"{k}" for k in list(args.keys())[:3])
+                return f"调用 {tool_name}({params})..."
+
+    @staticmethod
+    def _summarize_tool_result(tool_name: str, result_text: str) -> str:
+        """为工具结果生成简短叙事摘要。"""
+        if not result_text:
+            return ""
+        r = result_text.strip()
+        is_error = any(
+            m in r[:200]
+            for m in ["❌", "⚠️ 工具执行错误", "错误类型:", "Tool error:", "⚠️ 策略拒绝:"]
+        )
+        if is_error:
+            # 提取第一行错误信息
+            first_line = r.split("\n")[0][:120]
+            return f"出错: {first_line}"
+        r_len = len(r)
+        match tool_name:
+            case "read_file":
+                lines = r.count("\n") + 1
+                return f"已读取 ({lines} 行, {r_len} 字符)"
+            case "grep" | "search" | "ripgrep" | "search_files":
+                matches = r.count("\n") + 1 if r else 0
+                return f"找到 {matches} 条结果" if matches > 0 else "无匹配结果"
+            case "web_search":
+                return f"搜索完成 ({r_len} 字符)"
+            case "execute_code" | "run_code" | "run_command":
+                lines = r.count("\n") + 1
+                preview = r[:80].replace("\n", " ")
+                return f"执行完成: {preview}{'...' if r_len > 80 else ''}"
+            case "write_file" | "edit_file":
+                return (
+                    "写入成功"
+                    if "成功" in r or "ok" in r.lower() or r_len < 100
+                    else f"完成 ({r_len} 字符)"
+                )
+            case "browser_screenshot":
+                return "截图已获取"
+            case "desktop_screenshot":
+                return "桌面截图已保存"
+            case "deliver_artifacts":
+                try:
+                    import json as _json
+
+                    _d = _json.loads(r)
+                    _n = len(_d.get("receipts", []))
+                    return f"已交付 {_n} 个文件" if _n else ""
+                except Exception:
+                    return ""
+            case "switch_persona":
+                return "切换完成"
+            case _:
+                if r_len < 100:
+                    return r[:100]
+                return f"完成 ({r_len} 字符)"
+
+    # ==================== ReAct 推理链保存 ====================
+
+    def _save_react_trace(
+        self,
+        react_trace: list[dict],
+        conversation_id: str | None,
+        session_type: str,
+        result: str,
+        started_at: str,
+        working_messages: list[dict] | None = None,
+    ) -> None:
+        """
+        保存完整的 ReAct 推理链到文件。
+
+        同时暂存到 self._last_react_trace 供 agent_handler 读取（思维链功能）。
+        若传入 working_messages，一并暂存供 token 统计读取。
+
+        路径: data/react_traces/{date}/trace_{conversation_id}_{timestamp}.json
+        """
+        # 思维链: 暂存 trace 供外部读取（即使为空也更新，清除旧数据）
+        self._last_react_trace = react_trace or []
+        if working_messages is not None:
+            self._last_working_messages = working_messages
+
+        _tc_count = sum(len(t.get("tool_calls", [])) for t in (react_trace or []))
+        _tr_count = sum(len(t.get("tool_results", [])) for t in (react_trace or []))
+        logger.debug(
+            f"[ReAct] _save_react_trace: result={result}, "
+            f"iterations={len(react_trace or [])}, "
+            f"tool_calls={_tc_count}, tool_results={_tr_count}"
+        )
+
+        if not react_trace:
+            return
+
+        try:
+            date_str = datetime.now().strftime("%Y%m%d")
+            trace_dir = Path("data/react_traces") / date_str
+            trace_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%H%M%S")
+            cid_part = (conversation_id or "unknown")[:16].replace(":", "_")
+            trace_file = trace_dir / f"trace_{cid_part}_{timestamp}.json"
+
+            # 汇总统计
+            total_in = sum(it.get("tokens", {}).get("input", 0) for it in react_trace)
+            total_out = sum(it.get("tokens", {}).get("output", 0) for it in react_trace)
+            all_tools = []
+            for it in react_trace:
+                for tc in it.get("tool_calls", []):
+                    name = tc.get("name")
+                    if name and name not in all_tools:
+                        all_tools.append(name)
+
+            trace_data = {
+                "conversation_id": conversation_id or "",
+                "session_type": session_type,
+                "model": react_trace[0].get("model", "") if react_trace else "",
+                "started_at": started_at,
+                "ended_at": datetime.now().isoformat(),
+                "total_iterations": len(react_trace),
+                "total_tokens": {"input": total_in, "output": total_out},
+                "tools_used": all_tools,
+                "result": result,
+                "iterations": react_trace,
+            }
+
+            with open(trace_file, "w", encoding="utf-8") as f:
+                json.dump(trace_data, f, ensure_ascii=False, indent=2, default=str)
+
+            logger.info(
+                f"[ReAct] Trace saved: {trace_file} "
+                f"(iterations={len(react_trace)}, tools={all_tools}, "
+                f"tokens_in={total_in}, tokens_out={total_out})"
+            )
+
+            # 清理超过 7 天的旧 trace 文件
+            self._cleanup_old_traces(Path("data/react_traces"), max_age_days=7)
+
+        except Exception as e:
+            logger.warning(f"[ReAct] Failed to save trace: {e}")
+
+    def _cleanup_old_traces(self, base_dir: Path, max_age_days: int = 7) -> None:
+        """清理超过指定天数的旧 trace 日期目录"""
+        try:
+            if not base_dir.exists():
+                return
+            cutoff = time.time() - max_age_days * 86400
+            for date_dir in base_dir.iterdir():
+                if date_dir.is_dir() and date_dir.stat().st_mtime < cutoff:
+                    import shutil
+
+                    shutil.rmtree(date_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    # ==================== 取消收尾工具 ====================
+
+    def _reset_structural_cooldown_after_farewell(self):
+        """farewell 调用失败后清除 structural cooldown，防止毒化后续正常请求。"""
+        try:
+            llm_client = getattr(self._brain, "_llm_client", None)
+            if not llm_client:
+                return
+            providers = getattr(llm_client, "_providers", {})
+            for name, provider in providers.items():
+                if not provider.is_healthy and provider.error_category == "structural":
+                    provider.reset_cooldown()
+                    logger.info(f"[CancelFarewell] Reset structural cooldown for endpoint {name}")
+        except Exception as exc:
+            logger.debug(f"[CancelFarewell] Failed to reset cooldown: {exc}")
+
+    @staticmethod
+    def _yield_missing_tool_results(working_messages: list[dict]) -> None:
+        """Patch *working_messages* in-place so every ``tool_use`` block in the
+        last assistant message has a matching ``tool_result`` in a subsequent
+        user message.
+
+        When an exception (cancel / timeout / model-switch) fires after the
+        assistant emits ``tool_use`` blocks but before all tool executions
+        complete, some ``tool_result`` entries will be absent.  The next LLM
+        API call would then fail with HTTP 400.  This helper fills the gaps
+        with synthetic ``[cancelled]`` results.
+        """
+        if not working_messages:
+            return
+
+        last_asst_idx: int | None = None
+        for i in range(len(working_messages) - 1, -1, -1):
+            msg = working_messages[i]
+            if msg.get("role") == "assistant":
+                content = msg.get("content")
+                if isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_use" for b in content
+                ):
+                    last_asst_idx = i
+                break
+
+        if last_asst_idx is None:
+            return
+
+        tool_use_ids: set[str] = set()
+        for block in working_messages[last_asst_idx].get("content", []):
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id"):
+                tool_use_ids.add(block["id"])
+        if not tool_use_ids:
+            return
+
+        answered_ids: set[str] = set()
+        existing_result_msg: dict | None = None
+        for msg in working_messages[last_asst_idx + 1 :]:
+            if msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                            tid = block.get("tool_use_id")
+                            if tid:
+                                answered_ids.add(tid)
+                                if existing_result_msg is None:
+                                    existing_result_msg = msg
+
+        missing_ids = tool_use_ids - answered_ids
+        if not missing_ids:
+            return
+
+        synthetic = [
+            {
+                "type": "tool_result",
+                "tool_use_id": mid,
+                "content": "[cancelled]",
+                "is_error": True,
+            }
+            for mid in missing_ids
+        ]
+
+        if existing_result_msg is not None:
+            existing_result_msg["content"].extend(synthetic)
+        else:
+            working_messages.append({"role": "user", "content": synthetic})
+
+        logger.debug(
+            "[ToolResultSafetyNet] Injected %d synthetic tool_result(s) for IDs: %s",
+            len(synthetic),
+            ", ".join(missing_ids),
+        )
+
+    @staticmethod
+    def _sanitize_messages_for_farewell(messages: list[dict]) -> list[dict]:
+        """
+        清理 working_messages 使其可安全发送给 LLM 的 farewell 调用。
+
+        问题：assistant 消息包含 tool_calls 但缺少对应的 tool result 时，
+        LLM API 会返回 400：'tool_calls must be followed by tool messages'。
+        这可能出现在尾部（中断时最后一轮未完成）或中间（rollback 后残留）。
+
+        策略：全量扫描，收集所有 tool_call_id 及其 tool result 匹配情况，
+        移除所有未闭合的 assistant(tool_calls) 及其孤立的 tool result。
+        """
+        if not messages:
+            return messages
+
+        answered_tool_ids: set[str] = set()
+        for msg in messages:
+            if msg.get("role") == "tool" and msg.get("tool_call_id"):
+                answered_tool_ids.add(msg["tool_call_id"])
+
+        result: list[dict] = []
+        skip_tool_call_ids: set[str] = set()
+
+        for msg in messages:
+            role = msg.get("role", "")
+
+            if role == "assistant" and msg.get("tool_calls"):
+                tc_ids = [tc.get("id", "") for tc in msg["tool_calls"] if tc.get("id")]
+                missing = [tid for tid in tc_ids if tid not in answered_tool_ids]
+                if missing:
+                    skip_tool_call_ids.update(tc_ids)
+                    continue
+                result.append(msg)
+            elif role == "tool":
+                tc_id = msg.get("tool_call_id", "")
+                if tc_id in skip_tool_call_ids:
+                    continue
+                result.append(msg)
+            else:
+                result.append(msg)
+
+        if not result:
+            result = [{"role": "user", "content": "（对话上下文不可用）"}]
+
+        return result
+
+    async def _cancel_farewell(
+        self,
+        working_messages: list[dict],
+        system_prompt: str,
+        current_model: str,
+        state: TaskState | None = None,
+    ) -> str:
+        """非流式场景下的取消收尾：立即返回默认文本，后台异步发起 LLM 收尾。"""
+        self._yield_missing_tool_results(working_messages)
+
+        # Issue #608: persist the (orphan-repaired) working_messages so the
+        # next turn resumes completed tool work instead of re-running it.
+        self._maybe_persist_resumable_working_messages(
+            working_messages,
+            state,
+            current_model,
+            exit_reason="user_cancelled",
+            detail=(getattr(state, "cancel_reason", "") if state else ""),
+        )
+
+        cancel_reason = (state.cancel_reason if state else "") or "用户请求停止"
+        logger.info(
+            f"[ReAct][CancelFarewell] 进入收尾流程: cancel_reason={cancel_reason!r}, "
+            f"model={current_model}, msg_count={len(working_messages)}"
+        )
+
+        default_farewell = "✅ 好的，已停止当前任务。"
+
+        asyncio.create_task(
+            self._background_cancel_farewell(
+                list(working_messages), system_prompt, current_model, cancel_reason
+            )
+        )
+
+        return default_farewell
+
+    # ==================== 取消收尾（流式） ====================
+
+    async def _stream_cancel_farewell(
+        self,
+        working_messages: list[dict],
+        system_prompt: str,
+        current_model: str,
+        state: TaskState | None = None,
+    ):
+        """流式场景下的取消收尾：立即返回默认文本，后台异步发起 LLM 收尾。
+
+        Yields:
+            {"type": "user_insert", ...} 和 {"type": "text_delta", ...} 事件
+        """
+        self._yield_missing_tool_results(working_messages)
+
+        # Issue #608: persist the (orphan-repaired) working_messages so the
+        # next turn resumes completed tool work instead of re-running it.
+        self._maybe_persist_resumable_working_messages(
+            working_messages,
+            state,
+            current_model,
+            exit_reason="user_cancelled",
+            detail=(getattr(state, "cancel_reason", "") if state else ""),
+        )
+
+        cancel_reason = (state.cancel_reason if state else "") or "用户请求停止"
+        logger.info(
+            f"[ReAct-Stream][CancelFarewell] 进入收尾流程: cancel_reason={cancel_reason!r}, "
+            f"model={current_model}, msg_count={len(working_messages)}"
+        )
+
+        user_text = ""
+        if cancel_reason.startswith("用户发送停止指令: "):
+            user_text = cancel_reason[len("用户发送停止指令: ") :]
+        elif cancel_reason.startswith("用户发送跳过指令: "):
+            user_text = cancel_reason[len("用户发送跳过指令: ") :]
+        if user_text:
+            logger.info(f"[ReAct-Stream][CancelFarewell] 回传用户指令文本: {user_text!r}")
+            yield {"type": "user_insert", "content": user_text}
+
+        default_farewell = "✅ 好的，已停止当前任务。"
+        yield {"type": "text_delta", "content": default_farewell}
+
+        asyncio.create_task(
+            self._background_cancel_farewell(
+                list(working_messages), system_prompt, current_model, cancel_reason
+            )
+        )
+
+    async def _background_cancel_farewell(
+        self,
+        working_messages: list[dict],
+        system_prompt: str,
+        current_model: str,
+        cancel_reason: str,
+    ) -> None:
+        """后台执行 LLM 收尾调用，将结果持久化到上下文（不阻塞用户）。"""
+        try:
+            self._yield_missing_tool_results(working_messages)
+            cancel_msg = (
+                f"[系统通知] 用户发送了停止指令「{cancel_reason}」，"
+                "请立即停止当前操作，简要告知用户已停止以及当前进度（1~2 句话即可）。"
+                "不要调用任何工具。"
+            )
+            farewell_messages = self._sanitize_messages_for_farewell(working_messages)
+            farewell_messages.append({"role": "user", "content": cancel_msg})
+
+            _tt = set_tracking_context(
+                TokenTrackingContext(
+                    operation_type="farewell",
+                    channel="api",
+                )
+            )
+            try:
+                farewell_response = await asyncio.wait_for(
+                    self._brain.messages_create_async(
+                        model=current_model,
+                        max_tokens=200,
+                        system=system_prompt,
+                        tools=[],
+                        messages=farewell_messages,
+                    ),
+                    timeout=5.0,
+                )
+                for block in farewell_response.content:
+                    if block.type == "text" and block.text.strip():
+                        logger.info(
+                            f"[ReAct-Stream][BgFarewell] LLM farewell 完成: "
+                            f"{block.text.strip()[:100]}"
+                        )
+                        break
+            except TimeoutError:
+                logger.warning("[ReAct-Stream][BgFarewell] LLM farewell 超时 (5s)")
+            except Exception as e:
+                logger.warning(f"[ReAct-Stream][BgFarewell] LLM farewell 失败: {e}")
+                self._reset_structural_cooldown_after_farewell()
+            finally:
+                reset_tracking_context(_tt)
+        except Exception as e:
+            logger.warning(f"[ReAct-Stream][BgFarewell] 后台收尾异常: {e}")
+
+    # ==================== 流式推理 ====================
+
+    _HEARTBEAT_INTERVAL = 15  # 秒：无事件时心跳间隔
+
+    async def _reason_stream_iter(
+        self,
+        messages: list[dict],
+        *,
+        system_prompt: str,
+        tools: list[dict],
+        current_model: str,
+        conversation_id: str | None = None,
+        thinking_mode: str | None = None,
+        thinking_depth: str | None = None,
+        iteration: int = 0,
+        agent_profile_id: str = "default",
+    ):
+        """流式推理迭代器：即时 yield text/thinking delta，流结束后 yield Decision。
+
+        参考 Claude Code (claude.ts) 的 for-await 事件循环模式：
+        - 每个 LLM token 到达时即通过 StreamAccumulator 产出高层事件
+        - 流结束后从累积状态构建 Decision 对象
+
+        Yields:
+            {"type": "text_delta", "content": "..."}
+            {"type": "thinking_delta", "content": "..."}
+            {"type": "heartbeat"}
+            {"type": "decision", "decision": Decision}
+        """
+        import time as _time
+
+        from .stream_accumulator import StreamAccumulator, post_process_streamed_decision
+
+        acc = StreamAccumulator()
+        last_yield_time = _time.monotonic()
+
+        state = (
+            self._state.get_task_for_session(conversation_id) if conversation_id else None
+        ) or self._state.current_task
+        cancel_event = state.cancel_event if state else asyncio.Event()
+
+        use_thinking = None
+        if thinking_mode == "on":
+            use_thinking = True
+        elif thinking_mode == "off":
+            use_thinking = False
+
+        # on_before_llm_call: 允许插件向最后一条 user 消息注入上下文
+        # 注入到 user 消息侧（而非 system prompt）以保护 Anthropic prompt cache
+        if self._plugin_hooks:
+            try:
+                hook_results = await self._plugin_hooks.dispatch(
+                    "on_before_llm_call",
+                    messages=copy.deepcopy(messages),
+                    tools=copy.deepcopy(tools),
+                )
+                extra_parts = [r for r in hook_results if isinstance(r, str) and r.strip()]
+                if active_transcript.get() is not None:
+                    await active_transcript.get().update_context(
+                        messages, "plugin_context", "\n".join(extra_parts)
+                    )
+                elif extra_parts and messages:
+                    # #581 (upstream 86914fc2): list-shaped (multimodal) user
+                    # messages previously fell through silently, dropping plugin
+                    # context whenever the turn had attachments. Append a text
+                    # part for the list case instead of skipping.
+                    plugin_text = "\n\n[Plugin Context]\n" + "\n".join(extra_parts)
+                    for i in range(len(messages) - 1, -1, -1):
+                        if messages[i].get("role") == "user":
+                            content = messages[i].get("content", "")
+                            if isinstance(content, str):
+                                messages[i]["content"] = content + plugin_text
+                            elif isinstance(content, list):
+                                content.append({"type": "text", "text": plugin_text})
+                            break
+            except Exception as _hook_err:
+                logger.debug(f"on_before_llm_call hook error (ignored): {_hook_err}")
+
+        await commit_model_messages(messages)
+        tracer = get_tracer()
+        with tracer.llm_span(model=current_model) as span:
+            async for raw_event in self._brain.messages_create_stream(
+                use_thinking=use_thinking,
+                thinking_depth=thinking_depth,
+                model=current_model,
+                max_tokens=self._brain.max_tokens,
+                system=system_prompt,
+                tools=tools,
+                messages=messages,
+                conversation_id=conversation_id,
+                iteration=iteration,
+                agent_profile_id=agent_profile_id,
+            ):
+                if cancel_event.is_set():
+                    cancel_reason = state.cancel_reason if state else "用户请求停止"
+                    raise UserCancelledError(
+                        reason=cancel_reason,
+                        source="llm_stream",
+                    )
+
+                # 端点元信息（如 vision_degraded）由 LLMClient 直接 yield
+                # 在流开始之前，不走 StreamAccumulator，原样向上转发。
+                if isinstance(raw_event, dict) and raw_event.get("type") == "endpoint_meta":
+                    yield raw_event
+                    last_yield_time = _time.monotonic()
+                    continue
+
+                for high_event in acc.feed(raw_event):
+                    transcript = active_transcript.get()
+                    if transcript is not None and high_event.get("type") in (
+                        "text_delta",
+                        "thinking_delta",
+                        "reasoning_delta",
+                    ):
+                        kind = "text" if high_event["type"] == "text_delta" else "thinking"
+                        await transcript.record_frame(kind, high_event.get("content", ""))
+                    yield high_event
+                    last_yield_time = _time.monotonic()
+
+                now = _time.monotonic()
+                if now - last_yield_time > self._HEARTBEAT_INTERVAL:
+                    yield {"type": "heartbeat"}
+                    last_yield_time = now
+
+            # 流结束 → 构建 Decision
+            decision = acc.build_decision()
+            raw_streamed_text = decision.text_content or ""
+            post_process_streamed_decision(decision)
+
+            if acc.usage:
+                in_tok = acc.usage.get("input_tokens", 0)
+                out_tok = acc.usage.get("output_tokens", 0)
+                span.set_attribute("input_tokens", in_tok)
+                span.set_attribute("output_tokens", out_tok)
+
+            span.set_attribute("decision_type", decision.type.value)
+            span.set_attribute("tool_count", len(decision.tool_calls))
+
+            yield {
+                "type": "decision",
+                "decision": decision,
+                "usage": acc.usage,
+                "raw_streamed_text": raw_streamed_text,
+            }
+
+    # ==================== 心跳保活（非流式路径使用） ====================
+
+    async def _reason_with_heartbeat(
+        self,
+        messages: list[dict],
+        *,
+        system_prompt: str,
+        tools: list[dict],
+        current_model: str,
+        conversation_id: str | None = None,
+        thinking_mode: str | None = None,
+        thinking_depth: str | None = None,
+        iteration: int = 0,
+        agent_profile_id: str = "default",
+    ):
+        """
+        包装 _reason()，在等待 LLM 响应期间每隔 HEARTBEAT_INTERVAL 秒
+        产出 heartbeat 事件，防止前端 SSE idle timeout。
+
+        同时监听 cancel_event，当用户取消时立即中断 LLM 调用并抛出 UserCancelledError。
+
+        Yields:
+            {"type": "heartbeat"} 或 {"type": "decision", "decision": Decision}
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+
+        # 获取当前 session 对应的 cancel_event（避免跨会话误取消）
+        state = (
+            self._state.get_task_for_session(conversation_id) if conversation_id else None
+        ) or self._state.current_task
+        cancel_event = state.cancel_event if state else asyncio.Event()
+
+        async def _do_reason():
+            try:
+                decision = await self._reason(
+                    messages,
+                    system_prompt=system_prompt,
+                    tools=tools,
+                    current_model=current_model,
+                    conversation_id=conversation_id,
+                    thinking_mode=thinking_mode,
+                    thinking_depth=thinking_depth,
+                    iteration=iteration,
+                    agent_profile_id=agent_profile_id,
+                    cancel_event=cancel_event,
+                )
+                await queue.put(("result", decision))
+            except Exception as exc:
+                await queue.put(("error", exc))
+
+        async def _heartbeat_loop():
+            try:
+                while True:
+                    await asyncio.sleep(self._HEARTBEAT_INTERVAL)
+                    await queue.put(("heartbeat", None))
+            except asyncio.CancelledError:
+                pass
+
+        async def _cancel_watcher():
+            """监听 cancel_event，触发时通过 queue 通知主循环"""
+            try:
+                await cancel_event.wait()
+                await queue.put(("cancelled", None))
+            except asyncio.CancelledError:
+                pass
+
+        reason_task = asyncio.create_task(_do_reason())
+        hb_task = asyncio.create_task(_heartbeat_loop())
+        cancel_task = asyncio.create_task(_cancel_watcher())
+
+        try:
+            while True:
+                typ, data = await queue.get()
+                if typ == "heartbeat":
+                    yield {"type": "heartbeat"}
+                elif typ == "cancelled":
+                    cancel_reason = state.cancel_reason if state else "用户请求停止"
+                    raise UserCancelledError(
+                        reason=cancel_reason,
+                        source="llm_call_stream",
+                    )
+                elif typ == "error":
+                    raise data  # 传播 _reason 的异常
+                else:
+                    yield {"type": "decision", "decision": data}
+                    break
+        finally:
+            hb_task.cancel()
+            cancel_task.cancel()
+            if not reason_task.done():
+                reason_task.cancel()
+                try:
+                    await reason_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+    # ==================== 推理阶段 ====================
+
+    async def _reason(
+        self,
+        messages: list[dict],
+        *,
+        system_prompt: str,
+        tools: list[dict],
+        current_model: str,
+        conversation_id: str | None = None,
+        thinking_mode: str | None = None,
+        thinking_depth: str | None = None,
+        iteration: int = 0,
+        agent_profile_id: str = "default",
+        cancel_event: asyncio.Event | None = None,
+        request_id: str = "",
+        turn_id: str = "",
+    ) -> Decision:
+        """
+        推理阶段: 调用 LLM，返回结构化 Decision。
+        """
+        # 根据 thinking_mode 决定 use_thinking 参数
+        use_thinking = None  # None = 让 Brain 使用默认逻辑
+        if thinking_mode == "on":
+            use_thinking = True
+        elif thinking_mode == "off":
+            use_thinking = False
+        # "auto" 或 None: use_thinking=None → Brain 使用自身默认逻辑
+
+        tracer = get_tracer()
+        with tracer.llm_span(model=current_model) as span:
+            _tt = set_tracking_context(
+                TokenTrackingContext(
+                    session_id=conversation_id or "",
+                    request_id=request_id,
+                    turn_id=turn_id,
+                    operation_type="chat_react_iteration",
+                    channel="api",
+                    iteration=iteration,
+                    agent_profile_id=agent_profile_id,
+                )
+            )
+            try:
+                await commit_model_messages(messages)
+                response = await self._brain.messages_create_async(
+                    use_thinking=use_thinking,
+                    thinking_depth=thinking_depth,
+                    cancel_event=cancel_event,
+                    model=current_model,
+                    max_tokens=self._brain.max_tokens,
+                    system=system_prompt,
+                    tools=tools,
+                    messages=messages,
+                    conversation_id=conversation_id,
+                )
+            finally:
+                reset_tracking_context(_tt)
+
+            # 记录 token 使用
+            if hasattr(response, "usage"):
+                span.set_attribute("input_tokens", getattr(response.usage, "input_tokens", 0))
+                span.set_attribute("output_tokens", getattr(response.usage, "output_tokens", 0))
+
+            decision = self._parse_decision(response)
+            span.set_attribute("decision_type", decision.type.value)
+            span.set_attribute("tool_count", len(decision.tool_calls))
+            return decision
+
+    def _parse_decision(self, response: Any) -> Decision:
+        """解析 LLM 响应为 Decision"""
+        tool_calls = []
+        text_content = ""
+        thinking_content = ""
+        assistant_content = []
+
+        for block in response.content:
+            if block.type == "thinking":
+                thinking_text = block.thinking if hasattr(block, "thinking") else str(block)
+                thinking_content += (
+                    thinking_text if isinstance(thinking_text, str) else str(thinking_text)
+                )
+                assistant_content.append(
+                    {
+                        "type": "thinking",
+                        "thinking": thinking_text,
+                    }
+                )
+            elif block.type == "text":
+                raw_text = block.text
+                # brain.py 将 OpenAI-compatible 的 reasoning_content 包装为 <thinking> 标签
+                # 嵌入 TextBlock；Qwen3/MiniMax 可能产出 <think> 标签。
+                # 将其正确路由到 thinking_content 避免原始标签泄漏到前端，
+                # assistant_content 保留原文（消息历史需要标签用于下轮提取）。
+                if "<thinking>" in raw_text or "<think>" in raw_text:
+                    display_text = strip_thinking_tags(raw_text)
+                    if display_text != raw_text and not thinking_content:
+                        import re
+
+                        m = re.search(r"<think(?:ing)?>(.*?)</think(?:ing)?>", raw_text, re.DOTALL)
+                        if m:
+                            thinking_content = m.group(1).strip()
+                else:
+                    display_text = raw_text
+                text_content += display_text
+                assistant_content.append({"type": "text", "text": raw_text})
+            elif block.type == "tool_use":
+                tc_dict: dict = {
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                }
+                if getattr(block, "provider_extra", None):
+                    tc_dict["provider_extra"] = block.provider_extra
+                tool_calls.append(tc_dict)
+                assistant_content.append({"type": "tool_use", **tc_dict})
+
+        # 内部 trace marker 清理 —— 必须在下面的 ``parse_text_tool_calls``
+        # 之前。模型可能整段模仿 ``<<TOOL_TRACE>>\n- web_search({...})``，
+        # 若先做工具调用提取，模仿的调用会被误识别为本轮真实意图而触发
+        # 额外工具执行（安全风险）。
+        #
+        # 同步清理：
+        # - text_content：避免泄露到用户可见正文
+        # - thinking_content：避免下一轮 reasoning_content 回灌再被复读
+        # - assistant_content text/thinking block：避免持久化后下一轮回放
+        #   再次拼回 LLM 上下文
+        if text_content:
+            _trace_cleaned = strip_internal_trace_markers(text_content)
+            if _trace_cleaned != text_content:
+                logger.info(
+                    "[_parse_decision] Stripped internal trace marker(s) from text_content "
+                    f"({len(text_content) - len(_trace_cleaned)} chars removed)"
+                )
+            text_content = _trace_cleaned
+        if thinking_content:
+            thinking_content = strip_internal_trace_markers(thinking_content)
+        for _block in assistant_content:
+            if not isinstance(_block, dict):
+                continue
+            _btype = _block.get("type")
+            if _btype == "text" and _block.get("text"):
+                _block["text"] = strip_internal_trace_markers(_block["text"])
+            elif _btype == "thinking" and _block.get("thinking"):
+                _block["thinking"] = strip_internal_trace_markers(_block["thinking"])
+
+        # 防御层：如果 provider 层未能从 thinking 内容中提取嵌入的工具调用，
+        # 在此做最后一次检查（MiniMax-M2.5 已知会将 <minimax:tool_call> 嵌入 thinking 块）
+        if not tool_calls and thinking_content:
+            try:
+                from ..llm.converters.tools import has_text_tool_calls, parse_text_tool_calls
+
+                if has_text_tool_calls(thinking_content):
+                    _, embedded_tool_calls = parse_text_tool_calls(thinking_content)
+                    if embedded_tool_calls:
+                        for tc in embedded_tool_calls:
+                            tc_dict = {
+                                "id": tc.id,
+                                "name": tc.name,
+                                "input": tc.input,
+                            }
+                            if getattr(tc, "provider_extra", None):
+                                tc_dict["provider_extra"] = tc.provider_extra
+                            tool_calls.append(tc_dict)
+                            assistant_content.append({"type": "tool_use", **tc_dict})
+                        logger.warning(
+                            f"[_parse_decision] Recovered {len(embedded_tool_calls)} tool calls "
+                            f"from thinking content (provider-level extraction missed)"
+                        )
+            except Exception as e:
+                logger.debug(f"[_parse_decision] Thinking tool-call check failed: {e}")
+
+        # 防御层：从 text_content 中提取嵌入的工具调用（Python dot-style 等）。
+        # 部分模型（如 qwen3-coder, qwen3.5）不使用原生 function calling，
+        # 而是在文本中输出 .web_search(query="...") 风格的工具调用。
+        if not tool_calls and text_content:
+            try:
+                from ..llm.converters.tools import has_text_tool_calls, parse_text_tool_calls
+
+                if has_text_tool_calls(text_content):
+                    _clean, embedded_tool_calls = parse_text_tool_calls(text_content)
+                    if embedded_tool_calls:
+                        text_content = _clean
+                        for tc in embedded_tool_calls:
+                            tc_dict = {
+                                "id": tc.id,
+                                "name": tc.name,
+                                "input": tc.input,
+                            }
+                            if getattr(tc, "provider_extra", None):
+                                tc_dict["provider_extra"] = tc.provider_extra
+                            tool_calls.append(tc_dict)
+                            assistant_content.append({"type": "tool_use", **tc_dict})
+                        logger.warning(
+                            f"[_parse_decision] Recovered {len(embedded_tool_calls)} tool calls "
+                            f"from text content: {[tc.name for tc in embedded_tool_calls]}"
+                        )
+            except Exception as e:
+                logger.debug(f"[_parse_decision] Text tool-call check failed: {e}")
+
+        # 防御层：剥离 text_content 末尾的裸工具名。
+        # 部分模型会在 content 中输出 "用户原文\nbrowser_open" 这类垃圾，
+        # 其中裸工具名既不是合法工具调用（无参数/格式），也不是有意义的回复。
+        # 仅在 text_content 较短（<200 字符）时触发，避免误伤正常长文本。
+        if text_content and len(text_content.strip()) < 200:
+            import re
+
+            _lines = text_content.strip().split("\n")
+            _last = _lines[-1].strip() if _lines else ""
+            if re.match(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$", _last):
+                text_content = "\n".join(_lines[:-1]).strip()
+                logger.warning(
+                    f"[_parse_decision] Stripped bare tool name '{_last}' from text_content"
+                )
+
+        decision_type = DecisionType.TOOL_CALLS if tool_calls else DecisionType.FINAL_ANSWER
+
+        return Decision(
+            type=decision_type,
+            text_content=text_content,
+            tool_calls=tool_calls,
+            thinking_content=thinking_content,
+            raw_response=response,
+            stop_reason=getattr(response, "stop_reason", ""),
+            assistant_content=assistant_content,
+        )
+
+    def _collect_inbound_artifact_receipts(self) -> list[dict]:
+        """从当前 session 的 sub_agent_records 合成"父节点已收到子节点交付物"的回执列表。
+
+        coordinator 多智能体场景下，子 agent 完成后由 orchestrator 调
+        ``_persist_sub_agent_record`` 把 ``output_files`` 写到
+        ``ctx.sub_agent_records[*].output_files``。此处在父节点 ReAct 收尾
+        verify_task_completion 之前把这些已落盘的文件合成 receipt 抄入
+        ``delivery_receipts``，让 trust-but-verify 能：
+          1. 通过 ``_has_produced_files`` 信号触发"方案/策划/计划/报告"等弱
+             关键词的 expects_artifact=True 升级；
+          2. 在父节点真没调 ``deliver_artifacts`` 的情况下让 LLM 复核能看到
+             "上下文已有附件、但本节点没转发给用户"，更准确地判 INCOMPLETE
+             并触发下一轮 deliver_artifacts。
+
+        如果 session 不可用 / 没有 sub_agent_records，安全返回空列表。
+        """
+        try:
+            session = getattr(self._state, "current_session", None)
+            ctx = getattr(session, "context", None) if session is not None else None
+            records = getattr(ctx, "sub_agent_records", None) if ctx is not None else None
+            if not records:
+                return []
+            seen_paths: set[str] = set()
+            receipts: list[dict] = []
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+                files = rec.get("output_files") or []
+                if not isinstance(files, list):
+                    continue
+                for fp in files:
+                    if not isinstance(fp, str) or not fp:
+                        continue
+                    if fp in seen_paths:
+                        continue
+                    seen_paths.add(fp)
+                    receipts.append(
+                        {
+                            "status": "delivered",
+                            "from_sub_agent": rec.get("agent_name") or rec.get("agent_id") or "",
+                            "file_path": fp,
+                            "filename": fp.rsplit("/", 1)[-1].rsplit("\\", 1)[-1],
+                            "summary": f"子节点已交付文件: {fp}",
+                            "source": "sub_agent_record",
+                        }
+                    )
+            return receipts
+        except Exception:
+            return []
+
+    @staticmethod
+    def _build_fallback_summary(
+        executed_tool_names: list[str],
+        delivery_receipts: list[dict],
+    ) -> str | None:
+        """当 LLM 多次未返回可见文本时，从工具执行记录构建 fallback 摘要。"""
+        parts: list[str] = []
+
+        if delivery_receipts:
+            for r in delivery_receipts:
+                desc = r.get("description") or r.get("summary") or r.get("title") or ""
+                if desc:
+                    parts.append(f"• {desc}")
+            if parts:
+                return "已完成以下操作：\n" + "\n".join(parts)
+
+        if executed_tool_names:
+            unique = list(dict.fromkeys(executed_tool_names))
+            tool_summary = "、".join(unique[:10])
+            if len(unique) > 10:
+                tool_summary += f" 等共 {len(unique)} 项"
+            return f"任务已执行完毕（使用了工具：{tool_summary}），但模型未生成文本总结。如需详情请重新提问。"
+
+        return None
+
+    # ==================== Steer done-drain ====================
+
+    @staticmethod
+    async def _drain_steer_before_finish(
+        *,
+        state: "TaskState | None",
+        working_messages: list[dict],
+        final_text: str,
+        iteration: int,
+        max_iterations: int,
+    ) -> list[str]:
+        """Final-answer done-drain: rescue a message steered in during the
+        last LLM generation so the turn does not terminate while it is still
+        sitting un-read in ``pending_user_inserts``.
+
+        Background
+        ----------
+        ``process_post_tool_signals`` only drains ``pending_user_inserts``
+        after a tool round. When the model produces a *final answer with no
+        tool calls* that drain never runs, so anything that arrived via
+        ``insert_user_message`` while the answer was being generated would be
+        lost the instant the loop terminates. This is the STEER race: the
+        desktop client injects the follow-up the moment the turn appears to
+        finish.
+
+        Behaviour
+        ---------
+        * No pending insert → return ``[]``; caller terminates normally.
+        * Pending insert AND iteration budget remains → fold ``final_text``
+          back into ``working_messages`` as a settled assistant turn, append
+          the steered message(s) with the canonical insert wording, and
+          return the drained texts so the caller continues the loop.
+        * Pending insert but ``iteration`` is the last allowed one → return
+          ``[]`` WITHOUT draining. This is the hard anti-hang ceiling: the
+          loop can never be extended past ``max_iterations``, so a client
+          that keeps steering a message on every single final answer can at
+          worst consume the remaining iteration budget, never loop forever.
+          (The un-drained message stays in ``pending_user_inserts`` rather
+          than being appended to a context we are about to abandon.)
+
+        The method is intentionally static + dependency-free so it can be
+        unit-tested in isolation against a real :class:`TaskState`, without
+        standing up the full reasoning-engine coroutine.
+        """
+        if state is None or not getattr(state, "pending_user_inserts", None):
+            return []
+        # Hard ceiling: never grant another iteration on the last loop tick.
+        if iteration >= max_iterations - 1:
+            return []
+        drained = await state.drain_user_inserts()
+        if not drained:
+            return []
+        # Settle the answer the model just produced into the transcript so the
+        # follow-up turn sees what was already told to the user. Skip the fold
+        # when the final answer is blank (the empty-content / model-glitch
+        # exit can return ""): an empty text block is rejected by strict
+        # providers, and the downstream context layer already collapses the
+        # resulting consecutive user turns just like the empty-retry path does.
+        if final_text and final_text.strip():
+            working_messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": final_text}]}
+            )
+        for _text in drained:
+            working_messages.append(state.build_user_insert_message(_text))
+        return drained
+
+    # ==================== 最终答案处理 ====================
+
+    async def _handle_final_answer(
+        self,
+        *,
+        decision: Decision,
+        working_messages: list[dict],
+        original_messages: list[dict],
+        tools_executed_in_task: bool,
+        executed_tool_names: list[str],
+        delivery_receipts: list[dict],
+        all_tool_results: list[dict] | None = None,
+        no_tool_call_count: int,
+        verify_incomplete_count: int,
+        no_confirmation_text_count: int,
+        max_no_tool_retries: int,
+        max_verify_retries: int,
+        max_confirmation_text_retries: int,
+        base_force_retries: int,
+        conversation_id: str | None,
+        supervisor_intervened: bool = False,
+        tool_evidence_required: bool = False,
+        mode: str = "agent",
+        final_response_candidates: list[str] | None = None,
+    ) -> str | tuple:
+        """
+        处理纯文本响应（无工具调用）。
+
+        Returns:
+            str: 最终答案
+            tuple: (working_messages, no_tool_call_count, verify_incomplete_count,
+                    no_confirmation_text_count, max_no_tool_retries) - 需要继续循环
+        """
+        # ============================================================
+        # Plan-mode 守卫：当处于 plan_mode 且 plan 仍有未完成步骤时，
+        # 若 LLM 返回的是「描述计划 + 询问确认」式纯文本，拦截不走 final，
+        # 改为塞一条 user reminder 让 LLM 继续推进 plan。
+        # ============================================================
+        if (
+            mode == "plan"
+            and self._has_active_todo_pending(conversation_id)
+            and decision.text_content
+        ):
+            _stripped_for_plan = strip_thinking_tags(decision.text_content) or ""
+            _, _stripped_for_plan = parse_intent_tag(_stripped_for_plan)
+            _stripped_for_plan = (_stripped_for_plan or "").strip()
+            if _stripped_for_plan and self._looks_like_plan_proposal(_stripped_for_plan):
+                logger.info(
+                    "[PlanGuard] _handle_final_answer intercepted — "
+                    "plan_mode active with pending steps, response looks like "
+                    "plan-proposal/confirmation; redirecting to ForceToolCall"
+                )
+                working_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": decision.text_content}],
+                        "reasoning_content": decision.thinking_content or None,
+                    }
+                )
+                working_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[系统] Plan 模式仍有未完成步骤。不要再次描述或询问是否继续，"
+                            "请直接调用工具推进当前 pending 步骤；若全部完成请显式调用 "
+                            "exit_plan_mode 结束 plan。"
+                        ),
+                    }
+                )
+                return (
+                    working_messages,
+                    no_tool_call_count,
+                    verify_incomplete_count,
+                    no_confirmation_text_count,
+                    max_no_tool_retries,
+                )
+
+        if tools_executed_in_task:
+            cleaned_text = strip_thinking_tags(decision.text_content)
+            _, cleaned_text = parse_intent_tag(cleaned_text)
+            if cleaned_text and len(cleaned_text.strip()) > 0:
+                last_user_request = ResponseHandler.get_last_user_request(original_messages)
+                if _looks_like_waiting_for_user_response(
+                    cleaned_text
+                ) and not _has_recoverable_tool_issue(all_tool_results):
+                    logger.info(
+                        "[TaskVerify] Skipping completion verify because response "
+                        "hands control back to user."
+                    )
+                    self._last_exit_reason = "waiting_user"
+                    return cleaned_text
+
+                current_is_generic = _looks_like_generic_task_completion(cleaned_text)
+                previous_candidates = list(final_response_candidates or [])
+                selected_text = _select_task_final_response(cleaned_text, previous_candidates)
+                if final_response_candidates is not None:
+                    if current_is_generic or cleaned_text not in final_response_candidates:
+                        final_response_candidates.append(cleaned_text)
+                    del final_response_candidates[:-8]
+
+                is_scheduled_task = (last_user_request or "").lstrip().startswith("[定时任务执行]")
+                if is_scheduled_task and current_is_generic and selected_text == cleaned_text:
+                    generic_attempts = sum(
+                        _looks_like_generic_task_completion(candidate)
+                        for candidate in (final_response_candidates or [cleaned_text])
+                    )
+                    if generic_attempts <= 1:
+                        working_messages.append(
+                            {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": decision.text_content}],
+                                "reasoning_content": decision.thinking_content or None,
+                            }
+                        )
+                        working_messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "[系统] 这是一项定时任务，上一条回复只有完成状态，"
+                                    "不能作为最终结果。请基于已经产生的 tool_result，"
+                                    "把用户需要看到的完整报告、关键数据和结论写在回复正文中；"
+                                    "不要只说任务已完成，也不要省略脚本输出。"
+                                ),
+                            }
+                        )
+                        return (
+                            working_messages,
+                            no_tool_call_count,
+                            verify_incomplete_count,
+                            no_confirmation_text_count,
+                            max_no_tool_retries,
+                        )
+                    self._last_exit_reason = "verify_incomplete"
+                    return cleaned_text
+
+                cleaned_text = selected_text
+                # 汇总轮（root post-summary 注入的 [用户指令最终汇总] 提示）下，
+                # 本次 ReAct 的目的就是输出汇总文本而非再产出文件，verify 全程绕过。
+                # 与 B1 的关键词白名单互补：B1 修关键词命中根因，B2 兜底全路径。
+                is_summary_round = (
+                    (last_user_request or "").lstrip().startswith("[用户指令最终汇总]")
+                )
+                # 同时拼装组织级 verify 上下文（B4 由 ValidationContext 消费）
+                org_validation_kwargs = self._build_org_validation_kwargs()
+                # 把子节点已落盘的文件合成回执并入 delivery_receipts，
+                # 避免 coordinator 节点没显式调 deliver_artifacts 时
+                # trust-but-verify 看不到任何"已交付证据"而 INSUFFICIENT。
+                inbound_receipts = self._collect_inbound_artifact_receipts()
+                _verify_receipts = (
+                    list(delivery_receipts) + inbound_receipts
+                    if inbound_receipts
+                    else delivery_receipts
+                )
+                is_completed = await self._response_handler.verify_task_completion(
+                    user_request=last_user_request,
+                    assistant_response=cleaned_text,
+                    executed_tools=executed_tool_names,
+                    delivery_receipts=_verify_receipts,
+                    tool_results=all_tool_results,
+                    conversation_id=conversation_id,
+                    bypass=supervisor_intervened or is_summary_round,
+                    **org_validation_kwargs,
+                )
+
+                if is_completed:
+                    # P0-2 阶段 4：工具失败 vs 助手乐观措辞 一致性检测（成功路径 belt）
+                    # verify=completed 说明任务整体被判完成，但单步工具失败可能被
+                    # LLM 用乐观措辞掩盖。此处补一道 banner 提醒用户核对。
+                    failure_warning = _check_tool_failure_acknowledgement(
+                        cleaned_text, all_tool_results
+                    )
+                    if failure_warning:
+                        return cleaned_text + failure_warning
+                    return _select_task_final_response(
+                        cleaned_text, final_response_candidates or []
+                    )
+
+                verify_incomplete_count += 1
+
+                has_todo_pending = self._has_active_todo_pending(conversation_id)
+                effective_max = max_verify_retries + 1 if has_todo_pending else max_verify_retries
+
+                is_in_progress_promise = self._is_in_progress_promise(cleaned_text)
+
+                if verify_incomplete_count >= effective_max:
+                    if is_in_progress_promise and verify_incomplete_count <= effective_max + 1:
+                        logger.warning(
+                            "[TaskVerify] Verify retries exhausted but response is an "
+                            "in-progress promise (no actual execution). "
+                            "Forcing one final tool-execution round."
+                        )
+                        working_messages.append(
+                            {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": decision.text_content}],
+                                "reasoning_content": decision.thinking_content or None,
+                            }
+                        )
+                        working_messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "[系统] ⚠️ 严重警告：你已经连续多轮只是在描述将要做什么，"
+                                    "但从未实际调用工具执行。系统日志确认你没有生成任何文件。"
+                                    "文字描述≠实际执行。"
+                                    "请立即调用 write_file、平台命令工具"
+                                    "（Windows 用 run_powershell，其他环境用 run_shell）等工具来完成实际操作，"
+                                    "不要再输出任何描述性文字。"
+                                ),
+                            }
+                        )
+                        return (
+                            working_messages,
+                            no_tool_call_count,
+                            verify_incomplete_count,
+                            no_confirmation_text_count,
+                            max_no_tool_retries,
+                        )
+                    self._last_exit_reason = "verify_incomplete"
+                    return cleaned_text
+
+                # 继续循环
+                working_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": decision.text_content}],
+                        "reasoning_content": decision.thinking_content or None,
+                    }
+                )
+
+                if has_todo_pending:
+                    working_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[系统提示] 当前 Plan 仍有未完成的步骤。"
+                                "请立即继续执行下一个 pending 步骤。"
+                            ),
+                        }
+                    )
+                elif is_in_progress_promise:
+                    working_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[系统] ⚠️ 你的上一条回复只是在描述将要执行的操作，"
+                                "但系统日志确认你没有调用任何工具（tool_calls=0）。"
+                                "文字描述不等于实际执行。"
+                                "请立即调用所需工具来完成任务，不要只输出文字说明。"
+                            ),
+                        }
+                    )
+                else:
+                    # 按"用户是否明确要求附件交付"分两套提示：
+                    # - expects_artifact=True：硬约束，给出具体工具签名 + 路径样例，
+                    #   逼 LLM 真的走 write_file / org_submit_deliverable(file_attachments=...)
+                    #   而不是再来一段纯文字"我已经做好了"。
+                    # - expects_artifact=False：温和复核提示，避免对纯对话场景喷
+                    #   "你必须交付文件"的噪音误导。
+                    # 子节点已经产出过文件 → "方案/策划/计划/报告"等弱信号
+                    # 词也升级成 expects_artifact=True，提示 LLM 走附件交付。
+                    _has_produced_files_re = (
+                        bool(delivery_receipts)
+                        or bool(self._collect_inbound_artifact_receipts())
+                        or any(
+                            (tr.get("tool_name") or tr.get("name") or "")
+                            in {"write_file", "auto_persist_node_final_answer"}
+                            for tr in (all_tool_results or [])
+                            if isinstance(tr, dict) and not tr.get("is_error")
+                        )
+                    )
+                    expects_artifact = request_expects_artifact(
+                        last_user_request, has_produced_files=_has_produced_files_re
+                    )
+                    if expects_artifact:
+                        retry_msg = (
+                            "[系统] ⚠️ 用户请求里明确提到附件/文件类交付物，"
+                            "但你刚才只回了纯文字、没有产生任何文件证据。"
+                            "请立即在本轮调用以下工具之一完成真正的落盘交付，"
+                            "不要再仅靠文字声明完成：\n"
+                            '1) `write_file({"path": "<workspace>/deliverables/<title>.md", '
+                            '"content": "<完整内容>"})` —— 把成果写到工作区；\n'
+                            "2) 如果你处在协作组织内、需要交给上级，调用 "
+                            '`org_submit_deliverable({"to_node": "<上级>", '
+                            '"deliverable": "<摘要>", "file_attachments": '
+                            '[{"filename": "<title>.md", "file_path": '
+                            '"<workspace>/deliverables/<title>.md"}]})` —— '
+                            "带附件提交并触发上级验收；\n"
+                            "3) 若是图片/视频类成果，先用对应生成工具产出文件，"
+                            "再用上面任一方式落盘。\n"
+                            "记住：文字描述 ≠ 已交付。"
+                        )
+                    else:
+                        retry_msg = (
+                            "[系统提示] 根据复核判断，用户请求可能还有未完成的部分。"
+                            "如果确实还有剩余步骤，请继续调用工具执行；"
+                            "如果已全部完成，请直接给用户一个包含结果的总结回复"
+                            "（无需强行产出附件）。"
+                        )
+                    working_messages.append({"role": "user", "content": retry_msg})
+                return (
+                    working_messages,
+                    no_tool_call_count,
+                    verify_incomplete_count,
+                    no_confirmation_text_count,
+                    max_no_tool_retries,
+                )
+            else:
+                # 无可见文本
+                no_confirmation_text_count += 1
+                if no_confirmation_text_count <= max_confirmation_text_retries:
+                    if no_confirmation_text_count == 1:
+                        retry_prompt = (
+                            "[系统] 你已执行过工具，但你刚才没有输出任何用户可见的文字确认。"
+                            "请基于已产生的 tool_result 证据，给出最终答复。"
+                        )
+                    else:
+                        retry_prompt = (
+                            "[系统] 警告：你已连续多次未输出可见文字。"
+                            "请立即用一两句话简要总结你完成了什么，不要调用任何工具，不要输出思考过程。"
+                        )
+                    working_messages.append(
+                        {
+                            "role": "user",
+                            "content": retry_prompt,
+                        }
+                    )
+                    return (
+                        working_messages,
+                        no_tool_call_count,
+                        verify_incomplete_count,
+                        no_confirmation_text_count,
+                        max_no_tool_retries,
+                    )
+
+                # 所有重试用尽，尝试从工具执行记录构建 fallback 摘要
+                fallback = self._build_fallback_summary(executed_tool_names, delivery_receipts)
+                if fallback:
+                    logger.warning(
+                        "[ForceToolCall] LLM returned empty confirmation; using fallback summary from tool history"
+                    )
+                    return fallback
+
+                # thinking 内容不为空时，从 thinking 中提取可用信息
+                if decision.thinking_content:
+                    thinking_text = decision.thinking_content.strip()
+                    if len(thinking_text) > 20:
+                        logger.warning(
+                            "[ForceToolCall] LLM returned empty visible text but has thinking content; "
+                            "extracting summary from thinking"
+                        )
+                        preview = thinking_text[:500]
+                        return f"（以下为模型内部推理摘要，原始回复未生成可见文本）\n\n{preview}"
+
+                return (
+                    "⚠️ 大模型返回异常：工具已执行，但多次未返回任何可见文本确认，任务已中断。"
+                    "请重试、或切换到更稳定的端点/模型后再继续。"
+                )
+
+        # 未执行过"实质性"工具 — 解析意图声明标记
+        intent, stripped_text = parse_intent_tag(decision.text_content or "")
+        logger.info(
+            f"[IntentTag] intent={intent or 'NONE'}, "
+            f"has_tool_calls=False, tools_executed_in_task=False, "
+            f'text_preview="{(stripped_text or "")[:80].replace(chr(10), " ")}"'
+        )
+
+        # 管理型工具（create_todo 等）已执行且有文本回复 → 任务已完成，
+        # 不要 ForceToolCall 强制重试，否则会把"创建 plan"变成"执行 plan"。
+        if (
+            executed_tool_names
+            and all(t in _ADMIN_TOOL_NAMES for t in executed_tool_names)
+            and stripped_text
+            and len(stripped_text.strip()) > 10
+        ):
+            logger.info(
+                "[IntentTag] Admin-only tools executed with substantial reply — "
+                "accepting as completed (skip ForceToolCall)"
+            )
+            return clean_llm_response(stripped_text)
+
+        # Model glitch: LLM returned empty content (content: []) but consumed
+        # output tokens on internal reasoning. Retry silently without counting
+        # against the ForceToolCall budget.
+        _empty_retry_attr = "_empty_content_retries"
+        empty_retries = getattr(self, _empty_retry_attr, 0)
+        if (
+            not stripped_text
+            and not decision.thinking_content
+            and intent is None
+            and empty_retries < 2
+        ):
+            setattr(self, _empty_retry_attr, empty_retries + 1)
+            logger.warning(
+                f"[EmptyContent] LLM returned empty content (attempt {empty_retries + 1}/2), "
+                f"silent retry without counting against ForceToolCall budget"
+            )
+            working_messages.append(
+                {
+                    "role": "user",
+                    "content": "[系统] 你的上一次回复为空。请直接回复用户的问题。",
+                }
+            )
+            return (
+                working_messages,
+                no_tool_call_count,
+                verify_incomplete_count,
+                no_confirmation_text_count,
+                max_no_tool_retries,
+            )
+
+        _txt = (stripped_text or "").strip()
+
+        # 复读防护（通用入口）：无论 intent 是什么，只要输出是系统提示词
+        # 的复读，一律不直接返回；交给下方统一重试逻辑处理。
+        from .response_handler import is_system_prompt_echo
+
+        _echo_detected = bool(_txt) and is_system_prompt_echo(_txt)
+
+        # [整改 2026-10-10 对标 OpenAkita P-RC-5] 无工具完成声明检测：
+        # 文本含"已保存/已删除/调用X完成/已通过验证"等完成态措辞但本轮零工具调用时，
+        # 不能直接作为 REPLY/implicit REPLY 采信，否则多轮任务末轮会"报文本即停"。
+        _has_no_tool_completion_claim = _looks_like_no_tool_completion_claim(
+            _txt, _get_action_claim_re()
+        )
+
+        # [整改 2026-10-10 对标 OpenAkita legacy] 伪工具调用围栏检测：
+        # LLM 把工具调用写成 ```tool_call ... ``` 文本块而未真正发起调用时，
+        # 补救式重试（本轮预算 1 次），把文本块转换为真实 tool_calls 的指令。
+        _pseudo_toolcall_names = _guard_text_toolcall_block(
+            _txt, executed_tool_names, intent
+        )
+        _pseudo_toolcall_retry_attr = "_pseudo_toolcall_retries"
+        _pseudo_retries = getattr(self, _pseudo_toolcall_retry_attr, 0)
+
+        has_todo_pending = self._has_active_todo_pending(conversation_id)
+
+        # [整改 2026-10-10] Stall Guard（对标 Hermes trailing_continue_intent）：
+        # 任务型轮次（存在未完成 TODO 或要求工具证据）中，纯文本以"接下来/下一步/
+        # 继续/先…再…"等预告结尾却未调用任何工具 → 视为卡住，追加 [系统] 提示
+        # 重试（最多 2 次），而不是把文本当最终答复直接收尾（防"报文本即停"）。
+        _stall_continue = False
+        if _txt and (has_todo_pending or tool_evidence_required):
+            from .response_handler import has_trailing_continue_intent
+
+            if has_trailing_continue_intent(_txt):
+                _stall_attr = "_stall_continue_retries"
+                _stall_retries = getattr(self, _stall_attr, 0)
+                if _stall_retries < 2:
+                    setattr(self, _stall_attr, _stall_retries + 1)
+                    _stall_continue = True
+                    logger.warning(
+                        "[StallGuard] 文本以继续意图结尾但未调用工具，"
+                        f"追加重试（{_stall_retries + 1}/2）"
+                    )
+
+        if _pseudo_toolcall_names and _pseudo_retries < 1:
+            setattr(self, _pseudo_toolcall_retry_attr, _pseudo_retries + 1)
+            logger.warning(
+                "[PseudoToolCall] LLM 把工具调用写成了文本（%s），"
+                "未真正发起调用——补救式重试",
+                ", ".join(_pseudo_toolcall_names[:5]),
+            )
+            if stripped_text:
+                working_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": stripped_text}],
+                        "reasoning_content": decision.thinking_content or None,
+                    }
+                )
+            retry_msg = (
+                "[系统] 你刚才把工具调用写成了文本（例如 ```tool_call``` 块或"
+                " `org_xxx(...)` 字样），但本轮没有发起任何真实的 tool_calls，"
+                "这些文本不会被执行。请立即改为发起真实的 tool_calls 完成用户请求；"
+                "若确实无需执行工具，请用纯文本直接回答，不要包含工具调用字样。"
+            )
+            working_messages.append({"role": "user", "content": retry_msg})
+            return (
+                working_messages,
+                no_tool_call_count,
+                verify_incomplete_count,
+                no_confirmation_text_count,
+                max_no_tool_retries,
+            )
+
+        if (
+            intent == "REPLY"
+            and stripped_text
+            and len(stripped_text.strip()) > 10
+            and not tool_evidence_required
+            and not _echo_detected
+            and not _stall_continue
+            and not _has_no_tool_completion_claim
+        ):
+            logger.info(
+                "[IntentTag] REPLY intent with substantial text, "
+                "accepting as valid response (no ForceToolCall)"
+            )
+            return clean_llm_response(stripped_text)
+
+        if _stall_continue:
+            if stripped_text:
+                working_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": stripped_text}],
+                        "reasoning_content": decision.thinking_content or None,
+                    }
+                )
+            retry_msg = (
+                "[系统] 你刚才以文本预告了后续动作（如\"继续/接下来/下一步\"），"
+                "但没有调用任何工具。如果任务需要工具执行，请直接调用工具；"
+                "如果确实只需文本回复，请直接给出最终结论，不要预告未执行的动作。"
+            )
+            working_messages.append({"role": "user", "content": retry_msg})
+            return (
+                working_messages,
+                no_tool_call_count,
+                verify_incomplete_count,
+                no_confirmation_text_count,
+                max_no_tool_retries,
+            )
+
+        # [整改 2026-10-10 对标 OpenAkita] 强制重试条件从"仅 [ACTION]"恢复为
+        # "显式 [ACTION] **或** 无工具完成声明"——后者是多轮任务"报文本即停"的
+        # 主因：模型以"已保存/已删除/调用X完成"收尾却零工具调用。
+        # 约束（防重蹈 OrgRuntime 死锁）：完成声明触发需满足
+        # max_no_tool_retries > 0 或 tool_evidence_required 或 has_todo_pending，
+        # 且重试预算上限不变（有界重试）。
+        should_force_no_tool_action = intent == "ACTION" or (
+            _has_no_tool_completion_claim
+            and (max_no_tool_retries > 0 or tool_evidence_required or has_todo_pending)
+        )
+        if should_force_no_tool_action:
+            effective_max_no_tool_retries = max_no_tool_retries
+            if has_todo_pending and effective_max_no_tool_retries < 1:
+                effective_max_no_tool_retries = 1
+
+            no_tool_call_count += 1
+            if no_tool_call_count <= effective_max_no_tool_retries:
+                reason = (
+                    "ACTION intent declared"
+                    if intent == "ACTION"
+                    else "action-completion claim emitted"
+                )
+                logger.warning(
+                    "[IntentTag] %s but no tool calls — forcing retry (%s/%s)",
+                    reason,
+                    no_tool_call_count,
+                    effective_max_no_tool_retries,
+                )
+                if stripped_text:
+                    working_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": stripped_text}],
+                            "reasoning_content": decision.thinking_content or None,
+                        }
+                    )
+                if intent == "ACTION":
+                    retry_msg = (
+                        "[系统] 你将本轮标记为 [ACTION]，但没有发起任何真实 "
+                        "tool_calls。请直接调用所需工具；如果只需要回复文本，"
+                        "请改用 [REPLY]。"
+                    )
+                else:
+                    retry_msg = (
+                        "[系统] ⚠️ 你刚才声称已经执行/完成了外部操作，"
+                        "但本轮没有真正发起任何工具调用（tool_calls=0）。"
+                        "文字里的“调用 run_shell(... )...完成”或“已删除/已验证”"
+                        "不会被执行。\n"
+                        "请立即发起真实 tool_calls 完成用户请求；如果不需要执行"
+                        "工具，请明确说明这是历史回顾或建议，不要使用完成态措辞。"
+                    )
+                working_messages.append({"role": "user", "content": retry_msg})
+                return (
+                    working_messages,
+                    no_tool_call_count,
+                    verify_incomplete_count,
+                    no_confirmation_text_count,
+                    effective_max_no_tool_retries,
+                )
+
+            logger.warning(
+                "[IntentTag] No-tool action claim retry budget exhausted — "
+                "returning non-deceptive failure instead of original text"
+            )
+            return (
+                "⚠️ 本轮没有检测到任何真实工具调用，因此我不能确认外部操作已经完成。"
+                "上一次回复中的完成态描述没有工具凭证支持，未作为执行结果采信。"
+                "请重新发送指令，或允许我调用对应工具后再继续。"
+            )
+
+        if (
+            intent is None
+            and _txt
+            and not _has_no_tool_completion_claim
+            and not tool_evidence_required
+            and not _stall_continue
+        ):
+            # 复读防护：模型在超长上下文/KV 缓存复用场景下可能把系统提示词
+            # 原样吐出（以 <|im_start|>system 开头）。此类输出绝不能透传
+            # 给前端，否则用户会看到"描述词泄露"。命中后强制重试（最多 2 次）。
+            from .response_handler import is_system_prompt_echo
+
+            if is_system_prompt_echo(_txt):
+                _echo_retry_attr = "_system_echo_retries"
+                echo_retries = getattr(self, _echo_retry_attr, 0)
+                if echo_retries < 2:
+                    setattr(self, _echo_retry_attr, echo_retries + 1)
+                    logger.warning(
+                        f"[SystemEcho] LLM 输出复读系统提示词（attempt "
+                        f"{echo_retries + 1}/2, {len(_txt)} chars），丢弃并重试"
+                    )
+                    working_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": stripped_text}],
+                            "reasoning_content": decision.thinking_content or None,
+                        }
+                    )
+                    working_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[系统] 你刚才的输出异常：把系统提示词原样复读了出来，"
+                                "没有回答用户的问题。请忽略之前的输出，直接回复用户的"
+                                "实际问题；需要工具时直接调用工具。"
+                            ),
+                        }
+                    )
+                    return (
+                        working_messages,
+                        no_tool_call_count,
+                        verify_incomplete_count,
+                        no_confirmation_text_count,
+                        max_no_tool_retries,
+                    )
+                logger.error(
+                    "[SystemEcho] 复读防护重试预算耗尽，返回明确错误而非泄露内容"
+                )
+                return (
+                    "模型输出异常（复读了系统提示词且重试后仍未恢复）。"
+                    "请稍后重试，或检查本地推理服务（llama.cpp 8220）的 KV 缓存状态。"
+                )
+
+            logger.info(
+                f"[IntentTag] No intent tag but visible text "
+                f"({len(_txt)} chars), accepting as implicit REPLY"
+            )
+            return clean_llm_response(stripped_text)
+
+        # P0-2 阶段 1（修正版）：精简伪重试块
+        # ----------------------------------------------------------------
+        # 旧逻辑：4 种触发条件（evidence_required / ACTION / REPLY 短文本 / 无 intent）
+        #         全都走 ForceToolCall 重试，导致大量 token 浪费 + text_replace 抖动 +
+        #         OrgRuntime 误判 task_failed。
+        # 新逻辑：仅对显式 [ACTION] 做重试，不从回复措辞推断动作是否执行。
+        # ----------------------------------------------------------------
+
+        # No hard-action claim remained. Other no-tool cases stay on the soft
+        # source-disclaimer path to avoid reintroducing organization deadlocks.
+        if tool_evidence_required:
+            logger.info(
+                "[ToolEvidence] No tool calls but evidence recommended — "
+                "softly noted without response-text inference"
+            )
+        elif intent == "REPLY":
+            logger.info(
+                f"[IntentTag] REPLY intent with short text "
+                f"({len(stripped_text or '')} chars), "
+                f"tool_calls=0 — accepting as-is"
+            )
+        else:
+            logger.info(
+                f"[IntentTag] Edge case (intent={intent or 'NONE'}, "
+                f"text_len={len(stripped_text or '')}) — accepting as-is"
+            )
+
+        # 追问次数用尽。
+        # P0-2 阶段 0（修正版）：不再硬替换 LLM 文本、不再设 _last_exit_reason="tool_evidence_missing"
+        # （那个 exit_reason 会被 OrgRuntime 错误映射为 task_failed 导致组织死锁）。
+        # 改为柔性追加 disclaimer：让 LLM 原文返回 + 末尾追加来源不确定的提示。
+        # 这样组织编排走 normal 路径自然回流，主链不会卡死。
+        cleaned_text = clean_llm_response(stripped_text) or ""
+        if _echo_detected:
+            # 复读防护兜底：走到这里的任何复读输出（无论 intent 分支）都
+            # 不允许透传给前端。返回明确错误，由上层决定重试或提示用户。
+            _echo_retry_attr = "_system_echo_retries"
+            echo_retries = getattr(self, _echo_retry_attr, 0)
+            if echo_retries < 2:
+                setattr(self, _echo_retry_attr, echo_retries + 1)
+                logger.warning(
+                    f"[SystemEcho] 兜底拦截复读输出（attempt {echo_retries + 1}/2），"
+                    f"强制重试"
+                )
+                working_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": stripped_text}],
+                        "reasoning_content": decision.thinking_content or None,
+                    }
+                )
+                working_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[系统] 你刚才的输出异常：把系统提示词原样复读了出来，"
+                            "没有回答用户的问题。请忽略之前的输出，直接回复用户的"
+                            "实际问题；需要工具时直接调用工具。"
+                        ),
+                    }
+                )
+                return (
+                    working_messages,
+                    no_tool_call_count,
+                    verify_incomplete_count,
+                    no_confirmation_text_count,
+                    max_no_tool_retries,
+                )
+            logger.error("[SystemEcho] 兜底重试预算耗尽，返回明确错误而非泄露内容")
+            return (
+                "模型输出异常（复读了系统提示词且重试后仍未恢复）。"
+                "请稍后重试，或检查本地推理服务（llama.cpp 8220）的 KV 缓存状态。"
+            )
+        if tool_evidence_required and not tools_executed_in_task:
+            # [整改 2026-10-10 对标 OpenAkita] 上下文敏感的提示文案：
+            # 动作完成短语（已查/已读/已保存…）用强警告，普通陈述用弱提示。
+            if cleaned_text and _get_action_done_re().search(cleaned_text):
+                disclaimer = (
+                    "\n\n---\n"
+                    "⚠️ **系统提示**：本轮未实际调用任何工具，上述声明的"
+                    '"已执行/已查到/已读取"等内容可能不准确，请你核实。'
+                    "如需精确数据请告诉我去查。"
+                )
+            else:
+                disclaimer = (
+                    "\n\n---\n"
+                    "（提示：本次回答未调用工具核对外部状态，"
+                    "结论来自训练常识或历史对话；如需最新精确数据请允许我调用相关工具。）"
+                )
+            return (
+                cleaned_text + disclaimer
+                if cleaned_text
+                else ("未能就该问题给出可靠回答。请允许我调用读取、搜索或相关工具后再继续核对。")
+            )
+
+        return cleaned_text or (
+            "⚠️ 大模型返回异常：未产生可用输出。任务已中断。请重试、或更换端点/模型后再执行。"
+        )
+
+    # ==================== 循环检测 ====================
+
+    # ==================== 模型切换 ====================
+
+    def _check_model_switch(
+        self,
+        task_monitor: Any,
+        state: TaskState,
+        working_messages: list[dict],
+        current_model: str,
+    ) -> tuple[str, list[dict]] | None:
+        """检查是否需要模型切换。返回 (new_model, new_messages) 或 None"""
+        if not task_monitor or not task_monitor.should_switch_model:
+            return None
+
+        new_model = task_monitor.fallback_model
+        self._switch_llm_endpoint(new_model, reason="task_monitor timeout fallback")
+        task_monitor.switch_model(
+            new_model,
+            "任务超时后切换",
+            reset_context=True,
+        )
+
+        try:
+            llm_client = getattr(self._brain, "_llm_client", None)
+            current = llm_client.get_current_model() if llm_client else None
+            new_model = current.model if current else new_model
+        except Exception:
+            pass
+
+        new_messages = list(state.original_user_messages)
+        new_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "[系统提示] 发生模型切换：之前的 tool_use/tool_result 历史已清除。"
+                    "请从头开始处理用户请求。"
+                ),
+            }
+        )
+
+        # 注意：_check_model_switch 不做状态转换，因为它不使用 continue，
+        # 执行后自然走到主循环的 REASONING 转换逻辑。
+        state.reset_for_model_switch()
+        return new_model, new_messages
+
+    # 最大模型切换次数（防止死循环）
+    MAX_MODEL_SWITCHES = 2
+
+    # 跨模型切换的全局重试上限：达到后立即终止并告知用户
+    MAX_TOTAL_LLM_RETRIES = 3
+
+    @staticmethod
+    def _strip_heavy_content(messages: list[dict]) -> tuple[list[dict], bool]:
+        """从消息中剥离重型多媒体内容（视频/大 data URL），替换为文字描述。
+
+        Returns:
+            (处理后的消息列表, 是否有内容被剥离)
+        """
+        DATA_URL_SIZE_THRESHOLD = 5 * 1024 * 1024  # 5MB
+        stripped = False
+        result = []
+
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                result.append(msg)
+                continue
+
+            new_parts = []
+            for part in content:
+                part_type = part.get("type", "")
+
+                if part_type == "video_url":
+                    url = (part.get("video_url") or {}).get("url", "")
+                    if len(url) > DATA_URL_SIZE_THRESHOLD:
+                        new_parts.append(
+                            {
+                                "type": "text",
+                                "text": "[视频内容已移除：视频文件过大，超过 API data-uri 限制。请发送更小的视频文件。]",
+                            }
+                        )
+                        stripped = True
+                        continue
+
+                elif part_type == "video":
+                    source = part.get("source", {})
+                    data = source.get("data", "")
+                    if len(data) > DATA_URL_SIZE_THRESHOLD:
+                        new_parts.append(
+                            {
+                                "type": "text",
+                                "text": "[视频内容已移除：视频文件过大，超过 API data-uri 限制。请发送更小的视频文件。]",
+                            }
+                        )
+                        stripped = True
+                        continue
+
+                elif part_type == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    if len(url) > DATA_URL_SIZE_THRESHOLD:
+                        new_parts.append(
+                            {
+                                "type": "text",
+                                "text": "[图片内容已移除：文件过大，超过 API 限制。]",
+                            }
+                        )
+                        stripped = True
+                        continue
+
+                new_parts.append(part)
+
+            result.append({**msg, "content": new_parts})
+
+        return result, stripped
+
+    @staticmethod
+    def _strip_tool_results_for_content_safety(
+        messages: list[dict],
+    ) -> tuple[list[dict], bool]:
+        """Strip recent tool result content that may have triggered content safety filters.
+
+        When the LLM API rejects a request due to content inspection (e.g. DashScope
+        DataInspectionFailed), the cause is typically inappropriate text in the most
+        recent batch of tool results (e.g. web search returning NSFW content).
+
+        This method finds the last user message containing tool_results and replaces
+        each tool_result's content with a safe placeholder, allowing the LLM to
+        continue reasoning with the remaining context.
+        """
+        _PLACEHOLDER = (
+            "[工具返回内容已移除：内容触发了平台安全审核，无法发送给模型。"
+            "不要基于被移除的内容下结论。请换用更具体的查询词、web_fetch、浏览器或权威来源继续获取证据；"
+            "如果当前确实无法验证，请简要说明无法联网验证，不要编造结果。]"
+        )
+        stripped = False
+        result = list(messages)
+
+        for i in range(len(result) - 1, -1, -1):
+            msg = result[i]
+            content = msg.get("content")
+            if msg.get("role") != "user" or not isinstance(content, list):
+                continue
+
+            has_tool_results = any(
+                isinstance(item, dict) and item.get("type") == "tool_result" for item in content
+            )
+            if not has_tool_results:
+                continue
+
+            new_content = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "tool_result":
+                    new_content.append({**item, "content": _PLACEHOLDER})
+                    stripped = True
+                else:
+                    new_content.append(item)
+
+            result[i] = {**msg, "content": new_content}
+            break
+
+        return result, stripped
+
+    @staticmethod
+    def _truncate_oversized_messages(
+        messages: list[dict],
+        max_single_tokens: int = 30000,
+    ) -> tuple[list[dict], bool]:
+        """截断超大文本消息，防止上下文溢出。
+
+        当单条消息的文本内容超过 max_single_tokens 估算值时，
+        保留开头和结尾各一半，中间截断并插入提示。
+        """
+        from ._context_runtime import ContextManager
+
+        truncated = False
+        result = []
+        target_chars = max_single_tokens * 3
+
+        for msg in messages:
+            content = msg.get("content")
+
+            if isinstance(content, str):
+                est = ContextManager.static_estimate_tokens(content)
+                if est > max_single_tokens:
+                    half = target_chars // 2
+                    content = (
+                        content[:half]
+                        + "\n\n[... 内容过长已截断，以适应模型上下文窗口 ...]\n\n"
+                        + content[-half:]
+                    )
+                    truncated = True
+                    result.append({**msg, "content": content})
+                    continue
+
+            elif isinstance(content, list):
+                new_parts = []
+                for part in content:
+                    text = ""
+                    if isinstance(part, dict):
+                        text = str(part.get("text", part.get("content", "")))
+                    elif isinstance(part, str):
+                        text = part
+
+                    if text:
+                        est = ContextManager.static_estimate_tokens(text)
+                        if est > max_single_tokens:
+                            half = target_chars // 2
+                            text = text[:half] + "\n\n[... 内容过长已截断 ...]\n\n" + text[-half:]
+                            truncated = True
+                            if isinstance(part, dict):
+                                key = "text" if "text" in part else "content"
+                                part = {**part, key: text}
+                            else:
+                                part = text
+
+                    new_parts.append(part)
+
+                if truncated:
+                    result.append({**msg, "content": new_parts})
+                    continue
+
+            result.append(msg)
+
+        return result, truncated
+
+    @staticmethod
+    def _force_hard_truncate(
+        working_messages: list[dict],
+        target_tokens: int,
+    ) -> bool:
+        """强制截断对话历史以适应上下文窗口。
+
+        保留 system prompt（第一条）和最近的消息，从中间丢弃
+        较早的消息，直到估算 token 数降到 target_tokens 以下。
+        返回 True 表示确实做了截断。
+        """
+        from ._context_runtime import ContextManager
+
+        total = ContextManager.static_estimate_tokens(
+            str([m.get("content", "") for m in working_messages])
+        )
+        if total <= target_tokens:
+            return False
+
+        system_msgs = []
+        rest_msgs = []
+        for msg in working_messages:
+            if msg.get("role") == "system":
+                system_msgs.append(msg)
+            else:
+                rest_msgs.append(msg)
+
+        if len(rest_msgs) <= 2:
+            return False
+
+        keep_recent = max(2, len(rest_msgs) // 3)
+        recent = rest_msgs[-keep_recent:]
+
+        total = ContextManager.static_estimate_tokens(
+            str([m.get("content", "") for m in system_msgs + recent])
+        )
+
+        middle = rest_msgs[:-keep_recent]
+        added_back: list[dict] = []
+
+        for msg in reversed(middle):
+            msg_tokens = ContextManager.static_estimate_tokens(str(msg.get("content", "")))
+            if total + msg_tokens < target_tokens:
+                added_back.insert(0, msg)
+                total += msg_tokens
+            else:
+                break
+
+        dropped = len(middle) - len(added_back)
+        if dropped <= 0:
+            return False
+
+        truncation_notice = {
+            "role": "system",
+            "content": (
+                f"[注意] 由于模型上下文窗口限制，已自动丢弃 {dropped} 条"
+                "较早的对话消息。请基于剩余上下文继续回答。"
+            ),
+        }
+
+        new_messages = system_msgs + added_back + [truncation_notice] + recent
+        working_messages.clear()
+        working_messages.extend(new_messages)
+
+        logger.info(
+            "[ReAct] Force hard truncate: dropped %d messages, "
+            "kept %d (system=%d, recovered=%d, recent=%d), "
+            "estimated tokens ~%d → target %d",
+            dropped,
+            len(new_messages),
+            len(system_msgs),
+            len(added_back),
+            len(recent),
+            total,
+            target_tokens,
+        )
+        return True
+
+    @staticmethod
+    def _is_llm_timeout_error(error: Exception) -> bool:
+        error_text = str(error).lower()
+        return any(
+            marker in error_text
+            for marker in (
+                "timeout",
+                "timed out",
+                "readtimeout",
+                "first-byte",
+                "stream stalled",
+            )
+        )
+
+    @classmethod
+    def _retry_progress_message(cls, error: Exception, attempt: int, max_attempts: int) -> str:
+        progress = f"（{attempt}/{max_attempts}）"
+        if cls._is_llm_timeout_error(error):
+            return f"AI 服务响应较慢，正在尝试恢复连接{progress}..."
+        return f"AI 服务暂时不可用，正在重试{progress}..."
+
+    async def _handle_llm_error(
+        self,
+        error: Exception,
+        task_monitor: Any,
+        state: TaskState,
+        working_messages: list[dict],
+        current_model: str,
+    ) -> str | tuple | None:
+        """
+        处理 LLM 调用错误。
+
+        Returns:
+            "retry" - 重试
+            (new_model, new_messages) - 切换模型
+            None - 重新抛出
+        """
+        from ..llm.types import AllEndpointsFailedError
+
+        if not task_monitor:
+            return None
+
+        if active_transcript.get() is not None and any(
+            pattern in str(error).lower()
+            for pattern in (
+                "context window",
+                "context length",
+                "context_length_exceeded",
+                "too many tokens",
+                "token limit",
+                "payload",
+                "(413)",
+                "input too long",
+            )
+        ):
+            if getattr(state, "_durable_overflow_retried", False):
+                return None
+            state._durable_overflow_retried = True
+            try:
+                candidate = await self._context_manager.reactive_compact(
+                    working_messages,
+                    system_prompt=getattr(state, "_system_prompt", ""),
+                    memory_manager=self._memory_manager,
+                    conversation_id=getattr(state, "session_id", None),
+                )
+            except _CtxCancelledError:
+                raise
+            except Exception:
+                logger.warning("Durable context recovery failed; refusing destructive fallback")
+                return None
+            if candidate == working_messages:
+                return None
+            working_messages[:] = candidate
+            return "retry"
+
+        # ── 全局重试计数器（跨模型切换） ──
+        # 无论错误类型，总重试次数达到上限即终止并告知用户。
+        total_retries = getattr(state, "_total_llm_retries", 0) + 1
+        state._total_llm_retries = total_retries
+
+        if total_retries > self.MAX_TOTAL_LLM_RETRIES:
+            logger.error(
+                f"[ReAct] Global retry limit reached ({total_retries}/{self.MAX_TOTAL_LLM_RETRIES}). "
+                f"Aborting and notifying user. Last error: {str(error)[:200]}"
+            )
+            return None
+
+        # ── 方案 A+B: 结构性错误快速熔断 ──
+        if isinstance(error, AllEndpointsFailedError) and error.is_structural:
+            already_stripped = getattr(state, "_structural_content_stripped", False)
+
+            if not already_stripped:
+                stripped_messages, did_strip = self._strip_heavy_content(working_messages)
+                if did_strip:
+                    logger.warning(
+                        "[ReAct] Structural API error detected. "
+                        "Stripping heavy content (video/large attachments) "
+                        "and retrying once with degraded content."
+                    )
+                    state._structural_content_stripped = True
+                    working_messages.clear()
+                    working_messages.extend(stripped_messages)
+                    llm_client = getattr(self._brain, "_llm_client", None)
+                    if llm_client:
+                        llm_client.reset_all_cooldowns(include_structural=True)
+                    return "retry"
+
+                # 方案 C: 上下文溢出 — 媒体剥离无效时尝试截断超大文本
+                error_lower = str(error).lower()
+                _ctx_overflow_patterns = [
+                    "context length",
+                    "context size",
+                    "too many tokens",
+                    "token limit",
+                    "context_length_exceeded",
+                    "context window",
+                    "max_tokens",
+                    "input too long",
+                    "payload too large",
+                    "request entity too large",
+                    "larger than allowed",
+                    "(413)",
+                ]
+                is_ctx_overflow = any(p in error_lower for p in _ctx_overflow_patterns) or (
+                    "maximum" in error_lower and "length" in error_lower
+                )
+                if not is_ctx_overflow:
+                    is_ctx_overflow = "exceeded" in error_lower and (
+                        "context" in error_lower or "token" in error_lower
+                    )
+                if not is_ctx_overflow:
+                    is_ctx_overflow = "payload" in error_lower and "larger" in error_lower
+                if is_ctx_overflow:
+                    # Layer 2: Reactive compact (三层压缩策略的第三层)
+                    try:
+                        compacted = await self._context_manager.reactive_compact(
+                            working_messages,
+                            system_prompt=getattr(state, "_system_prompt", ""),
+                            memory_manager=self._memory_manager,
+                            conversation_id=getattr(state, "session_id", None),
+                        )
+                        if compacted is not working_messages:
+                            working_messages.clear()
+                            working_messages.extend(compacted)
+                        llm_client = getattr(self._brain, "_llm_client", None)
+                        if llm_client:
+                            llm_client.reset_all_cooldowns(include_structural=True)
+                        return "retry"
+                    except Exception:
+                        pass
+
+                    trunc_msgs, did_trunc = self._truncate_oversized_messages(working_messages)
+                    if did_trunc:
+                        logger.warning(
+                            "[ReAct] Context length overflow detected. "
+                            "Truncating oversized text content and retrying."
+                        )
+                        state._structural_content_stripped = True
+                        working_messages.clear()
+                        working_messages.extend(trunc_msgs)
+                        llm_client = getattr(self._brain, "_llm_client", None)
+                        if llm_client:
+                            llm_client.reset_all_cooldowns(include_structural=True)
+                        return "retry"
+
+                    # 方案 C2: 单条截断无效（多条小消息累积溢出）
+                    # 强制按当前上下文预算的 50% 做硬截断
+                    if len(working_messages) > 3:
+                        cm = self._context_manager
+                        budget = cm.get_max_context_tokens() if cm else 60000
+                        reduced_budget = budget // 2
+                        force_truncated = self._force_hard_truncate(
+                            working_messages, reduced_budget
+                        )
+                        if force_truncated:
+                            logger.warning(
+                                "[ReAct] Context overflow: individual messages "
+                                "are small but total exceeds model limit. "
+                                "Force-truncating conversation history to %d "
+                                "tokens and retrying.",
+                                reduced_budget,
+                            )
+                            state._structural_content_stripped = True
+                            llm_client = getattr(self._brain, "_llm_client", None)
+                            if llm_client:
+                                llm_client.reset_all_cooldowns(include_structural=True)
+                            return "retry"
+
+                # 方案 D: 内容安全审核 — 工具结果触发平台内容过滤
+                _content_safety_patterns = [
+                    "data_inspection",
+                    "datainspectionfailed",
+                    "inappropriate content",
+                    "content_filter",
+                ]
+                is_content_safety = any(p in error_lower for p in _content_safety_patterns)
+                if is_content_safety:
+                    cleaned_msgs, did_clean = self._strip_tool_results_for_content_safety(
+                        working_messages
+                    )
+                    if did_clean:
+                        logger.warning(
+                            "[ReAct] Content safety error detected. "
+                            "Stripping recent tool result content and retrying."
+                        )
+                        state._structural_content_stripped = True
+                        working_messages.clear()
+                        working_messages.extend(cleaned_msgs)
+                        llm_client = getattr(self._brain, "_llm_client", None)
+                        if llm_client:
+                            llm_client.reset_all_cooldowns(include_structural=True)
+                        return "retry"
+
+                    # 方案 E: 没有可剥离的 tool_results，触发源可能是
+                    # system prompt（过长或含审核敏感词）。降级为最小化系统提示词
+                    # 重试一次，仅保留最近用户消息。
+                    if not getattr(state, "_content_safety_minimal_prompt", False):
+                        logger.warning(
+                            "[ReAct] Content safety error but no tool_results to strip. "
+                            "Falling back to minimal system prompt and retrying once."
+                        )
+                        state._content_safety_minimal_prompt = True
+                        state._structural_content_stripped = True
+
+                        last_user_msg = None
+                        for msg in reversed(working_messages):
+                            if msg.get("role") == "user":
+                                last_user_msg = msg
+                                break
+                        if last_user_msg:
+                            working_messages.clear()
+                            working_messages.append(last_user_msg)
+
+                        llm_client = getattr(self._brain, "_llm_client", None)
+                        if llm_client:
+                            llm_client.reset_all_cooldowns(include_structural=True)
+                        return "retry"
+
+                    logger.error(
+                        "[ReAct] Content safety error persists even with minimal prompt. "
+                        "Likely triggered by user input itself. "
+                        "Aborting without further retry."
+                    )
+                    return None
+
+            logger.error(
+                f"[ReAct] Structural API error, cannot recover "
+                f"(content already stripped={already_stripped}). "
+                f"Aborting. Error: {str(error)[:200]}"
+            )
+            return None
+
+        # ── 常规错误：TaskMonitor 重试链 ──
+        should_retry = task_monitor.record_error(str(error))
+
+        if should_retry:
+            logger.info(
+                f"[LLM] Will retry (attempt {task_monitor.retry_count}, "
+                f"global {total_retries}/{self.MAX_TOTAL_LLM_RETRIES})"
+            )
+            return "retry"
+
+        # --- 熔断：超过最大模型切换次数时终止 ---
+        switch_count = getattr(state, "_model_switch_count", 0) + 1
+        state._model_switch_count = switch_count
+        if switch_count > self.MAX_MODEL_SWITCHES:
+            logger.error(
+                f"[ReAct] Exceeded max model switches ({self.MAX_MODEL_SWITCHES}), "
+                f"aborting. Last error: {str(error)[:200]}"
+            )
+            return None
+
+        # --- 检查 fallback 模型是否可用 ---
+        new_model = task_monitor.fallback_model
+        if not new_model:
+            logger.warning(
+                "[ModelSwitch] No fallback model available (all endpoints may be in cooldown), "
+                "aborting model switch"
+            )
+            return None
+
+        resolved = self._resolve_endpoint_name(new_model)
+        current_endpoint = self._resolve_endpoint_name(current_model)
+        if resolved and current_endpoint and resolved == current_endpoint:
+            logger.warning(
+                f"[ModelSwitch] Fallback model '{new_model}' resolves to same endpoint "
+                f"as current '{current_model}' ({resolved}), aborting retry loop"
+            )
+            return None
+
+        # 切换前先重置目标端点的冷静期：所有端点刚刚失败，
+        # fallback 端点必然处于冷静期，不重置的话 switch_model 会拒绝切换
+        llm_client = getattr(self._brain, "_llm_client", None)
+        if llm_client and resolved:
+            llm_client.reset_endpoint_cooldown(resolved)
+
+        switched = self._switch_llm_endpoint(new_model, reason=f"LLM error fallback: {error}")
+        if not switched:
+            logger.warning(
+                f"[ModelSwitch] _switch_llm_endpoint failed for '{new_model}', "
+                f"proceeding with model switch anyway (endpoint selection will use fallback strategy)"
+            )
+        task_monitor.switch_model(new_model, "LLM 调用失败后切换", reset_context=True)
+
+        try:
+            if llm_client:
+                current = llm_client.get_current_model()
+                new_model = current.model if current else new_model
+        except Exception:
+            pass
+
+        new_messages = list(state.original_user_messages)
+        new_messages.append(
+            {
+                "role": "user",
+                "content": ("[系统提示] 发生模型切换：之前的历史已清除。请从头开始处理用户请求。"),
+            }
+        )
+
+        try:
+            state.transition(TaskStatus.MODEL_SWITCHING)
+        except ValueError:
+            # Same race surface as the reason_stream main-loop reasoning-entry:
+            # a concurrent request may have driven the shared TaskState into a
+            # terminal status. Swallow rather than crash the model-switch path.
+            logger.warning(
+                "[ReAct] _handle_llm_error: illegal transition %s -> "
+                "MODEL_SWITCHING; skipping (concurrent terminal state).",
+                state.status.value,
+            )
+        state.reset_for_model_switch()
+        return new_model, new_messages
+
+    def _switch_llm_endpoint(self, model_or_endpoint: str, reason: str = "") -> bool:
+        """执行模型切换"""
+        llm_client = getattr(self._brain, "_llm_client", None)
+        if not llm_client:
+            return False
+
+        endpoint_name = self._resolve_endpoint_name(model_or_endpoint)
+        if not endpoint_name:
+            return False
+
+        ok, msg = llm_client.switch_model(
+            endpoint_name=endpoint_name,
+            hours=0.05,
+            reason=reason,
+        )
+        if not ok:
+            return False
+
+        try:
+            current = llm_client.get_current_model()
+            if current and current.model:
+                self._brain.model = current.model
+        except Exception:
+            pass
+
+        logger.info(f"[ModelSwitch] {msg}")
+        return True
+
+    def _resolve_endpoint_name(self, model_or_endpoint: str) -> str | None:
+        """解析 endpoint 名称"""
+        try:
+            llm_client = getattr(self._brain, "_llm_client", None)
+            if not llm_client:
+                return None
+            available = [m.name for m in llm_client.list_available_models()]
+            if model_or_endpoint in available:
+                return model_or_endpoint
+            for m in llm_client.list_available_models():
+                if m.model == model_or_endpoint:
+                    return m.name
+            return None
+        except Exception:
+            return None
+
+    # ==================== 取消恢复持久化（Issue #608） ====================
+
+    @staticmethod
+    def _resume_eligible(conversation_id: str | None, is_sub_agent: bool) -> bool:
+        """是否对该会话启用"取消后续聊恢复"旁路文件。
+
+        排除：falsy conversation_id（无 key 无法续聊）、sub-agent（与父任务共享
+        conversation_id，持久化会互相覆盖）、合成的 ``_run_xxx`` ephemeral id
+        （一次性运行，无续聊价值）。
+        """
+        if not conversation_id or is_sub_agent:
+            return False
+        return not str(conversation_id).startswith("_run_")
+
+    def _maybe_persist_resumable_working_messages(
+        self,
+        working_messages: list[dict],
+        state: "TaskState | None",
+        current_model: str,
+        *,
+        exit_reason: str,
+        detail: str = "",
+    ) -> None:
+        """Persist complete working_messages for a future continuation.
+
+        key 用 ``state.session_id``（在两个 loop 入口处恒等于 conversation_id）。
+        仅当含真实工具块时才落盘，避免无意义旁路文件。任何异常都吞掉——持久化
+        失败不应影响当前退出路径本身。
+        """
+        if active_transcript.get() is not None:
+            return  # The model transcript owns normal and interrupted history alike.
+        try:
+            conversation_id = getattr(state, "session_id", "") if state else ""
+            is_sub_agent = bool(getattr(state, "is_sub_agent", False)) if state else False
+            if not self._resume_eligible(conversation_id, is_sub_agent):
+                return
+            if not working_messages or not has_tool_blocks(working_messages):
+                return
+            synthetic_count = synthesize_tool_results_for_orphans(working_messages)
+            written = persist_working_messages(
+                conversation_id,
+                working_messages,
+                base_dir=settings.data_dir,
+                metadata={
+                    "exit_reason": exit_reason or "",
+                    "cancel_reason": (getattr(state, "cancel_reason", "") if state else ""),
+                    "model": current_model or "",
+                    "detail": (detail or "")[:500],
+                    "synthetic_tool_results": synthetic_count,
+                },
+            )
+            # Mark on the state object that this turn just wrote a resume
+            # snapshot.  The finally-stage clear keys off this flag (not off an
+            # inferred ``cancelled`` read) so it can never delete a file we just
+            # persisted, even on a future cancel path where ``cancelled`` is not
+            # set the way we expect.
+            if written is not None and state is not None:
+                try:
+                    state._resume_persisted = True
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.debug("[ResumeSnapshot] persist skipped: %s", exc)
+
+    def _maybe_persist_cancelled_working_messages(
+        self,
+        working_messages: list[dict],
+        state: "TaskState | None",
+        current_model: str,
+    ) -> None:
+        """Backward-compatible cancel wrapper for older local callers."""
+        self._maybe_persist_resumable_working_messages(
+            working_messages,
+            state,
+            current_model,
+            exit_reason="user_cancelled",
+            detail=(getattr(state, "cancel_reason", "") if state else ""),
+        )
+
+    def _maybe_persist_recoverable_exit_working_messages(
+        self,
+        working_messages: list[dict],
+        state: "TaskState | None",
+        current_model: str,
+        *,
+        exit_reason: str,
+        done_seen: bool,
+        error_seen: bool = False,
+        detail: str = "",
+    ) -> None:
+        """Persist a resume snapshot for non-completed exits.
+
+        Normal completed / ask-user / plan-review turns must keep clearing stale
+        snapshots. Error, missing-done, budget/max-iteration and explicit failed
+        checkpoint exits keep the structured tool context so a later "continue"
+        turn does not rebuild from flattened visible history and redo tools.
+        """
+        try:
+            if state is not None and getattr(state, "_resume_persisted", False):
+                return
+
+            normalized = (exit_reason or "").strip()
+            should_persist = (
+                error_seen
+                or not done_seen
+                or normalized in self._RECOVERABLE_RESUME_EXIT_REASONS
+                or bool(getattr(state, "cancelled", False) if state is not None else False)
+            )
+            if not should_persist:
+                return
+            if not normalized:
+                normalized = "stream_error" if error_seen else "stream_incomplete"
+            self._maybe_persist_resumable_working_messages(
+                working_messages,
+                state,
+                current_model,
+                exit_reason=normalized,
+                detail=detail,
+            )
+        except Exception as exc:
+            logger.debug("[ResumeSnapshot] recoverable-exit persist skipped: %s", exc)
+
+    def _maybe_clear_resume_state(
+        self,
+        conversation_id: str | None,
+        is_sub_agent: bool,
+        state: "TaskState | None",
+    ) -> None:
+        """正常（非取消）退出时清除旁路文件，避免下一轮误加载已完成任务的旧状态。
+
+        取消退出时**不清**——persist helper 刚写入的文件要留给续聊。在 reason_stream
+        impl 的 finally 与 run() wrapper 的 finally 集中调用，覆盖所有 return 分支。
+        """
+        try:
+            if not self._resume_eligible(conversation_id, is_sub_agent):
+                return
+            # Preserve a snapshot this turn just persisted for resume. We check
+            # an explicit per-turn flag set by the persist helper rather than
+            # re-inferring ``cancelled`` here — bulletproof against any cancel
+            # path that doesn't leave ``cancelled`` True at finally time.
+            if state is not None and (
+                getattr(state, "_resume_persisted", False) or getattr(state, "cancelled", False)
+            ):
+                return
+            clear_persisted_working_messages(conversation_id, base_dir=settings.data_dir)
+        except Exception as exc:
+            logger.debug("[CancelResume] clear skipped: %s", exc)
+
+    def _maybe_load_resume_working_messages(
+        self,
+        messages: list[dict],
+        conversation_id: str | None,
+        is_sub_agent: bool,
+        *,
+        consume: bool = True,
+    ) -> list[dict] | None:
+        """续聊入口尝试恢复上一轮取消时持久化的 working_messages（Issue #608）。
+
+        返回 merge 后的 working_messages（已完成结构化工具块 + 本轮新 user 消息 +
+        续聊提示），无可恢复状态时返回 None（调用方回退到文本历史重建）。
+
+        merge 语义：保留 loaded 的结构化工具块，把 ``messages`` 尾部"最后一条人类
+        user 消息及其后续"拼到其后（系统提示等附着在新一轮的块随之带入）。
+        """
+        try:
+            if not self._resume_eligible(conversation_id, is_sub_agent):
+                return None
+            # Peek age before the consuming load so we can decide whether the
+            # turn is still "fresh" enough to inject a continue-nudge.  The load
+            # itself uses the 24h hygiene window (DEFAULT_TTL_SECONDS): a snapshot
+            # is ALWAYS restored if it survived the startup janitor, so completed
+            # tools are never re-run just because the user came back later.
+            age = persisted_age_seconds(conversation_id, base_dir=settings.data_dir)
+            loaded = load_persisted_working_messages(
+                conversation_id,
+                base_dir=settings.data_dir,
+                ttl_seconds=DEFAULT_TTL_SECONDS,
+                consume=consume,
+            )
+            if not loaded:
+                return None
+
+            tail_idx: int | None = None
+            for i in range(len(messages) - 1, -1, -1):
+                if self._is_human_user_message(messages[i]):
+                    tail_idx = i
+                    break
+            new_tail = list(messages[tail_idx:]) if tail_idx is not None else []
+            merged = list(loaded) + new_tail
+            # Hint freshness is separate from load: past the freshness window we
+            # still feed completed tool results back (no redo) but stop actively
+            # telling the model to continue, since a long-stale resume is more
+            # likely a topic change.  age is None only if the file vanished
+            # between peek and load (race) — treat as fresh.
+            inject_hint = age is None or age <= RESUME_HINT_FRESHNESS_SECONDS
+            if inject_hint:
+                merged.append(
+                    {
+                        "role": "user",
+                        "_model_source": "resume_hint",
+                        "content": (
+                            "[系统提示] 上一轮任务被中断，以上工具调用与结果是上一轮已真实"
+                            "执行完成的进度（尚未写入可见对话）。如果当前消息是要继续该任务，"
+                            "请直接复用这些已完成的结果，不要重复执行；如果是新的请求，正常处理即可。"
+                        ),
+                    }
+                )
+            logger.info(
+                "[CancelResume] resumed working_messages: conv=%s, loaded=%d, new_tail=%d, "
+                "age=%.0fs, hint=%s",
+                conversation_id,
+                len(loaded),
+                len(new_tail),
+                (age if age is not None else -1.0),
+                inject_hint,
+            )
+            return merged
+        except Exception as exc:
+            logger.warning(
+                "[CancelResume] load/merge failed, falling back to text history: %s", exc
+            )
+            return None
+
+    # ==================== 辅助方法 ====================
+
+    @staticmethod
+    def _is_human_user_message(msg: dict) -> bool:
+        """判断是否为人类用户消息（排除 tool_result）"""
+        if not is_human_message(msg):
+            return False
+        if msg.get("role") != "user":
+            return False
+        content = msg.get("content")
+        if isinstance(content, str):
+            return True
+        if isinstance(content, list):
+            part_types = {
+                part.get("type") for part in content if isinstance(part, dict) and part.get("type")
+            }
+            return "tool_result" not in part_types
+        return False
+
+    def _build_org_validation_kwargs(self) -> dict[str, object]:
+        """从 agent._org_context 拼装组织视角的 verify 上下文 (B4)。
+
+        - 严格分支：runtime.get_accepted_child_count(org_id, chain_id)
+        - 弱信号兜底：runtime.has_recent_accepted_signal(org_id, node_id)
+
+        非组织 agent / 拿不到上下文时返回空 dict，verify 行为与旧版完全一致。
+        """
+        try:
+            agent = getattr(self._tool_executor, "_agent_ref", None)
+            if agent is None:
+                return {}
+            ctx = getattr(agent, "_org_context", None)
+            if not isinstance(ctx, dict):
+                return {}
+            org_id = ctx.get("current_org_id") or ""
+            node_id = ctx.get("current_node_id") or ""
+            chain_id = ctx.get("current_chain_id") or ""
+            if not org_id or not node_id:
+                return {}
+
+            from openkitsune.orgs.runtime import get_runtime  # 延迟导入避免环路
+
+            runtime = get_runtime()
+            if runtime is None:
+                return {}
+
+            accepted = 0
+            try:
+                accepted = int(runtime.get_accepted_child_count(org_id, chain_id) or 0)
+            except Exception:
+                accepted = 0
+
+            has_recent = False
+            if accepted == 0:
+                # 严格信号失败时再问弱信号，避免重复 IO
+                try:
+                    has_recent = bool(runtime.has_recent_accepted_signal(org_id, node_id))
+                except Exception:
+                    has_recent = False
+
+            return {
+                "accepted_child_count": accepted,
+                "has_recent_accepted_signal": has_recent,
+            }
+        except Exception as exc:
+            logger.debug("[Verify] _build_org_validation_kwargs failed: %s", exc)
+            return {}
+
+    @staticmethod
+    def _is_in_progress_promise(text: str) -> bool:
+        """检测响应是否为'进行中承诺'——模型声称正在执行但实际未调用工具。
+
+        典型特征：响应很短，包含"正在生成"、"稍等"等进度描述，
+        但没有任何实际的执行结果或完整内容。
+        """
+
+        _text = (text or "").strip()
+        if len(_text) > 500:
+            return False
+        promise_patterns = [
+            r"正在.*(?:生成|创建|制作|处理|执行|准备)",
+            r"(?:生成|创建|制作|处理).*中",
+            r"稍等",
+            r"马上.*(?:生成|创建|完成)",
+            r"请.*(?:稍候|等待|等一下)",
+            r"立即.*(?:开始|为你|帮你)",
+            r"文[件档].*(?:生成|创建)中",
+        ]
+        return any(re.search(pat, _text) for pat in promise_patterns)
+
+    @staticmethod
+    def _is_confirmation_response(text: str) -> bool:
+        """检测模型回复是否为确认式回复（要求用户确认后再执行）。
+
+        典型场景：语音识别后确认识别结果、复述执行计划等待确认。
+        这类回复不应触发 ForceToolCall 重试——模型是有意征询用户意见。
+        """
+
+        _text = text.strip()
+        if len(_text) < 10:
+            return False
+        _tail = _text[-200:] if len(_text) > 200 else _text
+        confirmation_patterns = [
+            r"确认后.*(?:回复|发送|输入)",
+            r"请(?:回复|发送|输入).*[\"「]?确认[\"」]?",
+            r"(?:是否|请)确认",
+            r"请确认以上",
+            r"确认.*(?:准确|正确|无误)",
+        ]
+        return any(re.search(pat, _tail) for pat in confirmation_patterns)
+
+    @staticmethod
+    def _effective_force_retries(base_retries: int, conversation_id: str | None) -> int:
+        """计算有效 ForceToolCall 重试次数。
+
+        不再因 active plan 自动提升——Plan 推进由 Supervisor 自检和
+        todo_reminder 驱动，ForceToolCall 仅尊重配置值。
+        """
+        return max(0, int(base_retries))
+
+    @staticmethod
+    def _looks_like_plan_proposal(text: str) -> bool:
+        """检测「描述计划 + 询问确认」式纯文本响应。
+
+        plan 模式下，LLM 经常返回类似「我打算先做 A，再做 B …… 你确认吗？」的
+        提案文本。如果同时已有 active plan + pending step，应该拦截这类输出，
+        逼 LLM 直接进入工具调用推进 plan，而不是反复请用户确认。
+        """
+        if not text:
+            return False
+        snippet = text.strip()
+        if not snippet:
+            return False
+        # 询问句号/确认关键词
+        ask_markers = (
+            "?",
+            "？",
+            "确认",
+            "确定",
+            "是否继续",
+            "是否同意",
+            "可以吗",
+            "对吗",
+            "需要我",
+            "要不要",
+            "请确认",
+        )
+        # 计划意图关键词
+        plan_markers = (
+            "计划",
+            "打算",
+            "建议",
+            "准备",
+            "我会",
+            "接下来",
+            "下一步",
+            "拟定",
+            "方案",
+            "步骤",
+            "Step ",
+            "step ",
+        )
+        has_ask = any(mk in snippet for mk in ask_markers)
+        has_plan = any(mk in snippet for mk in plan_markers)
+        return has_ask and has_plan
+
+    @staticmethod
+    def _has_active_todo_pending(conversation_id: str | None) -> bool:
+        """检查是否有活跃 Plan 且有未完成步骤"""
+        try:
+            from ..tools.handlers.plan import get_todo_handler_for_session, has_active_todo
+
+            if conversation_id and has_active_todo(conversation_id):
+                handler = get_todo_handler_for_session(conversation_id)
+                plan = handler.get_plan_for(conversation_id) if handler else None
+                if plan:
+                    steps = plan.get("steps", [])
+                    pending = [s for s in steps if s.get("status") in ("pending", "in_progress")]
+                    return bool(pending)
+        except Exception:
+            pass
+        return False
+
+
+# Keep the streaming source-inspection sentinel pointed at the live loop body.
+ReasoningEngine.reason_stream.__wrapped__ = ReasoningEngine._reason_stream_impl
+
+
+from openkitsune.runtime.state_graph.guards.tool_failure_ack import (
+    successful_tool_names as _successful_tool_names,  # noqa: F401
+)
+from openkitsune.runtime.state_graph.guards.tool_filters import (
+    SHELL_WRITE_PATTERNS as _SHELL_WRITE_PATTERNS,  # noqa: F401
+)
+from openkitsune.runtime.state_graph.guards.tool_filters import (
+    get_mode_ruleset as _get_mode_ruleset,  # noqa: F401
+)
+from openkitsune.runtime.state_graph.guards.tool_filters import (
+    is_shell_write_command as _is_shell_write_command,  # noqa: F401
+)

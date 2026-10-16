@@ -1,0 +1,2139 @@
+"""
+Setup Center Bridge
+
+该模块用于给 Setup Center（Tauri App）提供一个稳定的 Python 入口：
+
+- `python -m openkitsune.setup_center.bridge list-providers`
+- `python -m openkitsune.setup_center.bridge list-models --api-type ... --base-url ... [--provider-slug ...]`
+- `python -m openkitsune.setup_center.bridge list-skills --workspace-dir ...`
+
+输出均为 JSON（stdout），错误输出到 stderr 并以非 0 退出码返回。
+"""
+
+from __future__ import annotations
+
+import openkitsune._ensure_utf8  # noqa: F401  # isort: skip
+
+import argparse
+import asyncio
+import contextlib
+import json
+import os
+import re
+import sys
+import time
+import zipfile
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+from typing import Any
+
+_MODEL_LIST_ACCEPT_ENCODING = "gzip, deflate"
+
+
+def _model_list_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Avoid zstd responses in model-list probes; some bundles ship broken zstandard."""
+    return {
+        **headers,
+        "Accept-Encoding": _MODEL_LIST_ACCEPT_ENCODING,
+    }
+
+
+def _json_print(obj: Any) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False))
+    sys.stdout.write("\n")
+
+
+class SkillInstallError(RuntimeError):
+    """Structured install failure for Setup Center API responses."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _to_dict(obj: Any) -> Any:
+    if is_dataclass(obj):
+        return asdict(obj)
+    if isinstance(obj, dict):
+        return {k: _to_dict(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_dict(v) for v in obj]
+    return obj
+
+
+def list_providers() -> None:
+    from openkitsune.llm.registries import list_providers as _list_providers
+
+    providers = _list_providers()
+    _json_print([_to_dict(p) for p in providers])
+
+
+async def _list_models_openai(api_key: str, base_url: str, provider_slug: str | None) -> list[dict]:
+    import httpx
+
+    from openkitsune.llm.capabilities import infer_capabilities
+
+    def _is_openrouter_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        return slug == "openrouter" or "openrouter.ai" in b
+
+    def _openrouter_router_models() -> list[dict]:
+        return [
+            {
+                "id": "openrouter/auto",
+                "name": "OpenRouter Auto Router",
+                "capabilities": infer_capabilities("openrouter/auto", provider_slug="openrouter")
+                | {"tools": True},
+            },
+            {
+                "id": "openrouter/free",
+                "name": "OpenRouter Free Models Router",
+                "capabilities": infer_capabilities("openrouter/free", provider_slug="openrouter")
+                | {"tools": True},
+            },
+        ]
+
+    def _is_minimax_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        return slug in {"minimax", "minimax-cn", "minimax-int"} or "minimax" in b or "minimaxi" in b
+
+    def _is_volc_coding_plan_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        is_volc = slug == "volcengine" or "volces.com" in b
+        return is_volc and "/api/coding" in b
+
+    def _is_longcat_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        return slug == "longcat" or "longcat.chat" in b
+
+    def _is_dashscope_coding_plan_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        is_dashscope = slug in {"dashscope", "dashscope-intl"} or "dashscope.aliyuncs.com" in b
+        return is_dashscope and "coding" in b
+
+    def _is_qianfan_coding_plan_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        is_qianfan = slug == "qianfan" or "qianfan.baidubce.com" in b
+        return is_qianfan and "coding" in b
+
+    def _is_xfyun_coding_plan_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        is_xfyun = slug == "xfyun" or "xf-yun.com" in b
+        return is_xfyun and "maas-coding-api" in b
+
+    def _xfyun_coding_plan_fallback_models() -> list[dict]:
+        ids = [
+            "astron-code-latest",
+        ]
+        return [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="xfyun"),
+            }
+            for mid in ids
+        ]
+
+    def _minimax_fallback_models() -> list[dict]:
+        # 内置候选：仅在上游 /v1/models 拉取失败时回退使用。
+        # 不含 M3 —— 列表里出现 M3 即说明用的是在线列表，否则是这份内置回退。
+        ids = [
+            "MiniMax-M2.7",
+            "MiniMax-M2.5",
+            "MiniMax-M2.5-highspeed",
+            "MiniMax-M2.1",
+            "MiniMax-M2.1-highspeed",
+            "MiniMax-M2",
+        ]
+        out = [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="minimax"),
+            }
+            for mid in ids
+        ]
+        out.sort(key=lambda x: x["id"])
+        return out
+
+    def _qianfan_coding_plan_fallback_models() -> list[dict]:
+        ids = [
+            "kimi-k2.5",
+            "deepseek-v3.2",
+            "glm-5",
+            "minimax-m2.5",
+        ]
+        return [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="qianfan"),
+            }
+            for mid in ids
+        ]
+
+    def _volc_coding_plan_fallback_models() -> list[dict]:
+        ids = [
+            "doubao-seed-2.0-code",
+            "doubao-seed-code",
+            "glm-4.7",
+            "deepseek-v3.2",
+            "kimi-k2-thinking",
+            "kimi-k2.5",
+        ]
+        return [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="volcengine"),
+            }
+            for mid in ids
+        ]
+
+    def _longcat_fallback_models() -> list[dict]:
+        ids = [
+            "LongCat-Flash-Chat",
+            "LongCat-Flash-Thinking",
+            "LongCat-Flash-Thinking-2601",
+            "LongCat-Flash-Lite",
+        ]
+        out = [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="longcat"),
+            }
+            for mid in ids
+        ]
+        out.sort(key=lambda x: x["id"])
+        return out
+
+    def _dashscope_coding_plan_fallback_models() -> list[dict]:
+        ids = [
+            "qwen3.5-plus",
+            "kimi-k2.5",
+            "glm-5",
+            "MiniMax-M2.5",
+            "qwen3-max-2026-01-23",
+            "qwen3-coder-next",
+            "qwen3-coder-plus",
+            "glm-4.7",
+        ]
+        out = [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="dashscope"),
+            }
+            for mid in ids
+        ]
+        out.sort(key=lambda x: x["id"])
+        return out
+
+    if _is_volc_coding_plan_provider():
+        return _volc_coding_plan_fallback_models()
+    if _is_dashscope_coding_plan_provider():
+        return _dashscope_coding_plan_fallback_models()
+    if _is_qianfan_coding_plan_provider():
+        return _qianfan_coding_plan_fallback_models()
+    if _is_xfyun_coding_plan_provider():
+        return _xfyun_coding_plan_fallback_models()
+    if _is_longcat_provider():
+        return _longcat_fallback_models()
+
+    # MiniMax 现已提供 OpenAI 兼容的 /v1/models 端点，正常流程即可拉取。
+    # 拉取失败（旧网关无该端点 / 网络错误等）时回退到内置候选，详见下方 except。
+
+    from openkitsune.llm.types import normalize_base_url
+
+    url = normalize_base_url(base_url) + "/models"
+    # 本地服务（Ollama/LM Studio 等）不需要真实 API Key，使用 placeholder
+    effective_key = api_key.strip() or "local"
+    auth_header = f"Bearer {effective_key}"
+
+    async def _ensure_auth(request: httpx.Request):
+        request.headers.setdefault("Authorization", auth_header)
+
+    from openkitsune.llm.providers.proxy_utils import get_httpx_client_kwargs
+
+    client_kw = get_httpx_client_kwargs(timeout=30, target_url=base_url)
+    client_kw["follow_redirects"] = True
+    client_kw["event_hooks"] = {"request": [_ensure_auth]}
+
+    async with httpx.AsyncClient(**client_kw) as client:
+        try:
+            resp = await client.get(
+                url,
+                headers=_model_list_headers({"Authorization": auth_header}),
+            )
+            resp.raise_for_status()
+            ct = (resp.headers.get("content-type") or "").lower()
+            if "json" not in ct:
+                preview = resp.text[:200].strip()
+                raise ValueError(
+                    f"API 返回了非 JSON 响应 (content-type: {ct})。"
+                    f"请检查 Base URL 是否正确（通常需要以 /v1 结尾）。"
+                    f"\n响应预览: {preview}"
+                )
+            data = resp.json()
+        except Exception:
+            # MiniMax：在线拉取失败时回退到内置候选（列表里因此不会出现 M3）。
+            if _is_minimax_provider():
+                return _minimax_fallback_models()
+            raise
+
+    out: list[dict] = _openrouter_router_models() if _is_openrouter_provider() else []
+    seen = {str(m.get("id") or "") for m in out}
+    for m in data.get("data", []):
+        mid = str(m.get("id", "")).strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        out.append(
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug=provider_slug),
+            }
+        )
+    out.sort(key=lambda x: x["id"])
+    # MiniMax：在线端点返回空列表时也回退内置候选，避免空选择框。
+    if not out and _is_minimax_provider():
+        return _minimax_fallback_models()
+    return out
+
+
+async def _list_models_anthropic(
+    api_key: str, base_url: str, provider_slug: str | None
+) -> list[dict]:
+    import httpx
+
+    from openkitsune.llm.capabilities import infer_capabilities
+
+    def _is_minimax_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        return slug in {"minimax", "minimax-cn", "minimax-int"} or "minimax" in b or "minimaxi" in b
+
+    def _is_volc_coding_plan_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        is_volc = slug == "volcengine" or "volces.com" in b
+        return is_volc and "/api/coding" in b
+
+    def _is_longcat_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        return slug == "longcat" or "longcat.chat" in b
+
+    def _is_dashscope_coding_plan_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        is_dashscope = slug in {"dashscope", "dashscope-intl"} or "dashscope.aliyuncs.com" in b
+        return is_dashscope and "coding" in b
+
+    def _is_qianfan_coding_plan_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        is_qianfan = slug == "qianfan" or "qianfan.baidubce.com" in b
+        return is_qianfan and "coding" in b
+
+    def _is_xfyun_coding_plan_provider() -> bool:
+        slug = (provider_slug or "").strip().lower()
+        b = (base_url or "").strip().lower()
+        is_xfyun = slug == "xfyun" or "xf-yun.com" in b
+        return is_xfyun and "maas-coding-api" in b
+
+    def _xfyun_coding_plan_fallback_models() -> list[dict]:
+        ids = [
+            "astron-code-latest",
+        ]
+        return [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="xfyun"),
+            }
+            for mid in ids
+        ]
+
+    def _minimax_fallback_models() -> list[dict]:
+        # 内置候选：仅在上游 /v1/models 拉取失败时回退使用。
+        # 不含 M3 —— 列表里出现 M3 即说明用的是在线列表，否则是这份内置回退。
+        ids = [
+            "MiniMax-M2.7",
+            "MiniMax-M2.5",
+            "MiniMax-M2.5-highspeed",
+            "MiniMax-M2.1",
+            "MiniMax-M2.1-highspeed",
+            "MiniMax-M2",
+        ]
+        return [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="minimax"),
+            }
+            for mid in ids
+        ]
+
+    def _qianfan_coding_plan_fallback_models() -> list[dict]:
+        ids = [
+            "kimi-k2.5",
+            "deepseek-v3.2",
+            "glm-5",
+            "minimax-m2.5",
+        ]
+        return [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="qianfan"),
+            }
+            for mid in ids
+        ]
+
+    def _volc_coding_plan_fallback_models() -> list[dict]:
+        ids = [
+            "doubao-seed-2.0-code",
+            "doubao-seed-code",
+            "glm-4.7",
+            "deepseek-v3.2",
+            "kimi-k2-thinking",
+            "kimi-k2.5",
+        ]
+        return [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="volcengine"),
+            }
+            for mid in ids
+        ]
+
+    def _longcat_fallback_models() -> list[dict]:
+        ids = [
+            "LongCat-Flash-Chat",
+            "LongCat-Flash-Thinking",
+            "LongCat-Flash-Thinking-2601",
+            "LongCat-Flash-Lite",
+        ]
+        return [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="longcat"),
+            }
+            for mid in ids
+        ]
+
+    def _dashscope_coding_plan_fallback_models() -> list[dict]:
+        ids = [
+            "qwen3.5-plus",
+            "kimi-k2.5",
+            "glm-5",
+            "MiniMax-M2.5",
+            "qwen3-max-2026-01-23",
+            "qwen3-coder-next",
+            "qwen3-coder-plus",
+            "glm-4.7",
+        ]
+        return [
+            {
+                "id": mid,
+                "name": mid,
+                "capabilities": infer_capabilities(mid, provider_slug="dashscope"),
+            }
+            for mid in ids
+        ]
+
+    if _is_volc_coding_plan_provider():
+        return _volc_coding_plan_fallback_models()
+    if _is_dashscope_coding_plan_provider():
+        return _dashscope_coding_plan_fallback_models()
+    if _is_qianfan_coding_plan_provider():
+        return _qianfan_coding_plan_fallback_models()
+    if _is_xfyun_coding_plan_provider():
+        return _xfyun_coding_plan_fallback_models()
+    if _is_longcat_provider():
+        return _longcat_fallback_models()
+
+    # MiniMax 现已提供模型列表端点，正常流程即可拉取；失败时回退内置候选（见下方 except）。
+
+    b = base_url.rstrip("/")
+    url = b + "/models" if b.endswith("/v1") else b + "/v1/models"
+
+    from openkitsune.llm.providers.proxy_utils import get_httpx_client_kwargs
+
+    client_kw = get_httpx_client_kwargs(timeout=30, target_url=base_url)
+
+    async with httpx.AsyncClient(**client_kw) as client:
+        try:
+            resp = await client.get(
+                url,
+                headers=_model_list_headers(
+                    {
+                        "x-api-key": api_key,
+                        # 部分 Anthropic 兼容网关仅识别 Bearer。
+                        "Authorization": f"Bearer {api_key}",
+                        "anthropic-version": "2023-06-01",
+                    }
+                ),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            # MiniMax：在线拉取失败时回退到内置候选（列表里因此不会出现 M3）。
+            if _is_minimax_provider():
+                return _minimax_fallback_models()
+            raise
+
+    out: list[dict] = []
+    for m in data.get("data", []):
+        mid = str(m.get("id", "")).strip()
+        if not mid:
+            continue
+        out.append(
+            {
+                "id": mid,
+                "name": str(m.get("display_name", mid)),
+                "capabilities": infer_capabilities(mid, provider_slug=provider_slug),
+            }
+        )
+    # MiniMax：在线端点返回空列表时也回退内置候选，避免空选择框。
+    if not out and _is_minimax_provider():
+        return _minimax_fallback_models()
+    return out
+
+
+async def list_models(
+    api_type: str, base_url: str, provider_slug: str | None, api_key: str
+) -> None:
+    api_type = (api_type or "").strip().lower()
+    base_url = (base_url or "").strip()
+    if not api_type:
+        raise ValueError("--api-type 不能为空")
+    if not base_url:
+        raise ValueError("--base-url 不能为空")
+    # 本地服务商（Ollama/LM Studio 等）不需要 API Key，允许空值
+    # 前端会传入 placeholder key，但也兼容完全为空的情况
+
+    if api_type in ("openai", "openai_responses"):
+        _json_print(await _list_models_openai(api_key, base_url, provider_slug))
+        return
+    if api_type == "anthropic":
+        _json_print(await _list_models_anthropic(api_key, base_url, provider_slug))
+        return
+
+    raise ValueError(f"不支持的 api-type: {api_type}")
+
+
+async def health_check_endpoint(workspace_dir: str, endpoint_name: str | None) -> None:
+    """检测 LLM 端点连通性，同时更新业务状态（cooldown/mark_healthy）"""
+    import time
+
+    from openkitsune.llm.client import LLMClient
+
+    wd = Path(workspace_dir).expanduser().resolve()
+    config_path = wd / "data" / "llm_endpoints.json"
+    if not config_path.exists():
+        raise ValueError(f"端点配置文件不存在: {config_path}")
+
+    env_path = wd / ".env"
+    if env_path.exists():
+        for line in env_path.read_bytes().decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            eq = line.find("=")
+            if eq > 0:
+                val = line[eq + 1 :].strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                os.environ.setdefault(line[:eq].strip(), val)
+
+    client = LLMClient(config_path=config_path)
+
+    results = []
+    targets = list(client._providers.items())
+    if endpoint_name:
+        targets = [(n, p) for n, p in targets if n == endpoint_name]
+        if not targets:
+            raise ValueError(f"未找到端点: {endpoint_name}")
+
+    for name, provider in targets:
+        t0 = time.time()
+        try:
+            await provider.health_check()
+            latency = round((time.time() - t0) * 1000)
+            results.append(
+                {
+                    "name": name,
+                    "status": "healthy",
+                    "latency_ms": latency,
+                    "error": None,
+                    "error_category": None,
+                    "consecutive_failures": 0,
+                    "cooldown_remaining": 0,
+                    "is_extended_cooldown": False,
+                    "last_checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+            )
+        except Exception as e:
+            latency = round((time.time() - t0) * 1000)
+            results.append(
+                {
+                    "name": name,
+                    "status": "unhealthy" if provider.consecutive_cooldowns >= 3 else "degraded",
+                    "latency_ms": latency,
+                    "error": str(e)[:500],
+                    "error_category": provider.error_category,
+                    "consecutive_failures": provider.consecutive_cooldowns,
+                    "cooldown_remaining": round(provider.cooldown_remaining),
+                    "is_extended_cooldown": provider.is_extended_cooldown,
+                    "last_checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+            )
+
+    _json_print(results)
+
+
+async def health_check_im(workspace_dir: str, channel: str | None) -> None:
+    """检测 IM 通道连通性"""
+    import httpx
+
+    wd = Path(workspace_dir).expanduser().resolve()
+
+    env: dict[str, str] = {}
+    env_path = wd / ".env"
+    if env_path.exists():
+        for line in env_path.read_bytes().decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            eq = line.find("=")
+            if eq > 0:
+                env[line[:eq].strip()] = line[eq + 1 :]
+
+    channels_def = [
+        {
+            "id": "telegram",
+            "name": "Telegram",
+            "enabled_key": "TELEGRAM_ENABLED",
+            "required_keys": ["TELEGRAM_BOT_TOKEN"],
+        },
+        {
+            "id": "feishu",
+            "name": "飞书",
+            "enabled_key": "FEISHU_ENABLED",
+            "required_keys": ["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
+        },
+        {
+            "id": "wework",
+            "name": "企业微信",
+            "enabled_key": "WEWORK_ENABLED",
+            "required_keys": ["WEWORK_CORP_ID", "WEWORK_TOKEN", "WEWORK_ENCODING_AES_KEY"],
+        },
+        {
+            "id": "dingtalk",
+            "name": "钉钉",
+            "enabled_key": "DINGTALK_ENABLED",
+            "required_keys": ["DINGTALK_CLIENT_ID", "DINGTALK_CLIENT_SECRET"],
+        },
+        {
+            "id": "onebot",
+            "name": "OneBot",
+            "enabled_key": "ONEBOT_ENABLED",
+            "required_keys": [],  # 动态：forward 需要 WS_URL，reverse 需要端口
+        },
+        {
+            "id": "qqbot",
+            "name": "QQ 官方机器人",
+            "enabled_key": "QQBOT_ENABLED",
+            "required_keys": ["QQBOT_APP_ID", "QQBOT_APP_SECRET"],
+        },
+        {
+            "id": "wework_ws",
+            "name": "企业微信(WS)",
+            "enabled_key": "WEWORK_WS_ENABLED",
+            "required_keys": ["WEWORK_WS_BOT_ID", "WEWORK_WS_SECRET"],
+        },
+        {
+            "id": "wechat",
+            "name": "微信",
+            "enabled_key": "WECHAT_ENABLED",
+            "required_keys": ["WECHAT_TOKEN"],
+        },
+    ]
+
+    import time
+
+    targets = channels_def
+    if channel:
+        targets = [c for c in targets if c["id"] == channel]
+        if not targets:
+            raise ValueError(f"未知 IM 通道: {channel}")
+
+    results = []
+    for ch in targets:
+        enabled = env.get(ch["enabled_key"], "").strip().lower() in ("true", "1", "yes")
+        if not enabled:
+            results.append(
+                {
+                    "channel": ch["id"],
+                    "name": ch["name"],
+                    "status": "disabled",
+                    "error": None,
+                    "last_checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+            )
+            continue
+
+        missing = [k for k in ch["required_keys"] if not env.get(k, "").strip()]
+        if missing:
+            results.append(
+                {
+                    "channel": ch["id"],
+                    "name": ch["name"],
+                    "status": "unhealthy",
+                    "error": f"缺少配置: {', '.join(missing)}",
+                    "last_checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+            )
+            continue
+
+        # 实际连通性测试
+        try:
+            from openkitsune.llm.providers.proxy_utils import get_httpx_client_kwargs
+
+            ch_client_kw = get_httpx_client_kwargs(timeout=15)
+            async with httpx.AsyncClient(**ch_client_kw) as client:
+                if ch["id"] == "telegram":
+                    token = env["TELEGRAM_BOT_TOKEN"]
+                    resp = await client.get(f"https://api.telegram.org/bot{token}/getMe")
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if not data.get("ok"):
+                        raise Exception(data.get("description", "Telegram API 返回错误"))
+                elif ch["id"] == "feishu":
+                    app_id = env["FEISHU_APP_ID"]
+                    app_secret = env["FEISHU_APP_SECRET"]
+                    resp = await client.post(
+                        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                        json={"app_id": app_id, "app_secret": app_secret},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if data.get("code", -1) != 0:
+                        raise Exception(data.get("msg", "飞书验证失败"))
+                elif ch["id"] == "wework":
+                    # 智能机器人模式不需要 secret/access_token，无法通过 API 验证
+                    # 只检查必填参数是否完整
+                    corp_id = env.get("WEWORK_CORP_ID", "").strip()
+                    token = env.get("WEWORK_TOKEN", "").strip()
+                    aes_key = env.get("WEWORK_ENCODING_AES_KEY", "").strip()
+                    if not corp_id or not token or not aes_key:
+                        missing = []
+                        if not corp_id:
+                            missing.append("WEWORK_CORP_ID")
+                        if not token:
+                            missing.append("WEWORK_TOKEN")
+                        if not aes_key:
+                            missing.append("WEWORK_ENCODING_AES_KEY")
+                        raise Exception(f"缺少必填参数: {', '.join(missing)}")
+                elif ch["id"] == "dingtalk":
+                    client_id = env["DINGTALK_CLIENT_ID"]
+                    client_secret = env["DINGTALK_CLIENT_SECRET"]
+                    resp = await client.post(
+                        "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+                        json={"appKey": client_id, "appSecret": client_secret},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if not data.get("accessToken"):
+                        raise Exception(data.get("message", "钉钉验证失败"))
+                elif ch["id"] == "onebot":
+                    ob_mode = env.get("ONEBOT_MODE", "reverse").strip().lower()
+                    if ob_mode == "forward":
+                        ws_url = env.get("ONEBOT_WS_URL", "")
+                        if not ws_url.startswith(("ws://", "wss://")):
+                            raise Exception(f"无效的 WebSocket URL: {ws_url}")
+                        http_url = ws_url.replace("ws://", "http://").replace("wss://", "https://")
+                        resp = await client.get(http_url, timeout=5)
+                    else:
+                        port_str = env.get("ONEBOT_REVERSE_PORT", "6700").strip()
+                        try:
+                            port = int(port_str)
+                            if not (1 <= port <= 65535):
+                                raise ValueError
+                        except (ValueError, TypeError):
+                            raise Exception(f"无效的端口: {port_str}")
+                elif ch["id"] == "qqbot":
+                    # QQ 官方机器人：验证 AppID/AppSecret 能获取 Access Token
+                    app_id = env["QQBOT_APP_ID"]
+                    app_secret = env["QQBOT_APP_SECRET"]
+                    resp = await client.post(
+                        "https://bots.qq.com/app/getAppAccessToken",
+                        json={"appId": app_id, "clientSecret": app_secret},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if not data.get("access_token"):
+                        raise Exception(data.get("message", "QQ 机器人验证失败"))
+                elif ch["id"] == "wework_ws":
+                    bot_id = env.get("WEWORK_WS_BOT_ID", "").strip()
+                    secret = env.get("WEWORK_WS_SECRET", "").strip()
+                    if not bot_id or not secret:
+                        missing_ws = []
+                        if not bot_id:
+                            missing_ws.append("WEWORK_WS_BOT_ID")
+                        if not secret:
+                            missing_ws.append("WEWORK_WS_SECRET")
+                        raise Exception(f"缺少必填参数: {', '.join(missing_ws)}")
+                elif ch["id"] == "wechat":
+                    token = env.get("WECHAT_TOKEN", "").strip()
+                    if not token:
+                        raise Exception("缺少必填参数: WECHAT_TOKEN")
+
+            results.append(
+                {
+                    "channel": ch["id"],
+                    "name": ch["name"],
+                    "status": "healthy",
+                    "error": None,
+                    "last_checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "channel": ch["id"],
+                    "name": ch["name"],
+                    "status": "unhealthy",
+                    "error": str(e)[:500],
+                    "last_checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+            )
+
+    _json_print(results)
+
+
+def ensure_channel_deps(workspace_dir: str) -> None:
+    """检查已启用 IM 通道的 Python 依赖，缺失的自动 pip install。"""
+    wd = Path(workspace_dir).expanduser().resolve()
+
+    env: dict[str, str] = {}
+    env_path = wd / ".env"
+    if env_path.exists():
+        for line in env_path.read_bytes().decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            eq = line.find("=")
+            if eq > 0:
+                env[line[:eq].strip()] = line[eq + 1 :].strip()
+
+    from openkitsune.runtime_channel_deps import ensure_channel_dependencies
+
+    _json_print(ensure_channel_dependencies(workspace_env=env))
+
+
+async def feishu_onboard_start(domain: str) -> None:
+    """启动飞书 Device Flow：init 握手 + begin 获取 device_code 和 QR URL"""
+    from openkitsune.setup.feishu_onboard import FeishuOnboard
+
+    ob = FeishuOnboard(domain=domain)
+    await ob.init()
+    begin_data = await ob.begin()
+    result = {
+        "device_code": begin_data.get("device_code", ""),
+        "verification_uri": begin_data.get("verification_uri_complete", ""),
+        "interval": begin_data.get("interval", 5),
+        "expire_in": begin_data.get("expire_in", 600),
+    }
+    _json_print(result)
+
+
+async def feishu_onboard_poll(domain: str, device_code: str) -> None:
+    """单次轮询 Device Flow 授权状态"""
+    from openkitsune.setup.feishu_onboard import FeishuOnboard
+
+    ob = FeishuOnboard(domain=domain)
+    result = await ob.poll(device_code)
+    _json_print(result)
+
+
+async def feishu_validate(app_id: str, app_secret: str, domain: str) -> None:
+    """验证飞书凭证有效性"""
+    from openkitsune.setup.feishu_onboard import validate_credentials
+
+    result = await validate_credentials(app_id, app_secret, domain=domain)
+    _json_print(result)
+
+
+async def wecom_onboard_start() -> None:
+    """生成企微扫码配置二维码，返回 auth_url + scode"""
+    from openkitsune.setup.wecom_onboard import WecomOnboard
+
+    ob = WecomOnboard()
+    data = await ob.generate()
+    result = {
+        "auth_url": data.get("auth_url", ""),
+        "scode": data.get("scode", ""),
+    }
+    _json_print(result)
+
+
+async def wecom_onboard_poll(scode: str) -> None:
+    """单次轮询企微扫码配置结果"""
+    from openkitsune.setup.wecom_onboard import WecomOnboard
+
+    ob = WecomOnboard()
+    result = await ob.poll(scode)
+    _json_print(result)
+
+
+async def qqbot_onboard_start() -> None:
+    """创建 QQ 登录会话，返回 session_id 和 QR URL"""
+    from openkitsune.setup.qqbot_onboard import QQBotOnboard
+
+    ob = QQBotOnboard()
+    try:
+        result = await ob.create_session()
+        _json_print(result)
+    finally:
+        await ob.close()
+
+
+async def qqbot_onboard_poll(session_id: str) -> None:
+    """单次轮询 QQ 扫码登录状态"""
+    from openkitsune.setup.qqbot_onboard import QQBotOnboard
+
+    ob = QQBotOnboard()
+    try:
+        result = await ob.poll(session_id)
+        _json_print(result)
+    finally:
+        await ob.close()
+
+
+async def qqbot_onboard_create() -> None:
+    """创建 QQ 机器人，返回 app_id / app_secret"""
+    from openkitsune.setup.qqbot_onboard import QQBotOnboard
+
+    ob = QQBotOnboard()
+    try:
+        result = await ob.create_bot()
+        _json_print(result)
+    finally:
+        await ob.close()
+
+
+async def qqbot_onboard_poll_and_create(session_id: str) -> None:
+    """原子操作：poll 确认登录态 + 创建机器人（同一 httpx 客户端保持 cookie）"""
+    from openkitsune.setup.qqbot_onboard import QQBotOnboard
+
+    ob = QQBotOnboard()
+    try:
+        result = await ob.poll_and_create(session_id)
+        _json_print(result)
+    finally:
+        await ob.close()
+
+
+async def qqbot_validate(app_id: str, app_secret: str) -> None:
+    """验证 QQ 机器人凭证有效性"""
+    from openkitsune.setup.qqbot_onboard import validate_credentials
+
+    result = await validate_credentials(app_id, app_secret)
+    _json_print(result)
+
+
+async def wechat_onboard_start() -> None:
+    """获取微信 iLink Bot 登录二维码，返回 uuid 和 qrcode_url"""
+    from openkitsune.setup.wechat_onboard import WeChatOnboard
+
+    ob = WeChatOnboard()
+    try:
+        result = await ob.fetch_qrcode()
+        _json_print(result)
+    finally:
+        await ob.close()
+
+
+async def wechat_onboard_poll(qrcode: str) -> None:
+    """单次轮询微信扫码登录状态"""
+    from openkitsune.setup.wechat_onboard import WeChatOnboard
+
+    ob = WeChatOnboard()
+    try:
+        result = await ob.poll_status(qrcode)
+        _json_print(result)
+    finally:
+        await ob.close()
+
+
+def list_skills(workspace_dir: str) -> None:
+    from openkitsune.skills.loader import SkillLoader
+
+    wd = Path(workspace_dir).expanduser().resolve()
+    if not wd.exists() or not wd.is_dir():
+        raise ValueError(f"--workspace-dir 不存在或不是目录: {workspace_dir}")
+
+    # 外部技能启用状态（Setup Center 用于展示“可启用/禁用”的开关）
+    # 文件：<workspace>/data/skills.json
+    # - 不存在 / 无 external_allowlist => 外部技能全部启用（兼容历史行为）
+    # - external_allowlist: [] => 禁用所有外部技能
+    external_allowlist: set[str] | None = None
+    try:
+        cfg_path = wd / "data" / "skills.json"
+        if cfg_path.exists():
+            raw = cfg_path.read_text(encoding="utf-8")
+            cfg = json.loads(raw) if raw.strip() else {}
+            al = cfg.get("external_allowlist", None)
+            if isinstance(al, list):
+                external_allowlist = {str(x).strip() for x in al if str(x).strip()}
+    except Exception:
+        external_allowlist = None
+
+    loader = SkillLoader()
+    loader.load_all(base_path=wd)
+    skills = loader.registry.list_all()
+    from openkitsune.skills.marketplace import installed_marketplace_names
+
+    marketplace_names = installed_marketplace_names(
+        [s.skill_path for s in skills if s.skill_path and not s.system]
+    )
+    out = []
+    for s in skills:
+        skill_path = getattr(s, "skill_path", None)
+        source_url = getattr(s, "source_url", None)
+        if skill_path and not source_url:
+            try:
+                source_base = Path(skill_path)
+                if source_base.name == "SKILL.md" or source_base.is_file():
+                    source_base = source_base.parent
+                origin_file = source_base / ".openkitsune-source"
+                if origin_file.exists():
+                    source_url = origin_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                pass
+        sid = getattr(s, "skill_id", None) or s.name
+        out.append(
+            {
+                "skill_id": sid,
+                "name": s.name,
+                "description": s.description,
+                "system": bool(getattr(s, "system", False)),
+                "enabled": bool(getattr(s, "system", False))
+                or (external_allowlist is None)
+                or (sid in external_allowlist),
+                "tool_name": getattr(s, "tool_name", None),
+                "category": getattr(s, "category", None),
+                "path": skill_path,
+                "source_url": source_url,
+                "marketplace_name": marketplace_names.get(str(skill_path)),
+                "config": getattr(s, "config", None) or getattr(s, "config_schema", None),
+            }
+        )
+    _json_print({"count": len(out), "skills": out})
+
+
+def _looks_like_github_shorthand(url: str) -> bool:
+    """判断 URL 是否为 GitHub 简写格式，如 'owner/repo' 或 'owner/repo@skill'。
+
+    排除本地路径（包含反斜杠、以 . 或 / 开头、包含盘符如 C:）。
+    """
+    if " " in url:
+        return False
+    if url.startswith((".", "/", "~")) or "\\" in url:
+        return False
+    if len(url) > 1 and url[1] == ":":
+        return False  # Windows 盘符路径，如 C:\\...
+    # 至少包含一个 / 分隔 owner/repo
+    parts = url.split("@")[0] if "@" in url else url
+    return "/" in parts and len(parts.split("/")) == 2
+
+
+def _sanitize_skill_dir_name(name: str) -> str:
+    """Sanitize user-provided skill name into a safe directory name."""
+    cleaned = (name or "").strip().replace("\\", "/").strip("/")
+    if "/" in cleaned:
+        cleaned = cleaned.split("/")[-1]
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", cleaned).strip("-._")
+    return cleaned or "custom-skill"
+
+
+def _resolve_skills_dir(workspace_dir: str) -> Path:
+    """计算技能安装目录。
+
+    优先使用 Tauri 传入的 workspace_dir（支持多工作区），
+    若参数为空则使用 OPENKITSUNE_ROOT 环境变量确定根目录，最后回退到默认路径。
+    """
+    if workspace_dir and workspace_dir.strip():
+        return Path(workspace_dir).expanduser().resolve() / "skills"
+    import os
+
+    root = os.environ.get("OPENKITSUNE_ROOT", "").strip()
+    if root:
+        return Path(root) / "workspaces" / "default" / "skills"
+    return Path.home() / ".openkitsune" / "workspaces" / "default" / "skills"
+
+
+def _has_git() -> bool:
+    """检查系统是否安装了 git。"""
+    import shutil
+
+    return shutil.which("git") is not None
+
+
+_GITHUB_ZIP_MIRRORS: list[str] = [
+    "https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip",
+    "https://gh-proxy.com/https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip",
+    "https://mirror.ghproxy.com/https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip",
+    "https://ghproxy.net/https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip",
+]
+
+
+def _try_platform_skill_download(skill_id: str, dest_dir: Path) -> bool:
+    """Try downloading a cached skill ZIP from the OpenKitsune platform.
+
+    Returns True if successful, False otherwise.
+    """
+    import io
+    import urllib.request
+    import zipfile
+
+    from openkitsune.config import settings
+
+    hub_url = (getattr(settings, "hub_api_url", "") or "").rstrip("/")
+    if not hub_url:
+        return False
+
+    url = f"{hub_url}/skills/{skill_id}/download"
+    headers = {"User-Agent": "OpenKitsune-SetupCenter"}
+    api_key = getattr(settings, "hub_api_key", "") or ""
+    if api_key:
+        headers["X-Akita-Key"] = api_key
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+        if len(data) < 22:
+            return False
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            zf.extractall(dest_dir)
+        skill_md = dest_dir / "SKILL.md"
+        if skill_md.exists():
+            return True
+        # ZIP didn't contain SKILL.md — clean up the directory we created
+        import shutil
+
+        shutil.rmtree(str(dest_dir), ignore_errors=True)
+        return False
+    except Exception:
+        # Clean up partially created directory on any failure
+        if dest_dir.exists():
+            import shutil
+
+            shutil.rmtree(str(dest_dir), ignore_errors=True)
+        return False
+
+
+def _download_github_zip(repo_owner: str, repo_name: str, dest_dir: Path) -> None:
+    """通过 GitHub Archive API 下载仓库 ZIP 并解压到 dest_dir（不依赖 git）。
+
+    自动尝试 main/master 分支，并在直连失败时回退到国内 CDN 镜像。
+    """
+    import io
+    import shutil
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    data: bytes | None = None
+    last_err: Exception | None = None
+
+    for branch in ("main", "master"):
+        if data is not None:
+            break
+        for tpl in _GITHUB_ZIP_MIRRORS:
+            url = tpl.format(owner=repo_owner, repo=repo_name, branch=branch)
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "OpenKitsune"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = resp.read()
+                break
+            except Exception as e:
+                last_err = e
+
+    if data is None:
+        raise RuntimeError(
+            f"无法下载仓库 {repo_owner}/{repo_name}，请检查网络或安装 Git。（最后错误: {last_err}）"
+        )
+
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        _validate_zip_members(zf)
+        tmp_extract = Path(tempfile.mkdtemp(prefix="openkitsune_zip_"))
+        try:
+            zf.extractall(tmp_extract)
+            children = list(tmp_extract.iterdir())
+            src = children[0] if len(children) == 1 and children[0].is_dir() else tmp_extract
+            shutil.copytree(str(src), str(dest_dir))
+        finally:
+            shutil.rmtree(str(tmp_extract), ignore_errors=True)
+
+
+def _validate_zip_members(zf: zipfile.ZipFile) -> None:
+    """Reject ZIP archives containing path-traversal members (Zip Slip)."""
+    import os
+
+    for name in zf.namelist():
+        normalized = os.path.normpath(name)
+        if (
+            name.startswith("/")
+            or name.startswith("\\")
+            or normalized.startswith("..")
+            or os.path.isabs(normalized)
+        ):
+            raise RuntimeError(f"Zip Slip detected: dangerous member '{name}'")
+
+
+_SKILLHUB_ARCHIVE_MAX_BYTES = 50 * 1024 * 1024
+_SKILLHUB_UNCOMPRESSED_MAX_BYTES = 200 * 1024 * 1024
+_SKILLHUB_ARCHIVE_MAX_FILES = 5000
+
+
+def _download_skillhub_skill(source: str, dest_dir: Path) -> dict[str, str | None]:
+    """Download and safely extract a SkillHub registry package."""
+    import io
+    import shutil
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    from openkitsune.skills.marketplace import (
+        build_skillhub_download_url,
+        parse_skillhub_locator,
+    )
+
+    locator = parse_skillhub_locator(source)
+    request = urllib.request.Request(
+        build_skillhub_download_url(locator),
+        headers={"User-Agent": "OpenKitsune-SetupCenter"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > _SKILLHUB_ARCHIVE_MAX_BYTES:
+            raise ValueError("SkillHub 技能包超过 50 MiB 下载限制")
+        data = response.read(_SKILLHUB_ARCHIVE_MAX_BYTES + 1)
+    if len(data) > _SKILLHUB_ARCHIVE_MAX_BYTES:
+        raise ValueError("SkillHub 技能包超过 50 MiB 下载限制")
+
+    tmp_extract = Path(tempfile.mkdtemp(prefix="openkitsune_skillhub_"))
+    staging_root = Path(tempfile.mkdtemp(prefix=".openkitsune-skillhub-", dir=str(dest_dir.parent)))
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            _validate_zip_members(zf)
+            files = [item for item in zf.infolist() if not item.is_dir()]
+            if len(files) > _SKILLHUB_ARCHIVE_MAX_FILES:
+                raise ValueError("SkillHub 技能包文件数量超过安全限制")
+            if sum(item.file_size for item in files) > _SKILLHUB_UNCOMPRESSED_MAX_BYTES:
+                raise ValueError("SkillHub 技能包解压后超过 200 MiB 安全限制")
+            zf.extractall(tmp_extract)
+
+        source_dir = tmp_extract
+        if not (source_dir / "SKILL.md").is_file():
+            children = list(source_dir.iterdir())
+            if len(children) == 1 and children[0].is_dir():
+                source_dir = children[0]
+        if not (source_dir / "SKILL.md").is_file():
+            raise ValueError("SkillHub 技能包根目录缺少 SKILL.md")
+        staged_skill = staging_root / "skill"
+        _copy_skill_tree(source_dir, staged_skill)
+        staged_skill.rename(dest_dir)
+    finally:
+        shutil.rmtree(str(tmp_extract), ignore_errors=True)
+        shutil.rmtree(str(staging_root), ignore_errors=True)
+
+    return {
+        "provider": "skillhub",
+        "locator": locator.canonical_locator,
+        "namespace": locator.namespace,
+        "slug": locator.slug,
+        "version": locator.version,
+    }
+
+
+_PROXY_ENV_KEYS: tuple[str, ...] = (
+    "ALL_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+)
+
+
+def _validate_git_proxy_environment(env: dict[str, str]) -> None:
+    """Fail early when Git would inherit a malformed proxy URL."""
+    from urllib.parse import urlparse
+
+    for key in _PROXY_ENV_KEYS:
+        value = (env.get(key) or "").strip()
+        if not value:
+            continue
+        parsed = urlparse(value)
+        if "：" in value or parsed.scheme not in {"http", "https", "socks4", "socks5", "socks5h"}:
+            raise SkillInstallError(
+                "git_proxy_invalid",
+                (
+                    f"代理配置格式错误：{key}={value!r}。"
+                    "请在设置中心修正为类似 http://127.0.0.1:7890，或清空该代理配置后重试。"
+                ),
+            )
+        if not parsed.hostname:
+            raise SkillInstallError(
+                "git_proxy_invalid",
+                (f"代理配置缺少主机名：{key}={value!r}。请检查代理地址，或清空该代理配置后重试。"),
+            )
+
+
+def _git_clone(args: list[str]) -> None:
+    """执行 git clone，git 不可用或代理错误时抛出友好错误。"""
+    import subprocess
+
+    try:
+        env = os.environ.copy()
+        _validate_git_proxy_environment(env)
+        extra: dict = {}
+        if sys.platform == "win32":
+            extra["creationflags"] = subprocess.CREATE_NO_WINDOW
+        subprocess.run(
+            args,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            **extra,
+        )
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            "未找到 git 命令。请安装 Git (https://git-scm.com) 或使用 GitHub 简写格式安装技能"
+        )
+    except subprocess.CalledProcessError as e:
+        output = f"{e.stdout or ''}\n{e.stderr or ''}".strip()
+        lower = output.lower()
+        if "invalid proxy" in lower or "proxy url" in lower:
+            raise SkillInstallError(
+                "git_proxy_invalid",
+                (
+                    "Git 代理配置无效，导致无法下载技能。"
+                    f"请检查 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 配置。\n\nGit 输出：{output[-1200:]}"
+                ),
+            ) from e
+        raise SkillInstallError(
+            "git_clone_failed",
+            f"Git 下载技能失败，请检查仓库地址、网络或权限。\n\nGit 输出：{output[-1200:]}",
+        ) from e
+
+
+def _parse_github_url(url: str) -> tuple[str, str, str | None] | None:
+    """从 HTTPS GitHub URL 中提取 (owner, repo, subdir)，非 GitHub URL 返回 None。
+
+    委托给 skills.source_url 的统一解析器，保持 bridge 接口为 plain tuple。
+    """
+    from openkitsune.skills.source_url import parse_github_source
+
+    result = parse_github_source(url)
+    if result is not None:
+        return result.owner, result.repo, result.subdir
+    return None
+
+
+def _parse_gitee_url(url: str) -> tuple[str, str] | None:
+    """从 HTTPS Gitee URL 中提取 (owner, repo)，非 Gitee URL 返回 None。"""
+    import re
+
+    m = re.match(r"https?://gitee\.com/([^/]+)/([^/.]+)", url)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def _download_gitee_zip(repo_owner: str, repo_name: str, dest_dir: Path) -> None:
+    """通过 Gitee Archive API 下载仓库 ZIP 并解压到 dest_dir（不依赖 git）。"""
+    import io
+    import shutil
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    data: bytes | None = None
+    last_err: Exception | None = None
+
+    for branch in ("master", "main"):
+        if data is not None:
+            break
+        url = f"https://gitee.com/{repo_owner}/{repo_name}/repository/archive/{branch}.zip"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "OpenKitsune"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+        except Exception as e:
+            last_err = e
+
+    if data is None:
+        raise RuntimeError(
+            f"无法下载 Gitee 仓库 {repo_owner}/{repo_name}，请检查网络。（最后错误: {last_err}）"
+        )
+
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        _validate_zip_members(zf)
+        tmp_extract = Path(tempfile.mkdtemp(prefix="openkitsune_gitee_"))
+        try:
+            zf.extractall(tmp_extract)
+            children = list(tmp_extract.iterdir())
+            src = children[0] if len(children) == 1 and children[0].is_dir() else tmp_extract
+            shutil.copytree(str(src), str(dest_dir))
+        finally:
+            shutil.rmtree(str(tmp_extract), ignore_errors=True)
+
+
+def _is_valid_skill_dir(d: Path) -> bool:
+    """目录存在且包含 SKILL.md（排除残留空目录）。"""
+    return d.is_dir() and (d / "SKILL.md").exists()
+
+
+def _read_skill_source(d: Path) -> str:
+    """读取技能目录的安装来源标记。"""
+    try:
+        return (d / ".openkitsune-source").read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _make_path_writable(path: str) -> None:
+    """Best-effort chmod used before deleting Git pack files on Windows."""
+    import os
+    import stat
+
+    with contextlib.suppress(Exception):
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+
+
+def _remove_tree(d: Path, *, retries: int = 3) -> None:
+    """Remove a directory with small Windows-friendly retries."""
+    import shutil
+
+    def onerror(func, path, exc_info):
+        _make_path_writable(path)
+        func(path)
+
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(d, onerror=onerror)
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(0.15 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+
+
+def _quarantine_broken_skill_dir(d: Path) -> Path:
+    """Move an undeletable partial install aside so a clean install can continue."""
+    quarantine_root = d.parent / ".openkitsune-broken"
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+    target = quarantine_root / f"{d.name}-{int(time.time())}"
+    d.rename(target)
+    return target
+
+
+def _cleanup_broken_skill_dir(d: Path) -> None:
+    """清理残留的无效技能目录（无 SKILL.md）。清理失败则抛出异常。"""
+    try:
+        _remove_tree(d)
+    except Exception as remove_err:
+        try:
+            quarantined = _quarantine_broken_skill_dir(d)
+        except Exception as quarantine_err:
+            raise SkillInstallError(
+                "skill_residual_cleanup_failed",
+                (
+                    f"无法清理残留技能目录：{d}。"
+                    "该目录可能被 Git、杀毒软件或文件管理器占用。"
+                    "请关闭相关程序后重试，或手动删除该目录。"
+                ),
+            ) from quarantine_err
+        sys.stderr.write(
+            f"[install_skill] 残留目录无法直接删除，已隔离到 {quarantined}: {remove_err}\n"
+        )
+
+
+def _ensure_target_available(target: Path, url: str) -> None:
+    """确保安装目标目录可用：不存在、或是残留目录则清理。
+
+    - 目录不存在 → 直接返回
+    - 目录存在但无 SKILL.md（残留） → 清理后返回
+    - 目录存在且有 SKILL.md + 相同来源 → raise "该技能已安装"
+    - 目录存在且有 SKILL.md + 不同来源 → raise "技能目录名称冲突"
+    """
+    if not target.exists():
+        return
+    if not _is_valid_skill_dir(target):
+        _cleanup_broken_skill_dir(target)
+        return
+    if _read_skill_source(target) == url:
+        raise ValueError(f"该技能已安装: {target}")
+    raise ValueError(f"技能目录名称冲突: {target}")
+
+
+def _copy_skill_tree(source_dir: Path, target: Path) -> None:
+    """Copy a validated skill tree to the final directory without Git metadata."""
+    import shutil
+
+    shutil.copytree(
+        str(source_dir),
+        str(target),
+        ignore=shutil.ignore_patterns(".git", ".git/*"),
+    )
+
+
+def _install_repo_tree_to_target(
+    *,
+    repo_url: str,
+    target: Path,
+    subdir: str | None = None,
+    zip_downloader: Any | None = None,
+) -> None:
+    """Clone/download a repo into temp storage, then copy only the skill tree."""
+    import shutil
+    import tempfile
+
+    tmp_parent = Path(tempfile.mkdtemp(prefix="openkitsune_skill_"))
+    tmp_dir = tmp_parent / "repo"
+    try:
+        if _has_git():
+            _git_clone(["git", "clone", "--depth", "1", repo_url, str(tmp_dir)])
+        elif zip_downloader is not None:
+            zip_downloader(tmp_dir)
+        else:
+            raise FileNotFoundError("未找到 git 命令。请安装 Git (https://git-scm.com) 后重试")
+
+        source_dir = tmp_dir / subdir if subdir else tmp_dir
+        if not source_dir.is_dir():
+            raise ValueError(f"仓库中未找到技能目录: {subdir}")
+        _copy_skill_tree(source_dir, target)
+    finally:
+        shutil.rmtree(str(tmp_parent), ignore_errors=True)
+
+
+# 通用 CLI 命令前缀清洗：用户经常直接复制类似
+#   "openkitsune install-skill owner/repo"
+#   "npx skills add owner/repo"
+#   "uv pip install owner/repo"
+#   "Run: openkitsune skill add owner/repo"
+# 这样的指令到对话框 / API 里。从中抽出真正的 URL/owner/repo 信号，
+# 避免 install_skill 因为前面的命令串而拒绝。
+_CMD_VERB = r"(?:add|install|i|get|use|run)"
+_CMD_TOOL = (
+    r"(?:openkitsune(?:\s+(?:skills?|install[- ]skill))?"
+    r"|npx\s+skills?"
+    r"|skills?"
+    r"|pnpm\s+(?:add|install)"
+    r"|npm\s+(?:i|install|add)"
+    r"|yarn\s+add"
+    r"|uv(?:\s+pip)?"
+    r"|pipx?"
+    r"|cargo)"
+)
+_CMD_PREFIXES = re.compile(
+    rf"^(?:Run\s*:\s*)?(?:{_CMD_TOOL}\s+){_CMD_VERB}?\s+",
+    re.IGNORECASE,
+)
+
+# 用于从混杂文本里提取首个有效 skill 信号（URL / owner/repo / 本地路径）
+_SKILL_URL_RE = re.compile(
+    r"(github:[A-Za-z0-9_./-]+"
+    r"|https?://\S+"
+    r"|git@[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+\.git"
+    r"|[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+)"
+)
+
+
+def _extract_skill_signal(raw: str) -> str:
+    """从用户输入里提取真正的 skill 安装信号。
+
+    支持三种粘贴方式：
+      1. 纯 URL / owner/repo / 本地路径（直接 strip）。
+      2. 单行 CLI：``openkitsune install-skill owner/repo`` —— 先用
+         ``_CMD_PREFIXES`` 剥离命令前缀；剥离后还可能留 ``--flag value``，
+         再尝试用 ``_SKILL_URL_RE`` 抽出第一个 URL/owner-repo 片段。
+      3. 多行文本：按行扫描，取第一行能命中 URL/owner-repo 的内容。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+
+    # Single line first: cheapest and most common.
+    if "\n" not in text:
+        cleaned = _CMD_PREFIXES.sub("", text).strip()
+        if not cleaned:
+            return ""
+        # If the cleaned form has flags / extra args, keep only the first URL-like token.
+        if cleaned.split() and len(cleaned.split()) > 1:
+            m = _SKILL_URL_RE.search(cleaned)
+            if m:
+                return m.group(1).strip()
+        return cleaned
+
+    # Multi-line: scan lines, pick the first that yields a URL-like token.
+    for line in text.splitlines():
+        line = line.strip().strip("`").strip()
+        if not line or line.startswith("#"):
+            continue
+        candidate = _CMD_PREFIXES.sub("", line).strip()
+        if not candidate:
+            continue
+        m = _SKILL_URL_RE.search(candidate)
+        if m:
+            return m.group(1).strip()
+        if candidate.startswith(("./", "../", "/", "~", ".\\", "..\\")) or (
+            len(candidate) >= 2 and candidate[1] == ":"
+        ):
+            return candidate
+    return ""
+
+
+def install_skill(
+    workspace_dir: str,
+    url: str,
+    *,
+    category: str | None = None,
+    emit_result: bool = True,
+) -> Path:
+    """安装技能（从 SkillHub、Git URL、GitHub 简写或本地目录）。
+
+    Args:
+        workspace_dir: 工作区根目录
+        url: 技能来源（skillhub:@namespace/slug / Git URL / owner/repo / 本地路径）
+        category: 可选大类。命中且通过校验时，安装到 ``skills/<category>/<skill_id>/``；
+            否则维持旧行为安装到 ``skills/<skill_id>/``（顶层平铺）。
+    """
+    url = _extract_skill_signal(url)
+    if not url:
+        raise ValueError("请输入有效的技能地址，如 owner/repo 或 Git URL")
+    from openkitsune.skills.marketplace import normalize_skillhub_source
+
+    skillhub_source = normalize_skillhub_source(url)
+    if skillhub_source:
+        url = skillhub_source
+
+    root_skills_dir = _resolve_skills_dir(workspace_dir)
+    root_skills_dir.mkdir(parents=True, exist_ok=True)
+    origin_metadata: dict[str, str | None] | None = None
+
+    # 校验 category 并解析最终落盘根。校验失败时退化为顶层安装并向 stderr
+    # 写一行提示，**不污染 stdout 的 JSON 协议**（CLI 与 API 都按行解析 stdout）。
+    skills_dir = root_skills_dir
+    if category:
+        try:
+            from openkitsune.skills.categories import is_valid_category_name
+
+            if is_valid_category_name(category):
+                skills_dir = root_skills_dir / category
+                skills_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                sys.stderr.write(f"[install_skill] 分类名 {category!r} 非法，已忽略并安装到顶层\n")
+        except Exception as ce:
+            sys.stderr.write(f"[install_skill] 分类校验异常 {category!r}: {ce}，已安装到顶层\n")
+            skills_dir = root_skills_dir
+
+    if url.startswith("skillhub:"):
+        from openkitsune.skills.marketplace import parse_skillhub_locator
+
+        locator = parse_skillhub_locator(url)
+        source_locator = locator.canonical_locator
+        skill_name = _sanitize_skill_dir_name(locator.slug)
+        target = skills_dir / skill_name
+        if target.exists() and _is_valid_skill_dir(target):
+            if _read_skill_source(target) != source_locator and locator.namespace:
+                skill_name = _sanitize_skill_dir_name(f"{locator.namespace}-{locator.slug}")
+                target = skills_dir / skill_name
+        _ensure_target_available(target, source_locator)
+        origin_metadata = _download_skillhub_skill(url, target)
+        url = source_locator
+
+    elif url.startswith("github:"):
+        # github:user/repo/path -> clone from GitHub
+        parts = url.replace("github:", "").split("/")
+        if len(parts) < 2:
+            raise ValueError(f"无效的 GitHub URL: {url}")
+        owner, repo = parts[0], parts[1]
+        skill_name = parts[-1] if len(parts) > 2 else repo
+        gh_subdir = "/".join(parts[2:]) if len(parts) > 2 else None
+        target = skills_dir / skill_name
+
+        _ensure_target_available(target, url)
+
+        git_url = f"https://github.com/{owner}/{repo}.git"
+        _install_repo_tree_to_target(
+            repo_url=git_url,
+            target=target,
+            subdir=gh_subdir,
+            zip_downloader=lambda dest: _download_github_zip(owner, repo, dest),
+        )
+
+    elif url.startswith("http://") or url.startswith("https://"):
+        gh = _parse_github_url(url)
+        ge = _parse_gitee_url(url)
+
+        if gh:
+            # GitHub URL（含 blob/tree）— 始终用规范化的仓库 URL 克隆
+            owner, repo, gh_subdir = gh
+            skill_name = (gh_subdir or "").rsplit("/", 1)[-1] if gh_subdir else repo
+            skill_name = _sanitize_skill_dir_name(skill_name)
+            target = skills_dir / skill_name
+            _ensure_target_available(target, url)
+
+            repo_url = f"https://github.com/{owner}/{repo}.git"
+            _install_repo_tree_to_target(
+                repo_url=repo_url,
+                target=target,
+                subdir=gh_subdir,
+                zip_downloader=lambda dest: _download_github_zip(owner, repo, dest),
+            )
+        elif ge:
+            skill_name = url.rstrip("/").split("/")[-1].replace(".git", "")
+            target = skills_dir / skill_name
+            _ensure_target_available(target, url)
+            _install_repo_tree_to_target(
+                repo_url=url,
+                target=target,
+                zip_downloader=lambda dest: _download_gitee_zip(ge[0], ge[1], dest),
+            )
+        else:
+            skill_name = url.rstrip("/").split("/")[-1].replace(".git", "")
+            target = skills_dir / skill_name
+            _ensure_target_available(target, url)
+            _install_repo_tree_to_target(repo_url=url, target=target)
+
+    elif _looks_like_github_shorthand(url):
+        # GitHub 简写格式: "owner/repo@skill-name" 或 "owner/repo"
+        import shutil
+        import tempfile
+
+        if "@" in url:
+            repo_part, requested_skill = url.split("@", 1)
+            requested_skill = requested_skill.strip().replace("\\", "/").strip("/")
+            if not requested_skill:
+                requested_skill = repo_part.split("/")[-1]
+        else:
+            repo_part = url
+            requested_skill = repo_part.split("/")[-1]
+
+        owner, repo = repo_part.split("/", 1)
+        skill_name = _sanitize_skill_dir_name(requested_skill)
+        target = skills_dir / skill_name
+
+        if target.exists():
+            if _is_valid_skill_dir(target) and _read_skill_source(target) != url:
+                # 不同来源的同名技能，用 owner 前缀消歧
+                skill_name = _sanitize_skill_dir_name(f"{owner}-{requested_skill}")
+                target = skills_dir / skill_name
+            # 无论原始目录还是消歧目录，统一检查
+        _ensure_target_available(target, url)
+
+        # Strategy 1: Try platform cache first
+        platform_skill_id = f"{owner}-{repo}-{skill_name}".lower().replace("/", "-")
+        if _try_platform_skill_download(platform_skill_id, target):
+            try:
+                origin_file = target / ".openkitsune-source"
+                origin_file.write_text(url, encoding="utf-8")
+            except Exception:
+                pass
+            if emit_result:
+                _json_print({"status": "ok", "skill_dir": str(target), "source": "platform-cache"})
+            return target
+        # Cache downloads may leave a partial directory if interrupted or locked.
+        _ensure_target_available(target, url)
+
+        # Strategy 2: git clone / ZIP download
+        tmp_parent = Path(tempfile.mkdtemp(prefix="openkitsune_skill_"))
+        tmp_dir = tmp_parent / "repo"
+        try:
+            if _has_git():
+                repo_url = f"https://github.com/{repo_part}.git"
+                _git_clone(["git", "clone", "--depth", "1", repo_url, str(tmp_dir)])
+            else:
+                _download_github_zip(owner, repo, tmp_dir)
+
+            # 支持 skillId 为子路径（如 "skills/web-search"）
+            preferred_rel_paths: list[str] = []
+            if requested_skill:
+                preferred_rel_paths.append(requested_skill)
+                if requested_skill.startswith("skills/"):
+                    stripped = requested_skill[len("skills/") :]
+                    if stripped:
+                        preferred_rel_paths.append(stripped)
+                else:
+                    preferred_rel_paths.append(f"skills/{requested_skill}")
+            if skill_name:
+                preferred_rel_paths.extend([f"skills/{skill_name}", skill_name])
+
+            source_dir: Path | None = None
+            seen: set[str] = set()
+            for rel in preferred_rel_paths:
+                rel_norm = rel.replace("\\", "/").strip("/")
+                if not rel_norm or rel_norm in seen:
+                    continue
+                seen.add(rel_norm)
+                candidate = tmp_dir / rel_norm
+                if candidate.is_dir():
+                    source_dir = candidate
+                    break
+
+            # 若未命中子目录，则按“整个仓库就是一个技能”处理
+            source_dir = source_dir or tmp_dir
+            _copy_skill_tree(source_dir, target)
+        finally:
+            shutil.rmtree(str(tmp_parent), ignore_errors=True)
+    else:
+        # Local path — copy into workspace skills directory
+        src = Path(url).expanduser().resolve()
+        if not src.exists():
+            raise ValueError(f"源路径不存在: {url}")
+        if not src.is_dir():
+            raise ValueError(f"源路径不是目录: {url}")
+
+        target = skills_dir / src.name
+        _ensure_target_available(target, url)
+        _copy_skill_tree(src, target)
+
+    # Record install origin for marketplace matching (Issue #15)
+    try:
+        origin_file = target / ".openkitsune-source"
+        origin_file.write_text(url, encoding="utf-8")
+        if origin_metadata:
+            (target / ".openkitsune-origin.json").write_text(
+                json.dumps(origin_metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    except Exception:
+        pass
+
+    if emit_result:
+        _json_print({"status": "ok", "skill_dir": str(target)})
+    return target
+
+
+def uninstall_skill(workspace_dir: str, skill_name: str) -> None:
+    """卸载技能"""
+    import shutil
+
+    skills_dir = _resolve_skills_dir(workspace_dir)
+    target = (skills_dir / skill_name).resolve()
+
+    if target == skills_dir.resolve():
+        raise ValueError("不允许删除技能根目录")
+
+    if not target.exists():
+        raise ValueError(f"技能不存在: {skill_name}")
+
+    # 防止路径穿越：确保解析后的路径仍在 skills_dir 下
+    # 使用 relative_to 而不是 str.startswith（避免前缀碰撞，如 skills_evil/）
+    try:
+        target.relative_to(skills_dir.resolve())
+    except ValueError:
+        raise ValueError(f"不允许删除非工作区技能: {target}")
+
+    # 检查是否为系统技能（SKILL.md 中 system: true）
+    skill_md = target / "SKILL.md"
+    if skill_md.exists():
+        content = skill_md.read_bytes().decode("utf-8", errors="replace")
+        if "system: true" in content.lower()[:500]:
+            raise ValueError(f"不允许删除系统技能: {skill_name}")
+
+    shutil.rmtree(str(target))
+    _json_print({"status": "ok", "removed": skill_name})
+
+
+def list_marketplace(query: str = "agent", page: int = 1, page_size: int = 20) -> None:
+    """Search SkillHub and emit the provider-neutral marketplace model."""
+    import urllib.parse
+    import urllib.request
+
+    from openkitsune.skills.marketplace import SKILLHUB_SKILLS_API, normalize_skillhub_response
+
+    page = max(1, page)
+    page_size = min(100, max(1, page_size))
+    params = urllib.parse.urlencode(
+        {
+            "keyword": query.strip(),
+            "page": page,
+            "pageSize": page_size,
+            "sortBy": "downloads",
+            "order": "desc",
+        }
+    )
+    request = urllib.request.Request(
+        f"{SKILLHUB_SKILLS_API}?{params}",
+        headers={"User-Agent": "OpenKitsune-SetupCenter"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    _json_print(normalize_skillhub_response(payload, page=page, page_size=page_size))
+
+
+def get_skill_config(workspace_dir: str, skill_name: str) -> None:
+    """获取技能的配置 schema"""
+    from openkitsune.skills.loader import SkillLoader
+
+    wd = Path(workspace_dir).expanduser().resolve()
+    loader = SkillLoader()
+    loader.load_all(base_path=wd)
+
+    entry = loader.registry.get(skill_name)
+    if entry is None:
+        raise ValueError(f"技能未找到: {skill_name}")
+
+    _json_print(
+        {
+            "name": entry.name,
+            "config": entry.config or [],
+        }
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    p = argparse.ArgumentParser(prog="openkitsune.setup_center.bridge")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list-providers", help="列出服务商（JSON）")
+
+    pm = sub.add_parser("list-models", help="拉取模型列表（JSON）")
+    pm.add_argument("--api-type", required=True, help="openai | anthropic")
+    pm.add_argument("--base-url", required=True, help="API Base URL（openai 通常是 .../v1）")
+    pm.add_argument("--provider-slug", default="", help="可选：用于能力推断与注册表命中")
+
+    ps = sub.add_parser("list-skills", help="列出技能（JSON）")
+    ps.add_argument(
+        "--workspace-dir", required=True, help="工作区目录（用于扫描 skills/.cursor/skills 等）"
+    )
+
+    ph = sub.add_parser("health-check-endpoint", help="检测 LLM 端点健康度（JSON）")
+    ph.add_argument("--workspace-dir", required=True, help="工作区目录")
+    ph.add_argument("--endpoint-name", default="", help="可选：仅检测指定端点（为空=全部）")
+
+    pi = sub.add_parser("health-check-im", help="检测 IM 通道连通性（JSON）")
+    pi.add_argument("--workspace-dir", required=True, help="工作区目录")
+    pi.add_argument("--channel", default="", help="可选：仅检测指定通道 ID（为空=全部）")
+
+    p_ecd = sub.add_parser("ensure-channel-deps", help="检查并自动安装已启用 IM 通道的依赖（JSON）")
+    p_ecd.add_argument("--workspace-dir", required=True, help="工作区目录")
+
+    p_inst = sub.add_parser("install-skill", help="安装技能（从 URL/路径）")
+    p_inst.add_argument("--workspace-dir", required=True, help="工作区目录")
+    p_inst.add_argument("--url", required=True, help="技能来源 URL 或路径")
+
+    p_uninst = sub.add_parser("uninstall-skill", help="卸载技能")
+    p_uninst.add_argument("--workspace-dir", required=True, help="工作区目录")
+    p_uninst.add_argument("--skill-name", required=True, help="技能名称")
+
+    p_market = sub.add_parser("list-marketplace", help="搜索市场可用技能（JSON）")
+    p_market.add_argument("--query", default="agent", help="搜索关键词")
+    p_market.add_argument("--page", type=int, default=1, help="结果页码")
+    p_market.add_argument("--page-size", type=int, default=20, help="每页结果数")
+
+    p_cfg = sub.add_parser("get-skill-config", help="获取技能配置 schema（JSON）")
+    p_cfg.add_argument("--workspace-dir", required=True, help="工作区目录")
+    p_cfg.add_argument("--skill-name", required=True, help="技能名称")
+
+    p_fos = sub.add_parser("feishu-onboard-start", help="启动飞书 Device Flow 扫码建应用（JSON）")
+    p_fos.add_argument("--domain", default="feishu", help="feishu | lark")
+
+    p_fop = sub.add_parser("feishu-onboard-poll", help="轮询飞书 Device Flow 授权状态（JSON）")
+    p_fop.add_argument("--domain", default="feishu", help="feishu | lark")
+    p_fop.add_argument("--device-code", required=True, help="init 返回的 device_code")
+
+    p_fv = sub.add_parser("feishu-validate", help="验证飞书凭证有效性（JSON）")
+    p_fv.add_argument("--app-id", required=True, help="飞书 App ID")
+    p_fv.add_argument("--app-secret", required=True, help="飞书 App Secret")
+    p_fv.add_argument("--domain", default="feishu", help="feishu | lark")
+
+    sub.add_parser("wecom-onboard-start", help="生成企微扫码配置二维码（JSON）")
+
+    p_wop = sub.add_parser("wecom-onboard-poll", help="轮询企微扫码配置结果（JSON）")
+    p_wop.add_argument("--scode", required=True, help="generate 返回的 scode")
+
+    sub.add_parser("qqbot-onboard-start", help="创建 QQ 登录会话（JSON）")
+
+    p_qop = sub.add_parser("qqbot-onboard-poll", help="轮询 QQ 扫码登录状态（JSON）")
+    p_qop.add_argument("--session-id", required=True, help="create_session 返回的 session_id")
+
+    sub.add_parser("qqbot-onboard-create", help="创建 QQ 机器人（JSON）")
+
+    p_qpc = sub.add_parser("qqbot-onboard-poll-and-create", help="原子 poll+create（JSON）")
+    p_qpc.add_argument("--session-id", required=True, help="create_session 返回的 session_id")
+
+    p_qv = sub.add_parser("qqbot-validate", help="验证 QQ 机器人凭证有效性（JSON）")
+    p_qv.add_argument("--app-id", required=True, help="QQ 机器人 App ID")
+    p_qv.add_argument("--app-secret", required=True, help="QQ 机器人 App Secret")
+
+    sub.add_parser("wechat-onboard-start", help="获取微信登录二维码（JSON）")
+
+    p_wcp = sub.add_parser("wechat-onboard-poll", help="轮询微信扫码登录状态（JSON）")
+    p_wcp.add_argument("--qrcode", required=True, help="get_bot_qrcode 返回的 qrcode")
+
+    args = p.parse_args(argv)
+
+    if args.cmd == "list-providers":
+        list_providers()
+        return
+
+    if args.cmd == "list-models":
+        api_key = os.environ.get("SETUPCENTER_API_KEY", "")
+        asyncio.run(
+            list_models(
+                api_type=args.api_type,
+                base_url=args.base_url,
+                provider_slug=(args.provider_slug.strip() or None),
+                api_key=api_key,
+            )
+        )
+        return
+
+    if args.cmd == "list-skills":
+        list_skills(args.workspace_dir)
+        return
+
+    if args.cmd == "health-check-endpoint":
+        asyncio.run(
+            health_check_endpoint(
+                workspace_dir=args.workspace_dir,
+                endpoint_name=(args.endpoint_name.strip() or None),
+            )
+        )
+        return
+
+    if args.cmd == "health-check-im":
+        asyncio.run(
+            health_check_im(
+                workspace_dir=args.workspace_dir,
+                channel=(args.channel.strip() or None),
+            )
+        )
+        return
+
+    if args.cmd == "ensure-channel-deps":
+        ensure_channel_deps(workspace_dir=args.workspace_dir)
+        return
+
+    if args.cmd == "install-skill":
+        install_skill(workspace_dir=args.workspace_dir, url=args.url)
+        return
+
+    if args.cmd == "uninstall-skill":
+        uninstall_skill(workspace_dir=args.workspace_dir, skill_name=args.skill_name)
+        return
+
+    if args.cmd == "list-marketplace":
+        list_marketplace(query=args.query, page=args.page, page_size=args.page_size)
+        return
+
+    if args.cmd == "get-skill-config":
+        get_skill_config(workspace_dir=args.workspace_dir, skill_name=args.skill_name)
+        return
+
+    if args.cmd == "feishu-onboard-start":
+        asyncio.run(feishu_onboard_start(domain=args.domain))
+        return
+
+    if args.cmd == "feishu-onboard-poll":
+        asyncio.run(feishu_onboard_poll(domain=args.domain, device_code=args.device_code))
+        return
+
+    if args.cmd == "feishu-validate":
+        asyncio.run(
+            feishu_validate(
+                app_id=args.app_id,
+                app_secret=args.app_secret,
+                domain=args.domain,
+            )
+        )
+        return
+
+    if args.cmd == "wecom-onboard-start":
+        asyncio.run(wecom_onboard_start())
+        return
+
+    if args.cmd == "wecom-onboard-poll":
+        asyncio.run(wecom_onboard_poll(scode=args.scode))
+        return
+
+    if args.cmd == "qqbot-onboard-start":
+        asyncio.run(qqbot_onboard_start())
+        return
+
+    if args.cmd == "qqbot-onboard-poll":
+        asyncio.run(qqbot_onboard_poll(session_id=args.session_id))
+        return
+
+    if args.cmd == "qqbot-onboard-create":
+        asyncio.run(qqbot_onboard_create())
+        return
+
+    if args.cmd == "qqbot-onboard-poll-and-create":
+        asyncio.run(qqbot_onboard_poll_and_create(session_id=args.session_id))
+        return
+
+    if args.cmd == "qqbot-validate":
+        asyncio.run(
+            qqbot_validate(
+                app_id=args.app_id,
+                app_secret=args.app_secret,
+            )
+        )
+        return
+
+    if args.cmd == "wechat-onboard-start":
+        asyncio.run(wechat_onboard_start())
+        return
+
+    if args.cmd == "wechat-onboard-poll":
+        asyncio.run(wechat_onboard_poll(qrcode=args.qrcode))
+        return
+
+    raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    from openkitsune.runtime_env import IS_FROZEN, ensure_ssl_certs, inject_module_paths
+
+    if IS_FROZEN:
+        ensure_ssl_certs()
+        inject_module_paths()
+
+    try:
+        main()
+    except Exception as e:
+        sys.stderr.write(str(e))
+        sys.stderr.write("\n")
+        raise

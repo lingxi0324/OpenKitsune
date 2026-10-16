@@ -1,0 +1,235 @@
+{
+  "timestamp": "2026-06-19T10:33:17.967759",
+  "max_iterations": 10,
+  "evolution_cycles": 10,
+  "best_accuracy": 0.42857142857142855,
+  "best_weights": {
+    "year": 0.258,
+    "month": 0.361,
+    "day": 0.258,
+    "hour": 0.124
+  },
+  "best_threshold": 0.03,
+  "hase_ternary": true,
+  "trajectory": [
+    {
+      "iteration": 1,
+      "weights": {
+        "year": 0.385,
+        "month": 0.256,
+        "day": 0.256,
+        "hour": 0.103
+      },
+      "threshold": 0.05,
+      "accuracy": 0.3333333333333333,
+      "correct": 5,
+      "total": 15,
+      "evolve_once": {
+        "cycle": 1,
+        "dominant": "震魂",
+        "state": "阴",
+        "R": 3,
+        "realm": "水转"
+      }
+    },
+    {
+      "iteration": 2,
+      "weights": {
+        "year": 0.467,
+        "month": 0.267,
+        "day": 0.133,
+        "hour": 0.133
+      },
+      "threshold": 0.03,
+      "accuracy": 0.3333333333333333,
+      "correct": 6,
+      "total": 18,
+      "evolve_once": {
+        "cycle": 2,
+        "dominant": "兑魄",
+        "state": "中",
+        "R": 1,
+        "realm": "水转"
+      }
+    },
+    {
+      "iteration": 3,
+      "weights": {
+        "year": 0.474,
+        "month": 0.211,
+        "day": 0.211,
+        "hour": 0.105
+      },
+      "threshold": 0.03,
+      "accuracy": 0.29411764705882354,
+      "correct": 5,
+      "total": 17,
+      "evolve_once": {
+        "cycle": 3,
+        "dominant": "兑魄",
+        "state": "中",
+        "R": 4,
+        "realm": "水转"
+      }
+    },
+    {
+      "iteration": 4,
+      "weights": {
+        "year": 0.373,
+        "month": 0.299,
+        "day": 0.149,
+        "hour": 0.179
+      },
+      "threshold": 0.02,
+      "accuracy": 0.4,
+      "correct": 8,
+      "total": 20,
+      "evolve_once": {
+        "cycle": 4,
+        "dominant": "兑魄",
+        "state": "中",
+        "R": 1,
+        "realm": "水转"
+      }
+    },
+    {
+      "iteration": 5,
+      "weights": {
+        "year": 0.375,
+        "month": 0.25,
+        "day": 0.187,
+        "hour": 0.187
+      },
+      "threshold": 0.05,
+      "accuracy": 0.3333333333333333,
+      "correct": 5,
+      "total": 15,
+      "evolve_once": {
+        "cycle": 5,
+        "dominant": "兑魄",
+        "state": "阳",
+        "R": 5,
+        "realm": "水转"
+      }
+    },
+    {
+      "iteration": 6,
+      "weights": {
+        "year": 0.381,
+        "month": 0.19,
+        "day": 0.286,
+        "hour": 0.143
+      },
+      "threshold": 0.01,
+      "accuracy": 0.4,
+      "correct": 8,
+      "total": 20,
+      "evolve_once": {
+        "cycle": 6,
+        "dominant": "兑魄",
+        "state": "阴",
+        "R": 0,
+        "realm": "水转"
+      }
+    },
+    {
+      "iteration": 7,
+      "weights": {
+        "year": 0.529,
+        "month": 0.235,
+        "day": 0.176,
+        "hour": 0.059
+      },
+      "threshold": 0.02,
+      "accuracy": 0.3333333333333333,
+      "correct": 6,
+      "total": 18,
+      "evolve_once": {
+        "cycle": 7,
+        "dominant": "兑魄",
+        "state": "阳",
+        "R": 2,
+        "realm": "水转"
+      }
+    },
+    {
+      "iteration": 8,
+      "weights": {
+        "year": 0.258,
+        "month": 0.361,
+        "day": 0.258,
+        "hour": 0.124
+      },
+      "threshold": 0.01,
+      "accuracy": 0.42857142857142855,
+      "correct": 9,
+      "total": 21,
+      "evolve_once": {
+        "cycle": 8,
+        "dominant": "兑魄",
+        "state": "阴",
+        "R": 6,
+        "realm": "水转"
+      }
+    },
+    {
+      "iteration": 9,
+      "weights": {
+        "year": 0.389,
+        "month": 0.389,
+        "day": 0.167,
+        "hour": 0.056
+      },
+      "threshold": 0.05,
+      "accuracy": 0.35714285714285715,
+      "correct": 5,
+      "total": 14,
+      "evolve_once": {
+        "cycle": 9,
+        "dominant": "兑魄",
+        "state": "阳",
+        "R": 5,
+        "realm": "水转"
+      }
+    },
+    {
+      "iteration": 10,
+      "weights": {
+        "year": 0.37,
+        "month": 0.324,
+        "day": 0.231,
+        "hour": 0.074
+      },
+      "threshold": 0.01,
+      "accuracy": 0.3684210526315789,
+      "correct": 7,
+      "total": 19,
+      "evolve_once": {
+        "cycle": 10,
+        "dominant": "兑魄",
+        "state": "阴",
+        "R": 3,
+        "realm": "水转"
+      }
+    }
+  ],
+  "best_wrong_cases": [
+    "2024-01 木: 预期=0.049 实际=-12% ❌",
+    "2024-01 火: 预期=0.161 实际=-18% ❌",
+    "2024-01 土: 预期=0.374 实际=-8% ❌",
+    "2024-05 木: 预期=0.217 实际=-5% ❌",
+    "2024-05 火: 预期=0.069 实际=-8% ❌",
+    "2024-07 木: 预期=0.026 实际=-8% ❌",
+    "2024-07 火: 预期=0.176 实际=-15% ❌",
+    "2024-08 火: 预期=0.077 实际=-5% ❌",
+    "2024-09 金: 预期=-0.116 实际=+12% ❌",
+    "2024-09 水: 预期=0.309 实际=-8% ❌"
+  ],
+  "best_correct_samples": [
+    "2024-02 木: 预期=0.084 实际=+8% ✅",
+    "2024-02 火: 预期=0.073 实际=+15% ✅",
+    "2024-03 火: 预期=0.026 实际=+8% ✅",
+    "2024-06 火: 预期=-0.024 实际=-12% ✅",
+    "2024-09 木: 预期=0.081 实际=+25% ✅"
+  ]
+}

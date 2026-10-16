@@ -1,0 +1,17 @@
+.marketplace-install-indeterminate {
+  width: 35%;
+  animation: marketplace-install-progress 1.5s ease-in-out infinite;
+}
+
+@keyframes marketplace-install-progress {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(290%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .marketplace-install-indeterminate {
+    animation: none;
+    transform: translateX(95%);
+    opacity: 0.7;
+  }
+}

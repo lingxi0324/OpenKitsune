@@ -1,0 +1,962 @@
+"""
+File 工具 - 文件操作
+"""
+
+import heapq
+import logging
+import re
+import shutil
+import threading
+import time
+from dataclasses import dataclass
+from fnmatch import fnmatch
+from pathlib import Path
+
+import aiofiles
+import aiofiles.os
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_IGNORE_DIRS = {
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    "coverage",
+    ".tox",
+    ".eggs",
+    ".cache",
+    ".parcel-cache",
+    "egg-info",
+}
+
+# Extra prune list applied only to grep (heavier/longer than glob/list).
+# Treats the OpenKitsune data plane and any vendored Python install as no-go
+# zones — the LLM should never need to recursively scan these. Previously a
+# misrouted grep on `~/.openkitsune` could lock up the worker for minutes
+# (see incident 2026-05-09 P0-1).
+GREP_EXTRA_BLOCKED_DIR_NAMES = {
+    "site-packages",
+    "Lib",  # Windows venv layout: <venv>/Lib/site-packages
+    "lib",  # Unix venv layout
+    "Scripts",
+    "bin",
+    "include",
+    "Include",
+    "share",
+    "runtime",
+    "workspaces",
+    "dist-web",
+    "logs",
+    "llm_debug",
+    "react_traces",
+    "delegation_logs",
+    "failure_analysis",
+    "diagnostics",
+    "memory_db",
+    "vector_store",
+}
+
+GREP_HARD_FORBIDDEN_PATH_FRAGMENTS = (
+    "/.openkitsune/runtime",
+    "/.openkitsune/workspaces",
+    "\\.openkitsune\\runtime",
+    "\\.openkitsune\\workspaces",
+)
+
+GREP_DEFAULT_MAX_FILES = 5000
+GREP_DEFAULT_MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50 MiB
+
+GLOB_DEFAULT_MAX_DIRS = 3000
+GLOB_DEFAULT_MAX_FILES = 20000
+GLOB_DEFAULT_MAX_RESULTS = 200
+GLOB_DEFAULT_TIMEOUT_SEC = 30
+
+
+@dataclass(slots=True)
+class GlobScanResult:
+    """Bounded result returned by the synchronous glob scanner."""
+
+    matches: list[tuple[str, float]]
+    total_matches: int
+    dirs_scanned: int
+    files_scanned: int
+    skipped: int
+    capped_reason: str | None = None
+
+
+class FileTool:
+    """文件操作工具"""
+
+    def __init__(self, base_path: str | None = None):
+        self.base_path = Path(base_path) if base_path else Path.cwd()
+        self.last_traversal_skipped = 0
+
+    def _resolve_path(self, path: str) -> Path:
+        """解析路径（支持相对路径和绝对路径）"""
+        p = Path(path)
+        if p.is_absolute():
+            return p.expanduser().resolve(strict=False)
+        from ..core.policy_v2.context import get_current_context
+        from ..core.working_directory import (
+            current_working_directory,
+            normalize_working_directory,
+        )
+
+        if get_current_context() is not None:
+            root = current_working_directory(require_available=True)
+        else:
+            root = normalize_working_directory(self.base_path, must_exist=True)
+        return (root / p).resolve(strict=False)
+
+    # 二进制文件扩展名
+    BINARY_EXTENSIONS = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".ico",
+        ".webp",
+        ".svg",
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".ppt",
+        ".pptx",
+        ".zip",
+        ".rar",
+        ".7z",
+        ".tar",
+        ".gz",
+        ".bz2",
+        ".exe",
+        ".dll",
+        ".so",
+        ".dylib",
+        ".mp3",
+        ".mp4",
+        ".avi",
+        ".mkv",
+        ".wav",
+        ".flac",
+        ".ttf",
+        ".otf",
+        ".woff",
+        ".woff2",
+        ".pyc",
+        ".pyo",
+        ".class",
+    }
+
+    async def read(self, path: str, encoding: str = "utf-8") -> str:
+        """
+        读取文件内容
+
+        Args:
+            path: 文件路径
+            encoding: 编码
+
+        Returns:
+            文件内容（二进制文件返回提示信息）
+        """
+        file_path = self._resolve_path(path)
+        logger.debug(f"Reading file: {file_path}")
+
+        # Windows 下用 open() 打开目录会抛 PermissionError [WinError 5]，导致
+        # 错误分类为 PERMISSION 触发反复重试。提前显式检测目录并抛 IsADirectoryError，
+        # 让 classify_error 能正确建议 LLM 改用 list_directory。
+        if file_path.is_dir():
+            raise IsADirectoryError(f"路径是目录而非文件，无法读取文件内容: {file_path}")
+
+        # 检查是否为二进制文件
+        suffix = file_path.suffix.lower()
+        if suffix in self.BINARY_EXTENSIONS:
+            # 获取文件大小
+            stat = await aiofiles.os.stat(file_path)
+            size_kb = stat.st_size / 1024
+            return f"[二进制文件: {file_path.name}, 类型: {suffix}, 大小: {size_kb:.1f}KB - 无法作为文本读取]"
+
+        try:
+            async with aiofiles.open(file_path, encoding=encoding) as f:
+                return await f.read()
+        except UnicodeDecodeError:
+            # 尝试检测编码或返回二进制提示
+            stat = await aiofiles.os.stat(file_path)
+            size_kb = stat.st_size / 1024
+            return f"[无法解码的文件: {file_path.name}, 大小: {size_kb:.1f}KB - 可能是二进制文件或使用了非 {encoding} 编码]"
+
+    async def write(
+        self,
+        path: str,
+        content: str,
+        encoding: str = "utf-8",
+        create_dirs: bool = True,
+    ) -> None:
+        """
+        写入文件
+
+        Args:
+            path: 文件路径
+            content: 内容
+            encoding: 编码
+            create_dirs: 是否自动创建目录
+        """
+        file_path = self._resolve_path(path)
+
+        if create_dirs:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        logger.debug(f"Writing file: {file_path}")
+
+        async with aiofiles.open(file_path, mode="w", encoding=encoding) as f:
+            await f.write(content)
+
+    async def append(
+        self,
+        path: str,
+        content: str,
+        encoding: str = "utf-8",
+    ) -> None:
+        """
+        追加内容到文件
+
+        Args:
+            path: 文件路径
+            content: 内容
+            encoding: 编码
+        """
+        file_path = self._resolve_path(path)
+        logger.debug(f"Appending to file: {file_path}")
+
+        async with aiofiles.open(file_path, mode="a", encoding=encoding) as f:
+            await f.write(content)
+
+    async def _read_preserving_newlines(self, path: str) -> str:
+        """读取文件内容，保留原始换行符（不做 CRLF→LF 转换）。
+
+        普通 ``read()`` 使用 text mode 会将 ``\\r\\n`` 转为 ``\\n``，
+        导致写回时丢失原有换行风格。本方法使用 ``newline=''``
+        保留原始字节级换行符。
+        """
+        file_path = self._resolve_path(path)
+        suffix = file_path.suffix.lower()
+        if suffix in self.BINARY_EXTENSIONS:
+            raise ValueError(f"Cannot edit binary file: {file_path.name}")
+        try:
+            async with aiofiles.open(file_path, encoding="utf-8", newline="") as f:
+                return await f.read()
+        except UnicodeDecodeError as e:
+            raise ValueError(f"Cannot decode file (non-UTF-8): {file_path.name}") from e
+
+    async def _write_preserving_newlines(self, path: str, content: str) -> None:
+        """写入文件内容，保留原始换行符（不做 LF→CRLF 转换）。"""
+        file_path = self._resolve_path(path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        async with aiofiles.open(file_path, mode="w", encoding="utf-8", newline="") as f:
+            await f.write(content)
+
+    async def edit(
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> dict:
+        """精确字符串替换式编辑（兼容 CRLF/LF）。
+
+        使用 ``newline=''`` 读写，保留文件原始换行风格。LLM 产生的
+        old_string 换行符始终是 ``\\n``，但 Windows 文件可能使用
+        ``\\r\\n``。本方法先尝试原始匹配，失败后自动将 old_string 中的
+        ``\\n`` 适配为 ``\\r\\n`` 重试，写回时保留文件原有换行风格。
+
+        Returns:
+            dict with keys: replaced (int), path (str)
+        Raises:
+            FileNotFoundError, ValueError
+        """
+        file_path = self._resolve_path(path)
+        if not file_path.is_file():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        raw = await self._read_preserving_newlines(path)
+
+        # Phase 1: 直接匹配（文件本身就是 LF，或 old_string 已包含 CRLF）
+        count = raw.count(old_string)
+
+        if count == 0:
+            # Phase 2: LLM 给的 \n，文件是 \r\n → 适配后重试
+            if "\r\n" in raw and "\n" in old_string:
+                adapted_old = old_string.replace("\n", "\r\n")
+                count = raw.count(adapted_old)
+                if count == 0:
+                    raise ValueError(
+                        "old_string not found in file (tried both LF and CRLF matching)"
+                    )
+                if count > 1 and not replace_all:
+                    raise ValueError(
+                        f"old_string found {count} times in file, "
+                        "set replace_all=true or provide more surrounding context"
+                    )
+                adapted_new = new_string.replace("\n", "\r\n")
+                limit = -1 if replace_all else 1
+                result = raw.replace(adapted_old, adapted_new, limit)
+            else:
+                raise ValueError("old_string not found in file")
+        else:
+            if count > 1 and not replace_all:
+                raise ValueError(
+                    f"old_string found {count} times in file, "
+                    "set replace_all=true or provide more surrounding context"
+                )
+            limit = -1 if replace_all else 1
+            result = raw.replace(old_string, new_string, limit)
+
+        replaced = count if replace_all else 1
+        await self._write_preserving_newlines(path, result)
+        return {"replaced": replaced, "path": str(file_path)}
+
+    async def grep(
+        self,
+        pattern: str,
+        path: str = ".",
+        *,
+        include: str | None = None,
+        context_lines: int = 0,
+        max_results: int = 50,
+        case_insensitive: bool = False,
+        max_files: int | None = None,
+        max_total_bytes: int | None = None,
+    ) -> list[dict]:
+        """纯 Python 内容搜索（跨平台，无需外部工具）。
+
+        Safety guards (PR-A1, see incident 2026-05-09 P0-1):
+        - Hard-rejects scanning the OpenKitsune runtime/workspaces directory or
+          drive roots / user home.
+        - Caps file count and bytes scanned to avoid worker lock-up when the
+          LLM aims grep at a multi-GB tree.
+
+        Returns:
+            list of dicts: {file, line, text, context_before, context_after,
+                            _scan_summary?}
+        """
+        flags = re.IGNORECASE if case_insensitive else 0
+        try:
+            regex = re.compile(pattern, flags)
+        except re.error as e:
+            raise ValueError(f"Invalid regex pattern: {e}") from e
+
+        dir_path = self._resolve_path(path)
+        if dir_path.is_file():
+            if not include:
+                include = dir_path.name
+            dir_path = dir_path.parent
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"Directory not found: {dir_path}")
+
+        # Path safety (feature-flagged so ops can roll back).
+        try:
+            from ..core.feature_flags import is_enabled as _ff_enabled
+        except Exception:
+
+            def _ff_enabled(_name: str) -> bool:
+                return True
+
+        if _ff_enabled("grep_safety_v1"):
+            forbidden_reason = self._grep_path_forbidden(dir_path)
+            if forbidden_reason:
+                raise ValueError(f"grep refused: {forbidden_reason}")
+            file_cap = (
+                max_files
+                if isinstance(max_files, int) and max_files > 0
+                else GREP_DEFAULT_MAX_FILES
+            )
+            byte_cap = (
+                max_total_bytes
+                if isinstance(max_total_bytes, int) and max_total_bytes > 0
+                else GREP_DEFAULT_MAX_TOTAL_BYTES
+            )
+        else:
+            file_cap = max_files if isinstance(max_files, int) and max_files > 0 else 10**9
+            byte_cap = (
+                max_total_bytes
+                if isinstance(max_total_bytes, int) and max_total_bytes > 0
+                else 10**12
+            )
+
+        file_glob = include or "*"
+        results: list[dict] = []
+        files_scanned = 0
+        bytes_scanned = 0
+        capped_reason: str | None = None
+
+        iterator = (
+            self._iter_grep_paths(dir_path, file_glob)
+            if _ff_enabled("grep_safety_v1")
+            else self._iter_matching_paths(dir_path, file_glob, recursive=True)
+        )
+        for file_path in iterator:
+            if len(results) >= max_results:
+                break
+            if files_scanned >= file_cap:
+                capped_reason = f"reached file cap ({file_cap})"
+                break
+            if bytes_scanned >= byte_cap:
+                capped_reason = f"reached byte cap ({byte_cap // (1024 * 1024)} MiB)"
+                break
+
+            if file_path.suffix.lower() in self.BINARY_EXTENSIONS:
+                continue
+
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            if stat.st_size > 5 * 1024 * 1024:
+                continue
+
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+            except (OSError, PermissionError):
+                continue
+            files_scanned += 1
+            bytes_scanned += stat.st_size
+
+            lines = text.splitlines()
+            rel = str(file_path.relative_to(dir_path))
+
+            for i, line in enumerate(lines):
+                if len(results) >= max_results:
+                    break
+                if regex.search(line):
+                    entry: dict = {
+                        "file": rel,
+                        "line": i + 1,
+                        "text": line,
+                    }
+                    if context_lines > 0:
+                        start = max(0, i - context_lines)
+                        end = min(len(lines), i + context_lines + 1)
+                        entry["context_before"] = lines[start:i]
+                        entry["context_after"] = lines[i + 1 : end]
+                    results.append(entry)
+
+        if capped_reason and not results:
+            results.append(
+                {
+                    "_scan_summary": (
+                        f"grep stopped early: {capped_reason} after {files_scanned} files"
+                        f" / {bytes_scanned // 1024} KiB scanned. Narrow path/include."
+                    ),
+                }
+            )
+        elif capped_reason:
+            results.append(
+                {
+                    "_scan_summary": (
+                        f"grep partial: {capped_reason}. Scanned {files_scanned} files /"
+                        f" {bytes_scanned // 1024} KiB before stopping."
+                    ),
+                }
+            )
+
+        return results
+
+    @staticmethod
+    def _grep_path_forbidden(dir_path: Path) -> str | None:
+        """Return a human-readable rejection reason or ``None`` if path is safe."""
+        return FileTool._search_path_forbidden(dir_path, tool_name="grep")
+
+    @staticmethod
+    def _glob_path_forbidden(dir_path: Path) -> str | None:
+        """Return a human-readable rejection reason or ``None`` if path is safe."""
+        return FileTool._search_path_forbidden(dir_path, tool_name="glob")
+
+    @staticmethod
+    def _search_path_forbidden(dir_path: Path, *, tool_name: str) -> str | None:
+        """Return a human-readable rejection reason or ``None`` if path is safe."""
+        try:
+            resolved = dir_path.resolve()
+        except OSError:
+            resolved = dir_path
+        path_str = str(resolved)
+        path_norm = path_str.replace("\\", "/").lower()
+
+        for fragment in GREP_HARD_FORBIDDEN_PATH_FRAGMENTS:
+            if fragment.replace("\\", "/").lower() in path_norm:
+                return (
+                    f"path '{path_str}' is under a protected runtime/workspaces "
+                    f"directory; refuse to scan recursively. Use a project-local "
+                    f"path or read specific files instead."
+                )
+
+        if resolved.parent == resolved:
+            return f"path '{path_str}' is a filesystem root; too broad for {tool_name}."
+        try:
+            home = Path.home().resolve()
+        except OSError:
+            home = None
+        if home is not None and resolved == home:
+            return f"path '{path_str}' is the user home directory; too broad for {tool_name}."
+
+        return None
+
+    def _iter_grep_paths(self, dir_path: Path, pattern: str):
+        """Like ``_iter_matching_paths`` but with the grep-only prune list."""
+        self.last_traversal_skipped = 0
+        forbidden_norm = tuple(
+            f.replace("\\", "/").lower() for f in GREP_HARD_FORBIDDEN_PATH_FRAGMENTS
+        )
+
+        def walk(root: Path):
+            try:
+                children = list(root.iterdir())
+            except OSError:
+                self.last_traversal_skipped += 1
+                return
+
+            for child in children:
+                if self._should_skip_relative_path(child, dir_path):
+                    continue
+                if child.name in GREP_EXTRA_BLOCKED_DIR_NAMES:
+                    self.last_traversal_skipped += 1
+                    continue
+                try:
+                    child_resolved = str(child.resolve()).replace("\\", "/").lower()
+                except OSError:
+                    child_resolved = str(child).replace("\\", "/").lower()
+                if any(frag in child_resolved for frag in forbidden_norm):
+                    self.last_traversal_skipped += 1
+                    continue
+
+                try:
+                    is_dir = child.is_dir()
+                    is_file = child.is_file()
+                except OSError:
+                    self.last_traversal_skipped += 1
+                    continue
+
+                if is_file and self._matches_pattern(child, dir_path, pattern):
+                    yield child
+
+                if is_dir:
+                    yield from walk(child)
+
+        yield from walk(dir_path)
+
+    @staticmethod
+    def _search_dir_name_blocked(name: str) -> bool:
+        return name in GREP_EXTRA_BLOCKED_DIR_NAMES
+
+    @staticmethod
+    def _search_path_fragment_blocked(path_norm: str) -> bool:
+        forbidden_norm = tuple(
+            f.replace("\\", "/").lower() for f in GREP_HARD_FORBIDDEN_PATH_FRAGMENTS
+        )
+        return any(frag in path_norm for frag in forbidden_norm)
+
+    async def delete(self, path: str) -> bool:
+        """删除单个文件或空目录。非空目录一律拒绝。"""
+        file_path = self._resolve_path(path)
+        logger.debug(f"Deleting: {file_path}")
+
+        try:
+            if file_path.is_file() or file_path.is_symlink():
+                await aiofiles.os.remove(file_path)
+            elif file_path.is_dir():
+                children = list(file_path.iterdir())
+                if children:
+                    logger.warning(f"Refused to delete non-empty directory {file_path}")
+                    return False
+                file_path.rmdir()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete {file_path}: {e}")
+            return False
+
+    async def exists(self, path: str) -> bool:
+        """检查路径是否存在"""
+        file_path = self._resolve_path(path)
+        return file_path.exists()
+
+    async def is_file(self, path: str) -> bool:
+        """检查是否是文件"""
+        file_path = self._resolve_path(path)
+        return file_path.is_file()
+
+    async def is_dir(self, path: str) -> bool:
+        """检查是否是目录"""
+        file_path = self._resolve_path(path)
+        return file_path.is_dir()
+
+    async def list_dir(
+        self,
+        path: str = ".",
+        pattern: str = "*",
+        recursive: bool = False,
+    ) -> list[str]:
+        """
+        列出目录内容
+
+        Args:
+            path: 目录路径
+            pattern: 文件名模式
+            recursive: 是否递归
+
+        Returns:
+            文件路径列表
+        """
+        dir_path = self._resolve_path(path)
+
+        if recursive:
+            return [
+                str(p.relative_to(dir_path))
+                for p in self._iter_matching_paths(
+                    dir_path, pattern, recursive=True, files_only=False
+                )
+            ]
+
+        self.last_traversal_skipped = 0
+        try:
+            return [str(p.relative_to(dir_path)) for p in dir_path.glob(pattern)]
+        except OSError:
+            self.last_traversal_skipped = 1
+            return []
+
+    async def search(
+        self,
+        pattern: str,
+        path: str = ".",
+        content_pattern: str | None = None,
+    ) -> list[str]:
+        """
+        搜索文件
+
+        Args:
+            pattern: 文件名模式
+            path: 搜索路径
+            content_pattern: 内容匹配模式（可选）
+
+        Returns:
+            匹配的文件路径列表
+        """
+        import re
+
+        dir_path = self._resolve_path(path)
+        matches = []
+
+        for file_path in dir_path.rglob(pattern):
+            if file_path.is_file():
+                if content_pattern:
+                    try:
+                        content = file_path.read_text(encoding="utf-8")
+                        if re.search(content_pattern, content):
+                            matches.append(str(file_path.relative_to(dir_path)))
+                    except Exception:
+                        pass
+                else:
+                    matches.append(str(file_path.relative_to(dir_path)))
+
+        return matches
+
+    def glob_scan(
+        self,
+        pattern: str,
+        path: str = ".",
+        *,
+        max_dirs: int | None = None,
+        max_files: int | None = None,
+        max_results: int | None = None,
+        max_seconds: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> GlobScanResult:
+        """Synchronous bounded glob scanner.
+
+        This runs in a worker thread from the async handler. The traversal
+        checks a deadline and cancel flag internally because cancelling
+        ``asyncio.to_thread`` does not stop the underlying thread immediately.
+        """
+        dir_path = self._resolve_path(path)
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"Directory not found: {dir_path}")
+
+        forbidden_reason = self._glob_path_forbidden(dir_path)
+        if forbidden_reason:
+            raise ValueError(f"glob refused: {forbidden_reason}")
+
+        dir_cap = max_dirs if isinstance(max_dirs, int) and max_dirs > 0 else GLOB_DEFAULT_MAX_DIRS
+        file_cap = (
+            max_files if isinstance(max_files, int) and max_files > 0 else GLOB_DEFAULT_MAX_FILES
+        )
+        result_cap = (
+            max_results
+            if isinstance(max_results, int) and max_results > 0
+            else GLOB_DEFAULT_MAX_RESULTS
+        )
+        duration_cap = (
+            float(max_seconds)
+            if isinstance(max_seconds, (int, float)) and max_seconds > 0
+            else float(GLOB_DEFAULT_TIMEOUT_SEC)
+        )
+        deadline = time.monotonic() + duration_cap
+
+        self.last_traversal_skipped = 0
+        skipped = 0
+        dirs_scanned = 0
+        files_scanned = 0
+        total_matches = 0
+        capped_reason: str | None = None
+        top_matches: list[tuple[float, str]] = []
+        stack = [dir_path]
+
+        def should_stop(*, include_dir_cap: bool) -> bool:
+            nonlocal capped_reason
+            if cancel_event is not None and cancel_event.is_set():
+                capped_reason = "cancelled by caller"
+                return True
+            if time.monotonic() >= deadline:
+                capped_reason = f"reached time cap ({duration_cap:.0f}s)"
+                return True
+            if include_dir_cap and dirs_scanned >= dir_cap:
+                capped_reason = f"reached directory cap ({dir_cap})"
+                return True
+            if files_scanned >= file_cap:
+                capped_reason = f"reached file cap ({file_cap})"
+                return True
+            return False
+
+        while stack:
+            if should_stop(include_dir_cap=True):
+                break
+
+            root = stack.pop()
+            try:
+                root_norm = str(root.resolve()).replace("\\", "/").lower()
+            except OSError:
+                root_norm = str(root).replace("\\", "/").lower()
+            if root != dir_path and self._search_path_fragment_blocked(root_norm):
+                skipped += 1
+                continue
+
+            dirs_scanned += 1
+
+            try:
+                for child in root.iterdir():
+                    if should_stop(include_dir_cap=False):
+                        break
+
+                    try:
+                        child_norm = str(child.resolve()).replace("\\", "/").lower()
+                    except OSError:
+                        child_norm = str(child).replace("\\", "/").lower()
+                    if self._search_path_fragment_blocked(child_norm):
+                        skipped += 1
+                        continue
+
+                    try:
+                        is_dir = child.is_dir()
+                        is_file = child.is_file()
+                    except OSError:
+                        skipped += 1
+                        continue
+
+                    if is_dir and self._search_dir_name_blocked(child.name):
+                        skipped += 1
+                        continue
+
+                    if self._should_skip_relative_path(child, dir_path):
+                        continue
+
+                    if is_file:
+                        if files_scanned >= file_cap:
+                            capped_reason = f"reached file cap ({file_cap})"
+                            break
+                        files_scanned += 1
+                        if self._matches_pattern(child, dir_path, pattern):
+                            total_matches += 1
+                            try:
+                                mtime = child.stat().st_mtime
+                            except OSError:
+                                mtime = 0
+                            rel = str(child.relative_to(dir_path))
+                            if len(top_matches) < result_cap:
+                                heapq.heappush(top_matches, (mtime, rel))
+                            elif top_matches and mtime > top_matches[0][0]:
+                                heapq.heapreplace(top_matches, (mtime, rel))
+
+                    if is_dir:
+                        stack.append(child)
+            except OSError:
+                skipped += 1
+
+        self.last_traversal_skipped = skipped
+        matches = sorted(
+            ((rel, mtime) for mtime, rel in top_matches),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        return GlobScanResult(
+            matches=matches,
+            total_matches=total_matches,
+            dirs_scanned=dirs_scanned,
+            files_scanned=files_scanned,
+            skipped=skipped,
+            capped_reason=capped_reason,
+        )
+
+    def _iter_matching_paths(
+        self,
+        dir_path: Path,
+        pattern: str,
+        *,
+        recursive: bool,
+        files_only: bool = True,
+    ):
+        """Yield paths while pruning ignored and unstable directories.
+
+        Cloud desktops and package managers can mutate deep dependency trees while
+        we scan them. Treat those races like unreadable folders: skip and keep
+        returning useful results instead of failing the whole tool call.
+        """
+        self.last_traversal_skipped = 0
+
+        if not recursive:
+            try:
+                candidates = dir_path.glob(pattern)
+                for path in candidates:
+                    if self._should_skip_relative_path(path, dir_path):
+                        continue
+                    if files_only and not path.is_file():
+                        continue
+                    yield path
+            except OSError:
+                self.last_traversal_skipped += 1
+            return
+
+        def walk(root: Path):
+            try:
+                children = list(root.iterdir())
+            except OSError:
+                self.last_traversal_skipped += 1
+                return
+
+            for child in children:
+                if self._should_skip_relative_path(child, dir_path):
+                    continue
+
+                try:
+                    is_dir = child.is_dir()
+                    is_file = child.is_file()
+                except OSError:
+                    self.last_traversal_skipped += 1
+                    continue
+
+                if self._matches_pattern(child, dir_path, pattern) and (not files_only or is_file):
+                    yield child
+
+                if is_dir:
+                    yield from walk(child)
+
+        yield from walk(dir_path)
+
+    @staticmethod
+    def _matches_pattern(path: Path, root: Path, pattern: str) -> bool:
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            return False
+        rel_posix = rel.as_posix()
+        pattern_posix = pattern.replace("\\", "/")
+        return (
+            rel.match(pattern) or fnmatch(rel_posix, pattern_posix) or fnmatch(path.name, pattern)
+        )
+
+    @staticmethod
+    def _should_skip_relative_path(path: Path, root: Path) -> bool:
+        try:
+            parts = path.relative_to(root).parts
+        except ValueError:
+            return True
+        if any(part in DEFAULT_IGNORE_DIRS for part in parts):
+            return True
+        return any(
+            part.startswith(".") and part not in (".github", ".vscode", ".cursor")
+            for part in parts[:-1]
+        )
+
+    async def copy(self, src: str, dst: str) -> bool:
+        """
+        复制文件或目录
+
+        Args:
+            src: 源路径
+            dst: 目标路径
+
+        Returns:
+            是否成功
+        """
+        src_path = self._resolve_path(src)
+        dst_path = self._resolve_path(dst)
+
+        try:
+            if src_path.is_file():
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_path, dst_path)
+            else:
+                shutil.copytree(src_path, dst_path)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to copy {src_path} to {dst_path}: {e}")
+            return False
+
+    async def move(self, src: str, dst: str) -> bool:
+        """
+        移动文件或目录
+
+        Args:
+            src: 源路径
+            dst: 目标路径
+
+        Returns:
+            是否成功
+        """
+        src_path = self._resolve_path(src)
+        dst_path = self._resolve_path(dst)
+
+        try:
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(src_path, dst_path)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to move {src_path} to {dst_path}: {e}")
+            return False
+
+    async def mkdir(self, path: str, parents: bool = True) -> bool:
+        """
+        创建目录
+
+        Args:
+            path: 目录路径
+            parents: 是否创建父目录
+
+        Returns:
+            是否成功
+        """
+        dir_path = self._resolve_path(path)
+
+        try:
+            dir_path.mkdir(parents=parents, exist_ok=True)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to create directory {dir_path}: {e}")
+            return False

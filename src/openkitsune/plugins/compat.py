@@ -1,0 +1,263 @@
+"""Plugin version compatibility checking.
+
+Validates plugin manifest ``requires`` against the running system:
+
+- ``requires.openkitsune``  — minimum system version  (``>=1.27.0``)
+- ``requires.plugin_api`` — compatible API major     (``~1`` or ``~2``)
+- ``requires.sdk``        — minimum SDK version      (``>=0.1.0``, warn-only)
+- ``requires.python``     — minimum Python version   (``>=3.11``)
+
+Plugin API compatibility window
+-------------------------------
+The host advertises ``PLUGIN_API_VERSION = "2.0.0"`` but accepts plugins
+declaring ``plugin_api: "~1"`` as a transitional convenience: the v1 → v2
+upgrade was a soft API expansion (no breaking changes for existing
+plugins), so refusing to load v1 manifests would orphan the entire
+plugin ecosystem during the migration window. v1 plugins are loaded
+with a one-line warning so authors can upgrade at their own pace.
+``~3`` and beyond are still rejected — the window only covers the
+immediately previous major.
+"""
+
+from __future__ import annotations
+
+import logging
+import platform
+import sys
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .manifest import PluginManifest
+
+logger = logging.getLogger(__name__)
+
+PLUGIN_API_VERSION = "2.0.0"
+PLUGIN_UI_API_VERSION = "1.0.0"
+
+PLUGIN_API_COMPAT_WINDOW: frozenset[int] = frozenset({1, 2})
+"""Plugin API majors the current host accepts (with warnings for non-current)."""
+
+
+@dataclass
+class CompatResult:
+    """Outcome of a compatibility check."""
+
+    ok: bool = True
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+def check_compatibility(manifest: PluginManifest) -> CompatResult:
+    """Run all compatibility checks for *manifest*.
+
+    Returns a ``CompatResult`` — callers should skip loading when ``ok`` is
+    ``False`` and log any ``warnings`` regardless.
+    """
+    result = CompatResult()
+    requires = manifest.requires
+    if not requires:
+        return result
+
+    _check_openkitsune(manifest.id, requires.get("openkitsune", ""), result)
+    _check_plugin_api(manifest.id, requires.get("plugin_api", ""), result)
+    _check_sdk(manifest.id, requires.get("sdk", ""), result)
+    _check_python(manifest.id, requires.get("python", ""), result)
+
+    if manifest.has_ui:
+        _check_plugin_ui_api(manifest.id, requires.get("plugin_ui_api", ""), result)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_version(raw: str) -> tuple[int, ...] | None:
+    """Parse a dotted version string into a tuple of ints."""
+    raw = raw.strip().lstrip("v")
+    parts = []
+    for seg in raw.split("."):
+        seg = seg.strip()
+        digits = ""
+        for ch in seg:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            return None
+        parts.append(int(digits))
+    return tuple(parts) if parts else None
+
+
+def _get_system_version() -> tuple[int, ...]:
+    try:
+        from .. import __version__
+
+        v = _parse_version(__version__)
+        if v:
+            return v
+    except Exception:
+        pass
+    return (0, 0, 0)
+
+
+def _check_openkitsune(plugin_id: str, spec: str, result: CompatResult) -> None:
+    if not spec:
+        return
+    if not spec.startswith(">="):
+        result.warnings.append(f"Unrecognised openkitsune spec '{spec}' (expected >=X.Y.Z)")
+        return
+
+    min_ver = _parse_version(spec[2:])
+    if min_ver is None:
+        result.warnings.append(f"Cannot parse openkitsune version in '{spec}'")
+        return
+
+    current = _get_system_version()
+    if current < min_ver:
+        msg = (
+            f"Plugin '{plugin_id}' requires openkitsune {spec}, "
+            f"current is {'.'.join(str(x) for x in current)}"
+        )
+        result.errors.append(msg)
+        result.ok = False
+
+
+def _check_plugin_api(plugin_id: str, spec: str, result: CompatResult) -> None:
+    if not spec:
+        return
+
+    current = _parse_version(PLUGIN_API_VERSION)
+    if current is None:
+        return
+
+    if spec.startswith("~"):
+        req_major_str = spec[1:].strip()
+        req_major = _parse_version(req_major_str)
+        if req_major is None:
+            result.warnings.append(f"Cannot parse plugin_api spec '{spec}'")
+            return
+
+        if req_major[0] == current[0]:
+            if len(req_major) > 1 and len(current) > 1 and req_major[1] > current[1]:
+                result.warnings.append(
+                    f"Plugin '{plugin_id}' was built for API ~{req_major_str}, "
+                    f"current is {PLUGIN_API_VERSION} — some features may be missing"
+                )
+        elif req_major[0] in PLUGIN_API_COMPAT_WINDOW:
+            result.warnings.append(
+                f"Plugin '{plugin_id}' targets plugin_api ~{req_major_str} but host "
+                f"is {PLUGIN_API_VERSION}; loaded under v{current[0]} compatibility "
+                f"window — please upgrade the plugin manifest to '~{current[0]}' "
+                f"and verify behaviour."
+            )
+        else:
+            msg = (
+                f"Plugin '{plugin_id}' requires plugin_api {spec} "
+                f"(major {req_major[0]}), current API is {PLUGIN_API_VERSION} "
+                f"(major {current[0]}); outside compatibility window "
+                f"{sorted(PLUGIN_API_COMPAT_WINDOW)}"
+            )
+            result.errors.append(msg)
+            result.ok = False
+    elif spec.startswith(">="):
+        req = _parse_version(spec[2:])
+        if req is None:
+            result.warnings.append(f"Cannot parse plugin_api spec '{spec}'")
+            return
+        if current < req:
+            msg = (
+                f"Plugin '{plugin_id}' requires plugin_api {spec}, current is {PLUGIN_API_VERSION}"
+            )
+            result.errors.append(msg)
+            result.ok = False
+    else:
+        result.warnings.append(f"Unrecognised plugin_api spec '{spec}' (expected ~N or >=X.Y.Z)")
+
+
+def _check_sdk(plugin_id: str, spec: str, result: CompatResult) -> None:
+    """SDK version is informational — warn only."""
+    if not spec or not spec.startswith(">="):
+        return
+    req = _parse_version(spec[2:])
+    if req is None:
+        return
+
+    try:
+        from openkitsune_plugin_sdk.version import SDK_VERSION
+
+        sdk = _parse_version(SDK_VERSION)
+    except ImportError:
+        sdk = None
+
+    if sdk is None:
+        result.warnings.append(
+            f"Plugin '{plugin_id}' needs openkitsune-plugin-sdk {spec} but it is not "
+            f'installed. Fix it with `pip install "openkitsune[plugins]"` '
+            f"(or `pip install -e ./openkitsune-plugin-sdk` in monorepo dev). "
+            f"Plugins that import openkitsune_plugin_sdk classes will fail to "
+            f"load until this is resolved."
+        )
+    elif sdk < req:
+        result.warnings.append(
+            f"Plugin '{plugin_id}' recommends openkitsune-plugin-sdk {spec}, "
+            f"installed is {'.'.join(str(x) for x in sdk)}. "
+            f"Upgrade with `pip install -U openkitsune-plugin-sdk`."
+        )
+
+
+def _check_python(plugin_id: str, spec: str, result: CompatResult) -> None:
+    if not spec or not spec.startswith(">="):
+        return
+    req = _parse_version(spec[2:])
+    if req is None:
+        return
+    current = sys.version_info[:3]
+    if current < req:
+        msg = f"Plugin '{plugin_id}' requires Python {spec}, current is {platform.python_version()}"
+        result.errors.append(msg)
+        result.ok = False
+
+
+def _check_plugin_ui_api(plugin_id: str, spec: str, result: CompatResult) -> None:
+    """Check plugin_ui_api compatibility — same logic as _check_plugin_api."""
+    if not spec:
+        return
+
+    current = _parse_version(PLUGIN_UI_API_VERSION)
+    if current is None:
+        return
+
+    if spec.startswith("~"):
+        req_major_str = spec[1:].strip()
+        req_major = _parse_version(req_major_str)
+        if req_major is None:
+            result.warnings.append(f"Cannot parse plugin_ui_api spec '{spec}'")
+            return
+        if req_major[0] != current[0]:
+            result.warnings.append(
+                f"Plugin '{plugin_id}' requires plugin_ui_api {spec} "
+                f"(major {req_major[0]}), current UI API is {PLUGIN_UI_API_VERSION} "
+                f"(major {current[0]}) — UI will not be loaded"
+            )
+        elif len(req_major) > 1 and len(current) > 1 and req_major[1] > current[1]:
+            result.warnings.append(
+                f"Plugin '{plugin_id}' was built for UI API ~{req_major_str}, "
+                f"current is {PLUGIN_UI_API_VERSION} — some UI features may be missing"
+            )
+    elif spec.startswith(">="):
+        req = _parse_version(spec[2:])
+        if req is None:
+            result.warnings.append(f"Cannot parse plugin_ui_api spec '{spec}'")
+            return
+        if current < req:
+            result.warnings.append(
+                f"Plugin '{plugin_id}' requires plugin_ui_api {spec}, "
+                f"current is {PLUGIN_UI_API_VERSION} — UI will not be loaded"
+            )
+    else:
+        result.warnings.append(f"Unrecognised plugin_ui_api spec '{spec}' (expected ~N or >=X.Y.Z)")

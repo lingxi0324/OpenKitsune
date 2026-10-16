@@ -1,0 +1,115 @@
+from types import SimpleNamespace
+
+from openkitsune.llm.client import _friendly_error_hint
+from openkitsune.llm.error_types import FailoverReason
+from openkitsune.llm.types import (
+    DEFAULT_CONTEXT_WINDOW,
+    LOCAL_ENDPOINT_DEFAULT_CONTEXT_WINDOW,
+    EndpointConfig,
+    normalize_context_window,
+)
+from openkitsune.tools.handlers.config import ConfigHandler
+
+
+def test_local_endpoint_missing_context_window_uses_small_safe_default():
+    endpoint = EndpointConfig.from_dict(
+        {
+            "name": "lmstudio-gemma",
+            "provider": "lmstudio",
+            "api_type": "openai",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "gemma-4-e2b-it-Q8_0.gguf",
+        }
+    )
+
+    assert endpoint.context_window == LOCAL_ENDPOINT_DEFAULT_CONTEXT_WINDOW
+
+
+def test_local_endpoint_explicit_default_sized_context_window_is_preserved():
+    endpoint = EndpointConfig.from_dict(
+        {
+            "name": "localai-gemma",
+            "provider": "localai",
+            "api_type": "openai",
+            "base_url": "http://localhost:8080/v1",
+            "model": "gemma",
+            "context_window": 200000,
+        }
+    )
+
+    assert endpoint.context_window == DEFAULT_CONTEXT_WINDOW
+
+
+def test_local_endpoint_context_normalization_distinguishes_missing_from_explicit_default():
+    assert (
+        normalize_context_window(None, provider="lmstudio", base_url="http://127.0.0.1:1234/v1")
+        == LOCAL_ENDPOINT_DEFAULT_CONTEXT_WINDOW
+    )
+    assert (
+        normalize_context_window(
+            DEFAULT_CONTEXT_WINDOW,
+            provider="lmstudio",
+            base_url="http://127.0.0.1:1234/v1",
+        )
+        == DEFAULT_CONTEXT_WINDOW
+    )
+
+
+def test_local_endpoint_explicit_large_context_window_is_preserved():
+    endpoint = EndpointConfig.from_dict(
+        {
+            "name": "lmstudio-large-context",
+            "provider": "lmstudio",
+            "api_type": "openai",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "model": "qwen-large-context",
+            "context_window": 262144,
+        }
+    )
+
+    assert endpoint.context_window == 262144
+
+
+def test_hosted_endpoint_keeps_large_default_when_context_window_missing():
+    endpoint = EndpointConfig.from_dict(
+        {
+            "name": "qwen",
+            "provider": "dashscope",
+            "api_type": "openai",
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "model": "qwen-plus",
+        }
+    )
+
+    assert endpoint.context_window == 200000
+
+
+def test_models_response_context_window_extraction_prefers_matching_model():
+    response = SimpleNamespace(
+        json=lambda: {
+            "data": [
+                {"id": "other", "context_length": 8192},
+                {"id": "gemma", "metadata": {"n_ctx": 4096}},
+            ]
+        }
+    )
+
+    detected = ConfigHandler._extract_context_window_from_models_response(response, "gemma")
+
+    assert detected == 4096
+
+
+def test_context_overflow_hint_is_specific_and_friendly():
+    provider = SimpleNamespace(
+        error_category=FailoverReason.STRUCTURAL,
+        _last_error=(
+            "API error (400): request (44593 tokens) exceeds the available "
+            "context size (4096 tokens)"
+        ),
+    )
+
+    hint = _friendly_error_hint([provider])
+
+    assert "上下文窗口偏小" in hint
+    assert "调大 context size" in hint
+    assert "模型兼容性问题" not in hint

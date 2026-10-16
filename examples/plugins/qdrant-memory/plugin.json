@@ -1,0 +1,21 @@
+{
+  "id": "qdrant-memory",
+  "name": "Qdrant Memory Backend",
+  "version": "1.0.0",
+  "description": "Memory backend replacement demo: uses Qdrant as vector store",
+  "author": "OpenKitsune Team",
+  "license": "MIT",
+  "type": "python",
+  "entry": "plugin.py",
+  "permissions": ["memory.write", "memory.replace", "config.read", "config.write", "hooks.basic"],
+  "requires": {
+    "openkitsune": ">=1.5.0",
+    "plugin_api": "~1",
+    "python": ">=3.11",
+    "pip": ["qdrant-client"]
+  },
+  "provides": {"memory_backend": "qdrant"},
+  "category": "memory",
+  "tags": ["demo", "memory", "qdrant"]
+}
+

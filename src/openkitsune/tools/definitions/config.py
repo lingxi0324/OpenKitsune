@@ -1,0 +1,326 @@
+"""
+系统配置工具定义
+
+统一的 system_config 工具，用户通过聊天即可查看/修改所有系统配置。
+支持：查看配置、修改设置、LLM 端点管理、UI 偏好、动态配置发现。
+"""
+
+CONFIG_TOOLS = [
+    {
+        "name": "system_config",
+        "category": "Config",
+        "description": (
+            "Unified system configuration tool. When user wants to: "
+            "(1) view or change any system setting (log level, thinking mode, proxy, IM channel, etc.), "
+            "(2) add/remove/toggle/test LLM endpoints, or select the current conversation's LLM endpoint, "
+            "(3) switch UI theme or language, "
+            "(4) discover what settings are available, "
+            "(5) manage LLM providers (add/update/remove custom providers), "
+            "(6) check external extension modules (opencli, cli-anything) status and install/upgrade commands. "
+            "IMPORTANT: If the user wants to switch/use/select an existing model endpoint for this chat, "
+            "call action=select_endpoint. Do NOT use add_endpoint unless the user is creating a new endpoint. "
+            "Before calling action=set, action=add_endpoint, or action=manage_provider with add/update/remove, "
+            "ALWAYS use ask_user first to confirm the changes with the user. "
+            "If unsure which config key to use, call action=discover first."
+        ),
+        "detail": """统一系统配置工具，覆盖所有配置操作。
+
+## action 说明
+
+### discover -- 发现可配置项
+列出所有可配置项及其元信息（描述、类型、当前值、默认值）。
+系统新增的配置项会自动出现，无需修改工具代码。
+可通过 category 参数过滤特定分类。
+
+### get -- 查看当前配置
+读取当前配置值，支持按分类或指定 key 查看。
+敏感字段（API Key 等）自动脱敏。
+
+### set -- 修改配置
+更新 .env 文件并热重载到内存。
+- updates 使用**大写环境变量名**作为 key，如 {"LOG_LEVEL": "DEBUG"}
+- 自动做类型校验
+- 只读字段（路径/数据库）会被拒绝
+- 某些字段修改后需重启才能生效，会在响应中标注
+
+### add_endpoint -- 添加 LLM 端点
+根据 provider 自动补全默认 base_url 和 api_type。
+API Key 存入 .env，JSON 中只引用环境变量名。
+添加后自动热重载。
+
+### remove_endpoint -- 删除 LLM 端点
+按名称删除并热重载。
+
+### toggle_endpoint -- 启用/停用 LLM 端点
+按名称切换端点启用状态并热重载。仅在用户明确要求启用或停用某个端点时使用。
+
+### select_endpoint -- 选择当前会话使用的 LLM 端点
+按名称临时切换当前会话的主聊天模型端点，不修改端点配置文件。
+当用户说“切换到某模型/端点”“使用某模型”“改用某端点”时优先使用本 action。
+如果 endpoint_name 为 `auto` / `default` / `默认`，则恢复默认模型选择。
+
+### test_endpoint -- 测试端点连通性
+发送轻量请求验证 API 可达性，返回延迟和状态。
+
+### set_ui -- 设置 UI 偏好
+切换桌面客户端的主题和语言。非 Desktop 通道会提示仅影响桌面端。
+
+### manage_provider -- 管理 LLM 服务商
+管理 LLM 服务商列表（内置 + 自定义）。自定义服务商存储在工作区 data/custom_providers.json。
+- operation=list: 列出所有服务商
+- operation=add: 添加自定义服务商（provider 字段必填: slug, name, api_type, default_base_url）
+- operation=update: 修改服务商配置（可覆盖内置服务商的默认设置）
+- operation=remove: 删除自定义服务商（内置服务商不可删除，但可移除自定义覆盖）
+
+服务商规则:
+- slug: 唯一标识，只允许小写字母、数字、连字符、下划线
+- api_type: 只允许 "openai" 或 "anthropic"
+- default_base_url: 必须以 http:// 或 https:// 开头
+- registry_class: 不填则根据 api_type 自动选择 OpenAIRegistry 或 AnthropicRegistry
+
+### extensions -- 外部扩展模块管理
+查看可选外部 CLI 工具的安装状态、安装/升级命令和致谢信息。
+这些模块无需内嵌打包，由高级用户自行安装，安装后 OpenKitsune 自动检测并启用。
+- operation=status: 查看所有外部模块的安装状态和命令
+- operation=credits: 查看致谢信息
+
+## 使用流程
+1. 不确定 key 名 → 先 discover
+2. 查看当前值 → get
+3. 修改前 → 用 ask_user 确认
+4. 确认后 → set / add_endpoint / remove_endpoint / toggle_endpoint / manage_provider
+5. 用户只想切换当前聊天模型 → select_endpoint（无需修改配置）
+""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "discover",
+                        "get",
+                        "set",
+                        "add_endpoint",
+                        "remove_endpoint",
+                        "toggle_endpoint",
+                        "select_endpoint",
+                        "test_endpoint",
+                        "set_ui",
+                        "manage_provider",
+                        "extensions",
+                    ],
+                    "description": "操作类型",
+                },
+                "category": {
+                    "type": "string",
+                    "description": (
+                        "配置分类过滤（discover/get 时可选）。"
+                        "常见分类: Agent, LLM, 日志, 代理, IM/Telegram, IM/飞书, IM/思维链推送, "
+                        "会话, 定时任务, 人格, 活人感, 桌面通知, Embedding/记忆搜索, 语音识别 等。"
+                        "调用 discover 不带 category 可查看所有分类。"
+                    ),
+                },
+                "keys": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "指定查询的配置字段名列表（get 时可选，如 ['log_level', 'thinking_mode']）",
+                },
+                "updates": {
+                    "type": "object",
+                    "description": (
+                        "要修改的配置键值对（set 时必填）。"
+                        'key 使用大写环境变量名，如 {"LOG_LEVEL": "DEBUG", "PROACTIVE_ENABLED": "true"}'
+                    ),
+                },
+                "endpoint": {
+                    "type": "object",
+                    "description": (
+                        "LLM 端点配置（add_endpoint 时必填）。"
+                        "字段: name(必填), provider(必填), model(必填), "
+                        "api_key(可选,存入.env), api_type(可选,自动推断), "
+                        "base_url(可选,自动补全), priority(可选,默认10), "
+                        "max_tokens(可选), context_window(可选), timeout(可选), "
+                        "capabilities(可选,如['text','tools','vision'])"
+                    ),
+                    "properties": {
+                        "name": {"type": "string", "description": "端点唯一名称"},
+                        "provider": {
+                            "type": "string",
+                            "description": "服务商 slug（如 openai, anthropic, deepseek, dashscope, ollama 等）",
+                        },
+                        "model": {"type": "string", "description": "模型名称"},
+                        "api_key": {
+                            "type": "string",
+                            "description": "API Key（会自动存入 .env，不存入 JSON）",
+                        },
+                        "api_type": {
+                            "type": "string",
+                            "enum": ["openai", "anthropic"],
+                            "description": "API 协议类型（不填则根据 provider 自动推断）",
+                        },
+                        "base_url": {
+                            "type": "string",
+                            "description": "API 地址（不填则根据 provider 自动补全）",
+                        },
+                        "priority": {
+                            "type": "integer",
+                            "description": "优先级，数字越小越优先（默认 10）",
+                        },
+                        "max_tokens": {"type": "integer", "description": "最大输出 token 数"},
+                        "context_window": {"type": "integer", "description": "上下文窗口大小"},
+                        "timeout": {"type": "integer", "description": "请求超时（秒）"},
+                        "capabilities": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "模型能力列表，如 ['text','tools','vision','thinking']",
+                        },
+                    },
+                    "required": ["name", "provider", "model"],
+                },
+                "endpoint_name": {
+                    "type": "string",
+                    "description": (
+                        "端点名称（remove_endpoint / test_endpoint / select_endpoint 时必填）。"
+                        "select_endpoint 可用 auto/default/默认 恢复默认模型。"
+                    ),
+                },
+                "target": {
+                    "type": "string",
+                    "enum": ["main", "compiler", "stt"],
+                    "description": "端点类型（默认 main）: main=主端点, compiler=Prompt编译, stt=语音识别",
+                },
+                "theme": {
+                    "type": "string",
+                    "enum": ["light", "dark", "system"],
+                    "description": "UI 主题（set_ui 时）",
+                },
+                "language": {
+                    "type": "string",
+                    "enum": ["zh", "en"],
+                    "description": "UI 语言（set_ui 时）",
+                },
+                "operation": {
+                    "type": "string",
+                    "enum": ["list", "add", "update", "remove", "status", "credits"],
+                    "description": (
+                        "操作子类型。manage_provider 时: list/add/update/remove；"
+                        "extensions 时: status/credits"
+                    ),
+                },
+                "provider": {
+                    "type": "object",
+                    "description": (
+                        "服务商配置（manage_provider 的 add/update 时必填）。"
+                        "add 必填: slug, name, api_type, default_base_url。"
+                        "update 必填: slug（定位），其余为要修改的字段。"
+                    ),
+                    "properties": {
+                        "slug": {
+                            "type": "string",
+                            "description": "服务商唯一标识（小写字母、数字、连字符）",
+                        },
+                        "name": {"type": "string", "description": "显示名称"},
+                        "api_type": {
+                            "type": "string",
+                            "enum": ["openai", "anthropic"],
+                            "description": "API 协议类型",
+                        },
+                        "default_base_url": {"type": "string", "description": "默认 API 地址"},
+                        "api_key_env_suggestion": {
+                            "type": "string",
+                            "description": "建议的 API Key 环境变量名",
+                        },
+                        "supports_model_list": {
+                            "type": "boolean",
+                            "description": "是否支持拉取模型列表",
+                        },
+                        "requires_api_key": {"type": "boolean", "description": "是否需要 API Key"},
+                        "is_local": {
+                            "type": "boolean",
+                            "description": "是否为本地服务（如 Ollama）",
+                        },
+                        "coding_plan_base_url": {
+                            "type": "string",
+                            "description": "Coding Plan 专用 API 地址",
+                        },
+                        "coding_plan_api_type": {
+                            "type": "string",
+                            "description": "Coding Plan 协议类型",
+                        },
+                    },
+                },
+                "slug": {
+                    "type": "string",
+                    "description": "服务商 slug（manage_provider 的 remove 时必填）",
+                },
+            },
+            "required": ["action"],
+        },
+        "triggers": [
+            "User wants to view or change system settings",
+            "User asks about available configuration options",
+            "User wants to add, remove, or test LLM endpoints",
+            "User wants to switch, select, or use an existing model/LLM endpoint for the current chat",
+            "User wants to switch theme or language",
+            "User wants to add, modify, or remove LLM providers/服务商",
+            "User asks about external modules/extensions status, install, or upgrade",
+            "User asks about opencli or cli-anything",
+        ],
+        "examples": [
+            {
+                "scenario": "查看所有可配置项",
+                "params": {"action": "discover"},
+            },
+            {
+                "scenario": "查看 Agent 相关配置",
+                "params": {"action": "get", "category": "Agent"},
+            },
+            {
+                "scenario": "修改日志级别",
+                "params": {"action": "set", "updates": {"LOG_LEVEL": "DEBUG"}},
+            },
+            {
+                "scenario": "添加 DeepSeek 端点",
+                "params": {
+                    "action": "add_endpoint",
+                    "endpoint": {
+                        "name": "deepseek-chat",
+                        "provider": "deepseek",
+                        "model": "deepseek-chat",
+                        "api_key": "sk-xxx",
+                    },
+                },
+            },
+            {
+                "scenario": "切换暗色主题",
+                "params": {"action": "set_ui", "theme": "dark"},
+            },
+            {
+                "scenario": "列出所有 LLM 服务商",
+                "params": {"action": "manage_provider", "operation": "list"},
+            },
+            {
+                "scenario": "添加自定义服务商",
+                "params": {
+                    "action": "manage_provider",
+                    "operation": "add",
+                    "provider": {
+                        "slug": "my-proxy",
+                        "name": "My API Proxy",
+                        "api_type": "openai",
+                        "default_base_url": "https://my-proxy.example.com/v1",
+                        "api_key_env_suggestion": "MY_PROXY_API_KEY",
+                    },
+                },
+            },
+            {
+                "scenario": "查看外部扩展模块状态",
+                "params": {"action": "extensions", "operation": "status"},
+            },
+            {
+                "scenario": "查看外部模块致谢",
+                "params": {"action": "extensions", "operation": "credits"},
+            },
+        ],
+    },
+]

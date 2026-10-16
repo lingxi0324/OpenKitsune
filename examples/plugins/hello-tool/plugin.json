@@ -1,0 +1,20 @@
+{
+  "id": "hello-tool",
+  "name": "Hello Tool",
+  "version": "1.0.0",
+  "description": "Simplest plugin demo: registers a hello_world tool",
+  "author": "OpenKitsune Team",
+  "license": "MIT",
+  "type": "python",
+  "entry": "plugin.py",
+  "permissions": ["tools.register"],
+  "requires": {
+    "openkitsune": ">=1.5.0",
+    "plugin_api": "~1",
+    "python": ">=3.11"
+  },
+  "provides": {"tools": ["hello_world"]},
+  "category": "tool",
+  "tags": ["demo", "starter"]
+}
+

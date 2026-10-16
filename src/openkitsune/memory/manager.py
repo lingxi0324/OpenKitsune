@@ -1,0 +1,2838 @@
+"""
+记忆管理器 (v2) — 核心协调器
+
+v2 架构:
+- UnifiedStore (SQLite + SearchBackend) 取代 memories.json + ChromaDB 直接操作
+- RetrievalEngine 多路召回取代手动向量/关键词搜索
+- 支持 v2 提取 (工具感知/实体-属性) 和 Episode/Scratchpad
+- 向后兼容 v1 接口
+
+注入策略:
+- 三层注入: Scratchpad + Core Memory + Dynamic Memories
+- 由 builder.py 调用, 不再在本模块组装
+
+子组件:
+- store: UnifiedStore
+- extractor: MemoryExtractor
+- retrieval_engine: RetrievalEngine
+- consolidator: MemoryConsolidator (保留, JSONL 双写)
+- vector_store: VectorStore (可选, 由 SearchBackend 封装)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import contextvars
+import json
+import logging
+import os
+import re
+import threading
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from ..core.log_health import record_health_event
+from .consolidator import MemoryConsolidator
+from .exceptions import MemoryStorageUnavailable
+from .extractor import MemoryExtractor
+from .json_utils import coerce_text
+from .retention import apply_retention
+from .retrieval import RetrievalEngine
+from .session_identity import DESKTOP_USER_ID
+from .telemetry import emit_memory_health_event
+from .types import (
+    Attachment,
+    AttachmentDirection,
+    ConversationTurn,
+    Memory,
+    MemoryPriority,
+    MemoryType,
+    SemanticMemory,
+    normalize_tags,
+)
+from .unified_store import UnifiedStore
+from .vector_store import VectorStore
+
+logger = logging.getLogger(__name__)
+
+
+_apply_retention = apply_retention
+_UNSET_OWNER = object()
+
+
+class MemoryManager:
+    """记忆管理器 (v2)"""
+
+    def _ensure_context_vars(self) -> None:
+        """Initialize per-instance contextvars for legacy ``__new__`` test doubles."""
+        if not hasattr(self, "_current_session_id_var"):
+            self._current_session_id_var = contextvars.ContextVar(
+                f"openkitsune_memory_session_id_{id(self)}",
+                default=None,
+            )
+        if not hasattr(self, "_current_user_id_var"):
+            default_user = getattr(self, "_default_user_id", "default")
+            self._current_user_id_var = contextvars.ContextVar(
+                f"openkitsune_memory_user_id_{id(self)}",
+                default=default_user,
+            )
+        if not hasattr(self, "_current_workspace_id_var"):
+            self._current_workspace_id_var = contextvars.ContextVar(
+                f"openkitsune_memory_workspace_id_{id(self)}",
+                default="default",
+            )
+        if not hasattr(self, "_session_turns_var"):
+            self._session_turns_var = contextvars.ContextVar(
+                f"openkitsune_memory_session_turns_{id(self)}",
+                default=None,
+            )
+        if not hasattr(self, "_recent_messages_var"):
+            self._recent_messages_var = contextvars.ContextVar(
+                f"openkitsune_memory_recent_messages_{id(self)}",
+                default=None,
+            )
+        if not hasattr(self, "_session_cited_memories_var"):
+            self._session_cited_memories_var = contextvars.ContextVar(
+                f"openkitsune_memory_cited_{id(self)}",
+                default=None,
+            )
+        if not hasattr(self, "_relational_pending_nodes_var"):
+            self._relational_pending_nodes_var = contextvars.ContextVar(
+                f"openkitsune_memory_relational_pending_{id(self)}", default=None
+            )
+
+    @property
+    def _relational_pending_nodes(self) -> list:
+        self._ensure_context_vars()
+        nodes = self._relational_pending_nodes_var.get()
+        if nodes is None:
+            nodes = []
+            self._relational_pending_nodes_var.set(nodes)
+        return nodes
+
+    @_relational_pending_nodes.setter
+    def _relational_pending_nodes(self, nodes: list) -> None:
+        self._ensure_context_vars()
+        self._relational_pending_nodes_var.set(nodes)
+
+    @property
+    def _current_session_id(self) -> str | None:
+        self._ensure_context_vars()
+        return self._current_session_id_var.get()
+
+    @_current_session_id.setter
+    def _current_session_id(self, value: str | None) -> None:
+        self._ensure_context_vars()
+        self._current_session_id_var.set(value)
+
+    @property
+    def _current_user_id(self) -> str:
+        self._ensure_context_vars()
+        return self._current_user_id_var.get()
+
+    @_current_user_id.setter
+    def _current_user_id(self, value: str) -> None:
+        self._ensure_context_vars()
+        self._current_user_id_var.set(value or "default")
+
+    @property
+    def _current_workspace_id(self) -> str:
+        self._ensure_context_vars()
+        return self._current_workspace_id_var.get()
+
+    @_current_workspace_id.setter
+    def _current_workspace_id(self, value: str) -> None:
+        self._ensure_context_vars()
+        self._current_workspace_id_var.set(value or "default")
+
+    @property
+    def _session_turns(self) -> list[ConversationTurn]:
+        self._ensure_context_vars()
+        turns = self._session_turns_var.get()
+        if turns is None:
+            turns = []
+            self._session_turns_var.set(turns)
+        return turns
+
+    @_session_turns.setter
+    def _session_turns(self, value: list[ConversationTurn]) -> None:
+        self._ensure_context_vars()
+        self._session_turns_var.set(value)
+
+    @property
+    def _recent_messages(self) -> list[dict]:
+        self._ensure_context_vars()
+        messages = self._recent_messages_var.get()
+        if messages is None:
+            messages = []
+            self._recent_messages_var.set(messages)
+        return messages
+
+    @_recent_messages.setter
+    def _recent_messages(self, value: list[dict]) -> None:
+        self._ensure_context_vars()
+        self._recent_messages_var.set(value)
+
+    @property
+    def _session_cited_memories(self) -> list[dict]:
+        self._ensure_context_vars()
+        memories = self._session_cited_memories_var.get()
+        if memories is None:
+            memories = []
+            self._session_cited_memories_var.set(memories)
+        return memories
+
+    @_session_cited_memories.setter
+    def _session_cited_memories(self, value: list[dict]) -> None:
+        self._ensure_context_vars()
+        self._session_cited_memories_var.set(value)
+
+    def __init__(
+        self,
+        data_dir: Path,
+        memory_md_path: Path,
+        brain=None,
+        embedding_model: str | None = None,
+        embedding_device: str = "cpu",
+        model_download_source: str = "auto",
+        # v2 params
+        search_backend: str = "fts5",
+        embedding_api_provider: str = "",
+        embedding_api_key: str = "",
+        embedding_api_model: str = "",
+        agent_id: str = "",
+        identity_dir: Path | None = None,
+        desktop_owner_alignment: bool = False,
+    ):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.agent_id = agent_id
+        self._desktop_owner_alignment_requested = desktop_owner_alignment
+        # New desktop sessions must use the same identity as the panel even
+        # when historical data is ambiguous or its backup cannot be written.
+        # This changes only the implicit owner, not explicit IM/CLI identities.
+        self._default_user_id = (
+            DESKTOP_USER_ID
+            if desktop_owner_alignment and os.environ.get("OPENKITSUNE_DESKTOP_SESSION_TOKEN")
+            else "default"
+        )
+
+        self.memory_md_path = Path(memory_md_path)
+        self.identity_dir = Path(identity_dir) if identity_dir else self.memory_md_path.parent
+        self.brain = brain
+        self._ensure_memory_md_exists()
+
+        # Sub-components
+        self.extractor = MemoryExtractor(brain)
+        self.consolidator = MemoryConsolidator(data_dir, brain, self.extractor)
+
+        # VectorStore: only create when chromadb backend is selected
+        if search_backend == "chromadb":
+            self.vector_store = VectorStore(
+                data_dir=self.data_dir,
+                model_name=embedding_model,
+                device=embedding_device,
+                download_source=model_download_source,
+            )
+        else:
+            self.vector_store = None
+
+        # v3: Relational Memory (Mode 2) — initialized lazily on first use
+        self.relational_store = None
+        self.relational_encoder = None
+        self.relational_graph = None
+        self.relational_consolidator = None
+        self._relational_pending_nodes = []
+
+        # v1 compat: in-memory cache
+        self.memories_file = self.data_dir / "memories.json"
+        self._memories: dict[str, Memory] = {}
+        self._memories_lock = threading.RLock()
+
+        self._current_session_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+            f"openkitsune_memory_session_id_{id(self)}",
+            default=None,
+        )
+        self._current_user_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+            f"openkitsune_memory_user_id_{id(self)}",
+            default=self._default_user_id,
+        )
+        self._current_workspace_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+            f"openkitsune_memory_workspace_id_{id(self)}",
+            default="default",
+        )
+        self._session_turns_var: contextvars.ContextVar[list[ConversationTurn] | None] = (
+            contextvars.ContextVar(f"openkitsune_memory_session_turns_{id(self)}", default=None)
+        )
+        self._recent_messages_var: contextvars.ContextVar[list[dict] | None] = (
+            contextvars.ContextVar(
+                f"openkitsune_memory_recent_messages_{id(self)}",
+                default=None,
+            )
+        )
+        self._session_cited_memories_var: contextvars.ContextVar[list[dict] | None] = (
+            contextvars.ContextVar(f"openkitsune_memory_cited_{id(self)}", default=None)
+        )
+
+        self._current_session_id: str | None = None
+        self._current_user_id: str = self._default_user_id
+        self._current_workspace_id: str = "default"
+        self._session_turns: list[ConversationTurn] = []
+        self._recent_messages: list[dict] = []
+
+        # Citation tracking: memories retrieved via search_memory this session
+        self._session_cited_memories: list[dict] = []
+
+        # Track pending async tasks to await on shutdown
+        self._pending_tasks: set[asyncio.Task] = set()
+
+        # Global store fallback for isolated agents (set by AgentFactory)
+        self._global_store_ref: UnifiedStore | None = None
+
+        # Plugin-provided memory backends (shared dict from host_refs)
+        self._plugin_backends: dict | None = None
+
+        self.degraded: bool = False
+        self.degraded_reason: str | None = None
+        self.degraded_details: str | None = None
+        self.repair_completed_restart_required: bool = False
+
+        # v2: Unified Store + Search Backend
+        db_path = self.data_dir / "openkitsune.db"
+        try:
+            self.store = UnifiedStore(
+                db_path,
+                vector_store=self.vector_store,
+                backend_type=search_backend,
+                api_provider=embedding_api_provider,
+                api_key=embedding_api_key,
+                api_model=embedding_api_model,
+            )
+            # v2: Retrieval Engine (with brain for LLM query decomposition)
+            self.retrieval_engine = RetrievalEngine(self.store, brain=brain)
+            # Subscribe to DB write events: every successful save/update/delete
+            # going through ``self.store`` now keeps ``self._memories`` coherent
+            # automatically — including writes from LifecycleManager, API
+            # routes, plugins, or any other caller that holds a UnifiedStore
+            # reference. This eliminates the previous ad-hoc cache-update
+            # pattern scattered across MemoryManager and the
+            # ``_sync_json``/``_reload_from_sqlite`` ceremony in HTTP routes.
+            with contextlib.suppress(Exception):
+                self.store.register_observer(self._on_store_event)
+            # Load existing memories
+            self._load_memories()
+            self._align_desktop_owner()
+            self._maybe_schedule_snapshot()
+        except MemoryStorageUnavailable as e:
+            from .noop_store import NoopRetrievalEngine, NoopUnifiedStore
+
+            logger.error(
+                "[MemoryManager] Entering degraded mode: reason=%s details=%s",
+                e.reason,
+                e.details,
+                exc_info=True,
+            )
+            self.store = NoopUnifiedStore()
+            self.retrieval_engine = NoopRetrievalEngine()
+            self.degraded = True
+            self.degraded_reason = e.reason
+            self.degraded_details = e.details
+            with contextlib.suppress(Exception):
+                record_health_event("memory_degraded", {"reason": e.reason})
+            emit_memory_health_event("degraded", {"reason": e.reason})
+            # Also mirror into the cross-subsystem DegradedRegistry so the
+            # unified ``DegradedBanner`` in the UI sees memory failures
+            # alongside token_tracking / feedback / asset_bus. Without
+            # this the user gets a banner for the trivial subsystems but
+            # has to dig into the Status view for the most important one.
+            # The legacy ``memory_repair`` flow in StatusView keeps
+            # working in parallel — it reads ``memory_subsystem`` (a
+            # superset payload with backup/snapshot lists), not the
+            # registry, so this is purely additive.
+            #
+            # ONLY the main MemoryManager (no ``agent_id`` set) maps to
+            # the global ``memory`` key — that's the one StatusView's
+            # memory_subsystem block tracks and the one mark_repair_*
+            # clears. Isolated sub-agent / profile managers use a
+            # namespaced key so a sub-agent's broken DB doesn't make the
+            # banner imply the user's primary memory is degraded.
+            with contextlib.suppress(Exception):
+                from openkitsune.storage.degraded import registry as _degraded
+
+                key = "memory" if not self.agent_id else f"memory:{self.agent_id}"
+                _degraded.register(
+                    key,
+                    e.reason or "unknown",
+                    repair="memory_repair_flow" if key == "memory" else "manual_quarantine",
+                    details=e.details or None,
+                )
+
+    def _align_desktop_owner(self) -> None:
+        """Repair only a local desktop main store, before background work starts."""
+        self._desktop_owner_aligned = False
+        if not self._desktop_owner_alignment_requested or not os.environ.get(
+            "OPENKITSUNE_DESKTOP_SESSION_TOKEN"
+        ):
+            return
+        from .owner_migration import align_desktop_owner
+
+        try:
+            # Agent construction may create several managers over this shared
+            # DB. Only the first one may migrate; later constructors can run
+            # while the original manager is already serving requests.
+            storage = self.store.db
+            with storage._lock:
+                report = storage._desktop_owner_alignment_report
+                if report is None:
+                    report = align_desktop_owner(storage)
+                    storage._desktop_owner_alignment_report = report
+            self._desktop_owner_aligned = report["status"] in {"clean", "migrated"}
+            if report["status"] == "migrated":
+                self._reload_from_sqlite()
+            logger.info("[Memory] Desktop owner alignment: %s", report)
+        except Exception:
+            # A failed backup/migration must leave the original data usable.
+            # Retry on next startup. New implicit desktop sessions still use
+            # desktop_user; explicit owners are never silently rewritten.
+            self.store.db._desktop_owner_alignment_report = {"status": "failed"}
+            logger.exception("[Memory] Desktop owner alignment failed; keeping original owners")
+
+    def _on_store_event(self, kind: str, payload: Any) -> None:
+        """Observer mirror for ``UnifiedStore`` semantic writes.
+
+        Keeps the in-memory ``_memories`` cache in lock-step with SQLite for
+        every write path — including ones that bypass MemoryManager entirely.
+
+        Idempotent and safe to call when the id is already absent (delete) or
+        already present (upsert overwrites with fresher state).
+        """
+        if not isinstance(kind, str):
+            return
+        try:
+            with self._memories_lock:
+                if kind == "upsert":
+                    if payload is not None and getattr(payload, "id", None):
+                        self._memories[payload.id] = payload
+                elif kind == "delete":
+                    mem_id = payload if isinstance(payload, str) else getattr(payload, "id", None)
+                    if mem_id:
+                        self._memories.pop(mem_id, None)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Manager] _on_store_event %s failed: %s", kind, exc)
+
+    def _maybe_schedule_snapshot(self) -> None:
+        try:
+            marker = self.data_dir / ".last_memory_snapshot"
+            now = datetime.now()
+            if marker.exists():
+                last = datetime.fromtimestamp(marker.stat().st_mtime)
+                if now - last < timedelta(hours=24):
+                    return
+
+            async def _snapshot():
+                try:
+                    snapshot = await asyncio.to_thread(self.store.db.create_snapshot_incremental)
+                    if snapshot is not None:
+                        marker.touch()
+                except Exception as e:
+                    logger.debug("[Memory] Snapshot skipped: %s", e)
+
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(_snapshot())
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
+        except RuntimeError:
+            # No running loop during sync construction; snapshot is optional and
+            # must never block startup.
+            return
+        except Exception as e:
+            logger.debug("[Memory] Snapshot scheduling skipped: %s", e)
+
+    def _stamp_agent_id(self, mem: Memory) -> Memory:
+        """Set agent_id on a memory if not already set."""
+        if self.agent_id and not mem.agent_id:
+            mem.agent_id = self.agent_id
+        return mem
+
+    # ==================== Initialization ====================
+
+    def _ensure_memory_md_exists(self) -> None:
+        if self.memory_md_path.exists():
+            return
+        self.memory_md_path.parent.mkdir(parents=True, exist_ok=True)
+        default_content = """# Core Memory
+
+> Agent 核心记忆，每次对话都会加载。每日凌晨自动刷新。
+> 最后更新: {timestamp}
+
+## 用户偏好
+
+[待学习]
+
+## 重要规则
+
+[待添加]
+
+## 关键事实
+
+[待记录]
+""".format(timestamp=datetime.now().strftime("%Y-%m-%d %H:%M"))
+        self.memory_md_path.write_text(default_content, encoding="utf-8")
+        logger.info(f"Created default MEMORY.md at {self.memory_md_path}")
+
+    # v4 sentinel：标记 memories.json → SQLite 一次性 backfill 已经做完，
+    # 之后不再读取、也不再写出 memories.json，让 SQLite 成为唯一真相源。
+    _LEGACY_JSON_BACKFILL_SENTINEL = "legacy_json_backfill_done"
+
+    def _load_memories(self) -> None:
+        """Load memories from SQLite (authoritative source) into in-memory cache.
+
+        v4：SQLite 是唯一真相源。``memories.json`` 仅作为从旧版本升级时
+        一次性导入兼容入口；backfill 完成后通过 _schema_meta 里的
+        ``legacy_json_backfill_done`` sentinel 标记，并把 ``memories.json``
+        改名归档，``_save_memories`` 退化为 no-op，不再 dual-write。
+        """
+        try:
+            all_mems = self.store.load_all_memories()
+            migrated = self._backfill_legacy_json_memories(all_mems)
+            if migrated > 0:
+                all_mems = self.store.load_all_memories()
+            with self._memories_lock:
+                for mem in all_mems:
+                    self._memories[mem.id] = mem
+            if all_mems:
+                logger.info(f"Loaded {len(all_mems)} memories from SQLite")
+        except Exception as e:
+            logger.warning(f"[Manager] Failed to load from SQLite: {e}")
+        # v4：_save_memories 已退化为 no-op；不再启动期写 memories.json。
+
+    def _backfill_legacy_json_memories(self, existing_mems: list[Memory]) -> int:
+        """One-shot import of legacy ``memories.json`` into SQLite.
+
+        v4 改造点：
+        - 用 _schema_meta 里的 ``legacy_json_backfill_done`` sentinel 做幂等。
+          一旦标记设置完成，后续启动会跳过整个 backfill 流程，**不再读取
+          memories.json 内容**。
+        - 成功 backfill 后把 ``memories.json`` 改名为
+          ``memories.json.archived.<timestamp>``，让用户能在文件层看到这是
+          已归档的历史副本，同时彻底切断 dual-write 路径。
+        - 移除原来 ``len(existing_ids) >= len(raw)`` 的脆弱启发式：有了
+          sentinel 后我们不再需要它来"猜"是否已经导过。
+        """
+        # Sentinel 设置过 → 一次性 backfill 已完成，直接跳过。
+        try:
+            if self.store.get_meta(self._LEGACY_JSON_BACKFILL_SENTINEL):
+                return 0
+        except Exception:
+            pass
+
+        if not self.memories_file.exists():
+            # 没有 memories.json 也算 backfill 完成，标记 sentinel 避免每次
+            # 启动都走 file.exists 判断。
+            with contextlib.suppress(Exception):
+                self.store.set_meta(self._LEGACY_JSON_BACKFILL_SENTINEL, "no_legacy_file")
+            return 0
+
+        try:
+            raw = json.loads(self.memories_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"[Manager] Failed to read legacy memories.json: {e}")
+            return 0
+
+        if not isinstance(raw, list):
+            # JSON 不合法或不是 list，直接归档不再尝试，避免每次重试。
+            self._archive_legacy_memories_json("invalid_format")
+            with contextlib.suppress(Exception):
+                self.store.set_meta(self._LEGACY_JSON_BACKFILL_SENTINEL, "invalid_format")
+            return 0
+        if not raw:
+            self._archive_legacy_memories_json("empty_file")
+            with contextlib.suppress(Exception):
+                self.store.set_meta(self._LEGACY_JSON_BACKFILL_SENTINEL, "empty_file")
+            return 0
+
+        existing_ids = {m.id for m in existing_mems if getattr(m, "id", "")}
+
+        existing_fingerprints = {
+            (
+                (getattr(m, "subject", "") or "").strip().lower(),
+                (getattr(m, "predicate", "") or "").strip().lower(),
+                (getattr(m, "content", "") or "").strip(),
+            )
+            for m in existing_mems
+            if (getattr(m, "content", "") or "").strip()
+        }
+
+        migrated = 0
+        skipped = 0
+        for item in raw:
+            if not isinstance(item, dict):
+                skipped += 1
+                continue
+
+            try:
+                mem = Memory.from_dict(item)
+            except Exception:
+                content = str(item.get("content", "")).strip()
+                if not content:
+                    skipped += 1
+                    continue
+                mem = Memory(
+                    content=content,
+                    type=MemoryType.FACT,
+                    priority=MemoryPriority.SHORT_TERM,
+                    source=str(item.get("source", "legacy_json")),
+                    subject=str(item.get("subject", "")).strip(),
+                    predicate=str(item.get("predicate", "")).strip(),
+                    importance_score=float(item.get("importance_score", 0.5) or 0.5),
+                )
+
+            if not (mem.content or "").strip():
+                skipped += 1
+                continue
+
+            fingerprint = (
+                (mem.subject or "").strip().lower(),
+                (mem.predicate or "").strip().lower(),
+                (mem.content or "").strip(),
+            )
+            if mem.id in existing_ids or fingerprint in existing_fingerprints:
+                skipped += 1
+                continue
+
+            self.store.save_semantic(
+                self._stamp_agent_id(mem),
+                scope="legacy_quarantine",
+                scope_owner="",
+                user_id="legacy",
+                workspace_id=self._current_workspace_id,
+            )
+            existing_ids.add(mem.id)
+            existing_fingerprints.add(fingerprint)
+            migrated += 1
+
+        if migrated:
+            logger.info(
+                f"[Manager] Backfilled {migrated} memories from legacy JSON "
+                f"(skipped={skipped}, sqlite_before={len(existing_mems)}, json_total={len(raw)})"
+            )
+
+        # backfill 流程完成（无论是否真的导入了行）→ 归档 memories.json 文件 +
+        # 写入 sentinel，永久切断 dual-write 路径。
+        self._archive_legacy_memories_json(f"backfilled_{migrated}_skipped_{skipped}")
+        with contextlib.suppress(Exception):
+            self.store.set_meta(
+                self._LEGACY_JSON_BACKFILL_SENTINEL,
+                f"backfilled={migrated},skipped={skipped},total={len(raw)}",
+            )
+        return migrated
+
+    def _archive_legacy_memories_json(self, reason: str) -> None:
+        """把旧 ``memories.json`` 改名到 ``memories.json.archived.<ts>`` 防止被
+        重新读取或被新版 dual-write 覆盖。
+        """
+        try:
+            if not self.memories_file.exists():
+                return
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archived = self.memories_file.with_name(f"{self.memories_file.name}.archived.{ts}")
+            os.replace(self.memories_file, archived)
+            logger.info(
+                "[Manager] Archived legacy memories.json → %s (reason=%s)",
+                archived.name,
+                reason,
+            )
+        except Exception as e:
+            logger.warning(f"[Manager] Failed to archive legacy memories.json: {e}")
+
+    def _save_memories(self) -> None:
+        """v4：dual-write 已禁用。SQLite 是唯一真相源；此函数保留兼容旧调用站点，
+        改为 no-op。需要持久化记忆时直接调用 ``self.store.*`` 写 SQLite。
+        """
+        return
+
+    async def _save_memories_async(self) -> None:
+        return
+
+    # ==================== Session Management ====================
+
+    def start_session(
+        self,
+        session_id: str,
+        *,
+        user_id: str | None | object = _UNSET_OWNER,
+        workspace_id: str | None | object = _UNSET_OWNER,
+        focus_terms: list[str] | None = None,
+    ) -> None:
+        self._current_session_id = session_id
+        self._relational_pending_nodes = []
+        if user_id is not _UNSET_OWNER:
+            self._current_user_id = str(user_id).strip() if user_id else "anonymous"
+        if workspace_id is not _UNSET_OWNER:
+            self._current_workspace_id = str(workspace_id).strip() if workspace_id else "default"
+        # v4：把 session_id → (user_id, workspace_id) 的映射写进 session_tenants 表，
+        # 让凌晨 LifecycleManager 批处理时可以反查每条 conversation_turn 到底
+        # 属于哪个租户，而不是无脑落到 ContextVar 默认值 default/default。
+        if session_id:
+            with contextlib.suppress(Exception):
+                self.store.upsert_session_tenant(
+                    session_id,
+                    self._current_user_id or "default",
+                    self._current_workspace_id or "default",
+                )
+        # P1-5：每次切换会话时显式记录当前 (user_id, workspace_id) 范围，
+        # 让运维能从日志直接看出"本会话能看见的长期记忆来自哪个租户"，
+        # 排查跨用户串扰时不必再去翻代码或 DB。
+        # 同时 user_id 仍为默认 "default" 时降级为 warning：在多用户 IM 通道下
+        # 这往往意味着上游忘了把真实 OpenID 传下来，会导致所有人共用同一份长期记忆。
+        if self._current_user_id in ("default", "anonymous", ""):
+            logger.warning(
+                "[Memory] start_session(%s) using fallback user_id=%r workspace_id=%r — "
+                "long-term memories will be shared across all 'default' callers; "
+                "upstream channel/API entry should pass a real user_id to enforce tenant isolation.",
+                session_id,
+                self._current_user_id,
+                self._current_workspace_id,
+            )
+        else:
+            logger.info(
+                "[Memory] start_session(%s) tenant=(user=%s workspace=%s)",
+                session_id,
+                self._current_user_id,
+                self._current_workspace_id,
+            )
+        self._session_turns = []
+        self._recent_messages = []
+        self._session_cited_memories = []
+        self._set_retrieval_scope_context()
+        retrieval_engine = getattr(self, "retrieval_engine", None)
+        if hasattr(retrieval_engine, "set_focus_terms"):
+            retrieval_engine.set_focus_terms(focus_terms or [])
+        snapshot = getattr(self, "_precompact_snapshot", None)
+        if isinstance(snapshot, dict) and snapshot.get("session_id") != session_id:
+            self._precompact_snapshot = None
+        try:
+            self._turn_offset = self.store.get_max_turn_index(session_id)
+        except Exception:
+            self._turn_offset = 0
+        if self._turn_offset > 0:
+            logger.info(
+                f"[Memory] start_session({session_id}): resuming at turn_offset={self._turn_offset}"
+            )
+
+        backends = self._iter_memory_backends()
+        if backends:
+            with contextlib.suppress(Exception):
+                loop = asyncio.get_event_loop()
+                for backend in backends:
+                    start = getattr(backend, "start_session", None)
+                    if start:
+                        loop.create_task(start(session_id))
+        if self._get_replace_backend() is None:
+            logger.debug(f"[Memory] start_session({session_id}): fresh session (offset=0)")
+
+    def _visible_scope_entries(self) -> list[tuple[str, str, str, str]]:
+        """Return scopes visible to the current turn, ordered from private to shared.
+
+        会话记忆优先，随后是当前用户长期记忆，最后是系统记忆。
+        legacy_quarantine 永不默认进入推理链。
+        """
+        current = (self._current_session_id or "").strip()
+        user_id = self._current_user_id or "default"
+        workspace_id = self._current_workspace_id or "default"
+        entries: list[tuple[str, str, str, str]] = []
+        if current:
+            entries.append(("session", current, user_id, workspace_id))
+        entries.append(("user", "", user_id, workspace_id))
+        entries.append(("system", "", "system", workspace_id))
+        return entries
+
+    def _visible_scope_pairs(self) -> list[tuple[str, str]]:
+        """Backward-compatible view for callers that only understand scope pairs."""
+        return [(scope, owner) for scope, owner, _user, _workspace in self._visible_scope_entries()]
+
+    def _set_retrieval_scope_context(self) -> None:
+        retrieval_engine = getattr(self, "retrieval_engine", None)
+        setter = getattr(retrieval_engine, "set_scope_context", None)
+        if setter:
+            setter(self._visible_scope_entries())
+
+    def _current_write_scope(self) -> tuple[str, str]:
+        current = (self._current_session_id or "").strip()
+        if current:
+            return "session", current
+        return "user", ""
+
+    def _current_owner(self) -> tuple[str, str]:
+        return self._current_user_id or "default", self._current_workspace_id or "default"
+
+    _IDENTITY_SLOT_ALIASES: dict[str, str] = {
+        "姓名": "user.name",
+        "名字": "user.name",
+        "称呼": "user.name",
+        "name": "user.name",
+        "年龄": "user.age",
+        "age": "user.age",
+        "城市": "user.city",
+        "所在地": "user.city",
+        "位置": "user.city",
+        "居住地": "user.city",
+        "location": "user.city",
+        "city": "user.city",
+        "职业": "user.job",
+        "工作": "user.job",
+        "职位": "user.job",
+        "job": "user.job",
+        "profession": "user.job",
+        "宠物": "user.pet",
+        "pet": "user.pet",
+    }
+
+    @classmethod
+    def _identity_slot_for(cls, memory: SemanticMemory) -> str:
+        subject = (memory.subject or "").strip().lower()
+        if subject not in {"用户", "user", "当前用户", "我"}:
+            return ""
+        predicate = (memory.predicate or "").strip().lower()
+        for alias, slot in cls._IDENTITY_SLOT_ALIASES.items():
+            if alias.lower() == predicate:
+                return slot
+        if predicate.startswith("preference.") or predicate.startswith("偏好."):
+            return f"user.preference.{predicate.split('.', 1)[1]}"
+        return ""
+
+    def _save_identity_slot_memory(
+        self,
+        memory: SemanticMemory,
+        *,
+        scope: str,
+        scope_owner: str,
+        user_id: str,
+        workspace_id: str,
+        slot: str,
+    ) -> str:
+        """Save identity facts as active slots and supersede older conflicting values."""
+        old_active = self.store.query_semantic(
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            limit=20,
+            include_inactive=False,
+        )
+        memory.tags = sorted({*normalize_tags(memory.tags), "identity_slot", slot})
+        self.store.save_semantic(
+            self._stamp_agent_id(memory),
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            skip_dedup=True,
+        )
+        for old in old_active:
+            if old.id == memory.id or old.superseded_by:
+                continue
+            if self._identity_slot_for(old) != slot:
+                continue
+            # ``update_semantic`` re-fetches the row and fires an ``upsert``
+            # event with the fresh state, so the cached copy of ``old`` is
+            # replaced in-place by the observer. No manual mutation needed.
+            self.store.update_semantic(old.id, {"superseded_by": memory.id})
+        # Cache write happens via the observer; _save_memories stays for any
+        # future JSON-mirror code (currently a no-op in v4).
+        self._save_memories()
+        return memory.id
+
+    def _normalize_scope_for_owner(self, scope: str, source: str = "") -> tuple[str, str, str, str]:
+        """Normalize legacy/global user writes into owner-scoped user memories."""
+        norm_scope = (scope or "user").strip() or "user"
+        if norm_scope == "global":
+            norm_scope = "user"
+        user_id, workspace_id = self._current_owner()
+        if norm_scope == "system":
+            user_id = "system"
+        if norm_scope == "legacy_quarantine":
+            user_id = "legacy"
+        return norm_scope, source or "", user_id, workspace_id
+
+    def save_user_memory(
+        self,
+        memory: SemanticMemory,
+        *,
+        scope: str | None = None,
+        scope_owner: str | None = None,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        skip_dedup: bool = False,
+    ) -> str:
+        """Save user-owned semantic memory through the single owner-aware path."""
+        write_scope, write_owner = self._current_write_scope()
+        if scope:
+            write_scope = "user" if scope == "global" else scope
+            if write_scope != "session":
+                # An explicit cross-session scope must not inherit the active
+                # session's scope_owner, which the panel/recall cannot see.
+                write_owner = ""
+        if scope_owner is not None:
+            write_owner = scope_owner
+        if write_scope == "system":
+            write_user = "system"
+        elif write_scope == "legacy_quarantine":
+            write_user = "legacy"
+        else:
+            write_user = user_id or self._current_user_id or "default"
+        write_workspace = workspace_id or self._current_workspace_id or "default"
+        memory.scope = write_scope
+        memory.scope_owner = write_owner
+        memory.user_id = write_user
+        memory.workspace_id = write_workspace
+        identity_slot = self._identity_slot_for(memory)
+        if identity_slot:
+            write_scope = "user"
+            write_owner = ""
+            memory.scope = write_scope
+            memory.scope_owner = write_owner
+            return self._save_identity_slot_memory(
+                memory,
+                scope=write_scope,
+                scope_owner=write_owner,
+                user_id=write_user,
+                workspace_id=write_workspace,
+                slot=identity_slot,
+            )
+        saved_id = self.store.save_semantic(
+            self._stamp_agent_id(memory),
+            scope=write_scope,
+            scope_owner=write_owner,
+            user_id=write_user,
+            workspace_id=write_workspace,
+            skip_dedup=skip_dedup,
+        )
+        # Cache mirror is handled by the store observer (_on_store_event);
+        # _save_memories is a no-op in v4 but kept callable in case JSON sync
+        # is restored later. We only invoke it when an actual upsert happened
+        # (i.e. dedup did not short-circuit by returning a different id).
+        if saved_id == memory.id:
+            self._save_memories()
+        return saved_id
+
+    # ==================== Owner Bucket Merge ====================
+
+    @staticmethod
+    def _merge_recency_key(memory: SemanticMemory) -> tuple[str, str]:
+        """Recency ordering key for owner-merge conflict resolution.
+
+        Newer memories sort *higher*. Missing timestamps degrade to empty
+        strings so a memory without ``updated_at`` never crashes the merge.
+        """
+        updated = getattr(memory, "updated_at", None) or getattr(memory, "created_at", None)
+        created = getattr(memory, "created_at", None)
+
+        def _iso(value: Any) -> str:
+            return value.isoformat() if hasattr(value, "isoformat") else str(value or "")
+
+        return (_iso(updated), _iso(created))
+
+    def _merge_move_memory(
+        self, memory: SemanticMemory, *, to_user_id: str, to_workspace_id: str
+    ) -> str:
+        """Move a source memory into the target owner bucket via ``save_user_memory``.
+
+        ``save_semantic`` / ``_save_identity_slot_memory`` upsert **by id**, so
+        passing the source object (which keeps its id) rewrites the same row's
+        owner columns in place — a true move, not a copy. This reuses the
+        existing content-dedup and identity-slot supersede logic: when
+        ``save_semantic``'s dedup finds a near-duplicate already in the target
+        bucket it returns *that* id without touching the source row (the caller
+        then retires the leftover source copy); for identity facts the older
+        target slot value is superseded automatically.
+
+        Returns the surviving memory id (``memory.id`` when the row was moved,
+        or the pre-existing duplicate's id when dedup short-circuited).
+        """
+        return self.save_user_memory(
+            memory,
+            scope="user",
+            scope_owner="",
+            user_id=to_user_id,
+            workspace_id=to_workspace_id,
+        )
+
+    def _merge_deactivate_source(self, memory: SemanticMemory, *, superseded_by: str) -> None:
+        """Retire a source memory that lost to an existing target entry.
+
+        Marks it ``superseded_by`` the surviving target id so it drops out of
+        active reads (panel + recall) without a destructive delete — the same
+        retirement mechanism ``_save_identity_slot_memory`` uses for older slot
+        values.
+        """
+        if not superseded_by:
+            return
+        self.store.update_semantic(memory.id, {"superseded_by": superseded_by})
+
+    def merge_owner_memories(
+        self,
+        *,
+        from_user_id: str,
+        to_user_id: str,
+        from_workspace_id: str = "default",
+        to_workspace_id: str = "default",
+        scope: str = "user",
+        dry_run: bool = True,
+        sample_limit: int = 8,
+    ) -> dict[str, Any]:
+        """Safely merge one owner bucket's active memories into another.
+
+        Reuses ``save_user_memory`` (content dedup + identity-slot supersede)
+        so the merge cannot introduce duplicate facts or leave two active
+        values for the same identity slot (e.g. ``user.name``). Identity-slot
+        conflicts are resolved by *recency* (keep the newer value) rather than
+        letting the historical source blindly win; losing source rows are
+        retired via ``superseded_by`` instead of deleted.
+
+        Idempotent: moved rows leave the source bucket (their ``user_id`` now
+        points at the target) and retired rows become inactive, so a repeat
+        call finds nothing to do and returns all-zero counts.
+
+        With ``dry_run=True`` nothing is written; the same classification runs
+        against read-only probes and an in-memory projection of the target
+        bucket, so the returned counts / samples faithfully predict a real run.
+
+        The ``merged`` / ``superseded`` / ``skipped`` counts partition every
+        source item (plus ``errors``); ``conflicts`` is a diagnostic overlay
+        counting identity-slot collisions (a subset of superseded + skipped).
+        """
+        report: dict[str, Any] = {
+            "dry_run": bool(dry_run),
+            "scope": scope,
+            "from_owner": {"user_id": from_user_id, "workspace_id": from_workspace_id},
+            "to_owner": {"user_id": to_user_id, "workspace_id": to_workspace_id},
+            "source_total": 0,
+            "merged": 0,
+            "superseded": 0,
+            "skipped": 0,
+            "conflicts": 0,
+            "errors": 0,
+            "samples": {"merged": [], "superseded": [], "skipped": [], "conflicts": []},
+        }
+
+        if not to_user_id:
+            report["reason"] = "target user_id is required"
+            return report
+        if from_user_id == to_user_id and from_workspace_id == to_workspace_id:
+            report["reason"] = "source and target owner are identical"
+            return report
+
+        source = self.store.load_all_memories(
+            scope=scope,
+            scope_owner="",
+            user_id=from_user_id,
+            workspace_id=from_workspace_id,
+            include_inactive=False,
+        )
+        report["source_total"] = len(source)
+        if not source:
+            return report
+
+        target_active = self.store.load_all_memories(
+            scope=scope,
+            scope_owner="",
+            user_id=to_user_id,
+            workspace_id=to_workspace_id,
+            include_inactive=False,
+        )
+
+        # In-memory projection of the target bucket, mutated as we go so dry_run
+        # and real runs classify each source item identically (and so two source
+        # items that collapse into one another are counted once).
+        target_slots: dict[str, SemanticMemory] = {}
+        target_contents: set[str] = set()
+        for mem in target_active:
+            slot = self._identity_slot_for(mem)
+            if slot:
+                prev = target_slots.get(slot)
+                if prev is None or self._merge_recency_key(mem) > self._merge_recency_key(prev):
+                    target_slots[slot] = mem
+            else:
+                fp = (mem.content or "").strip().lower()[:120]
+                if fp:
+                    target_contents.add(fp)
+
+        def _sample(bucket: str, mem: SemanticMemory, **extra: Any) -> None:
+            samples = report["samples"][bucket]
+            if len(samples) < sample_limit:
+                entry: dict[str, Any] = {
+                    "id": mem.id,
+                    "content": (mem.content or "")[:120],
+                    "subject": getattr(mem, "subject", "") or "",
+                    "predicate": getattr(mem, "predicate", "") or "",
+                }
+                entry.update(extra)
+                samples.append(entry)
+
+        # Newest first: within an identity slot the freshest source value is
+        # considered first, so older duplicates deterministically lose.
+        source.sort(key=self._merge_recency_key, reverse=True)
+
+        for mem in source:
+            try:
+                slot = self._identity_slot_for(mem)
+                if slot:
+                    self._merge_identity_item(
+                        mem,
+                        slot=slot,
+                        target_slots=target_slots,
+                        to_user_id=to_user_id,
+                        to_workspace_id=to_workspace_id,
+                        dry_run=dry_run,
+                        report=report,
+                        sample=_sample,
+                    )
+                    continue
+
+                self._merge_content_item(
+                    mem,
+                    scope=scope,
+                    target_contents=target_contents,
+                    to_user_id=to_user_id,
+                    to_workspace_id=to_workspace_id,
+                    dry_run=dry_run,
+                    report=report,
+                    sample=_sample,
+                )
+            except Exception as exc:  # noqa: BLE001
+                report["errors"] += 1
+                logger.warning("[Manager] merge_owner_memories: failed on %s: %s", mem.id[:8], exc)
+
+        if not dry_run and report["merged"] + report["superseded"] + report["skipped"] > 0:
+            # Observer keeps _memories coherent per-write; a single defensive
+            # resync guarantees the cache reflects the bulk move immediately.
+            with contextlib.suppress(Exception):
+                self._reload_from_sqlite()
+        return report
+
+    def _merge_identity_item(
+        self,
+        mem: SemanticMemory,
+        *,
+        slot: str,
+        target_slots: dict[str, SemanticMemory],
+        to_user_id: str,
+        to_workspace_id: str,
+        dry_run: bool,
+        report: dict[str, Any],
+        sample,
+    ) -> None:
+        existing = target_slots.get(slot)
+        if existing is None:
+            if not dry_run:
+                self._merge_move_memory(mem, to_user_id=to_user_id, to_workspace_id=to_workspace_id)
+            target_slots[slot] = mem
+            report["merged"] += 1
+            sample("merged", mem, slot=slot)
+            return
+
+        report["conflicts"] += 1
+        if self._merge_recency_key(mem) > self._merge_recency_key(existing):
+            # Source is newer → it wins; save_user_memory supersedes the older
+            # target slot value automatically.
+            if not dry_run:
+                self._merge_move_memory(mem, to_user_id=to_user_id, to_workspace_id=to_workspace_id)
+            target_slots[slot] = mem
+            report["superseded"] += 1
+            sample("superseded", mem, slot=slot, superseded_target=existing.id)
+        else:
+            # Target already holds a newer value → keep it, retire the source.
+            if not dry_run:
+                self._merge_deactivate_source(mem, superseded_by=existing.id)
+            report["skipped"] += 1
+            sample("conflicts", mem, slot=slot, kept_target=existing.id)
+
+    def _merge_content_item(
+        self,
+        mem: SemanticMemory,
+        *,
+        scope: str,
+        target_contents: set[str],
+        to_user_id: str,
+        to_workspace_id: str,
+        dry_run: bool,
+        report: dict[str, Any],
+        sample,
+    ) -> None:
+        content = (mem.content or "").strip()
+        fp = content.lower()[:120]
+        dedup_eligible = bool(content) and len(content) > 10
+
+        if dry_run:
+            is_dup = False
+            if dedup_eligible:
+                if fp and fp in target_contents:
+                    is_dup = True
+                else:
+                    with contextlib.suppress(Exception):
+                        is_dup = bool(
+                            self.store._check_semantic_duplicate(
+                                content, scope, "", to_user_id, to_workspace_id
+                            )
+                        )
+            if is_dup:
+                report["skipped"] += 1
+                sample("skipped", mem)
+            else:
+                if fp:
+                    target_contents.add(fp)
+                report["merged"] += 1
+                sample("merged", mem)
+            return
+
+        # Real run: trust save_user_memory's actual dedup decision.
+        saved_id = self._merge_move_memory(
+            mem, to_user_id=to_user_id, to_workspace_id=to_workspace_id
+        )
+        if saved_id == mem.id:
+            if fp:
+                target_contents.add(fp)
+            report["merged"] += 1
+            sample("merged", mem)
+        else:
+            # Dedup short-circuited: a duplicate already lives in the target
+            # bucket. Retire the untouched source row so it stops lingering.
+            self._merge_deactivate_source(mem, superseded_by=saved_id)
+            report["skipped"] += 1
+            sample("skipped", mem, duplicate_of=saved_id)
+
+    # 任务流水账识别：包含这些动词或客观操作描述的提取项几乎一定是
+    # 一次性任务记录（删除 / 创建 / 上传 / 编辑 / 调用工具 / 帮我做 ...），
+    # 不应被自动升级为 PERMANENT，否则 USER.md 会被任务日志污染（P1-7）。
+    _TASK_MARKER_RE: re.Pattern[str] | None = None
+
+    @classmethod
+    def _task_marker_re_for_extraction(cls) -> re.Pattern[str]:
+        if cls._TASK_MARKER_RE is None:
+            cls._TASK_MARKER_RE = re.compile(
+                r"(?:用户(?:希望|想|想要|要求|让|请|让我|让你|交给|安排)|"
+                r"任务|操作|执行|完成|交付|生成|创建|删除|清理|清掉|搜索|查询|"
+                r"整理|发送|上传|下载|导出|导入|配置|安装|卸载|启动|关闭|访问|"
+                r"截图|录制|提交|推送|拉取|更新|修复|测试|部署|帮[我你他她]|"
+                r"call_mcp_tool|run_shell|run_powershell|write_file|edit_file)"
+            )
+        return cls._TASK_MARKER_RE
+
+    def query_visible_semantic(self, **kwargs) -> list[SemanticMemory]:
+        """Query memories visible to the current turn without leaking other sessions."""
+        limit = int(kwargs.pop("limit", 50) or 50)
+        merged: list[SemanticMemory] = []
+        seen: set[str] = set()
+        per_scope_limit = max(limit, 1)
+        for scope, scope_owner, user_id, workspace_id in self._visible_scope_entries():
+            results = self.store.query_semantic(
+                **kwargs,
+                scope=scope,
+                scope_owner=scope_owner,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                limit=per_scope_limit,
+            )
+            for mem in results:
+                if mem.id in seen:
+                    continue
+                seen.add(mem.id)
+                merged.append(mem)
+                if len(merged) >= limit:
+                    return merged
+        return merged
+
+    def search_visible_semantic_scored(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        filter_type: str | None = None,
+    ) -> list[tuple[SemanticMemory, float]]:
+        """Search current-session memories first, then explicitly global memories."""
+        merged: list[tuple[SemanticMemory, float]] = []
+        seen: set[str] = set()
+        for scope, scope_owner, user_id, workspace_id in self._visible_scope_entries():
+            scored = self.store.search_semantic_scored(
+                query,
+                limit=limit,
+                filter_type=filter_type,
+                scope=scope,
+                scope_owner=scope_owner,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+            for mem, score in scored:
+                if mem.id in seen:
+                    continue
+                seen.add(mem.id)
+                merged.append((mem, score))
+                if len(merged) >= limit:
+                    return merged
+        return merged
+
+    def search_visible_semantic(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        filter_type: str | None = None,
+    ) -> list[SemanticMemory]:
+        return [
+            mem
+            for mem, _score in self.search_visible_semantic_scored(
+                query,
+                limit=limit,
+                filter_type=filter_type,
+            )
+        ]
+
+    def record_turn(
+        self,
+        role: str,
+        content: str,
+        tool_calls: list | None = None,
+        tool_results: list | None = None,
+        attachments: list[dict] | None = None,
+    ) -> None:
+        """记录对话轮次 (v2: 写入 SQLite + JSONL + 异步提取 + 附件)
+
+        Args:
+            attachments: 本轮携带的文件/媒体信息列表, 每项包含:
+                filename, mime_type, local_path, url, description,
+                transcription, extracted_text, tags, direction, file_size
+        """
+        content = coerce_text(content)
+
+        backends = self._iter_memory_backends()
+        if backends:
+            with contextlib.suppress(Exception):
+                loop = asyncio.get_event_loop()
+                for backend in backends:
+                    record = getattr(backend, "record_turn", None)
+                    if record:
+                        loop.create_task(record(role, content))
+
+        turn = ConversationTurn(
+            role=role,
+            content=content,
+            tool_calls=tool_calls or [],
+            tool_results=tool_results or [],
+        )
+        self._session_turns.append(turn)
+
+        if attachments:
+            direction = "inbound" if role == "user" else "outbound"
+            for att_data in attachments:
+                self.record_attachment(
+                    filename=att_data.get("filename", ""),
+                    mime_type=att_data.get("mime_type", ""),
+                    local_path=att_data.get("local_path", ""),
+                    url=att_data.get("url", ""),
+                    description=att_data.get("description", ""),
+                    transcription=att_data.get("transcription", ""),
+                    extracted_text=att_data.get("extracted_text", ""),
+                    tags=att_data.get("tags", []),
+                    direction=att_data.get("direction", direction),
+                    file_size=att_data.get("file_size", 0),
+                    original_filename=att_data.get("original_filename", ""),
+                )
+
+        self._recent_messages.append({"role": role, "content": content})
+        if len(self._recent_messages) > 10:
+            self._recent_messages = self._recent_messages[-10:]
+
+        # v2: Write to SQLite
+        if self._current_session_id:
+            offset = getattr(self, "_turn_offset", 0)
+            self.store.save_turn(
+                session_id=self._current_session_id,
+                turn_index=offset + len(self._session_turns) - 1,
+                role=role,
+                content=content,
+                tool_calls=tool_calls,
+                tool_results=tool_results,
+            )
+
+        # v1 compat: Write to JSONL
+        if self._current_session_id:
+            self.consolidator.save_conversation_turn(self._current_session_id, turn)
+
+    def record_cited_memories(self, memories: list[dict]) -> None:
+        """Record memories retrieved via search_memory for later LLM scoring.
+
+        Args:
+            memories: list of {id, content} dicts
+        """
+        seen = {m["id"] for m in self._session_cited_memories}
+        for m in memories:
+            mid = m.get("id", "")
+            if mid and mid not in seen:
+                self._session_cited_memories.append({"id": mid, "content": m.get("content", "")})
+                seen.add(mid)
+
+    def _consume_cited_memories(self) -> list[dict]:
+        """Consume and return accumulated cited memories, clearing the buffer."""
+        cited = list(self._session_cited_memories)
+        self._session_cited_memories = []
+        return cited
+
+    def _apply_citation_scores(self, scores: list[dict]) -> int:
+        """Apply LLM citation scores: bump access_count for useful memories.
+
+        Args:
+            scores: list of {memory_id, useful} dicts from LLM
+        Returns:
+            Number of memories marked as useful
+        """
+        useful_ids = [s["memory_id"] for s in scores if s.get("useful")]
+        if useful_ids:
+            self.store.bump_access(useful_ids)
+        return len(useful_ids)
+
+    async def extract_on_topic_change(self) -> int:
+        """主题切换时，从已积累的对话中提取记忆，然后重置 turns 缓冲。
+
+        带 30s 超时保护，防止后台提取任务挂起。
+
+        Returns:
+            提取并保存的记忆条数
+        """
+        turns = list(self._session_turns)
+        if len(turns) < 3:
+            return 0
+
+        try:
+            cited = self._consume_cited_memories()
+            items, scores = await asyncio.wait_for(
+                self.extractor.extract_from_conversation(turns, cited_memories=cited or None),
+                timeout=30.0,
+            )
+
+            if scores:
+                self._apply_citation_scores(scores)
+
+            saved = 0
+            for item in items:
+                await self._save_extracted_item(item)
+                saved += 1
+            if saved:
+                logger.info(
+                    f"[Memory] Topic-change extraction: {saved} items saved from {len(turns)} turns"
+                )
+            # Reset turn buffer — new topic starts fresh
+            self._session_turns.clear()
+            return saved
+        except TimeoutError:
+            logger.warning("[Memory] Topic-change extraction timed out (30s), skipping")
+            self._session_turns.clear()
+            return 0
+        except Exception as e:
+            if record_health_event(
+                "memory",
+                "topic_change_extraction",
+                str(e),
+                suggestion="记忆抽取失败已降级跳过本轮，不影响聊天主链路；请检查当前 LLM 端点稳定性。",
+            ):
+                logger.warning(f"[Memory] Topic-change extraction failed: {e}")
+            return 0
+
+    async def _save_extracted_item(self, item: dict, episode_id: str | None = None) -> str | None:
+        """Save a v2 extracted item as SemanticMemory, with multi-layer dedup.
+
+        Returns the memory ID (new or evolved), or None on failure.
+        """
+        type_map = {
+            "PREFERENCE": MemoryType.PREFERENCE,
+            "FACT": MemoryType.FACT,
+            "SKILL": MemoryType.SKILL,
+            "ERROR": MemoryType.ERROR,
+            "RULE": MemoryType.RULE,
+            "PERSONA_TRAIT": MemoryType.PERSONA_TRAIT,
+            "EXPERIENCE": MemoryType.EXPERIENCE,
+        }
+        mem_type = type_map.get(item.get("type", "FACT"), MemoryType.FACT)
+        importance = item.get("importance", 0.5)
+        content = item.get("content", "").strip()
+
+        # PERMANENT 是最贵的层（不会被衰减、永远进 USER.md / MEMORY.md），
+        # 因此只允许 *用户身份层* 的记忆走到这里。否则一次任务记录就被永久化，
+        # USER.md 会被「[experience] 用户希望删除工作区 py 文件」这种一次性
+        # 流水账填满（P1-7）。
+        _persona_types = {
+            MemoryType.PERSONA_TRAIT,
+            MemoryType.PREFERENCE,
+            MemoryType.RULE,
+        }
+        # 内容含有任务/操作动词 → 几乎一定是任务流水账，不是身份层信息。
+        _task_marker_re = self._task_marker_re_for_extraction()
+        _looks_like_task = bool(_task_marker_re.search(content)) if content else False
+
+        if importance >= 0.9 and mem_type in _persona_types and not _looks_like_task:
+            priority = MemoryPriority.PERMANENT
+        elif importance >= 0.6:
+            priority = MemoryPriority.LONG_TERM
+        else:
+            priority = MemoryPriority.SHORT_TERM
+
+        write_scope, write_owner = self._current_write_scope()
+        write_user, write_workspace = self._current_owner()
+
+        # Dedup layer 1: exact subject+predicate match → evolve existing
+        subject = item.get("subject", "")
+        predicate = item.get("predicate", "")
+        self._sync_profile_fact(subject, predicate, content)
+        _identity_probe = SemanticMemory(subject=subject, predicate=predicate, content=content)
+        if subject and predicate and not self._identity_slot_for(_identity_probe):
+            existing = self.store.find_similar(
+                subject,
+                predicate,
+                scope=write_scope,
+                scope_owner=write_owner,
+                user_id=write_user,
+                workspace_id=write_workspace,
+            )
+            if existing:
+                self._evolve_memory(existing, content, importance)
+                logger.debug(f"[Memory] Dedup L1: evolved {existing.id[:8]} (subject+predicate)")
+                return existing.id
+
+        # Dedup layer 2: content similarity search
+        if content and len(content) >= 10:
+            try:
+                similar = self.store.search_semantic(
+                    content,
+                    limit=5,
+                    scope=write_scope,
+                    scope_owner=write_owner,
+                    user_id=write_user,
+                    workspace_id=write_workspace,
+                )
+                for s in similar:
+                    existing_content = (s.content or "").strip()
+                    dup_level = self._fast_dedup_check(content, existing_content)
+
+                    if dup_level == "exact":
+                        self._evolve_memory(s, content, importance)
+                        logger.debug(f"[Memory] Dedup L2: exact match, evolved {s.id[:8]}")
+                        return s.id
+
+                    if dup_level == "likely":
+                        is_dup = await self._check_duplicate_with_llm(content, existing_content)
+                        if is_dup:
+                            self._evolve_memory(s, content, importance)
+                            logger.debug(
+                                f"[Memory] Dedup L2: LLM confirmed dup, evolved {s.id[:8]}"
+                            )
+                            return s.id
+            except Exception as e:
+                logger.debug(f"[Memory] Dedup search failed: {e}")
+
+        mem = SemanticMemory(
+            type=mem_type,
+            priority=priority,
+            content=content,
+            source="session_extraction",
+            subject=subject,
+            predicate=predicate,
+            importance_score=importance,
+            source_episode_id=episode_id,
+            tags=[item.get("type", "fact").lower()],
+        )
+        _apply_retention(mem, item.get("duration"))
+        saved_id = self.save_user_memory(
+            mem,
+            scope=write_scope,
+            scope_owner=write_owner,
+            user_id=write_user,
+            workspace_id=write_workspace,
+        )
+
+        return saved_id
+
+    def _sync_profile_fact(self, subject: str, predicate: str, content: str) -> None:
+        """Mirror structured user identity facts into UserProfileManager when possible."""
+        if not content:
+            return
+        if (subject or "").strip().lower() not in {"用户", "user", "当前用户"}:
+            return
+        profile_mgr = getattr(self, "profile_manager", None)
+        if profile_mgr is None:
+            return
+        try:
+            from openkitsune.agent.user_profile import resolve_profile_key
+        except Exception:
+            return
+        key = resolve_profile_key((predicate or "").strip())
+        available = set(getattr(profile_mgr, "get_available_keys", lambda: [])())
+        if key not in available:
+            return
+        value = self._extract_profile_value(key, content)
+        if value:
+            with contextlib.suppress(Exception):
+                profile_mgr.update_profile(key, value)
+
+    @staticmethod
+    def _extract_profile_value(key: str, content: str) -> str:
+        import re
+
+        text = (content or "").strip()
+        if key == "age":
+            m = re.search(r"(\d{1,3})\s*岁?", text)
+            return m.group(1) if m else ""
+        if key in {"city", "location"}:
+            m = re.search(r"(?:在|位于|住在|居住在|城市[是为:]?)\s*([^，。；,;\s]+)", text)
+            return m.group(1) if m else text[:40]
+        if key in {"name", "profession", "work_field", "preferred_language"}:
+            m = re.search(r"(?:叫|是|为|使用|喜欢)\s*([^，。；,;\s]+)", text)
+            return m.group(1) if m else text[:40]
+        return text[:80]
+
+    @staticmethod
+    def _fast_dedup_check(new: str, existing: str) -> str:
+        """Fast local dedup: returns 'exact', 'likely', or 'no'.
+
+        - exact: definitely duplicate (skip without LLM)
+        - likely: might be duplicate (needs LLM confirmation)
+        - no: not duplicate
+        """
+        if not new or not existing:
+            return "no"
+        a, b = new.lower().strip(), existing.lower().strip()
+        if a == b:
+            return "exact"
+        if len(a) > 15 and len(b) > 15 and (a in b or b in a):
+            return "exact"
+        if len(a) >= 10 and len(b) >= 10:
+            bigrams_a = {a[i : i + 2] for i in range(len(a) - 1)}
+            bigrams_b = {b[i : i + 2] for i in range(len(b) - 1)}
+            if bigrams_a and bigrams_b:
+                overlap = len(bigrams_a & bigrams_b) / len(bigrams_a | bigrams_b)
+                if overlap > 0.8:
+                    return "exact"
+                if overlap > 0.3:
+                    return "likely"
+        return "no"
+
+    async def _check_duplicate_with_llm(self, new_content: str, existing_content: str) -> bool:
+        """Ask LLM whether two memory entries are semantically the same."""
+        brain = getattr(self.extractor, "brain", None)
+        if not brain:
+            return False
+        try:
+            resp = await brain.think(
+                f"判断这两条记忆是否表达相同的信息（语义重复）。\n"
+                f"记忆A: {new_content}\n"
+                f"记忆B: {existing_content}\n\n"
+                f"只回答 YES 或 NO。",
+                system="你是记忆去重判断器。如果两条记忆表达的核心信息相同（即使措辞不同），回答YES。否则回答NO。只输出一个词。",
+                enable_thinking=False,
+                max_tokens=16,
+            )
+            text = (getattr(resp, "content", None) or str(resp)).strip().upper()
+            return "YES" in text and "NO" not in text
+        except Exception:
+            return False
+
+    def _evolve_memory(
+        self, existing: SemanticMemory, new_content: str, new_importance: float
+    ) -> None:
+        """Evolve an existing memory: boost confidence/importance, optionally update content.
+
+        If the new content is longer or higher importance, update the content.
+        Always boost confidence (capped at 1.0) to signal repeated reinforcement.
+        """
+        updates: dict = {
+            "confidence": min(1.0, existing.confidence + 0.1),
+        }
+        # Same subject+predicate with a different value is an update/conflict,
+        # not a duplicate. Always move the active fact forward so "28 -> 29"
+        # cannot be swallowed by near-duplicate logic.
+        should_update_content = bool(new_content and new_content != (existing.content or ""))
+        if should_update_content:
+            updates["content"] = new_content
+        updates["importance_score"] = max(existing.importance_score, new_importance)
+
+        self.store.update_semantic(existing.id, updates)
+
+    # ==================== Relational Memory (Mode 2) ====================
+
+    def _save_relational_encoding(
+        self, result, *, user_id: str, workspace_id: str, session_id: str
+    ) -> None:
+        """Stamp every encoding layer with its captured, trusted session owner."""
+        for node in result.nodes:
+            node.user_id = user_id
+            node.workspace_id = workspace_id
+            node.session_id = session_id
+            if self.agent_id and not node.agent_id:
+                node.agent_id = self.agent_id
+        if result.nodes:
+            self.relational_store.save_nodes_batch(result.nodes)
+        if result.edges:
+            self.relational_store.save_edges_batch(result.edges)
+
+    def _ensure_relational(self) -> bool:
+        """Lazily initialize relational memory components. Returns True if available."""
+        if self.relational_store is not None:
+            return True
+        try:
+            from .relational.consolidator import RelationalConsolidator
+            from .relational.encoder import MemoryEncoder
+            from .relational.entity_resolver import EntityResolver
+            from .relational.graph_engine import GraphEngine
+            from .relational.store import RelationalMemoryStore
+
+            conn = self.store.db._conn
+            if conn is None:
+                return False
+
+            try:
+                from openkitsune.config import settings as _cfg
+
+                ui_lang = getattr(_cfg, "ui_language", "zh")
+            except Exception:
+                ui_lang = "zh"
+
+            self.relational_store = RelationalMemoryStore(conn)
+            self.relational_encoder = MemoryEncoder(
+                brain=self.brain,
+                session_id=self._current_session_id or "",
+                language=ui_lang,
+            )
+            self.relational_graph = GraphEngine(self.relational_store)
+            resolver = EntityResolver(self.relational_store, brain=self.brain, language=ui_lang)
+            self.relational_consolidator = RelationalConsolidator(
+                self.relational_store, entity_resolver=resolver
+            )
+            logger.info("[Memory] Relational memory (Mode 2) initialized")
+            return True
+        except Exception as e:
+            logger.debug(f"[Memory] Relational memory init skipped: {e}")
+            return False
+
+    def _get_memory_mode(self) -> str:
+        """Read memory_mode from config. Defaults to 'auto'."""
+        try:
+            from openkitsune.config import settings
+
+            return getattr(settings, "memory_mode", "auto")
+        except Exception:
+            return "auto"
+
+    def end_session(
+        self, task_description: str = "", success: bool = True, errors: list | None = None
+    ) -> None:
+        """结束会话: 生成 Episode + 双轨提取（用户画像 + 任务经验）+ 引用评分"""
+        if not self._current_session_id:
+            return
+
+        backends = self._iter_memory_backends()
+        if backends:
+            with contextlib.suppress(Exception):
+                loop_for_backends = asyncio.get_event_loop()
+                for backend in backends:
+                    end = getattr(backend, "end_session", None)
+                    if end:
+                        loop_for_backends.create_task(end())
+
+        session_id = self._current_session_id
+        session_user, session_workspace = self._current_owner()
+        turns = list(self._session_turns)
+        cited = self._consume_cited_memories()
+
+        relational_pending_snapshot = list(self._relational_pending_nodes)
+        self._relational_pending_nodes.clear()
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            async def _finalize_session():
+                episode = None
+                try:
+                    episode = await self.extractor.generate_episode(
+                        turns, session_id, source="session_end"
+                    )
+                    if episode:
+                        checkpoint = None
+                        with contextlib.suppress(Exception):
+                            checkpoint = self.store.get_latest_completed_compaction(session_id)
+                        if checkpoint:
+                            episode.compaction_checkpoint_id = checkpoint.get("id", "")
+                            episode.workspace_snapshot_id = checkpoint.get(
+                                "workspace_snapshot_id", ""
+                            )
+                        self.store.save_episode(episode)
+                        logger.info("[Memory] Session finalized: episode saved")
+                except Exception as e:
+                    if record_health_event(
+                        "memory",
+                        "episode_generation",
+                        str(e),
+                        suggestion="会话 episode 生成失败已跳过；通常是 LLM 连接瞬断。",
+                    ):
+                        logger.warning(f"[Memory] Episode generation failed: {e}")
+
+                ep_id = episode.id if episode else None
+                saved_memory_ids: list[str] = []
+
+                # Track 1: User profile extraction (+ citation scoring in same LLM call)
+                try:
+                    items, scores = await asyncio.wait_for(
+                        self.extractor.extract_from_conversation(
+                            turns,
+                            cited_memories=cited or None,
+                        ),
+                        timeout=30.0,
+                    )
+                    if scores:
+                        useful = self._apply_citation_scores(scores)
+                        logger.info(f"[Memory] Citation scores applied: {useful} useful")
+                    saved = 0
+                    for item in items:
+                        mid = await self._save_extracted_item(item, episode_id=ep_id)
+                        if mid:
+                            saved_memory_ids.append(mid)
+                        saved += 1
+                    if saved:
+                        logger.info(
+                            f"[Memory] Profile extraction: {saved}/{len(items)} items saved"
+                        )
+                except Exception as e:
+                    if record_health_event(
+                        "memory",
+                        "profile_extraction",
+                        str(e),
+                        suggestion="用户画像抽取失败已跳过本轮；主聊天不受影响。",
+                    ):
+                        logger.warning(f"[Memory] Profile extraction failed: {e}")
+
+                # Track 2: Task experience extraction
+                try:
+                    exp_items = await asyncio.wait_for(
+                        self.extractor.extract_experience_from_conversation(turns),
+                        timeout=30.0,
+                    )
+                    exp_saved = 0
+                    for item in exp_items:
+                        mid = await self._save_extracted_item(item, episode_id=ep_id)
+                        if mid:
+                            saved_memory_ids.append(mid)
+                        exp_saved += 1
+                    if exp_saved:
+                        logger.info(
+                            f"[Memory] Experience extraction: {exp_saved}/{len(exp_items)} items saved"
+                        )
+                except Exception as e:
+                    if record_health_event(
+                        "memory",
+                        "experience_extraction",
+                        str(e),
+                        suggestion="经验抽取失败已跳过本轮；可稍后手动整理记忆。",
+                    ):
+                        logger.warning(f"[Memory] Experience extraction failed: {e}")
+
+                # Back-fill bidirectional links between episode, memories, and turns
+                if ep_id:
+                    try:
+                        if saved_memory_ids:
+                            self.store.update_episode(
+                                ep_id, {"linked_memory_ids": saved_memory_ids}
+                            )
+                        linked = self.store.link_turns_to_episode(session_id, ep_id)
+                        logger.info(
+                            f"[Memory] Episode links: {len(saved_memory_ids)} memories, "
+                            f"{linked} turns linked to {ep_id[:8]}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"[Memory] Failed to back-fill episode links: {e}")
+
+                # Relational memory (Mode 2) — batch encode at session end
+                mode = self._get_memory_mode()
+                if mode in ("mode2", "auto") and self._ensure_relational():
+                    try:
+                        turn_dicts = [
+                            {
+                                "role": t.role,
+                                "content": t.content,
+                                "tool_calls": t.tool_calls,
+                                "tool_results": t.tool_results,
+                            }
+                            for t in turns
+                        ]
+                        existing = relational_pending_snapshot
+                        result = await self.relational_encoder.encode_session(
+                            turn_dicts,
+                            existing_nodes=existing or None,
+                            session_id=session_id,
+                        )
+                        self._save_relational_encoding(
+                            result,
+                            user_id=session_user,
+                            workspace_id=session_workspace,
+                            session_id=session_id,
+                        )
+                        if result.nodes or result.edges:
+                            logger.info(
+                                f"[Memory] Relational encoding: "
+                                f"{len(result.nodes)} nodes, {len(result.edges)} edges"
+                            )
+                    except Exception as e:
+                        logger.warning(f"[Memory] Relational session encoding failed: {e}")
+
+            task = loop.create_task(_finalize_session())
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
+        except RuntimeError:
+            self._enqueue_session_turns_for_extraction(session_id, turns)
+
+        try:
+            self.store.cleanup_expired()
+        except Exception:
+            pass
+
+        logger.info(f"Ended session {session_id}: finalization scheduled")
+        self._current_session_id = None
+        self._session_turns = []
+        self._set_retrieval_scope_context()
+
+    def _enqueue_session_turns_for_extraction(
+        self, session_id: str, turns: list[ConversationTurn]
+    ) -> None:
+        """Fallback: 将会话 turns 入队提取（用于无 event loop 的同步场景）"""
+        try:
+            enqueued = 0
+            for i, turn in enumerate(turns):
+                if turn.content and len(turn.content) >= 20:
+                    self.store.enqueue_extraction(
+                        session_id=session_id,
+                        turn_index=i,
+                        content=turn.content,
+                        tool_calls=turn.tool_calls or None,
+                        tool_results=turn.tool_results or None,
+                    )
+                    enqueued += 1
+            if enqueued:
+                logger.info(
+                    f"[Memory] Enqueued {enqueued} turns for deferred extraction (no event loop)"
+                )
+        except Exception as e:
+            logger.warning(f"[Memory] Failed to enqueue session turns: {e}")
+
+    async def await_pending_tasks(self, timeout: float = 30.0) -> None:
+        """等待所有挂起的异步任务完成（在 shutdown 时调用）"""
+        if not self._pending_tasks:
+            return
+        pending = list(self._pending_tasks)
+        logger.info(f"[Memory] Awaiting {len(pending)} pending tasks (timeout={timeout}s)...")
+        done, not_done = await asyncio.wait(pending, timeout=timeout)
+        if not_done:
+            logger.warning(f"[Memory] {len(not_done)} tasks did not complete within timeout")
+            for t in not_done:
+                t.cancel()
+        self._pending_tasks.clear()
+
+    def _safe_enqueue_extraction(
+        self,
+        session_id: str | None,
+        turn_index: int,
+        content: str,
+        tool_calls: list | None = None,
+        tool_results: list | None = None,
+    ) -> None:
+        """安全入队提取 — 捕获所有异常，永不抛出"""
+        try:
+            sid = session_id or self._current_session_id or "unknown"
+            self.store.enqueue_extraction(
+                session_id=sid,
+                turn_index=turn_index,
+                content=content,
+                tool_calls=tool_calls,
+                tool_results=tool_results,
+            )
+            logger.info(f"[Memory] Enqueued extraction for retry: session={sid}, turn={turn_index}")
+        except Exception as e:
+            # 最终 fallback: 写到本地文件，防止数据永久丢失
+            try:
+                fallback_dir = self.data_dir / "extraction_fallback"
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+                import json
+                from datetime import datetime
+
+                fallback_file = (
+                    fallback_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{turn_index}.json"
+                )
+                fallback_file.write_text(
+                    json.dumps(
+                        {"session_id": session_id, "turn_index": turn_index, "content": content},
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                logger.warning(
+                    f"[Memory] Enqueue failed ({e}), saved to fallback file: {fallback_file}"
+                )
+            except Exception as e2:
+                logger.error(
+                    f"[Memory] Both enqueue and fallback failed: enqueue={e}, fallback={e2}"
+                )
+
+    # ==================== Context Compression Hook ====================
+
+    async def on_context_compressing(self, messages: list[dict]) -> None:
+        """Called before context compression — extract quick facts and save to queue."""
+        quick_facts = self.extractor.extract_quick_facts(messages)
+        write_scope, write_owner = self._current_write_scope()
+        write_user, write_workspace = self._current_owner()
+        for fact in quick_facts:
+            self.save_user_memory(
+                fact,
+                scope=write_scope,
+                scope_owner=write_owner,
+                user_id=write_user,
+                workspace_id=write_workspace,
+            )
+        if quick_facts:
+            logger.info(f"[Memory] Quick extraction before compression: {len(quick_facts)} facts")
+
+        if self._current_session_id:
+            for i, msg in enumerate(messages[:10]):
+                content = msg.get("content", "")
+                if content and isinstance(content, str) and len(content) > 20:
+                    self.store.enqueue_extraction(
+                        session_id=self._current_session_id,
+                        turn_index=i,
+                        content=content,
+                        tool_calls=msg.get("tool_calls"),
+                        tool_results=msg.get("tool_results"),
+                    )
+
+        # Relational memory (Mode 2) — quick encode before messages are lost
+        mode = self._get_memory_mode()
+        if mode in ("mode2", "auto") and self._ensure_relational():
+            try:
+                result = self.relational_encoder.encode_quick(
+                    messages, self._current_session_id or ""
+                )
+                self._save_relational_encoding(
+                    result,
+                    user_id=write_user,
+                    workspace_id=write_workspace,
+                    session_id=self._current_session_id or "",
+                )
+                if result.nodes:
+                    self._relational_pending_nodes.extend(result.nodes)
+                if result.nodes:
+                    logger.info(
+                        f"[Memory] Relational quick encode: "
+                        f"{len(result.nodes)} nodes, {len(result.edges)} edges"
+                    )
+            except Exception as e:
+                logger.warning(f"[Memory] Relational quick encode failed: {e}")
+
+    def contribute_to_compaction(self, **_kwargs):
+        """Provide bounded durable-memory state to the compaction pipeline."""
+        from openkitsune.runtime.context.continuity import CompactionContribution
+
+        parts: list[str] = []
+        snapshot = self.get_precompact_snapshot_context(max_chars=1000)
+        if snapshot:
+            parts.append(snapshot)
+        with contextlib.suppress(Exception):
+            scratchpad = self.store.get_scratchpad(self._current_user_id or "default")
+            if scratchpad:
+                rendered = scratchpad.to_markdown().strip()
+                if rendered:
+                    parts.append(rendered[:1000])
+        if not parts:
+            return None
+        return CompactionContribution(
+            name="Durable memory state",
+            content="\n\n".join(parts),
+            priority=90,
+            max_tokens=700,
+        )
+
+    def get_cold_tool_output(self, blob_id: str) -> str | None:
+        """Load a cold tool payload, restricted to the active session."""
+        session_id = self._current_session_id or ""
+        if not session_id:
+            return None
+        return self.store.get_tool_output_blob(blob_id, session_id=session_id)
+
+    async def on_summary_generated(self, summary: str) -> None:
+        """Called after context compression generates a summary — Layer 2 backfill."""
+        mode = self._get_memory_mode()
+        if mode not in ("mode2", "auto") or not self._ensure_relational():
+            return
+        pending = list(self._relational_pending_nodes)
+        if not pending or not summary:
+            return
+        try:
+            result = self.relational_encoder.backfill_from_summary(summary, pending)
+            user_id, workspace_id = self._current_owner()
+            self._save_relational_encoding(
+                result,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                session_id=self._current_session_id or "",
+            )
+            if result.nodes or result.edges:
+                logger.info(
+                    f"[Memory] Relational backfill from summary: "
+                    f"{len(result.nodes)} nodes, {len(result.edges)} edges"
+                )
+        except Exception as e:
+            logger.warning(f"[Memory] Relational backfill failed: {e}")
+
+    # ==================== Memory CRUD (v1 compat) ====================
+
+    DUPLICATE_DISTANCE_THRESHOLD = 0.12
+
+    COMMON_PREFIXES = [
+        "任务执行复盘发现问题：",
+        "任务执行复盘：",
+        "复盘发现：",
+        "系统自检发现：",
+        "自检发现的典型问题模式：",
+        "系统自检发现的典型问题模式：",
+        "用户偏好：",
+        "用户习惯：",
+        "学习到：",
+        "记住：",
+    ]
+
+    def _strip_common_prefix(self, content: str) -> str:
+        for prefix in self.COMMON_PREFIXES:
+            if content.startswith(prefix):
+                return content[len(prefix) :]
+        return content
+
+    def add_memory(
+        self,
+        memory: Memory,
+        scope: str = "user",
+        scope_owner: str = "",
+        *,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> str:
+        """添加记忆 (v1 compat: writes to both v1 and v2 stores)"""
+        if scope == "global":
+            scope = "user"
+        if scope == "system":
+            user_id = "system"
+        elif scope == "legacy_quarantine":
+            user_id = "legacy"
+        else:
+            user_id = user_id or self._current_user_id or "default"
+        workspace_id = workspace_id or self._current_workspace_id or "default"
+        memory.scope = scope
+        memory.scope_owner = scope_owner
+        memory.user_id = user_id
+        memory.workspace_id = workspace_id
+        with self._memories_lock:
+            existing = [
+                m
+                for m in self._memories.values()
+                if (getattr(m, "scope", "global") or "global") == scope
+                and (getattr(m, "scope_owner", "") or "") == scope_owner
+                and (getattr(m, "user_id", "default") or "default") == user_id
+                and (getattr(m, "workspace_id", "default") or "default") == workspace_id
+            ]
+            unique = self.extractor.deduplicate([memory], existing)
+            if not unique:
+                return ""
+            memory = unique[0]
+            memory.scope = scope
+            memory.scope_owner = scope_owner
+
+            if (
+                self.vector_store is not None
+                and self.vector_store.enabled
+                and len(self._memories) > 0
+            ):
+                core_content = self._strip_common_prefix(memory.content)
+                similar = self.vector_store.search(core_content, limit=3)
+                for mid, distance in similar:
+                    if distance < self.DUPLICATE_DISTANCE_THRESHOLD:
+                        existing_mem = self._memories.get(mid)
+                        if existing_mem:
+                            if (
+                                (getattr(existing_mem, "scope", "global") or "global") != scope
+                                or (getattr(existing_mem, "scope_owner", "") or "") != scope_owner
+                                or (getattr(existing_mem, "user_id", "default") or "default")
+                                != user_id
+                                or (getattr(existing_mem, "workspace_id", "default") or "default")
+                                != workspace_id
+                            ):
+                                continue
+                            existing_core = self._strip_common_prefix(existing_mem.content)
+                            if core_content != existing_core:
+                                continue
+                            return ""
+            elif len(self._memories) > 0:
+                try:
+                    core_content = self._strip_common_prefix(memory.content)
+                    fts_hits = self.store.search_semantic(
+                        core_content,
+                        limit=5,
+                        scope=scope,
+                        scope_owner=scope_owner,
+                        user_id=user_id,
+                        workspace_id=workspace_id,
+                    )
+                    core_lower = core_content.strip()[:80].lower()
+                    for hit in fts_hits:
+                        if hit.content and core_lower in hit.content.lower():
+                            return ""
+                except Exception:
+                    pass
+
+            # Pre-commit cache write: kept (despite the store observer also
+            # populating ``_memories`` after the SQLite save below) because the
+            # dedup check above looks at ``_memories``, and two concurrent
+            # ``add_memory`` calls for near-duplicate content would otherwise
+            # race past the dedup gate before the observer fires. The
+            # subsequent observer upsert is idempotent — it overwrites with
+            # the fresh state.
+            self._memories[memory.id] = memory
+            self._save_memories()
+
+            if self.vector_store is not None:
+                self.vector_store.add_memory(
+                    memory_id=memory.id,
+                    content=memory.content,
+                    memory_type=memory.type.value,
+                    priority=memory.priority.value,
+                    importance=memory.importance_score,
+                    tags=memory.tags,
+                )
+
+        # v2: set TTL then save to SQLite + FTS
+        _apply_retention(memory)
+        sem = SemanticMemory(
+            id=memory.id,
+            type=memory.type,
+            priority=memory.priority,
+            content=memory.content,
+            source=memory.source,
+            subject=getattr(memory, "subject", "") or "",
+            predicate=getattr(memory, "predicate", "") or "",
+            importance_score=memory.importance_score,
+            tags=memory.tags,
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+        if hasattr(memory, "expires_at"):
+            sem.expires_at = memory.expires_at
+        self.store.save_semantic(
+            self._stamp_agent_id(sem),
+            scope=scope,
+            scope_owner=scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            skip_dedup=True,
+        )
+
+        backends = self._iter_memory_backends()
+        if backends:
+            with contextlib.suppress(Exception):
+                loop = asyncio.get_event_loop()
+                for backend in backends:
+                    store = getattr(backend, "store", None)
+                    if store:
+                        loop.create_task(store(sem.to_dict()))
+
+        # MDRM 同步：高重要性事实立即上图，避免只有等到下一次 quick_encode/
+        # consolidate 时才能被关系召回（小白用户的"再问一次"路径会走这里）。
+        try:
+            if (
+                memory.importance_score >= 0.6
+                and self._get_memory_mode() in ("mode2", "auto")
+                and self._ensure_relational()
+            ):
+                from .relational.types import MemoryNode, NodeType
+
+                _node_type = (
+                    NodeType.FACT
+                    if memory.type.value in ("fact", "preference", "rule")
+                    else NodeType.EVENT
+                )
+                node = MemoryNode(
+                    id=memory.id,
+                    content=memory.content,
+                    node_type=_node_type,
+                    session_id=self._current_session_id or "",
+                    agent_id=self.agent_id or "",
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    importance=memory.importance_score,
+                    confidence=0.7,
+                )
+                self.relational_store.save_nodes_batch([node])
+        except Exception as _rel_err:
+            logger.debug(f"[Memory] relational upsert skipped (non-fatal): {_rel_err}")
+
+        logger.debug(f"Added memory: {memory.id} - {memory.content}")
+        return memory.id
+
+    def get_memory(self, memory_id: str) -> Memory | None:
+        with self._memories_lock:
+            memory = self._memories.get(memory_id)
+            if memory:
+                now = datetime.now()
+                if memory.superseded_by or (memory.expires_at and memory.expires_at < now):
+                    return None
+                memory.access_count += 1
+                memory.updated_at = datetime.now()
+            return memory
+
+    def search_memories(
+        self,
+        query: str = "",
+        memory_type: MemoryType | None = None,
+        tags: list[str] | None = None,
+        limit: int = 10,
+        scope: str = "user",
+        scope_owner: str = "",
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        fallback_workspace_id: str | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
+        updated_after: str | None = None,
+        updated_before: str | None = None,
+    ) -> list[Memory]:
+        """搜索可见记忆。
+
+        Phase 2a：``fallback_workspace_id`` 可选参数。当主 workspace 命中数
+        < limit 时，再从 fallback_workspace_id 补充结果（按 id 去重）。
+        用于桌面用户从 ``"default"`` 平滑切换到项目专属工作区时仍能看到
+        历史共享记忆 —— 调用方可以传 ``fallback_workspace_id="default"``
+        激活。**默认 None 时与历史行为完全一致**。
+
+        ``created_after/created_before/updated_after/updated_before``：
+        ISO 时间字符串，按 created_at/updated_at 过滤时间范围。
+        """
+        now = datetime.now()
+        if scope == "global":
+            scope = "user"
+        user_id = (
+            user_id
+            or (
+                "system"
+                if scope == "system"
+                else "legacy"
+                if scope == "legacy_quarantine"
+                else self._current_user_id
+            )
+            or "default"
+        )
+        workspace_id = workspace_id or self._current_workspace_id or "default"
+
+        def _parse_time(value: str | None) -> datetime | None:
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(value.replace(" ", "T"))
+            except ValueError:
+                return None
+
+        created_after_dt = _parse_time(created_after)
+        created_before_dt = _parse_time(created_before)
+        updated_after_dt = _parse_time(updated_after)
+        updated_before_dt = _parse_time(updated_before)
+
+        def _in_time_range(memory: Memory) -> bool:
+            if created_after_dt and (not memory.created_at or memory.created_at < created_after_dt):
+                return False
+            if created_before_dt and (not memory.created_at or memory.created_at > created_before_dt):
+                return False
+            if updated_after_dt and (not memory.updated_at or memory.updated_at < updated_after_dt):
+                return False
+            if updated_before_dt and (not memory.updated_at or memory.updated_at > updated_before_dt):
+                return False
+            return True
+
+        def _collect(target_workspace_id: str) -> list[Memory]:
+            collected: list[Memory] = []
+            with self._memories_lock:
+                for memory in self._memories.values():
+                    if memory.superseded_by:
+                        continue
+                    if memory.expires_at and memory.expires_at < now:
+                        continue
+                    mem_scope = getattr(memory, "scope", "global") or "global"
+                    if mem_scope == "global":
+                        mem_scope = "user"
+                    mem_owner = getattr(memory, "scope_owner", "") or ""
+                    if mem_scope != scope or mem_owner != scope_owner:
+                        continue
+                    if (getattr(memory, "user_id", "default") or "default") != user_id:
+                        continue
+                    if (
+                        getattr(memory, "workspace_id", "default") or "default"
+                    ) != target_workspace_id:
+                        continue
+                    if memory_type and memory.type != memory_type:
+                        continue
+                    if tags and not any(tag in memory.tags for tag in tags):
+                        continue
+                    if not _in_time_range(memory):
+                        continue
+                    if query and query.lower() not in memory.content.lower():
+                        continue
+                    collected.append(memory)
+            return collected
+
+        results = _collect(workspace_id)
+
+        # Phase 2a：可选 workspace fallback。仅在主 workspace 命中不足 limit
+        # 且 fallback_workspace_id 与主不同时触发，按 id 去重再合并。
+        if fallback_workspace_id and fallback_workspace_id != workspace_id and len(results) < limit:
+            seen_ids = {m.id for m in results}
+            for mem in _collect(fallback_workspace_id):
+                if mem.id in seen_ids:
+                    continue
+                results.append(mem)
+                seen_ids.add(mem.id)
+                if len(results) >= limit:
+                    break
+
+        results.sort(key=lambda m: (m.importance_score, m.access_count), reverse=True)
+        return results[:limit]
+
+    def delete_memory(self, memory_id: str) -> bool:
+        """Delete a semantic memory by id.
+
+        SQLite is the source of truth. ``_memories`` is mirrored via the
+        observer registered on ``self.store``; we do not gate the DB delete
+        on cache presence (the pre-v4.1 implementation did and silently
+        leaked rows for memories that lifecycle had written between the
+        latest reload and now — see the regression test
+        ``test_delete_memory_works_for_uncached_rows``).
+        """
+        ok = bool(self.store.delete_semantic(memory_id))
+        if self.vector_store is not None:
+            # store.delete_semantic already routes through SearchBackend,
+            # which for vector-backed installs maps to the same
+            # vector_store.delete_memory call. This second call is a safety
+            # net for installs that bind vector_store as a separate plugin
+            # backend and is idempotent.
+            with contextlib.suppress(Exception):
+                self.vector_store.delete_memory(memory_id)
+        if not ok:
+            # Self-heal: if the row is no longer in DB but is still cached
+            # (rare; would only happen if the observer was bypassed earlier),
+            # drop it so iter_cached() stops returning a ghost.
+            with self._memories_lock:
+                if self._memories.pop(memory_id, None) is not None:
+                    return True
+        return ok
+
+    # ==================== Plugin Memory Backends ====================
+
+    def set_plugin_backends(self, backends: dict) -> None:
+        """Bind the shared plugin memory_backends dict from host_refs."""
+        self._plugin_backends = backends
+
+    def _get_replace_backend(self):
+        """Return the active replace-mode plugin backend, if any."""
+        backends = getattr(self, "_plugin_backends", None)
+        if not backends:
+            return None
+        for entry in backends.values():
+            if isinstance(entry, dict) and entry.get("replace"):
+                return entry.get("backend")
+        return None
+
+    def _iter_memory_backends(self) -> list:
+        """Return all plugin-provided memory backends, replace and augment alike."""
+        backends = getattr(self, "_plugin_backends", None)
+        if not backends:
+            return []
+        result = []
+        for entry in backends.values():
+            if isinstance(entry, dict):
+                backend = entry.get("backend")
+                if backend is not None:
+                    result.append(backend)
+        return result
+
+    # ==================== Injection (v1 compat) ====================
+
+    def get_injection_context(
+        self,
+        task_description: str = "",
+        max_related: int = 5,
+        scope: str = "global",
+        scope_owner: str = "",
+        precomputed_keywords: list[str] | None = None,
+    ) -> str:
+        """v1 compat — prefer using builder.py's three-layer injection"""
+        replace = self._get_replace_backend()
+        if replace is not None:
+            try:
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        asyncio.run,
+                        replace.get_injection_context(task_description, 700),
+                    )
+                    return future.result(timeout=10)
+            except Exception:
+                logger.warning(
+                    "Replace-mode memory backend failed, falling back to built-in",
+                    exc_info=True,
+                )
+        retrieve_kwargs = {
+            "query": task_description,
+            "recent_messages": self._recent_messages,
+            "max_tokens": 700,
+        }
+        if precomputed_keywords:
+            retrieve_kwargs["precomputed_keywords"] = precomputed_keywords
+        return self.retrieval_engine.retrieve(**retrieve_kwargs)
+
+    def save_precompact_snapshot(self, snapshot: dict) -> None:
+        """Store the latest session-scoped compaction snapshot."""
+        if not isinstance(snapshot, dict):
+            return
+        self._precompact_snapshot = snapshot
+        session_obj = getattr(self, "_current_session_obj", None)
+        context = getattr(session_obj, "context", None)
+        if context is not None and hasattr(context, "precompact_snapshot"):
+            context.precompact_snapshot = snapshot
+
+    def attach_session_context(self, session: object | None) -> None:
+        """Attach current Session object so snapshots can be persisted with SessionContext."""
+        self._current_session_obj = session
+        context = getattr(session, "context", None)
+        snapshot = getattr(context, "precompact_snapshot", None)
+        if isinstance(snapshot, dict) and snapshot.get("facts"):
+            self._precompact_snapshot = snapshot
+
+    def get_precompact_snapshot_context(self, max_chars: int = 1200) -> str:
+        """Return session-scoped compaction facts for prompt injection."""
+        snapshot = getattr(self, "_precompact_snapshot", None)
+        if not isinstance(snapshot, dict):
+            return ""
+        if snapshot.get("session_id") and snapshot.get("session_id") != self._current_session_id:
+            return ""
+        facts = [str(item).strip() for item in snapshot.get("facts", []) if str(item).strip()]
+        if not facts:
+            return ""
+        return "\n".join(f"- {fact}" for fact in facts)[:max_chars]
+
+    async def get_injection_context_async(
+        self,
+        task_description: str = "",
+        scope: str = "global",
+        scope_owner: str = "",
+        precomputed_keywords: list[str] | None = None,
+    ) -> str:
+        replace = self._get_replace_backend()
+        if replace is not None:
+            try:
+                return await asyncio.wait_for(
+                    replace.get_injection_context(task_description, 700),
+                    timeout=10,
+                )
+            except Exception:
+                logger.warning(
+                    "Replace-mode memory backend failed, falling back to built-in",
+                    exc_info=True,
+                )
+        retrieve_kwargs = {}
+        if precomputed_keywords:
+            retrieve_kwargs["precomputed_keywords"] = precomputed_keywords
+        return await asyncio.to_thread(
+            self.retrieval_engine.retrieve,
+            task_description,
+            self._recent_messages,
+            None,
+            700,
+            **retrieve_kwargs,
+        )
+
+    # Phase 1B：明确"绝不可从缓存直接返回给上层"的隔离桶。
+    # 走 `iter_cached`/`_keyword_search`/`get_stats` 这些会被注入提示词或
+    # 展示给用户的路径都必须排除它们；只有显式 scope 查询（点名要这些桶）
+    # 才能看到内容。
+    _ISOLATED_CACHE_SCOPES: frozenset[str] = frozenset(
+        {"legacy_quarantine", "pending_consolidation"}
+    )
+
+    def iter_cached(
+        self,
+        *,
+        scope: str | None = None,
+        scope_owner: str | None = None,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+        include_isolated: bool = False,
+    ):
+        """带 scope 过滤的 _memories 缓存迭代器（Phase 1B）。
+
+        这是新版**唯一推荐的**直接读缓存入口。和 ``self._memories.values()``
+        相比的关键差异：
+
+        - 默认会过滤掉 ``legacy_quarantine`` 和 ``pending_consolidation`` 两个
+          隔离桶，避免它们被注入提示词或返回到检索 / 统计接口；
+        - 可选按 (scope, scope_owner, user_id, workspace_id) 精确过滤；
+        - ``include_isolated=True`` 时才会放出隔离桶内容（只给特定迁徙工具用）。
+        """
+        with self._memories_lock:
+            for memory in self._memories.values():
+                mem_scope = getattr(memory, "scope", "user") or "user"
+                if not include_isolated and mem_scope in self._ISOLATED_CACHE_SCOPES:
+                    continue
+                if scope is not None and mem_scope != scope:
+                    continue
+                if (
+                    scope_owner is not None
+                    and (getattr(memory, "scope_owner", "") or "") != scope_owner
+                ):
+                    continue
+                if (
+                    user_id is not None
+                    and (getattr(memory, "user_id", "default") or "default") != user_id
+                ):
+                    continue
+                if (
+                    workspace_id is not None
+                    and (getattr(memory, "workspace_id", "default") or "default") != workspace_id
+                ):
+                    continue
+                yield memory
+
+    def _keyword_search(self, query: str, limit: int = 5) -> list[Memory]:
+        """Phase 1B：本地关键词回退检索，强制排除隔离桶（legacy_quarantine
+        和 pending_consolidation），避免被搜索后端失败时把这些桶的内容
+        泄漏到提示词。
+        """
+        keywords = [kw for kw in query.lower().split() if len(kw) > 2]
+        if not keywords:
+            return []
+        results = []
+        for memory in self.iter_cached():
+            content_lower = (memory.content or "").lower()
+            if any(kw in content_lower for kw in keywords):
+                results.append(memory)
+        results.sort(key=lambda m: m.importance_score, reverse=True)
+        return results[:limit]
+
+    # ==================== Daily Consolidation ====================
+
+    async def consolidate_daily(
+        self,
+        *,
+        checkpoint: dict | None = None,
+        checkpoint_callback=None,
+        time_budget_seconds: int | None = None,
+        review_max_batches: int | None = None,
+    ) -> dict:
+        """每日归纳 (v2: 委托给 LifecycleManager)"""
+        try:
+            from .lifecycle import LifecycleManager
+
+            lifecycle = LifecycleManager(
+                store=self.store,
+                extractor=self.extractor,
+                identity_dir=self.identity_dir,
+            )
+            result = await lifecycle.consolidate_daily(
+                checkpoint=checkpoint,
+                checkpoint_callback=checkpoint_callback,
+                time_budget_seconds=time_budget_seconds,
+                review_max_batches=review_max_batches,
+            )
+            if (
+                not result.get("partial")
+                and self._get_memory_mode() in ("mode2", "auto")
+                and self._ensure_relational()
+            ):
+                try:
+                    relational_report = await self.relational_consolidator.consolidate()
+                    result["relational_consolidation"] = relational_report
+                except Exception as e:
+                    logger.warning(f"[Manager] Relational consolidation failed: {e}")
+                    result["relational_consolidation_error"] = str(e)
+        except Exception as e:
+            from ..llm.types import LLMError
+
+            if isinstance(e, LLMError):
+                self._reload_from_sqlite()
+                raise  # LLM unavailable — legacy fallback would fail too
+            logger.error(f"[Manager] Daily consolidation failed, using legacy: {e}")
+            from .daily_consolidator import DailyConsolidator
+
+            dc = DailyConsolidator(
+                data_dir=self.data_dir,
+                memory_md_path=self.memory_md_path,
+                memory_manager=self,
+                brain=self.brain,
+                identity_dir=self.identity_dir,
+            )
+            result = await dc.consolidate_daily()
+
+        # After consolidation, sync SQLite → in-memory cache → JSON
+        self._reload_from_sqlite()
+        return result
+
+    def _reload_from_sqlite(self) -> None:
+        """Reload in-memory cache from SQLite and flush to JSON."""
+        try:
+            all_mems = self.store.load_all_memories()
+            with self._memories_lock:
+                self._memories.clear()
+                for m in all_mems:
+                    self._memories[m.id] = m
+            self._save_memories()
+            logger.debug(f"[Manager] Synced {len(all_mems)} memories: SQLite → cache → JSON")
+        except Exception as e:
+            logger.warning(f"[Manager] SQLite→JSON sync failed: {e}")
+
+    def _cleanup_expired_memories(self) -> int:
+        now = datetime.now()
+        expired = []
+        with self._memories_lock:
+            for memory_id, memory in list(self._memories.items()):
+                if memory.priority == MemoryPriority.SHORT_TERM:
+                    if (now - memory.updated_at) > timedelta(days=3):
+                        expired.append(memory_id)
+                elif memory.priority == MemoryPriority.TRANSIENT:
+                    if (now - memory.updated_at) > timedelta(days=1):
+                        expired.append(memory_id)
+            for memory_id in expired:
+                with contextlib.suppress(KeyError):
+                    del self._memories[memory_id]
+        if expired:
+            self._save_memories()
+            for memory_id in expired:
+                with contextlib.suppress(Exception):
+                    if self.vector_store is not None:
+                        self.vector_store.delete_memory(memory_id)
+                    self.store.delete_semantic(memory_id)
+            logger.info(f"Cleaned up {len(expired)} expired memories")
+        return len(expired)
+
+    # ==================== Attachments (文件/媒体记忆) ====================
+
+    def record_attachment(
+        self,
+        filename: str,
+        mime_type: str = "",
+        local_path: str = "",
+        url: str = "",
+        description: str = "",
+        transcription: str = "",
+        extracted_text: str = "",
+        tags: list[str] | None = None,
+        direction: str = "inbound",
+        file_size: int = 0,
+        original_filename: str = "",
+    ) -> str:
+        """记录一个文件/媒体附件, 返回 attachment ID"""
+        try:
+            dir_enum = AttachmentDirection(direction)
+        except ValueError:
+            dir_enum = AttachmentDirection.INBOUND
+
+        attachment = Attachment(
+            session_id=self._current_session_id or "",
+            filename=filename,
+            original_filename=original_filename or filename,
+            mime_type=mime_type,
+            file_size=file_size,
+            local_path=local_path,
+            url=url,
+            direction=dir_enum,
+            description=description,
+            transcription=transcription,
+            extracted_text=extracted_text,
+            tags=tags or [],
+        )
+        self.store.save_attachment(attachment)
+        logger.info(f"[Memory] Recorded attachment: {filename} ({direction}, {mime_type})")
+        return attachment.id
+
+    def search_attachments(
+        self,
+        query: str = "",
+        mime_type: str | None = None,
+        direction: str | None = None,
+        session_id: str | None = None,
+        limit: int = 20,
+    ) -> list[Attachment]:
+        """搜索附件 — 用户问"那天发给你的猫图"时调用"""
+        return self.store.search_attachments(
+            query=query,
+            mime_type=mime_type,
+            direction=direction,
+            session_id=session_id,
+            limit=limit,
+        )
+
+    def get_attachment(self, attachment_id: str) -> Attachment | None:
+        return self.store.get_attachment(attachment_id)
+
+    # ==================== Stats ====================
+
+    def get_stats(
+        self,
+        scope: str = "global",
+        scope_owner: str = "",
+        *,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> dict:
+        """Phase 1B：统计入口默认排除隔离桶（legacy_quarantine、
+        pending_consolidation），避免前端"记忆总数"被未审查内容污染。
+
+        如果调用方显式指定 ``scope='legacy_quarantine'`` /
+        ``'pending_consolidation'`` 来查这些桶时，仍可拿到对应统计。
+
+        三次审计新增 ``user_id`` / ``workspace_id``（Phase 2b.5 二次扩展）：
+        多用户 IM 部署下 LLM 工具 ``get_memory_stats`` 之前会暴露**总条数**
+        ——即便不暴露内容，counts 也是信息泄漏（"系统里一共有 1000 条记忆"
+        让 alice 推断出有其他用户）。这里收敛到 owner 视角。
+
+        不传时保持旧行为（desktop / 老 API 调用零感知）。
+        """
+        type_counts: dict[str, int] = {}
+        priority_counts: dict[str, int] = {}
+        wants_isolated = scope in self._ISOLATED_CACHE_SCOPES
+        for memory in self.iter_cached(
+            include_isolated=wants_isolated,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        ):
+            if scope != "global" or scope_owner:
+                mem_scope = getattr(memory, "scope", "global") or "global"
+                mem_owner = getattr(memory, "scope_owner", "") or ""
+                if mem_scope != scope or mem_owner != scope_owner:
+                    continue
+            type_counts[memory.type.value] = type_counts.get(memory.type.value, 0) + 1
+            priority_counts[memory.priority.value] = (
+                priority_counts.get(memory.priority.value, 0) + 1
+            )
+
+        v2_stats = self.store.get_stats(scope=scope, scope_owner=scope_owner)
+
+        total = sum(type_counts.values())
+        return {
+            "total": total,
+            "by_type": type_counts,
+            "by_priority": priority_counts,
+            "sessions_today": len(self.consolidator.get_today_sessions()),
+            "unprocessed_sessions": len(self.consolidator.get_unprocessed_sessions()),
+            "v2_store": v2_stats,
+        }

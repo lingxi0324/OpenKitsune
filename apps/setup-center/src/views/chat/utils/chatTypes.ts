@@ -1,0 +1,363 @@
+// ─── ChatView 本地类型定义 ───
+// 核心共享类型（ChatMessage, ChatConversation 等）位于 @/types.ts，此处仅定义 ChatView 内部使用的类型。
+
+import type {
+  ChatMessage,
+  ChatToolCall,
+  ChatTodo,
+  ChatProgressEvent,
+  ChatTodoStep,
+  ChatAskUser,
+  ChatAskQuestion,
+  OptionalFeatureInstallRequest,
+  ChatAttachment,
+  ChatArtifact,
+  ChatSource,
+  ChatMcpCall,
+  ChatErrorInfo,
+  MessageCompletionAction,
+  MessagePart,
+  OrgTimelineEntry,
+  ChatConversation,
+  ChatDisplayMode,
+  ConversationStatus,
+  EndpointSummary,
+  SlashCommand,
+  ChainGroup,
+  ChainToolCall,
+  ChainEntry,
+  ChainSummaryItem,
+  ChainTimelineGroup,
+} from "../../../types";
+
+export type {
+  ChatMessage,
+  ChatToolCall,
+  ChatTodo,
+  ChatProgressEvent,
+  ChatTodoStep,
+  ChatAskUser,
+  ChatAskQuestion,
+  OptionalFeatureInstallRequest,
+  ChatAttachment,
+  ChatArtifact,
+  ChatSource,
+  ChatMcpCall,
+  ChatErrorInfo,
+  MessageCompletionAction,
+  MessagePart,
+  OrgTimelineEntry,
+  ChatConversation,
+  ChatDisplayMode,
+  ConversationStatus,
+  EndpointSummary,
+  SlashCommand,
+  ChainGroup,
+  ChainToolCall,
+  ChainEntry,
+  ChainSummaryItem,
+  ChainTimelineGroup,
+};
+
+/** Lazy-loaded markdown rendering modules */
+export type MdModules = {
+  ReactMarkdown: typeof import("react-markdown").default;
+  remarkPlugins: import("react-markdown").Options["remarkPlugins"];
+  rehypePlugins: import("react-markdown").Options["rehypePlugins"];
+};
+
+/** Message queued for sequential sending */
+export type QueuedMessage = {
+  id: string;
+  text: string;
+  timestamp: number;
+  convId: string;
+  /**
+   * Attachments captured at queue time. A queued message is replayed as a
+   * brand-new turn (not a steer/insert), so it must carry its own attachments
+   * instead of picking up whatever happens to be in the composer at drain time.
+   */
+  attachments?: ChatAttachment[];
+  /** Composer mode captured at queue time, so the replay honours the user's intent. */
+  mode?: "agent" | "plan" | "ask";
+};
+
+type SecurityDecision = "allow_once" | "allow_session" | "allow_always" | "deny" | "sandbox";
+type SecurityTimeoutDefault = "allow_once" | "deny";
+type SecurityPresentationState = "active" | "queued" | "resolved";
+type SecurityDisplayToken = {
+  value: string;
+  label: string;
+  color?: string;
+  description?: string;
+};
+type SecurityConfirmDisplay = {
+  title: string;
+  reason: { text: string; raw?: string };
+  risk: SecurityDisplayToken & { color: string };
+  tool: SecurityDisplayToken;
+  channel?: SecurityDisplayToken;
+  approval_class?: SecurityDisplayToken;
+  arguments: { text: string; format?: string };
+};
+type SecurityDecisionChainStep = {
+  name: string;
+  action: string;
+  note: string;
+  metadata?: Record<string, unknown>;
+  display: {
+    label: string;
+    action: SecurityDisplayToken & { color: string };
+    note?: string;
+  };
+};
+
+/** SSE stream event union — synced with Python openkitsune.events / src/streamEvents.ts */
+export type StreamEvent =
+  | { type: "heartbeat"; ts?: number }
+  | { type: "preparation_stage"; stage: "analyzing_intent" | "building_context" | "ready" }
+  // [2026-10-09] 意图分析结果展示（并行化后由 _apply_late_intent 发出，rule/llm 两版）
+  | { type: "intent_ready"; intent?: string; task_type?: string; confidence?: number; summary?: string; source?: "rule" | "llm"; duration_ms?: number }
+  | { type: "org_command_started"; org_id: string; command_id: string; root_node_id?: string }
+  | { type: "org_progress"; org_id: string; command_id: string; event?: string; summary: string; node_id?: string; category?: string; label?: string; data?: Record<string, unknown> }
+  | { type: "org_command_done"; org_id: string; command_id: string; result?: Record<string, unknown>; error?: string }
+  | { type: "iteration_start"; iteration: number }
+  | { type: "context_compressed"; before_tokens: number; after_tokens: number }
+  | {
+      type: "context_usage";
+      conversation_id?: string;
+      context_scope_id?: string;
+      iteration?: number;
+      context_tokens: number;
+      context_limit: number;
+      history_context_tokens?: number;
+      history_context_limit?: number;
+      remaining_tokens?: number;
+      percent?: number;
+      updated_at?: number;
+      source?: string;
+      usage_estimated?: boolean;
+      endpoint_name?: string;
+      model?: string;
+    }
+  | { type: "thinking_start" }
+  | { type: "thinking_delta"; content: string }
+  | { type: "thinking_end"; duration_ms?: number; has_thinking?: boolean }
+  | { type: "chain_text"; content: string; icon?: string }
+  | { type: "text_delta"; content: string }
+  | { type: "text_replace"; content: string; attachments?: ChatAttachment[] }
+  | { type: "tool_call_start"; tool: string; tool_name?: string; args: Record<string, unknown>; id?: string; call_id?: string; protocol_version?: number }
+  // C23 P2-3: tool_executor 在执行任何工具前先批量发这个事件，
+  // 让前端能在敏感操作真正开始前给用户一个非阻塞 toast 提示。
+  // 后端 schema 见 src/openkitsune/core/tool_executor.py:_emit_tool_intent_previews
+  | { type: "tool_intent_preview"; tool_use_id?: string; tool_name?: string; params?: Record<string, unknown>; approval_class?: string; session_id?: string | null; batch_size?: number; batch_idx?: number; ts?: number }
+  | { type: "tool_call_end"; tool: string; tool_name?: string; result: string; id?: string; call_id?: string; is_error?: boolean; skipped?: boolean; protocol_version?: number }
+  // Structured config hint side-channel — emitted alongside tool_call_end when
+  // a ToolConfigError was raised by a handler (e.g. web_search needs a key).
+  // Backend shape: src/openkitsune/core/reasoning_engine.py:_build_tool_end_events.
+  // Carries enough metadata for ConfigHintCard to render an actionable card
+  // and (optionally) deep-link into the matching settings panel via
+  // dispatchExpandPanel({ panelId: actions[i].panel_id }).
+  | {
+      type: "config_hint";
+      tool_use_id: string;
+      scope: string;
+      error_code:
+        | "missing_credential"
+        | "auth_failed"
+        | "rate_limited"
+        | "network_unreachable"
+        | "content_filter"
+        | "compiler_unavailable"
+        | "unknown";
+      title: string;
+      message?: string;
+      actions?: Array<{
+        kind?: string;
+        label?: string;
+        view_id?: string;
+        panel_id?: string;
+        url?: string;
+        env_key?: string;
+        [k: string]: unknown;
+      }>;
+    }
+  | ({ type: "source_used"; protocol_version?: number } & ChatSource)
+  | { type: "mcp_call"; tool_use_id?: string; server: string; tool: string; status?: "ok" | "error" | string; auto_connected?: boolean; reconnected?: boolean; error?: string; protocol_version?: number }
+  | { type: "org_structure_changed"; action?: "created" | "updated" | "deleted" | string; org_id: string; org_name?: string; template_id?: string; node_count?: number; edge_count?: number; status?: string; tool_use_id?: string; protocol_version?: number }
+  | { type: "todo_created"; plan: ChatTodo; restored?: boolean }
+  | { type: "todo_step_updated"; planId?: string; plan_id?: string; stepId?: string; step_id?: string; stepIdx?: number; status: string; result?: string | null; protocol_version?: number }
+  | { type: "todo_completed"; planId?: string; plan_id?: string }
+  | { type: "todo_cancelled"; planId?: string; plan_id?: string }
+  | { type: "plan_ready_for_approval"; data: { conversation_id: string; summary: string; plan_id: string; plan_file: string }; conversation_id?: string; plan_id?: string; plan_file?: string; protocol_version?: number }
+  | { type: "ask_user"; question: string; options?: { id: string; label: string }[]; allow_multiple?: boolean; questions?: { id: string; prompt: string; options?: { id: string; label: string }[]; allow_multiple?: boolean }[]; confirmation_id?: string; risk_intent?: Record<string, unknown> }
+  | ({ type: "optional_feature_install" } & OptionalFeatureInstallRequest)
+  | { type: "user_insert"; content: string }
+  | { type: "agent_switch"; agentName: string; reason: string }
+  | { type: "agent_handoff"; from_agent: string; to_agent: string; reason?: string }
+  | { type: "sub_agent_state"; agent_id?: string; agentId?: string; session_id?: string; sessionId?: string; status?: string; reason?: string; protocol_version?: number }
+  | { type: "artifact"; artifact_type: string; file_url: string; path: string; name: string; caption: string; size?: number }
+  | {
+      type: "security_confirm";
+      source: "risk_gate" | "policy_v2";
+      kind?: "risk_gate";
+      tool: string;
+      args: Record<string, unknown>;
+      id: string;
+      confirm_id: string;
+      conversation_id: string;
+      reason: string;
+      risk_level: string;
+      needs_sandbox: boolean;
+      timeout_seconds: number;
+      default_on_timeout: SecurityTimeoutDefault;
+      approval_class: string | null;
+      policy_version: number;
+      channel: string;
+      delegate_chain: string[];
+      root_user_id: string | null;
+      decision_chain: SecurityDecisionChainStep[];
+      display: SecurityConfirmDisplay;
+      options: SecurityDecision[];
+      risk_intent: Record<string, unknown>;
+      original_message?: string;
+      presentation_state: SecurityPresentationState;
+      queue_position: number | null;
+      active_confirm_id: string | null;
+      queued_count: number;
+      pending_count: number;
+    }
+  | { type: "death_switch"; active: boolean; reason?: string }
+  | { type: "ui_preference"; theme?: string; language?: string }
+  | {
+      type: "endpoint_notice";
+      reason_code?: string;
+      notice_type?: string;
+      endpoint?: string;
+      from_endpoint?: string;
+      switch_reason?: string;
+      missing_capabilities?: string[];
+    }
+  | { type: "budget_warning"; dimension?: string; level?: string; usage_ratio?: number; renewed?: boolean; message?: string }
+  | { type: "budget_exceeded"; message?: string }
+  | {
+      type: "task_checkpoint";
+      checkpoint_id: string;
+      task_id: string;
+      conversation_id: string;
+      iteration: number;
+      created_at: number;
+      summary: string;
+      next_step_hint: string;
+      exit_reason: string;
+      artifacts: string[];
+      messages_offset: number;
+      protocol_version?: number;
+    }
+  | {
+      type: "error";
+      message: string;
+      error_code?: string;
+      org_status?: string | null;
+    }
+  | { type: "done"; reason?: string; usage?: {
+      input_tokens: number;
+      output_tokens: number;
+      total_tokens?: number;
+      context_tokens?: number;
+      context_limit?: number;
+      history_context_tokens?: number;
+      history_context_limit?: number;
+      billable_input_tokens?: number;
+      billable_output_tokens?: number;
+      billable_total_tokens?: number;
+      usage_estimated?: boolean;
+      usage_source?: string;
+      // ContextPressure 快照：来自 ReasoningEngine.calculate_context_pressure，
+      // 给"上下文健康度" UI 用。所有字段都是 token 数。
+      context_pressure?: {
+        messages_tokens: number;
+        system_tokens: number;
+        tools_tokens: number;
+        soft_limit: number;
+        hard_limit: number;
+        trigger_tokens: number;
+        max_tokens: number;
+        context_safe: boolean;
+        input_tokens?: number;
+        output_tokens?: number;
+      };
+    } };
+
+/** Sub-agent delegation entry for handoff display */
+export type SubAgentEntry = {
+  agentId: string;
+  status: "delegating" | "done" | "error";
+  reason?: string;
+  startTime: number;
+};
+
+/** Sub-agent task progress card data */
+export type SubAgentTask = {
+  run_id?: string;
+  agent_id: string;
+  profile_id: string;
+  session_id: string;
+  chat_id?: string;
+  name: string;
+  icon: string;
+  status: "starting" | "running" | "completed" | "error" | "timeout" | "cancelled";
+  iteration: number;
+  tools_executed: string[];
+  tools_total: number;
+  elapsed_s: number;
+  last_progress_s: number;
+  started_at: number;
+  tokens_used?: number;
+  current_tool_summary?: string;
+  reason?: string;
+  stream_text?: string;
+  stream_preview?: string;
+  stream_events?: number;
+  chain?: ChainGroup[];
+  last_stream_event_at?: number;
+  queue_count?: number;
+  // P5.1: agent_id of the agent that delegated this task (root tasks omit it).
+  // Inferred client-side from agent_handoff / delegate_to_agent / delegate_parallel
+  // events — the backend protocol stays untouched.
+  parent_agent_id?: string;
+};
+
+/** Per-session streaming context (supports concurrent streams across conversations) */
+export type StreamContext = {
+  abort: AbortController;
+  reader: ReadableStreamDefaultReader<Uint8Array> | null;
+  isStreaming: boolean;
+  userStopped: boolean;
+  messages: ChatMessage[];
+  activeSubAgents: SubAgentEntry[];
+  subAgentTasks: SubAgentTask[];
+  isDelegating: boolean;
+  pollingTimer: ReturnType<typeof setInterval> | null;
+  _hadError: boolean;
+  /**
+   * The composer mode (agent/plan/ask) this turn was started with. Used to
+   * decide whether a new submission while this turn is streaming can be
+   * steered (same mode → inject) or must be queued as a fresh turn
+   * (mode changed → the user explicitly wants different behaviour).
+   */
+  mode?: "agent" | "plan" | "ask";
+};
+
+/** Agent profile for agent selector */
+export type AgentProfile = {
+  id: string;
+  name: string;
+  description: string;
+  icon: string;
+  color: string;
+  name_i18n?: Record<string, string>;
+  description_i18n?: Record<string, string>;
+  preferred_endpoint?: string | null;
+  endpoint_policy?: "prefer" | "require";
+};

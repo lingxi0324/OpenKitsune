@@ -1,0 +1,756 @@
+name: Release Dry Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_notarization:
+        description: "是否执行 macOS 公证（两个 macOS 任务）。默认开启。"
+        required: false
+        default: true
+        type: boolean
+      matrix_scope:
+        description: "矩阵范围：full（7 平台，发版前必须跑）/ smoke（3 平台 win+linux24+mac-arm64，仅用于快速反馈）。"
+        required: false
+        default: "full"
+        type: choice
+        options:
+          - full
+          - smoke
+      disable_bootstrap_cache:
+        description: "禁用 PBS/uv 下载缓存（用于排查疑似缓存污染或验证从零下载链路）。默认关闭=启用缓存。"
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: ['release/**']
+
+concurrency:
+  group: release-dryrun-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ── Bootstrap contract 预检（廉价、快速、无 secret 依赖） ──
+  # 在 7 平台矩阵之前先跑 HEAD 校验：PBS archive / sha256 / uv 所有发布 URL +
+  # pyproject.toml 与 PBS pin 的版本一致性。任何 4xx 立即 fail，避免每个 matrix
+  # job 重复踩同一个 pin 错误。失败 30s 内可见，远早于 release dryrun 30+ min。
+  bootstrap_contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Verify remote bootstrap asset URLs + version pins
+        run: python build/prepare_bootstrap_resources.py --verify-remote-assets
+
+  # ── 计算 effective matrix（smoke / full） ──
+  # 单一来源：matrix_scope 输入 → matrix JSON。push 触发或 inputs 缺失时兜底 full，
+  # 避免一不小心跑出空矩阵或漏掉平台。smoke 只跑 win-x64 + mac-arm64 + linux-x64
+  # (ubuntu-24.04)，给"提交后想快速过一下打包"用；full 是发版前必跑。
+  matrix_setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      effective_scope: ${{ steps.set.outputs.scope }}
+    steps:
+      - id: set
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCOPE="${{ inputs.matrix_scope || 'full' }}"
+          echo "scope=${SCOPE}" >> "$GITHUB_OUTPUT"
+          echo "Effective matrix_scope=${SCOPE}"
+
+          # full：与原 7 行 include 等价；smoke：只挑 win-x64 + ubuntu-24.04 +
+          # macos-arm64 三条主推平台。注意 smoke 跳过 ubuntu-22.04（glibc 兼容）
+          # 与 mac-x64 / linux-arm64，发版前必须切回 full 才能信任。
+          FULL='{"include":[
+            {"platform":"windows-latest","bundles":"nsis","suffix":"windows-x64","target_platform":"win-x64"},
+            {"platform":"ubuntu-22.04","bundles":"deb,appimage","suffix":"ubuntu22-amd64","target_platform":"linux-x64"},
+            {"platform":"ubuntu-22.04-arm","bundles":"deb,appimage","suffix":"ubuntu22-arm64","target_platform":"linux-arm64"},
+            {"platform":"ubuntu-24.04","bundles":"deb,appimage","suffix":"ubuntu24-amd64","target_platform":"linux-x64"},
+            {"platform":"ubuntu-24.04-arm","bundles":"deb,appimage","suffix":"ubuntu24-arm64","target_platform":"linux-arm64"},
+            {"platform":"macos-latest","bundles":"app","args":"--target aarch64-apple-darwin","rust_target":"aarch64-apple-darwin","suffix":"macos-arm64","target_platform":"mac-arm64"},
+            {"platform":"macos-15-intel","bundles":"app","args":"--target x86_64-apple-darwin","rust_target":"x86_64-apple-darwin","suffix":"macos-x64","target_platform":"mac-x64"}
+          ]}'
+          # NOTE: macOS bundles uses "app" (not "app,dmg"). DMG is built in
+          # the dedicated "Build macOS DMG bundle" step below to avoid the
+          # bundle_dmg.sh hang on macos-15-intel. See release.yml for the
+          # full rationale.
+          SMOKE='{"include":[
+            {"platform":"windows-latest","bundles":"nsis","suffix":"windows-x64","target_platform":"win-x64"},
+            {"platform":"ubuntu-24.04","bundles":"deb,appimage","suffix":"ubuntu24-amd64","target_platform":"linux-x64"},
+            {"platform":"macos-latest","bundles":"app","args":"--target aarch64-apple-darwin","rust_target":"aarch64-apple-darwin","suffix":"macos-arm64","target_platform":"mac-arm64"}
+          ]}'
+
+          if [ "$SCOPE" = "smoke" ]; then
+            MATRIX=$(printf '%s' "$SMOKE" | tr -d '\n')
+          else
+            MATRIX=$(printf '%s' "$FULL" | tr -d '\n')
+          fi
+          # 用 jq 压成单行 JSON 给 fromJSON 用，并验证 JSON 合法
+          MATRIX=$(echo "$MATRIX" | python3 -c "import sys,json; print(json.dumps(json.loads(sys.stdin.read())))")
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "Matrix JSON: ${MATRIX}"
+
+  # ── CLI wheel 构建 + 安装验证 ──
+  python_wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node (for web frontend build)
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/setup-center/package-lock.json
+
+      - name: Build web frontend
+        working-directory: apps/setup-center
+        run: |
+          npm ci
+          npm run build:web
+
+      - name: Build user docs (VitePress)
+        working-directory: docs-site
+        run: |
+          npm ci
+          npm run build
+
+      - name: Stage web/docs assets for Python wheel
+        run: python scripts/stage_package_assets.py
+
+      - name: Build wheel
+        run: |
+          pip install build
+          python -m build --wheel
+
+      # 同时构建 Plugin SDK wheel 到 dist/，让 [all] extras 验证能从本地解析到
+      # monorepo 当前版本的 SDK（PyPI 上的版本通常滞后），真实模拟"SDK 已先发到
+      # PyPI、用户随后 pip install openkitsune[all]"的发布完成态。
+      - name: Build Plugin SDK wheel
+        run: python -m build --wheel openkitsune-plugin-sdk/ --outdir dist/
+
+      - name: Verify wheel installs correctly
+        run: |
+          python -m venv /tmp/test-venv
+          /tmp/test-venv/bin/pip install dist/openkitsune-*.whl
+          /tmp/test-venv/bin/openkitsune --help
+
+      - name: Verify extras install correctly
+        run: |
+          python -m venv /tmp/test-all
+          WHL=$(ls dist/openkitsune-*.whl)
+          # --find-links dist/ 让 pip 优先从本地索引解析 openkitsune-plugin-sdk，
+          # 既能验证 wheel 自身的依赖声明，又不被 PyPI 滞后版本卡住。
+          /tmp/test-all/bin/pip install --find-links dist/ "${WHL}[all]"
+          /tmp/test-all/bin/openkitsune --help
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: python-wheel
+          path: dist/*.whl
+          retention-days: 3
+
+  # ── Desktop 安装包构建（多平台矩阵） ──
+  # 矩阵从 matrix_setup 动态计算：full 跑 7 行、smoke 跑 3 行。push 触发兜底 full。
+  dryrun_build:
+    needs: [bootstrap_contract, matrix_setup]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix_setup.outputs.matrix) }}
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # 公共 prep：Python/Node/Rust 安装、web/docs 构建、PBS 缓存与
+      # bootstrap 资源准备、seed exec bit 校验。详见
+      # .github/actions/desktop-build-prepare/action.yml。
+      # 注意 inputs 全是字符串，所以 disable_bootstrap_cache 透传为
+      # `'true'/'false'` 字符串，由 action 内部用字符串比较判断。
+      - name: Desktop build prepare
+        id: desktop_prepare
+        uses: ./.github/actions/desktop-build-prepare
+        with:
+          target_platform: ${{ matrix.target_platform }}
+          rust_target: ${{ matrix.rust_target || '' }}
+          rust_cache_prefix: "dryrun-${{ matrix.suffix }}"
+          disable_bootstrap_cache: ${{ inputs.disable_bootstrap_cache && 'true' || 'false' }}
+
+      - name: Codesign embedded binaries for macOS notarization
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "No APPLE_CERTIFICATE configured, skipping codesign."
+            exit 0
+          fi
+          RESOURCE_DIR="apps/setup-center/src-tauri/resources"
+          IDENTITY="${APPLE_SIGNING_IDENTITY}"
+          ENTITLEMENTS="apps/setup-center/src-tauri/Entitlements.plist"
+
+          echo "Importing certificate to keychain..."
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security import $RUNNER_TEMP/certificate.p12 -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          echo "Signing embedded binaries with identity: ${IDENTITY}"
+          find "$RESOURCE_DIR" -type f -perm +111 | while read -r bin; do
+            echo "  Signing: $bin"
+            codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$bin"
+          done
+          echo "All embedded binaries signed."
+
+      - name: Create gitignored placeholders for Rust build
+        shell: bash
+        run: |
+          mkdir -p identity/personas
+          if [ ! -f identity/personas/user_custom.md ]; then
+            echo "# User Custom Persona (placeholder)" > identity/personas/user_custom.md
+          fi
+
+      - name: Build desktop frontend
+        working-directory: apps/setup-center
+        run: npm run build
+
+      # macOS runners ship Homebrew Rust shims that can shadow rustup's real cargo and
+      # make `cargo fetch` invoke rustup-init with a bogus "fetch" argv (see GH dryrun).
+      - name: Prefer rustup Cargo on PATH
+        shell: bash
+        run: echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+
+      - name: Compile Rust desktop binary
+        if: steps.desktop_prepare.outputs.rust_binary_cache_hit != 'true'
+        working-directory: apps/setup-center/src-tauri
+        timeout-minutes: 120
+        shell: bash
+        run: |
+          set +e
+          cargo fetch --locked || exit $?
+          for attempt in 1 2; do
+            echo "=== Rust build attempt ${attempt}/2 ==="
+            cargo build --release --features tauri/custom-protocol ${{ matrix.args }}
+            exit_code=$?
+            if [ "$exit_code" -eq 0 ]; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 1 ]; then
+              echo "::warning::Rust build failed; clearing stale cache before retry"
+              cargo clean
+              sleep 30
+            fi
+          done
+          exit "$exit_code"
+
+      - name: Prepare Cargo binary for Tauri bundler
+        run: python scripts/prepare_tauri_binary.py --target "${{ matrix.rust_target }}"
+
+      - name: Bundle Tauri installers
+        working-directory: apps/setup-center
+        timeout-minutes: 150
+        env:
+          TAURI_CONFIG: '{}'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          NO_STRIP: true
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        shell: bash
+        run: |
+          set +e
+          MAX_ATTEMPTS=2
+          ATTEMPT=1
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "=== Bundle attempt $ATTEMPT/$MAX_ATTEMPTS ==="
+            npx tauri bundle --bundles "${{ matrix.bundles }}" ${{ matrix.args }}
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "Bundle succeeded on attempt $ATTEMPT"
+              exit 0
+            fi
+            echo "Bundle failed (exit $EXIT_CODE) on attempt $ATTEMPT"
+            ATTEMPT=$((ATTEMPT + 1))
+            if [ $ATTEMPT -le $MAX_ATTEMPTS ]; then
+              echo "Waiting 30s before retry..."
+              sleep 30
+            fi
+          done
+          echo "All $MAX_ATTEMPTS attempts failed"
+          exit 1
+
+      - name: Verify Linux DEB URI handoff
+        if: runner.os == 'Linux'
+        run: python scripts/verify_linux_deb.py --target "${{ matrix.rust_target }}"
+
+      - name: Re-sign final macOS app bundles for notarization
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ] || [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "APPLE_CERTIFICATE / APPLE_SIGNING_IDENTITY not configured, skipping final app re-sign."
+            exit 0
+          fi
+
+          TARGET_BASE="apps/setup-center/src-tauri/target"
+          if [ -n "${{ matrix.rust_target }}" ]; then
+            BUNDLE_DIR="${TARGET_BASE}/${{ matrix.rust_target }}/release/bundle"
+          else
+            BUNDLE_DIR="${TARGET_BASE}/release/bundle"
+          fi
+
+          # Only sign top-level .app bundles under macos/.
+          MACOS_BUNDLE_DIR="${BUNDLE_DIR}/macos"
+          APPS=()
+          if [ -d "${MACOS_BUNDLE_DIR}" ]; then
+            while IFS= read -r -d '' app; do
+              APPS+=("${app}")
+            done < <(find "${MACOS_BUNDLE_DIR}" -maxdepth 1 -type d -name "*.app" -print0)
+          fi
+          if [ "${#APPS[@]}" -eq 0 ]; then
+            echo "No .app bundles found under ${MACOS_BUNDLE_DIR}; skip."
+            exit 0
+          fi
+
+          IDENTITY="${APPLE_SIGNING_IDENTITY}"
+          ENTITLEMENTS="apps/setup-center/src-tauri/Entitlements.plist"
+          for app in "${APPS[@]}"; do
+            echo "Signing app bundle root: ${app}"
+            codesign --force --options runtime --timestamp --entitlements "${ENTITLEMENTS}" --sign "${IDENTITY}" "${app}"
+            echo "Verifying app signature (deep): ${app}"
+            codesign --verify --deep --strict --verbose=2 "${app}"
+          done
+
+      - name: Build macOS DMG bundle
+        if: runner.os == 'macOS'
+        # See release.yml for full rationale. Short version: tauri build
+        # uses --bundles app and skips bundle_dmg.sh (which hangs on
+        # macos-15-intel via osascript). DMG is produced here, decoupled
+        # from the codesign step so it runs even without Apple secrets.
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET_BASE="apps/setup-center/src-tauri/target"
+          if [ -n "${{ matrix.rust_target }}" ]; then
+            BUNDLE_DIR="${TARGET_BASE}/${{ matrix.rust_target }}/release/bundle"
+          else
+            BUNDLE_DIR="${TARGET_BASE}/release/bundle"
+          fi
+
+          MACOS_BUNDLE_DIR="${BUNDLE_DIR}/macos"
+          APPS=()
+          if [ -d "${MACOS_BUNDLE_DIR}" ]; then
+            while IFS= read -r -d '' app; do
+              APPS+=("${app}")
+            done < <(find "${MACOS_BUNDLE_DIR}" -maxdepth 1 -type d -name "*.app" -print0)
+          fi
+          if [ "${#APPS[@]}" -eq 0 ]; then
+            echo "No .app bundles found under ${MACOS_BUNDLE_DIR}" >&2
+            exit 1
+          fi
+          app="${APPS[0]}"
+          app_name="$(basename "${app}" .app)"
+
+          case "${{ matrix.rust_target }}" in
+            aarch64-apple-darwin) arch_suffix="aarch64" ;;
+            x86_64-apple-darwin)  arch_suffix="x64" ;;
+            *) arch_suffix="$(uname -m)" ;;
+          esac
+          version="$(plutil -extract CFBundleShortVersionString raw "${app}/Contents/Info.plist" 2>/dev/null \
+            || defaults read "${app}/Contents/Info" CFBundleShortVersionString 2>/dev/null \
+            || echo "0.0.0")"
+          DMG_DIR="${BUNDLE_DIR}/dmg"
+          mkdir -p "${DMG_DIR}"
+          dmg_file="${DMG_DIR}/${app_name}_${version}_${arch_suffix}.dmg"
+          echo "Building DMG: ${dmg_file}"
+          echo "  source app : ${app}"
+
+          if [ "${{ matrix.suffix }}" != "macos-x64" ]; then
+            brew install create-dmg 2>/dev/null || true
+          fi
+
+          for vol in /Volumes/"${app_name}"*; do
+            [ -d "${vol}" ] && hdiutil detach "${vol}" -force 2>/dev/null || true
+          done
+          sleep 1
+
+          rm -f "${dmg_file}"
+          DMG_STAGE="$(mktemp -d)"
+          cp -a "${app}" "${DMG_STAGE}/"
+
+          if [ "${{ matrix.suffix }}" = "macos-x64" ]; then
+            echo "Intel runner: using hdiutil directly to avoid known create-dmg AppleScript hangs"
+            ln -sf /Applications "${DMG_STAGE}/Applications"
+            hdiutil create -volname "${app_name}" \
+              -srcfolder "${DMG_STAGE}" -ov -format UDRW "/tmp/_rw_$$.dmg"
+            hdiutil convert "/tmp/_rw_$$.dmg" -format UDZO -o "${dmg_file}"
+            rm -f "/tmp/_rw_$$.dmg"
+          elif command -v create-dmg &>/dev/null; then
+            DMG_BG="/tmp/dmg_bg_$$.png"
+            if command -v magick &>/dev/null; then
+              magick -size 660x400 xc:'#EDEDED' \
+                -fill '#A8A8AD' \
+                -draw "rectangle 290,195 340,205" \
+                -draw "polygon 335,178 368,200 335,222" \
+                "${DMG_BG}" 2>/dev/null || true
+            elif command -v convert &>/dev/null; then
+              convert -size 660x400 xc:'#EDEDED' \
+                -fill '#A8A8AD' \
+                -draw "rectangle 290,195 340,205" \
+                -draw "polygon 335,178 368,200 335,222" \
+                "${DMG_BG}" 2>/dev/null || true
+            fi
+
+            CREATE_DMG_ARGS=(
+              --volname "${app_name}"
+              --window-pos 200 120
+              --window-size 660 400
+              --icon-size 100
+              --icon "${app_name}.app" 180 200
+              --hide-extension "${app_name}.app"
+              --app-drop-link 480 200
+              --no-internet-enable
+            )
+            [ -f "${DMG_BG:-}" ] && CREATE_DMG_ARGS+=(--background "${DMG_BG}")
+
+            dmg_created=false
+            for attempt in 1 2; do
+              rm -f "${dmg_file}"
+              create-dmg "${CREATE_DMG_ARGS[@]}" \
+                "${dmg_file}" "${DMG_STAGE}/" &
+              CREATE_DMG_PID=$!
+              ( sleep 300 && kill "$CREATE_DMG_PID" 2>/dev/null && echo "create-dmg timed out after 300s" ) &
+              TIMER_PID=$!
+              create_dmg_status=0
+              wait "$CREATE_DMG_PID" 2>/dev/null || create_dmg_status=$?
+              kill "$TIMER_PID" 2>/dev/null || true
+              wait "$TIMER_PID" 2>/dev/null || true
+              if [ "${create_dmg_status}" -eq 0 ] && [ -s "${dmg_file}" ]; then
+                echo "DMG created with custom layout: ${dmg_file}"
+                dmg_created=true
+                break
+              fi
+              rm -f "${dmg_file}"
+              echo "create-dmg attempt ${attempt} failed or timed out, retrying in 3s..."
+              sleep 3
+            done
+            rm -f "${DMG_BG:-}" 2>/dev/null || true
+            find "$(dirname "${dmg_file}")" -maxdepth 1 -name "rw.*.dmg" -delete 2>/dev/null || true
+
+            if [ "${dmg_created}" != "true" ]; then
+              echo "create-dmg failed; falling back to hdiutil (UDRW → convert UDZO)"
+              ln -sf /Applications "${DMG_STAGE}/Applications"
+              hdiutil create -volname "${app_name}" \
+                -srcfolder "${DMG_STAGE}" -ov -format UDRW "/tmp/_rw_$$.dmg"
+              hdiutil convert "/tmp/_rw_$$.dmg" -format UDZO -o "${dmg_file}"
+              rm -f "/tmp/_rw_$$.dmg"
+            fi
+          else
+            ln -s /Applications "${DMG_STAGE}/Applications"
+            for attempt in 1 2 3; do
+              if hdiutil create \
+                -volname "${app_name}" \
+                -srcfolder "${DMG_STAGE}" \
+                -ov -format UDZO \
+                "${dmg_file}"; then
+                echo "DMG created: ${dmg_file}"
+                break
+              fi
+              echo "hdiutil create attempt ${attempt} failed, retrying in 3s..."
+              sleep 3
+            done
+          fi
+          rm -rf "${DMG_STAGE}"
+
+          if [ ! -f "${dmg_file}" ]; then
+            echo "ERROR: DMG creation failed: ${dmg_file}" >&2
+            exit 1
+          fi
+          ls -la "${dmg_file}"
+
+      - name: Notarize macOS artifacts (manual notarytool)
+        if: runner.os == 'macOS' && (github.event_name != 'workflow_dispatch' || inputs.enable_notarization == true || inputs.enable_notarization == 'true')
+        timeout-minutes: 90
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
+            echo "APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID not fully configured; notarization is required for dryrun macOS install validation." >&2
+            exit 1
+          fi
+
+          TARGET_BASE="apps/setup-center/src-tauri/target"
+          if [ -n "${{ matrix.rust_target }}" ]; then
+            BUNDLE_DIR="${TARGET_BASE}/${{ matrix.rust_target }}/release/bundle"
+          else
+            BUNDLE_DIR="${TARGET_BASE}/release/bundle"
+          fi
+
+          ARTIFACTS=()
+          while IFS= read -r -d '' artifact; do
+            ARTIFACTS+=("${artifact}")
+          done < <(find "${BUNDLE_DIR}" -type f -name "*.dmg" -print0)
+          if [ "${#ARTIFACTS[@]}" -eq 0 ]; then
+            echo "No DMG artifacts found for notarization." >&2
+            exit 1
+          fi
+
+          PROFILE_NAME="openkitsune-notary"
+          xcrun notarytool store-credentials "${PROFILE_NAME}" \
+            --apple-id "${APPLE_ID}" \
+            --password "${APPLE_PASSWORD}" \
+            --team-id "${APPLE_TEAM_ID}"
+
+          for artifact in "${ARTIFACTS[@]}"; do
+            echo "Submitting for notarization: ${artifact}"
+            submit_json="$(xcrun notarytool submit "${artifact}" \
+              --keychain-profile "${PROFILE_NAME}" \
+              --output-format json)"
+            submission_id="$(printf '%s' "${submit_json}" | python -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+            if [ -z "${submission_id}" ]; then
+              echo "Failed to parse notarization submission ID for ${artifact}" >&2
+              echo "${submit_json}" >&2
+              exit 1
+            fi
+            echo "Submission ID: ${submission_id}"
+
+            MAX_WAIT_SECONDS=$((3 * 60 * 60))
+            POLL_INTERVAL_SECONDS=30
+            START_TS=$(date +%s)
+            while true; do
+              if ! info_json="$(xcrun notarytool info "${submission_id}" \
+                --keychain-profile "${PROFILE_NAME}" \
+                --output-format json)"; then
+                echo "Failed to query submission ${submission_id}, retrying in ${POLL_INTERVAL_SECONDS}s..."
+                sleep "${POLL_INTERVAL_SECONDS}"
+                continue
+              fi
+
+              status="$(printf '%s' "${info_json}" | python -c 'import json,sys; print(json.load(sys.stdin).get("status","").strip().lower())')"
+              NOW_TS=$(date +%s)
+              ELAPSED_SECONDS=$((NOW_TS - START_TS))
+
+              case "${status}" in
+                accepted)
+                  echo "Notarization accepted in ${ELAPSED_SECONDS}s for ${artifact}"
+                  break
+                  ;;
+                invalid|rejected)
+                  echo "Notarization failed with status '${status}' for ${artifact}" >&2
+                  echo "Submission ID: ${submission_id}" >&2
+                  echo "Fetching notarization log..." >&2
+                  xcrun notarytool log "${submission_id}" \
+                    --keychain-profile "${PROFILE_NAME}" || true
+                  exit 1
+                  ;;
+                "in progress")
+                  echo "Current status: In Progress (elapsed ${ELAPSED_SECONDS}s)"
+                  ;;
+                *)
+                  echo "Current status: ${status:-unknown} (elapsed ${ELAPSED_SECONDS}s)"
+                  ;;
+              esac
+
+              if [ "${ELAPSED_SECONDS}" -ge "${MAX_WAIT_SECONDS}" ]; then
+                echo "Timed out waiting ${MAX_WAIT_SECONDS}s for submission ${submission_id}." >&2
+                echo "Check later with: xcrun notarytool info ${submission_id} --keychain-profile ${PROFILE_NAME}" >&2
+                exit 1
+              fi
+
+              sleep "${POLL_INTERVAL_SECONDS}"
+            done
+
+            echo "Stapling ticket: ${artifact}"
+            xcrun stapler staple -v "${artifact}"
+            xcrun stapler validate -v "${artifact}"
+          done
+
+      - name: List bundle outputs
+        shell: bash
+        run: |
+          TARGET_BASE="apps/setup-center/src-tauri/target"
+          if [ -n "${{ matrix.rust_target }}" ]; then
+            RELEASE_DIR="${TARGET_BASE}/${{ matrix.rust_target }}/release"
+            BUNDLE_DIR="${RELEASE_DIR}/bundle"
+          else
+            RELEASE_DIR="${TARGET_BASE}/release"
+            BUNDLE_DIR="${RELEASE_DIR}/bundle"
+          fi
+          echo "== release dir =="
+          ls -la "${RELEASE_DIR}" || true
+          echo "== bundle dir =="
+          ls -la "${BUNDLE_DIR}" || true
+          echo "== bundle tree (depth 4) =="
+          find "${BUNDLE_DIR}" -maxdepth 4 -type f -print || true
+
+      - name: Collect installer bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_BASE="apps/setup-center/src-tauri/target"
+          if [ -n "${{ matrix.rust_target }}" ]; then
+            BUNDLE_DIR="${TARGET_BASE}/${{ matrix.rust_target }}/release/bundle"
+          else
+            BUNDLE_DIR="${TARGET_BASE}/release/bundle"
+          fi
+          OUT_DIR="${BUNDLE_DIR}/_upload"
+          rm -rf "${OUT_DIR}"
+          mkdir -p "${OUT_DIR}"
+
+          SUFFIX="${{ matrix.suffix }}"
+          copy_norm() {
+            local f="$1"
+            local base
+            base="$(basename "$f")"
+            local norm="${base// /.}"
+            if [ -n "${SUFFIX}" ]; then
+              local ext
+              local name_no_ext
+              if [[ "${norm}" == *.app.tar.gz ]]; then
+                ext="app.tar.gz"
+                name_no_ext="${norm%.app.tar.gz}"
+              else
+                ext="${norm##*.}"
+                name_no_ext="${norm%.*}"
+              fi
+              local base_name="${name_no_ext%_*}"
+              norm="${base_name}_${SUFFIX}.${ext}"
+            fi
+            cp -f "$f" "${OUT_DIR}/${norm}"
+            if [ -f "${f}.sig" ]; then
+              cp -f "${f}.sig" "${OUT_DIR}/${norm}.sig"
+              sig_count=$((sig_count+1))
+            fi
+          }
+
+          want=()
+          case "${RUNNER_OS}" in
+            Windows) want=("exe") ;;
+            macOS) want=("app.tar.gz" "dmg") ;;
+            Linux) want=("deb" "AppImage") ;;
+            *) echo "Unsupported RUNNER_OS=${RUNNER_OS}" >&2; exit 2 ;;
+          esac
+
+          sig_count=0
+          found=0
+          for ext in "${want[@]}"; do
+            while IFS= read -r -d '' f; do
+              if [ "${RUNNER_OS}" = "Windows" ]; then
+                case "$f" in
+                  */nsis/*.exe)
+                    if [ "$(basename "$f")" = "uninstall.exe" ]; then
+                      continue
+                    fi
+                    ;;
+                  *)
+                    continue
+                    ;;
+                esac
+              fi
+
+              copy_norm "$f"
+              found=$((found+1))
+            done < <(find "${BUNDLE_DIR}" -type f -name "*.${ext}" -print0)
+          done
+
+          if [ "${sig_count}" -gt 0 ]; then
+            echo "Collected ${sig_count} signature file(s)."
+          fi
+
+          echo "Collected ${found} installer(s) into ${OUT_DIR}:"
+          ls -la "${OUT_DIR}" || true
+
+          if [ "${found}" -eq 0 ]; then
+            echo "ERROR: no installer bundles found." >&2
+            exit 1
+          fi
+          if [ "${sig_count}" -eq 0 ]; then
+            echo "ERROR: no updater signature files found. Check bundle.createUpdaterArtifacts and TAURI_SIGNING_PRIVATE_KEY." >&2
+            exit 1
+          fi
+
+      # Mirror of the PDB-archival step in release.yml so dryrun runs also
+      # exercise the symbol-collection path. The actions/upload-artifact step
+      # below uploads the entire `_upload/` directory, so anything we drop
+      # here ends up in the dryrun artifact for inspection without needing
+      # a separate upload step. See release.yml for the design rationale.
+      - name: Archive Windows debug symbols (PDB) into _upload/
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $targetBase = "apps/setup-center/src-tauri/target"
+          if ("${{ matrix.rust_target }}") {
+            $releaseDir = "$targetBase/${{ matrix.rust_target }}/release"
+          } else {
+            $releaseDir = "$targetBase/release"
+          }
+          $bundleDir = "$releaseDir/bundle"
+          $outDir = "$bundleDir/_upload"
+          if (-not (Test-Path $outDir)) {
+            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          }
+          # rustc converts crate-name dashes to underscores when emitting
+          # the symbol file (openkitsune-setup-center -> openkitsune_setup_center).
+          # The dryrun-1 log captured the actual filename as
+          # openkitsune_setup_center.pdb at 81 MB; the original dash-form
+          # filter found nothing and silently warned.
+          $pdb = Get-ChildItem -Path $releaseDir -Filter "openkitsune_setup_center.pdb" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $pdb) {
+            Write-Host "::warning::PDB not found in $releaseDir; symbols will not be archived for this dryrun."
+            Write-Host "Listing $releaseDir contents for diagnosis:"
+            Get-ChildItem -Path $releaseDir -File -ErrorAction SilentlyContinue | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+            return
+          }
+          # Dryrun has no `${{ env.RELEASE_TAG }}` (we never tagged a release
+          # for it), so synthesize a placeholder version from the workflow
+          # run number. Real releases land via release.yml which uses the
+          # actual tag.
+          $version = "dryrun-${{ github.run_number }}"
+          $zipPath = "$outDir/OpenKitsuneDesktop_${version}_${{ matrix.suffix }}.symbols.zip"
+          Compress-Archive -Path $pdb.FullName -DestinationPath $zipPath -Force
+          $sizeMb = [Math]::Round((Get-Item $zipPath).Length / 1MB, 2)
+          Write-Host "Created symbols archive: $zipPath ($sizeMb MB)"
+
+      - name: Upload build artifacts (for inspection)
+        uses: actions/upload-artifact@v6
+        with:
+          name: dryrun-${{ matrix.suffix }}
+          path: apps/setup-center/src-tauri/target/**/bundle/_upload/
+          retention-days: 3

@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "app_name": "openkitsune",
+  "app_version": "1.27.40",
+  "python_version": "3.11",
+  "python_abi": "cp311",
+  "wheel_tag": "py3-none-any",
+  "wheel": {
+    "name": "wheels/openkitsune-1.27.40-py3-none-any.whl",
+    "sha256": "702f4c931ff72d6b7ca3e40f83fb789142b6eb738c6663401a2daf4e1069f3f9"
+  },
+  "uv": {
+    "path": "bin/uv.exe",
+    "windows_path": "bin/uv.exe",
+    "version": "0.11.13",
+    "sha256": "97d32ea028fb68915fc8112d68c380b98a808f8eab86e7b1cb3542746de3ef26"
+  },
+  "python_seed": {
+    "packaged": true,
+    "path": "python/python.exe",
+    "sha256": "3c3a821490655d2d8e989d6ed6e520296050ffcf78170fe1090d12a55ed4f1ae",
+    "version": "3.11.12",
+    "release_tag": "20250409",
+    "source_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250409/cpython-3.11.12+20250409-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+    "target_triple": "x86_64-pc-windows-msvc",
+    "target_platform": "win-x64",
+    "archive_name": "cpython-3.11.12+20250409-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+  },
+  "node_seed": {
+    "packaged": false,
+    "path": "",
+    "note": "Reserved for managed Node.js seed packaging; release workflows currently do not bundle Node.js."
+  },
+  "third_party": {
+    "uv": {
+      "license": "Apache-2.0 OR MIT",
+      "source": "https://github.com/astral-sh/uv"
+    },
+    "python": {
+      "license": "Python-2.0",
+      "source": "https://www.python.org/"
+    },
+    "node": {
+      "license": "MIT",
+      "source": "https://nodejs.org/"
+    }
+  },
+  "default_pip_index": {
+    "id": "aliyun",
+    "url": "https://mirrors.aliyun.com/pypi/simple/",
+    "trusted_host": "mirrors.aliyun.com"
+  }
+}

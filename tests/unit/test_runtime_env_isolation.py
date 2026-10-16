@@ -1,0 +1,197 @@
+import json
+
+from openkitsune.agents.profile import AgentProfile
+from openkitsune.api.routes.agents import ProfileCreateRequest, create_agent_profile
+from openkitsune.experience import ToolExperienceTracker
+from openkitsune.runtime_envs import (
+    apply_execution_environment,
+    resolve_agent_env,
+    resolve_scratch_env,
+    resolve_skill_env,
+)
+from openkitsune.skills.parser import parse_skill
+from openkitsune.skills.runtime_registry import (
+    mark_skill_loaded,
+    mark_skill_pending_update,
+    mark_skills_loaded,
+    read_skill_runtime_registry,
+)
+
+
+def test_agent_profile_runtime_policy_roundtrip():
+    profile = AgentProfile(
+        id="seo-writer",
+        name="SEO Writer",
+        runtime_env_mode="agent",
+        runtime_env_dependencies=["pandas==2.2.0"],
+    )
+
+    restored = AgentProfile.from_dict(profile.to_dict())
+
+    assert restored.runtime_env_mode == "agent"
+    assert restored.runtime_env_dependencies == ["pandas==2.2.0"]
+
+
+def test_agent_profile_create_api_persists_runtime_policy(monkeypatch, tmp_path):
+    from openkitsune.agents import profile as profile_module
+
+    store = profile_module.ProfileStore(tmp_path / "agents")
+    monkeypatch.setattr(profile_module, "get_profile_store", lambda: store)
+
+    body = ProfileCreateRequest(
+        id="runtime-writer",
+        name="Runtime Writer",
+        runtime_env_mode="agent",
+        runtime_env_dependencies=["packaging==24.2"],
+    )
+
+    result = create_agent_profile(body)
+    try:
+        result = result.send(None)
+    except StopIteration as exc:
+        result = exc.value
+
+    profile = result["profile"]
+    assert profile["runtime_env_mode"] == "agent"
+    assert profile["runtime_env_dependencies"] == ["packaging==24.2"]
+
+
+def test_execution_env_resolvers_are_scoped(monkeypatch, tmp_path):
+    monkeypatch.setattr("openkitsune.runtime_envs.get_runtime_root", lambda: tmp_path / "runtime")
+
+    agent = resolve_agent_env("writer", deps=["requests==2.31.0"])
+    skill = resolve_skill_env("xlsx", deps=["openpyxl==3.1.2"])
+    scratch = resolve_scratch_env(session_id="session-1")
+
+    assert agent.scope == "agent"
+    assert skill.scope == "skill"
+    assert scratch.scope == "scratch"
+    assert "agents" in agent.venv_path.parts
+    assert "skills" in skill.venv_path.parts
+    assert "scratch" in scratch.venv_path.parts
+    assert agent.deps_hash
+
+
+def test_apply_execution_environment_prefers_managed_python(monkeypatch, tmp_path):
+    monkeypatch.setattr("openkitsune.runtime_envs.get_runtime_root", lambda: tmp_path / "runtime")
+    monkeypatch.setattr(
+        "openkitsune.runtime_envs.resolve_pip_index",
+        lambda: {"url": "https://example.invalid/simple", "trusted_host": "example.invalid"},
+    )
+    spec = resolve_agent_env("writer")
+
+    env = apply_execution_environment({"PATH": "base"}, spec)
+
+    assert env["OPENKITSUNE_EXECUTION_ENV_SCOPE"] == "agent"
+    assert env["OPENKITSUNE_AGENT_PYTHON"] == str(spec.python_path)
+    assert env["OPENKITSUNE_EXECUTION_DEPS_HASH"] == spec.deps_hash
+    assert env["PATH"].startswith(str(spec.bin_path))
+    assert env["PYTHONNOUSERSITE"] == "1"
+
+
+def test_skill_python_metadata_is_parsed(tmp_path):
+    skill_dir = tmp_path / "skills" / "data-skill"
+    skill_dir.mkdir(parents=True)
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text(
+        """---
+name: data-skill
+description: Data skill
+metadata:
+  openkitsune:
+    python:
+      env: skill
+      dependencies:
+        - pandas==2.2.0
+        - requests
+---
+# Data Skill
+""",
+        encoding="utf-8",
+    )
+
+    parsed = parse_skill(skill_file)
+
+    assert parsed.metadata.python_env == "skill"
+    assert parsed.metadata.python_dependencies == ["pandas==2.2.0", "requests"]
+
+
+def test_skill_runtime_registry_tracks_loaded_and_pending_update(monkeypatch, tmp_path):
+    monkeypatch.setattr("openkitsune.skills.runtime_registry._get_openkitsune_root", lambda: tmp_path)
+
+    mark_skill_loaded(
+        "data-skill",
+        source_path=str(tmp_path / "skills" / "data-skill"),
+        dependencies=["requests", "pandas==2.2.0"],
+    )
+    mark_skill_pending_update("data-skill", revision="rev-2")
+
+    state = read_skill_runtime_registry()["skills"]["data-skill"]
+    assert state["installed"] is True
+    assert state["loaded"] is True
+    assert state["pending_update_revision"] == "rev-2"
+    assert state["reload_required"] is True
+    assert state["update_policy"] == "disk-only"
+    assert state["deps_hash"]
+
+
+def test_skill_runtime_registry_batches_loaded_records(monkeypatch, tmp_path):
+    monkeypatch.setattr("openkitsune.skills.runtime_registry._get_openkitsune_root", lambda: tmp_path)
+
+    mark_skill_loaded(
+        "existing-skill",
+        source_path=str(tmp_path / "skills" / "existing-skill"),
+        dependencies=["requests"],
+    )
+    first_state = read_skill_runtime_registry()["skills"]["existing-skill"]
+    first_installed_at = first_state["installed_at"]
+
+    mark_skills_loaded(
+        [
+            {
+                "skill_id": "existing-skill",
+                "source_path": str(tmp_path / "skills" / "existing-skill-v2"),
+                "dependencies": ["requests", "pandas==2.2.0"],
+            },
+            {
+                "skill_id": "new-skill",
+                "source_path": str(tmp_path / "skills" / "new-skill"),
+                "enabled": False,
+                "dependencies": [],
+            },
+        ]
+    )
+
+    skills = read_skill_runtime_registry()["skills"]
+    existing = skills["existing-skill"]
+    assert existing["installed_at"] == first_installed_at
+    assert existing["source_path"].endswith("existing-skill-v2")
+    assert existing["dependencies"] == ["requests", "pandas==2.2.0"]
+    assert existing["reload_required"] is False
+
+    new_skill = skills["new-skill"]
+    assert new_skill["installed"] is True
+    assert new_skill["loaded"] is True
+    assert new_skill["enabled"] is False
+    assert new_skill["update_policy"] == "disk-only"
+
+
+def test_tool_experience_redacts_secrets(tmp_path):
+    tracker = ToolExperienceTracker(tmp_path / "tool_experience.jsonl")
+
+    tracker.record(
+        tool_name="run_shell",
+        agent_profile_id="writer",
+        env_scope="agent",
+        success=False,
+        input_summary={"command": "echo token=abc123"},
+        output="Authorization: Bearer secret-token",
+        error_type="runtime",
+    )
+
+    line = (tmp_path / "tool_experience.jsonl").read_text(encoding="utf-8").strip()
+    payload = json.loads(line)
+    dumped = json.dumps(payload)
+    assert "abc123" not in dumped
+    assert "secret-token" not in dumped
+    assert "[REDACTED]" in dumped

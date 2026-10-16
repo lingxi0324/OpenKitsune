@@ -1,0 +1,394 @@
+"""
+系统功能处理器
+
+处理系统功能相关的系统技能：
+- enable_thinking: 控制深度思考
+- get_session_logs: 获取会话日志
+- get_tool_info: 获取工具信息
+
+# ApprovalClass checklist (新增 / 修改工具时必读)
+# 1. 在本文件 Handler 类的 TOOLS 列表加新工具名
+# 2. 在同 Handler 类的 TOOL_CLASSES 字典加 ApprovalClass 显式声明
+#    （或在 agent.py:_init_handlers 的 register() 调用里加 tool_classes={...}）
+# 3. 行为依赖参数 → 在 policy_v2/classifier.py:_refine_with_params 加分支
+# 4. 跑 pytest tests/unit/test_classifier_completeness.py 验证
+# 详见 docs/policy_v2_research.md §4.21
+"""
+
+import logging
+from typing import TYPE_CHECKING, Any
+
+from ...core.policy_v2 import ApprovalClass
+from ...skills.exposure import get_skill_source_roots
+
+if TYPE_CHECKING:
+    from ...agent.core import Agent
+
+logger = logging.getLogger(__name__)
+
+
+class SystemHandler:
+    """系统功能处理器"""
+
+    TOOLS = [
+        "ask_user",
+        "enable_thinking",
+        "get_session_logs",
+        "get_tool_info",
+        "generate_image",
+        "set_task_timeout",
+        "get_workspace_map",
+    ]
+
+    # C7 explicit ApprovalClass
+    TOOL_CLASSES = {
+        "ask_user": ApprovalClass.INTERACTIVE,
+        "enable_thinking": ApprovalClass.EXEC_LOW_RISK,
+        "get_session_logs": ApprovalClass.READONLY_GLOBAL,
+        "get_tool_info": ApprovalClass.READONLY_GLOBAL,
+        # generate_image 是网络出站调用 + 写盘（image gen API），归 NETWORK_OUT；
+        # 实际写文件路径在 cwd，不算 mutating（不是用户文件）
+        "generate_image": ApprovalClass.NETWORK_OUT,
+        "set_task_timeout": ApprovalClass.CONTROL_PLANE,
+        "get_workspace_map": ApprovalClass.READONLY_GLOBAL,
+    }
+
+    def __init__(self, agent: "Agent"):
+        self.agent = agent
+
+    async def handle(self, tool_name: str, params: dict[str, Any]) -> str:
+        """处理工具调用"""
+        if tool_name == "ask_user":
+            # ask_user 正常由 ReasoningEngine 在 ACT 阶段拦截，不会到达此处
+            # 此为防御性兜底：若意外到达，返回问题文本而不是报错
+            question = params.get("question", "")
+            logger.warning(
+                f"[SystemHandler] ask_user reached handler (should be intercepted): {question[:80]}"
+            )
+            return question or "（等待用户回复）"
+        elif tool_name == "enable_thinking":
+            return self._enable_thinking(params)
+        elif tool_name == "get_session_logs":
+            return self._get_session_logs(params)
+        elif tool_name == "get_tool_info":
+            return self._get_tool_info(params)
+        elif tool_name == "generate_image":
+            return await self._generate_image(params)
+        elif tool_name == "set_task_timeout":
+            return self._set_task_timeout(params)
+        elif tool_name == "get_workspace_map":
+            return self._get_workspace_map()
+        else:
+            return f"❌ Unknown system tool: {tool_name}"
+
+    def _enable_thinking(self, params: dict) -> str:
+        """控制深度思考模式"""
+        enabled = params["enabled"]
+        reason = params.get("reason", "")
+
+        self.agent.brain.set_thinking_mode(enabled)
+
+        if enabled:
+            logger.info(f"Thinking mode enabled by LLM: {reason}")
+            return f"✅ 已启用深度思考模式。原因: {reason}\n后续回复将使用更强的推理能力。"
+        else:
+            logger.info(f"Thinking mode disabled by LLM: {reason}")
+            return f"✅ 已关闭深度思考模式。原因: {reason}\n将使用快速响应模式。"
+
+    def _get_session_logs(self, params: dict) -> str:
+        """获取会话日志"""
+        from ...logging import get_session_log_buffer
+
+        count = params.get("count", 20)
+        # level 参数改为 level_filter（修复参数名不匹配问题）
+        level_filter = params.get("level_filter") or params.get("level")
+        include_debug = bool(params.get("include_debug", False))
+
+        log_buffer = get_session_log_buffer()
+        logs = log_buffer.get_logs(count=count, level_filter=level_filter)
+        if not include_debug:
+            logs = [
+                log
+                for log in logs
+                if log.get("level") != "DEBUG" and "[LLM DEBUG]" not in str(log.get("message", ""))
+            ]
+
+        if not logs:
+            return "没有会话日志"
+
+        output = f"最近 {len(logs)} 条会话日志（不包含完整 LLM 调试 trace）:\n\n"
+        for log in logs:
+            output += f"[{log['level']}] {log['module']}: {log['message']}\n"
+
+        return output
+
+    def _get_tool_info(self, params: dict) -> str:
+        """获取工具信息"""
+        tool_name_to_query = params["tool_name"]
+        result = self.agent.tool_catalog.get_tool_info_formatted(tool_name_to_query)
+        # DEFERRED 工具引导（2026-10-15 实证修复）：延迟加载工具返回
+        # "Status : DEFERRED" 时，模型常误读为"工具不可用/未激活"，从而
+        # 反复调用 get_tool_info 查询状态（同参数重复 4~7 次）。
+        # 明确告知：DEFERRED 不影响可用性，用 tool_search 激活即可，勿重复查询。
+        if "DEFERRED" in result or "not yet loaded" in result:
+            result += (
+                "\n\n提示：该工具为延迟加载工具（DEFERRED），schema 尚未加载，"
+                "但这不影响其可用性。请直接调用 tool_search 搜索该工具名以激活"
+                "并获取完整参数定义，无需重复调用 get_tool_info 查询状态。"
+            )
+        return result
+
+    def _set_task_timeout(self, params: dict) -> str:
+        """动态调整当前任务的超时策略"""
+        pt = int(params.get("progress_timeout_seconds") or 0)
+        ht = int(params.get("hard_timeout_seconds") or 0)
+        reason = params.get("reason", "")
+
+        if pt < 0:
+            return "❌ progress_timeout_seconds 不能为负数（0=禁用）"
+        if 0 < pt < 60:
+            return "❌ progress_timeout_seconds 非 0 时最小为 60 秒；设为 0 表示禁用"
+        if ht < 0:
+            return "❌ hard_timeout_seconds 不能为负数"
+
+        monitor = getattr(self.agent, "_current_task_monitor", None)
+        if not monitor:
+            return "⚠️ 当前没有正在执行的任务，无法调整超时策略"
+
+        monitor.timeout_seconds = pt
+        monitor.hard_timeout_seconds = ht
+        logger.info(f"[TaskTimeout] Updated by LLM: progress={pt}s hard={ht}s reason={reason}")
+        progress_desc = "禁用" if pt == 0 else f"{pt}s"
+        hard_desc = "禁用" if ht == 0 else f"{ht}s"
+        return f"✅ 已更新当前任务超时策略：无进展超时={progress_desc}，硬超时={hard_desc}。原因：{reason}"
+
+    def _get_workspace_map(self) -> str:
+        """返回工作区目录结构和关键路径说明"""
+        from ...config import settings
+
+        root = settings.project_root
+        from ...core.working_directory import current_working_directory
+
+        working_directory = current_working_directory()
+
+        try:
+            identity_rel = settings.identity_path.relative_to(root)
+        except ValueError:
+            identity_rel = settings.identity_path
+        try:
+            logs_rel = settings.log_dir_path.relative_to(root)
+        except ValueError:
+            logs_rel = settings.log_dir_path
+
+        lines = [
+            "## 工作区路径地图",
+            "",
+            f"- **配置工作区**: {root}",
+            f"- **当前工作目录**: {working_directory}",
+            f"- **用户数据目录**: {settings.openkitsune_home}",
+            f"- **Identity**: {identity_rel}/ — 身份文档 (SOUL.md, AGENT.md, USER.md, MEMORY.md)",
+            "- **Skills**: 技能系统是多源的，可能来自 builtin、用户工作区或项目目录。",
+            "- **Skills Rule**: 不要根据 workspace map 猜测 skill 文件路径；请使用 list_skills / get_skill_info 查看真实来源与路径。",
+            "- **Data**: data/ — 运行数据根目录",
+            "  - sessions/ — 会话持久化",
+            "  - memory/ — 记忆存储",
+            "  - plans/ — 计划文件",
+            "  - media/ — IM 媒体文件",
+            "  - temp/ — 临时文件（可安全读写）",
+            "  - llm_debug/ — LLM 调试日志",
+            "  - scheduler/ — 定时任务",
+            "  - screenshots/ — 桌面/浏览器截图",
+            "  - generated_images/ — AI 生成的图片",
+            "  - tool_overflow/ — 工具大输出溢出文件",
+            "  - llm_endpoints.json — LLM 端点配置",
+            "  - agent.db — SQLite 数据库（记忆/会话）",
+            f"- **Logs**: {logs_rel}/",
+            f"  - {settings.log_file_prefix}.log — 主日志（滚动，最新）",
+            "  - error.log — 错误日志（按天滚动）",
+        ]
+
+        skill_roots = [
+            f"  - {origin}: {path}"
+            for origin, path in get_skill_source_roots(
+                project_root=root,
+                user_skills_dir=settings.skills_path,
+            )
+        ]
+        lines[6:6] = skill_roots
+
+        return "\n".join(line for line in lines if line is not None)
+
+    _GENERATE_IMAGE_FAIL_HINT = (
+        "\n[行为指引] 图片生成接口暂时不可用，请直接将上述失败原因告知用户。"
+        "不要尝试用 run_shell、pip install 或任何其他方式替代生成图片。"
+    )
+
+    async def _generate_image(self, params: dict) -> str:
+        """Generate an image through configured providers and save it locally."""
+        import json
+        import re
+        import time
+
+        import httpx
+
+        from ...config import settings
+        from ...llm.image_generation import (
+            ImageGenerationError,
+            load_image_endpoints,
+            request_image,
+            select_image_endpoints,
+        )
+        from ...llm.types import EndpointConfig
+
+        _hint = self._GENERATE_IMAGE_FAIL_HINT
+
+        prompt = (params.get("prompt") or "").strip()
+        if not prompt:
+            return "❌ prompt 不能为空"
+
+        requested_endpoint = (params.get("endpoint") or "").strip()
+        model = (params.get("model") or "").strip()
+        negative_prompt = (params.get("negative_prompt") or "").strip()
+        size = (params.get("size") or "").strip()
+        quality = (params.get("quality") or "").strip()
+        style = (params.get("style") or "").strip()
+        prompt_extend = params.get("prompt_extend", True)
+        watermark = params.get("watermark", False)
+        seed = params.get("seed")
+        output_path = (params.get("output_path") or "").strip()
+
+        endpoints = load_image_endpoints(settings.project_root)
+        if not endpoints:
+            legacy_key = (getattr(settings, "dashscope_api_key", "") or "").strip()
+            if legacy_key:
+                endpoints = [
+                    EndpointConfig(
+                        name="dashscope-legacy",
+                        provider="dashscope",
+                        api_type="dashscope",
+                        base_url=(getattr(settings, "dashscope_image_api_url", "") or "").strip(),
+                        api_key=legacy_key,
+                        model="qwen-image-max",
+                        priority=1,
+                        timeout=180,
+                        capabilities=["image_generation"],
+                        extra_params={"default_size": "1664*928"},
+                    )
+                ]
+            else:
+                return f"❌ 未配置图片生成端点，请在配置中心添加生图端点{_hint}"
+
+        try:
+            candidates = select_image_endpoints(endpoints, requested_endpoint)
+        except ImageGenerationError as exc:
+            return f"❌ {exc}{_hint}"
+
+        from ...channels.retry import async_with_retry
+        from ...llm.providers.proxy_utils import extract_connection_error, get_httpx_client_kwargs
+
+        _dl_headers = {"User-Agent": "OpenKitsune/1.0 (image-download)"}
+
+        async def _download_image(url: str) -> bytes:
+            """先直连后代理下载：国内 CDN 通常无需代理，直连更快更稳定。"""
+            # 第一次：不使用代理直连下载
+            try:
+                async with httpx.AsyncClient(
+                    timeout=60, trust_env=False, follow_redirects=True
+                ) as dl_client:
+                    resp = await dl_client.get(url, headers=_dl_headers)
+                    resp.raise_for_status()
+                    return resp.content
+            except Exception as direct_err:
+                logger.debug("generate_image: direct download failed: %s", direct_err)
+            # 第二次：使用全局代理配置重试
+            async with httpx.AsyncClient(
+                **get_httpx_client_kwargs(timeout=60), follow_redirects=True
+            ) as dl_client:
+                resp = await dl_client.get(url, headers=_dl_headers)
+                resp.raise_for_status()
+                return resp.content
+
+        t0 = time.time()
+        failures: list[str] = []
+        async with httpx.AsyncClient(
+            **get_httpx_client_kwargs(timeout=180), follow_redirects=True
+        ) as client:
+            for endpoint in candidates:
+                try:
+                    result = await request_image(
+                        client,
+                        endpoint,
+                        prompt=prompt,
+                        model=model,
+                        negative_prompt=negative_prompt,
+                        size=size,
+                        quality=quality,
+                        style=style,
+                        seed=seed,
+                        prompt_extend=bool(prompt_extend),
+                        watermark=bool(watermark),
+                    )
+                    if result.image_bytes is not None:
+                        img_bytes = result.image_bytes
+                    elif result.image_url:
+                        img_bytes = await async_with_retry(
+                            _download_image,
+                            result.image_url,
+                            max_retries=3,
+                            base_delay=2.0,
+                            operation_name="download_generated_image",
+                        )
+                    else:
+                        raise ImageGenerationError("provider returned no image payload")
+
+                    from ...core.working_directory import (
+                        current_working_directory,
+                        resolve_working_path,
+                    )
+
+                    if output_path:
+                        out_path = resolve_working_path(output_path)
+                    else:
+                        suffix = result.request_id or str(int(time.time()))
+                        safe_model = re.sub(r"[^A-Za-z0-9._-]+", "_", result.model)[:80]
+                        out_path = (
+                            current_working_directory(require_available=True)
+                            / f"{safe_model}_{suffix}.png"
+                        )
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_bytes(img_bytes)
+                except Exception as exc:  # noqa: BLE001 - each provider participates in fallback
+                    detail = (
+                        extract_connection_error(exc)
+                        if isinstance(exc, httpx.HTTPError)
+                        else str(exc)
+                    )
+                    failures.append(f"{endpoint.name}: {detail}")
+                    logger.warning("generate_image endpoint failed: %s", failures[-1])
+                    continue
+
+                elapsed_ms = int((time.time() - t0) * 1000)
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "endpoint": result.endpoint_name,
+                        "model": result.model,
+                        "image_url": result.image_url,
+                        "saved_to": str(out_path),
+                        "request_id": result.request_id,
+                        "elapsed_ms": elapsed_ms,
+                        "hint": "如需把图片真正交付给用户，请继续调用 deliver_artifacts(artifacts=[{type:'image', path:saved_to}])。仅调用一次，不要只在文字里说图片已发送。",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+        if failures:
+            return "❌ 所有图片生成端点均失败:\n" + "\n".join(f"- {x}" for x in failures) + _hint
+        return f"❌ 没有可用的图片生成端点{_hint}"
+
+
+def create_handler(agent: "Agent"):
+    """创建系统功能处理器"""
+    handler = SystemHandler(agent)
+    return handler.handle

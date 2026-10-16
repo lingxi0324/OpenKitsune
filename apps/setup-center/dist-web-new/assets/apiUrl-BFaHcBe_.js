@@ -1,0 +1,1 @@
+function a(e,...r){const t=(e||"").replace(/\/+$/,""),o=r.filter(n=>n!=null&&n!=="").map(n=>encodeURIComponent(String(n))).join("/");return o?`${t}/${o}`:t}function i(e){return encodeURIComponent(String(e))}export{a,i as e};

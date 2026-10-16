@@ -1,0 +1,454 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+!build/*.py
+!build/*.sh
+!build/*.ps1
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Generated release artifacts
+dist-sdk/
+dist-plugins/
+
+# Virtual environments
+.venv/
+.venv-ci/
+.venv-cli/
+.venv-wheelbuild/
+.venv-wheelrun/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.cursor/*
+!.cursor/rules/
+.cursor/rules/*
+!.cursor/rules/*.mdc
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Node / frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Frontend build outputs
+dist/
+dist-cli/
+.vite/
+src/openkitsune/web/
+src/openkitsune/docs_dist/
+# Plugins ship their built UI as part of the distributable source —
+# exempt plugins/*/ui/dist/ from the global `dist/` rule above.
+!plugins/*/ui/dist/
+!plugins/*/ui/dist/**
+
+# Rust / Tauri
+target/
+
+# Apps (keep sources, ignore build outputs)
+apps/**/node_modules/
+apps/**/dist/
+apps/**/dist-web/
+apps/**/.vite/
+apps/**/src-tauri/target/
+apps/**/tsconfig.tsbuildinfo
+# Tauri resources - 构建产物，不应提交（保留 .gitkeep 使空目录入库）
+apps/setup-center/src-tauri/resources/openkitsune-server/*
+!apps/setup-center/src-tauri/resources/openkitsune-server/.gitkeep
+apps/setup-center/src-tauri/resources/modules/
+apps/setup-center/src-tauri/resources/bootstrap/bin/
+apps/setup-center/src-tauri/resources/bootstrap/wheels/
+apps/setup-center/src-tauri/resources/bootstrap/wheelhouse/
+apps/setup-center/src-tauri/resources/bootstrap/python/
+
+# Data (keep structure)
+data/*
+!data/.gitkeep
+!data/*.example
+
+# Identity — 模板/策略/人格入库；用户定制文件和 runtime 派生产物不入库
+identity/SOUL.md
+identity/AGENT.md
+identity/USER.md
+identity/MEMORY.md
+identity/MEMORY.md.bak
+identity/personas/user_custom.md
+identity/runtime/
+
+# skills/ 目录全部是内置技能，需要被 git 完整跟踪。
+# 用户通过技能市场安装的技能存放在 ~/.openkitsune/workspaces/default/skills/，
+# 不在仓库目录内，无需 ignore。
+
+# Archived plugins (not auto-loaded; not for GitHub)
+# 整个目录及其所有内容都不进入 git
+plugins-archive/
+
+# Tests - only ignore test outputs, not test source code
+tests/__pycache__/
+tests/**/__pycache__/
+.pytest_cache/
+
+
+# Media files
+*.mp3
+*.mp4
+*.wav
+*.ogg
+*.oga
+*.webm
+*.m4a
+voice_*.txt
+voice_*.py
+
+# Bug reports (user-submitted, contain PII / binaries)
+bug-reports/
+
+# Personal/private folders
+stock_monitor/
+
+# Local notes (not for GitHub)
+TODO_LOCAL.md
+*_LOCAL.md
+
+# Local docs directory (architecture analysis, not for GitHub)
+docs_local/
+docs/bug_doc/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary scripts and files
+temp_*.py
+temp_*.json
+nul
+hello.txt
+time.txt
+todo.txt
+test_file.txt
+indentity_compiler.txt
+.tmp_validation/
+
+# Report generation scripts (temporary)
+*_report*.py
+create_report*.py
+fix_report.py
+!src/openkitsune/api/routes/bug_report.py
+!plugins/**/test_report_*.py
+!plugins/**/report_generator.py
+!plugins/**/report_routes.py
+
+# Image classification scripts (temporary)
+classify_*.py
+vision_*.py
+smart_classify.py
+analyze_*.py
+check_*.py
+verify_*.py
+
+# Chrome history scripts (temporary)
+read_chrome_history.py
+find_*_sites.py
+list_*.py
+
+# Reorganization scripts (temporary)
+reorganize_*.py
+execute_reorganization.py
+final_cleanup.py
+show_directory_tree.py
+get_time.py
+generate_vision_tasks.py
+
+# Temporary documents
+Microsoft_BitNet_*.docx
+OPENKITSUNE_PROJECT_STATUS.txt
+openkitsune_project_summary.md
+CLASSIFICATION_SYSTEM.md
+classification_report.json
+skills_list.md
+
+# Screenshots directory (temporary)
+screenshots/
+
+# Temporary script outputs
+vision_*.json
+*_results.json
+
+# Debug/fix scripts (temporary)
+scripts/run_feishu_bot.py
+scripts/fix_*.py
+scripts/debug_*.py
+scripts/add_log_injection.py
+scripts/apply_agent_changes.py
+scripts/refactor_agent_tools.py
+scripts/update_version.py
+
+# Local dev scripts (not for GitHub)
+scripts/clean-all.ps1
+scripts/start-backend.ps1
+scripts/start-frontend.ps1
+
+# Tauri signing keys (NEVER commit private keys)
+.tauri/
+
+# Cloudflare CDN credentials doc (contains secrets)
+docs/cloudflare-cdn-plan.md
+
+# Setup Center local/runtime artifacts
+apps/setup-center/identity/personas/user_custom.md
+apps/setup-center/src-tauri/identity/personas/user_custom.md
+temp-feedback/
+feedback-downloads/
+
+# Capacitor Android build artifacts (keep source, ignore build outputs)
+apps/setup-center/android/app/build/
+apps/setup-center/android/.gradle/
+apps/setup-center/android/app/src/main/assets/public/
+apps/setup-center/android/app/src/main/assets/capacitor.config.json
+$null
+OPENKITSUNE_RESEARCH_REPORT.md
+openkitsune-release.keystore
+ppt_build/
+
+# Claude Code reference materials
+claude_code/
+
+# Cursor commit message drafts
+.commitmsg
+.commitmsg_responses
+
+# QQ Bot SDK logs
+botpy.log*
+
+# ─────────────────────────────────────────────────────────────
+# 仓库收紧（2026-04-22）：移除临时/调研/归档/构建产物
+# 这些路径不影响打包 / CI / CLI / Docker
+# ─────────────────────────────────────────────────────────────
+
+# 环境变量备份（含敏感信息）
+.env.bak
+
+# SDK 暂存参考代码（README 明确写明零消费者、不参与打包与 CI）
+openkitsune-plugin-sdk/staging/
+
+# E2E 测试报告（手动/AI 生成的快照，pytest 只跑 .py，这些 .md 不参与 CI）
+tests/e2e/*.md
+
+# 技能内部 TODO 笔记
+skills/agent-browser/TODO.md
+
+# Tauri 自动生成的 schema（每次 tauri build 都会再生）
+apps/setup-center/src-tauri/gen/schemas/
+
+# docs/ 下的临时调研、计划稿、PRD 草稿、过期快照
+# （在线文档站使用 docs-site/，不依赖此处）
+docs/sprint18-cleanup-assessment.md
+docs/refs-extraction-report.md
+docs/llm-api-capabilities-research.md
+docs/api-comparison-openai-anthropic.md
+docs/auth_refactor_plan.md
+docs/im-channels-upgrade-plan.md
+docs/plans/
+docs/architecture/memory-redesign.md
+docs/wireframes-taskflow.md
+docs/wireframes-taskflow-v1.1.md
+docs/prd-taskflow-v1.md
+docs/prd-taskflow-v1.1.md
+docs/feature-priority-list.md
+docs/open-issues.md
+docs/llm_debug_failure_modes.md
+docs/plugin-overhaul-template.md
+
+# 插件目录下的用户测试用例文档（手测笔记，非自动化测试）
+plugins/*/USER_TEST_CASES.md
+plugins-archive/*/USER_TEST_CASES.md
+
+# ─────────────────────────────────────────────────────────────
+# 仓库收紧 第二轮（2026-04-22）：
+# docs/ 下的架构设计、流程规范、过程性产物、调试参考
+# 这些文档对本地开发者有用，但不属于面向用户/部署的发布文档
+# ─────────────────────────────────────────────────────────────
+
+# 架构与设计文档（开发者本地参考）
+docs/architecture.md
+docs/microservices-architecture.md
+docs/multi-agent-architecture.md
+docs/memory_architecture.md
+docs/tool-system-architecture.md
+docs/skill-loading-architecture.md
+docs/android-architecture.md
+docs/android-app-architecture.md
+docs/agent-org-technical-design.md
+docs/plugin-system-overview.md
+docs/plugin-context-cheatsheet.md
+docs/plugin-2.0-handover.md
+docs/agent-sharing-spec.md
+docs/tool-definition-spec.md
+docs/org-orchestration-compat-matrix.md
+docs/message-queue-and-interrupt.md
+docs/persona-and-liveness.md
+docs/prompt_structure.md
+docs/llm-tool-call-formats.md
+docs/mcp-integration.md
+docs/desktop-terminal-improvements.md
+docs/dependencies.md
+
+# 流程/任务/进度（过程性文档）
+docs/code-review-process.md
+docs/progress-tracking.md
+docs/im-channel-tasks.md
+
+# 测试用例快照
+docs/test-cases.md
+
+# Prompt 调试参考（本地开发用）
+docs/prompts/
+
+# 后期类插件路线图（本地规划草稿，不入库）
+docs/post-production-plugins-roadmap.md
+docs/subtitle-craft-plan.md
+docs/hook-picker-plan.md
+docs/media-post-plan.md
+
+# subtitle-craft 本地验证脚本（含 API 调用 + 临时音视频，不入库；
+# 验证结论统一记入 plugins/subtitle-craft/VALIDATION.md 后提交）
+plugins/subtitle-craft/validation_scripts/
+
+# ─────────────────────────────────────────────────────────────
+# 仓库收紧 第三轮（2026-05-14）：本地探针 / 临时 dump / 反馈下载
+# 这些目录纯属本地排查工具产物，含大量噪声和潜在 PII
+# ─────────────────────────────────────────────────────────────
+
+# 本地 QA / 探针（exploratory_report、explore_runs 等）
+_qa/
+tools-tmp/*
+!tools-tmp/README.md
+# tests/e2e/ 下以下划线开头的探针（pytest 不收集，但容易被 git status 污染）
+tests/e2e/_*.py
+
+# pytest / api 临时 dump
+.pytest_out.txt
+_diff_*.txt
+_agents.json
+_endpoints.json
+_openapi.json
+_sessions.json
+route_stats.md
+
+# 反馈下载（含 LLM 请求/响应、PII，二进制 zip）
+.feedback-downloads/
+feedback-downloads/
+
+# 误打包的插件 zip（plugins/<name>/ui/dist/ 仍走白名单保留）
+plugins/plugins.zip
+
+# ─────────────────────────────────────────────────────────────
+# Smoke / E2E plugin test artifacts (generated, not for git)
+# ─────────────────────────────────────────────────────────────
+plugins/happyhorse-video/tests/artifacts/
+tests/artifacts/
+**/*.smoke.json
+
+# ─────────────────────────────────────────────────────────────
+# Worker scratch / audit clutter (post-P10.7b hygiene)
+# tmp_p10/ collects throwaway helper scripts, ledger appenders, commit-msg
+# tempfiles, audit dumps, and pytest logs from past worker sessions.
+# Audit/planning .md docs and phase subdirs are preserved on disk but never
+# tracked here; everything in this directory is excluded from git.
+# ─────────────────────────────────────────────────────────────
+tmp_p10/
+tmp_p10/**
+_audit_*.txt
+_pytest_*.txt
+_main_gate_*.txt
+_narrow_*.txt
+_smoke_backend_*.log.err
+_v1_*.txt
+
+# ─────────────────────────────────────────────────────────────
+# 散文件清理 第四轮（2026-05-29，RC-5 closing）：
+# 工作树探路 / forensics / 临时测试产物的防复发模式（review §3.5）。
+# 说明：A 类 forensics（_v31~34_biz*/、_rc5_biz/）保留在磁盘上作决策依据，
+# 这些模式只阻止它们被 `git add .` 误带入版本库，不会删除磁盘文件；
+# 已 tracked 的 _v33_biz/*.md、_rc5_biz/sprint_s1/* 不受影响（git 不 untrack 已跟踪文件）。
+# ─────────────────────────────────────────────────────────────
+_v[0-9]*_biz*/
+_commit_msg_*.txt
+tmp_*/
+org_*/
+reports/
+apps/setup-center/test-results/
+*.sqlite-shm
+*.sqlite-wal
+plugins/*/data/
+_*_pytest*.txt
+_*_test.out
+_*_test.err
+_*_log.jsonl
+
+# ─────────────────────────────────────────────────────────────
+# 过程文件归档目录（2026-05-29）：
+# 所有过程测试 / forensics / 一次性调试脚本 / RCA / acceptance 产物
+# 统一归档到工程内的 _archive/ 下（保留原相对路径结构便于复查），
+# 该目录永不进入 git。已 tracked 的 forensics 文件通过 `git rm --cached`
+# 取消跟踪后再移入此处，磁盘文件完整保留。
+# ─────────────────────────────────────────────────────────────
+_archive/
+
+# Local tao patch working directory
+.patches/
+
+# Local runtime scratch (this checkout)
+temp/
+.data/
+.tools-tmp/
+

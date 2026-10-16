@@ -1,0 +1,103 @@
+{
+  "schema": "nine_tails_mapping_v1",
+  "description": "九尾分身 ↔ 九宫八宫 ↔ 五行 ↔ 洛书 ↔ 职能 ↔ V2.0 能力 ↔ 系统落点 映射表",
+  "fox_heart": {
+    "name": "狐心（中宫）",
+    "loshu": 5,
+    "function": "调度、整合、裁决",
+    "v2_capability": "九尾议会收敛 + 复盘尾（自我复盘进化）",
+    "system": "nine-palace-reasoning 中宫收敛 + evolution/self_check.py"
+  },
+  "tails": [
+    {
+      "tail": "战略尾",
+      "palace": "艮志",
+      "wu_xing": "土",
+      "alias": "天机",
+      "function": "长期布局、目标拆解、多路径推演",
+      "v2_capability": "灵韵推演",
+      "system": "qimen-diagnosis 九维立体推演",
+      "priority": 1
+    },
+    {
+      "tail": "心理尾",
+      "palace": "离神",
+      "wu_xing": "火",
+      "alias": "慧眼",
+      "function": "情绪识别、潜台词洞察、通灵识心",
+      "v2_capability": "通灵识心",
+      "system": "prompts/core/perception.md（情绪+九模式判定）",
+      "priority": 2
+    },
+    {
+      "tail": "创意尾",
+      "palace": "巽性",
+      "wu_xing": "木",
+      "alias": "知言",
+      "function": "发散思考、优化迭代、新解涌现",
+      "v2_capability": "九维洞察（创意维度）",
+      "system": "nine-palace-reasoning 巽宫",
+      "priority": 3
+    },
+    {
+      "tail": "风控尾",
+      "palace": "乾气",
+      "wu_xing": "金",
+      "alias": "天书",
+      "function": "风险预判、边界识别、合规校验",
+      "v2_capability": "守真护念",
+      "system": "identity/POLICIES.yaml + prompts/core/safety.md",
+      "priority": 4
+    },
+    {
+      "tail": "执行尾",
+      "palace": "震魂",
+      "wu_xing": "木",
+      "alias": "万象",
+      "function": "落地步骤、行动推进、任务拆解",
+      "v2_capability": "灵枢编排",
+      "system": "src/openkitsune/tools + scheduler + workspace",
+      "priority": 5
+    },
+    {
+      "tail": "伦理尾",
+      "palace": "坤情",
+      "wu_xing": "土",
+      "alias": "善应",
+      "function": "底线守护、温和纠正、正向引导",
+      "v2_capability": "守真护念（伦理维度）",
+      "system": "skills/governance + KITSUNE_SOUL 性格底线",
+      "priority": 6
+    },
+    {
+      "tail": "记忆尾",
+      "palace": "坎精",
+      "wu_xing": "水",
+      "alias": "墨阁",
+      "function": "长期记忆沉淀、历史唤醒、连续陪伴",
+      "v2_capability": "千年忆念",
+      "system": "src/openkitsune/memory + data/memory + fusion-memory",
+      "priority": 7
+    },
+    {
+      "tail": "工具尾",
+      "palace": "兑魄",
+      "wu_xing": "金",
+      "alias": "灵文",
+      "function": "技能/工具调度、多模态输出表达",
+      "v2_capability": "能力神通 + 幻化表达",
+      "system": "skills/catalog（意图动态注入）+ identity/personas",
+      "priority": 8
+    },
+    {
+      "tail": "复盘尾",
+      "palace": "中宫狐心",
+      "wu_xing": "—",
+      "alias": "自省",
+      "function": "自我复盘、评估进化、六问对齐",
+      "v2_capability": "自进化",
+      "system": "src/openkitsune/evolution + data/retrospects",
+      "priority": 9
+    }
+  ]
+}

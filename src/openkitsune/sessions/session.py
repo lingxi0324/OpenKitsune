@@ -1,0 +1,1161 @@
+"""
+会话对象定义
+
+Session 代表一个独立的对话上下文，包含:
+- 来源通道信息
+- 对话历史
+- 会话变量
+- 配置覆盖
+"""
+
+import logging
+import re
+import threading
+import uuid
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+DEDUP_TIME_WINDOW_SECONDS = 30
+AGENT_SCOPED_MESSAGE_ROLES = frozenset({"user", "assistant", "tool"})
+
+
+def _normalize_agent_profile_id(value: Any) -> str:
+    text = str(value or "default").strip()
+    return text or "default"
+
+
+def _message_agent_profile_id(message: dict) -> str:
+    raw = message.get("agent_profile_id") if isinstance(message, dict) else None
+    if raw is None or str(raw).strip() == "":
+        return ""
+    return _normalize_agent_profile_id(raw)
+
+
+def _record_parent_agent_profile_id(record: dict) -> str:
+    if not isinstance(record, dict):
+        return ""
+    raw = record.get("parent_agent_profile_id") or record.get("session_agent_profile_id")
+    if raw is None or str(raw).strip() == "":
+        return ""
+    return _normalize_agent_profile_id(raw)
+
+
+def is_duplicate_message(
+    existing_messages: list[dict],
+    candidate: dict,
+    *,
+    time_window_seconds: int = DEDUP_TIME_WINDOW_SECONDS,
+) -> bool:
+    """Return whether ``candidate`` is already represented in recent history."""
+    role = candidate.get("role")
+    content = candidate.get("content")
+    if not role or content is None:
+        return False
+    candidate_profile = _message_agent_profile_id(candidate)
+
+    candidate_ts = None
+    raw_ts = candidate.get("timestamp")
+    if raw_ts:
+        try:
+            candidate_ts = datetime.fromisoformat(str(raw_ts))
+        except (TypeError, ValueError):
+            candidate_ts = None
+
+    last_message = existing_messages[-1] if existing_messages else None
+    for msg in reversed(existing_messages[-8:]):
+        if msg.get("role") != role or msg.get("content") != content:
+            continue
+        existing_profile = _message_agent_profile_id(msg)
+        if candidate_profile or existing_profile:
+            if candidate_profile != existing_profile:
+                continue
+
+        if msg is last_message:
+            return True
+
+        if raw_ts and msg.get("timestamp") == raw_ts:
+            return True
+
+        msg_ts = None
+        msg_raw_ts = msg.get("timestamp")
+        if msg_raw_ts:
+            try:
+                msg_ts = datetime.fromisoformat(str(msg_raw_ts))
+            except (TypeError, ValueError):
+                msg_ts = None
+
+        if candidate_ts is None or msg_ts is None:
+            continue
+        if abs((candidate_ts - msg_ts).total_seconds()) < time_window_seconds:
+            return True
+
+    return False
+
+
+class SessionState(Enum):
+    """会话状态"""
+
+    ACTIVE = "active"  # 活跃中
+    IDLE = "idle"  # 空闲（无活动但未过期）
+    EXPIRED = "expired"  # 已过期
+    CLOSED = "closed"  # 已关闭
+
+
+@dataclass
+class SessionConfig:
+    """
+    会话配置
+
+    可覆盖全局配置，实现会话级别的定制
+    """
+
+    max_history: int = 2000  # 硬安全上限（日常由 _trim_old_metadata 控制体积，此值仅为极端兜底）
+    language: str = "zh"  # 语言
+    model: str | None = None  # 覆盖默认模型
+    custom_prompt: str | None = None  # 自定义系统提示
+    auto_summarize: bool = True  # 是否自动摘要长对话
+
+    def merge_with_defaults(self, defaults: "SessionConfig") -> "SessionConfig":
+        """合并配置，self 优先"""
+        return SessionConfig(
+            max_history=self.max_history or defaults.max_history,
+            language=self.language or defaults.language,
+            model=self.model or defaults.model,
+            custom_prompt=self.custom_prompt or defaults.custom_prompt,
+            auto_summarize=self.auto_summarize
+            if self.auto_summarize is not None
+            else defaults.auto_summarize,
+        )
+
+
+@dataclass
+class TaskCheckpoint:
+    """任务检查点 — 借鉴 claude-code 的"任务连续性"思路。
+
+    每条代表推理流式循环里的一次节点状态，用于：
+    1) 前端"任务时间线"展示（已完成什么、下一步打算）；
+    2) 流式中断 / 预算暂停后从特定 messages_offset 续跑。
+
+    实际持久化形式为 dict（嵌入 SessionContext.task_checkpoints），
+    本 dataclass 只是构造与字段校验的帮手，与 handoff_events 等同风格。
+    """
+
+    checkpoint_id: str
+    task_id: str
+    conversation_id: str
+    iteration: int
+    created_at: float
+    summary: str = ""
+    next_step_hint: str = ""
+    exit_reason: str = "running"
+    artifacts: list[str] = field(default_factory=list)
+    messages_offset: int = 0
+
+    # 合法 exit_reason 取值（仅供调用方对照，未做严格枚举校验以保持向前兼容）
+    EXIT_REASONS = (
+        "running",
+        "iteration_complete",
+        "budget_paused",
+        "user_cancelled",
+        "network_error",
+        "completed",
+        "failed",
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            "checkpoint_id": self.checkpoint_id,
+            "task_id": self.task_id,
+            "conversation_id": self.conversation_id,
+            "iteration": self.iteration,
+            "created_at": self.created_at,
+            "summary": self.summary,
+            "next_step_hint": self.next_step_hint,
+            "exit_reason": self.exit_reason,
+            "artifacts": list(self.artifacts),
+            "messages_offset": self.messages_offset,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TaskCheckpoint":
+        return cls(
+            checkpoint_id=str(data.get("checkpoint_id", "")),
+            task_id=str(data.get("task_id", "")),
+            conversation_id=str(data.get("conversation_id", "")),
+            iteration=int(data.get("iteration", 0) or 0),
+            created_at=float(data.get("created_at", 0.0) or 0.0),
+            summary=str(data.get("summary", "")),
+            next_step_hint=str(data.get("next_step_hint", "")),
+            exit_reason=str(data.get("exit_reason", "running")),
+            artifacts=list(data.get("artifacts") or []),
+            messages_offset=int(data.get("messages_offset", 0) or 0),
+        )
+
+
+@dataclass
+class SessionContext:
+    """
+    会话上下文
+
+    存储会话级别的状态和数据
+    """
+
+    messages: list[dict] = field(default_factory=list)  # 对话历史
+    variables: dict[str, Any] = field(default_factory=dict)  # 会话变量
+    current_task: str | None = None  # 当前任务 ID
+    memory_scope: str | None = None  # 记忆范围 ID
+    summary: str | None = None  # 对话摘要（用于长对话压缩）
+    topic_boundaries: list[int] = field(default_factory=list)  # 话题边界的消息索引
+    current_topic_start: int = 0  # 当前话题起始消息索引
+    agent_profile_id: str = "default"
+    agent_switch_history: list[dict] = field(default_factory=list)
+    working_facts: dict[str, Any] = field(default_factory=dict)
+    handoff_events: list[dict] = field(default_factory=list)  # agent_handoff events for SSE
+    # Active agents in this session (multi-agent collaboration)
+    active_agents: list[str] = field(default_factory=list)
+    # Delegation chain for the current request
+    delegation_chain: list[dict] = field(default_factory=list)
+    # Sub-agent work records — persisted traces of delegated tasks
+    sub_agent_records: list[dict] = field(default_factory=list)
+    # Task checkpoints — emitted by reasoning_engine.reason_stream for resume / timeline
+    # 上限由 append_task_checkpoint 控制，避免长会话无限增长。
+    task_checkpoints: list[dict] = field(default_factory=list)
+    focus_terms: list[str] = field(default_factory=list)
+    focus_updated_at: str | None = None
+    precompact_snapshot: dict[str, Any] = field(default_factory=dict)
+    compaction_checkpoints: list[dict] = field(default_factory=list)
+    context_epoch: dict[str, Any] = field(default_factory=dict)
+    workspace_snapshot_id: str = ""
+    _msg_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def add_message(self, role: str, content: str, **metadata) -> bool:
+        """添加消息（含去重：连续相同 + 时间窗口内相同）。
+
+        Returns:
+            True if the message was actually added, False if deduped.
+        """
+        with self._msg_lock:
+            now = datetime.now()
+            metadata = dict(metadata)
+            msg_ts = metadata.get("timestamp") or now.isoformat()
+            metadata["timestamp"] = msg_ts
+            if role in AGENT_SCOPED_MESSAGE_ROLES and not metadata.get("agent_profile_id"):
+                metadata["agent_profile_id"] = _normalize_agent_profile_id(
+                    self.agent_profile_id
+                )
+            candidate = {"role": role, "content": content, "timestamp": msg_ts}
+            if metadata.get("agent_profile_id"):
+                candidate["agent_profile_id"] = metadata["agent_profile_id"]
+            if is_duplicate_message(self.messages, candidate):
+                return False
+
+            self.messages.append(
+                {
+                    "role": role,
+                    "content": content,
+                    **metadata,
+                }
+            )
+            if role == "user" and content:
+                self.update_focus_terms(content)
+            return True
+
+    def append_marker(self, role: str, content: str, **metadata) -> None:
+        """直接追加一条消息，**绕过** :meth:`add_message` 的去重逻辑。
+
+        v1.27.14 (plan: conversation concurrency v1.28, S1.8):
+        ``_preempt_or_queue_prev_task`` 抢占 / abandon 老 task 时，需要在
+        会话历史里留一条 ``"[上一条任务被中断]"`` 标记，让前端时间线和
+        后续 LLM 上下文知道这里"老回答没说完"。这种 marker 几秒内连发可能
+        相同（连续被多次抢占），dedup 会把后几条丢掉——但 dedup 丢掉
+        marker 会让会话历史**变得不诚实**（前端"以为"老回答完整结束）。
+
+        本方法保证：每次调用都真的 append 一条，不做任何去重检查。
+
+        Args:
+            role: 通常是 ``"assistant"`` 或 ``"system"``；当作普通消息渲染。
+            content: marker 文本。
+            **metadata: 额外字段（``marker_type``、``preempted_task_id``、
+                ``policy`` 等）一并存入这条消息记录，便于前端按 marker_type
+                决定渲染样式。
+        """
+        with self._msg_lock:
+            metadata = dict(metadata)
+            if role in AGENT_SCOPED_MESSAGE_ROLES and not metadata.get("agent_profile_id"):
+                metadata["agent_profile_id"] = _normalize_agent_profile_id(
+                    self.agent_profile_id
+                )
+            self.messages.append(
+                {
+                    "role": role,
+                    "content": content,
+                    "timestamp": datetime.now().isoformat(),
+                    **metadata,
+                }
+            )
+
+    _FOCUS_FILE_RE = re.compile(
+        r"(?:[A-Za-z]:[\\/][^\s\"'<>|]+|[\w./\\-]+\.(?:py|ts|tsx|js|jsx|md|json|yaml|yml|toml|rs|go))"
+    )
+    _FOCUS_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,12}")
+    _FOCUS_STOP_WORDS = {
+        "帮我",
+        "这个",
+        "那个",
+        "一下",
+        "继续",
+        "看看",
+        "请问",
+        "如何",
+        "怎么",
+        "需要",
+        "实现",
+        "修改",
+        "the",
+        "and",
+        "for",
+        "with",
+    }
+
+    def update_focus_terms(self, content: str, *, max_terms: int = 12) -> None:
+        """Update lightweight session focus terms; never writes long-term memory."""
+        text = content.strip()
+        if not text:
+            return
+        if len(self.messages) - self.current_topic_start <= 1:
+            self.focus_terms = []
+
+        candidates: list[str] = []
+        candidates.extend(m.group(0).strip(".,，。;；") for m in self._FOCUS_FILE_RE.finditer(text))
+        for match in self._FOCUS_WORD_RE.finditer(text):
+            term = match.group(0).strip()
+            if len(term) < 2 or term.lower() in self._FOCUS_STOP_WORDS:
+                continue
+            if (
+                any(ch.isupper() for ch in term)
+                or "_" in term
+                or "-" in term
+                or "/" in term
+                or any(
+                    keyword in term
+                    for keyword in ("任务", "记忆", "权限", "审计", "会话", "路径", "压缩", "队列")
+                )
+            ):
+                candidates.append(term)
+
+        merged: list[str] = []
+        for term in [*candidates, *self.focus_terms]:
+            if term and term not in merged:
+                merged.append(term)
+        self.focus_terms = merged[:max_terms]
+        if candidates:
+            self.focus_updated_at = datetime.now().isoformat()
+
+    def mark_topic_boundary(self) -> None:
+        """在当前消息位置标记话题边界。
+
+        后续可用 get_current_topic_messages() 只获取当前话题的消息。
+        """
+        boundary_idx = len(self.messages)
+        self.topic_boundaries.append(boundary_idx)
+        self.current_topic_start = boundary_idx
+        self.focus_terms = []
+        self.focus_updated_at = datetime.now().isoformat()
+
+    def get_current_topic_messages(self) -> list[dict]:
+        """获取当前话题的消息（从最后一个边界开始）。"""
+        if self.current_topic_start >= len(self.messages):
+            return []
+        return self.messages[self.current_topic_start :]
+
+    def get_pre_topic_messages(self) -> list[dict]:
+        """获取当前话题边界之前的消息。"""
+        return self.messages[: self.current_topic_start]
+
+    def get_messages(self, limit: int | None = None) -> list[dict]:
+        """获取消息历史"""
+        if limit is not None:
+            try:
+                return self.messages[-int(limit) :]
+            except (ValueError, TypeError):
+                pass
+        return self.messages
+
+    def filter_messages_for_agent(
+        self,
+        messages: list[dict],
+        agent_profile_id: str | None = None,
+    ) -> list[dict]:
+        """Return only the history that belongs to the active agent profile.
+
+        Legacy sessions created before profile tagging have ambiguous ownership.
+        Untagged turns are replayed only while the session has never recorded a
+        profile switch. Once a session switches agents, untagged user/assistant
+        turns are not fed into profile-scoped LLM history.
+        """
+        source = list(messages or [])
+        if not source:
+            return []
+
+        profile_id = _normalize_agent_profile_id(agent_profile_id or self.agent_profile_id)
+        has_profile_tags = any(_message_agent_profile_id(msg) for msg in source)
+        has_switch_history = bool(self.agent_switch_history)
+        allow_legacy_untagged = not has_switch_history
+        if allow_legacy_untagged and not has_profile_tags:
+            return source
+
+        filtered: list[dict] = []
+        for msg in source:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role not in AGENT_SCOPED_MESSAGE_ROLES:
+                filtered.append(msg)
+                continue
+            msg_profile = _message_agent_profile_id(msg)
+            if msg_profile == profile_id or (not msg_profile and allow_legacy_untagged):
+                filtered.append(msg)
+        return filtered
+
+    def get_messages_for_agent(
+        self,
+        agent_profile_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict]:
+        """获取指定 agent profile 可见的消息历史。"""
+        messages = self.filter_messages_for_agent(self.messages, agent_profile_id)
+        if limit is not None:
+            try:
+                return messages[-int(limit) :]
+            except (ValueError, TypeError):
+                pass
+        return messages
+
+    def filter_sub_agent_records_for_agent(
+        self,
+        records: list[dict],
+        agent_profile_id: str | None = None,
+    ) -> list[dict]:
+        """Return sub-agent work records owned by the active parent profile."""
+        source = list(records or [])
+        if not source:
+            return []
+
+        profile_id = _normalize_agent_profile_id(agent_profile_id or self.agent_profile_id)
+        has_profile_tags = any(_record_parent_agent_profile_id(record) for record in source)
+        has_switch_history = bool(self.agent_switch_history)
+        allow_legacy_untagged = not has_switch_history
+        if allow_legacy_untagged and not has_profile_tags:
+            return source
+
+        return [
+            record
+            for record in source
+            if _record_parent_agent_profile_id(record) == profile_id
+            or (not _record_parent_agent_profile_id(record) and allow_legacy_untagged)
+        ]
+
+    def get_sub_agent_records_for_agent(
+        self,
+        agent_profile_id: str | None = None,
+    ) -> list[dict]:
+        """获取指定 agent profile 可见的子 agent 工作记录。"""
+        return self.filter_sub_agent_records_for_agent(
+            self.sub_agent_records,
+            agent_profile_id,
+        )
+
+    def set_variable(self, key: str, value: Any) -> None:
+        """设置会话变量"""
+        self.variables[key] = value
+
+    def get_variable(self, key: str, default: Any = None) -> Any:
+        """获取会话变量"""
+        return self.variables.get(key, default)
+
+    def clear_messages(self) -> None:
+        """清空消息历史"""
+        with self._msg_lock:
+            self.messages = []
+            self.topic_boundaries = []
+            self.current_topic_start = 0
+            self.compaction_checkpoints = []
+            self.context_epoch = {}
+            self.workspace_snapshot_id = ""
+            self.variables["_context_reset_at"] = datetime.now().isoformat()
+
+    def append_task_checkpoint(
+        self,
+        checkpoint: "TaskCheckpoint | dict",
+        *,
+        max_keep: int = 50,
+    ) -> dict:
+        """追加任务检查点，超出 max_keep 时仅保留最近若干条。
+
+        Args:
+            checkpoint: TaskCheckpoint 实例或等价 dict。
+            max_keep: 单会话内保留的检查点上限，默认 50。
+
+        Returns:
+            落到 task_checkpoints 中的 dict（也用于 SSE emit）。
+        """
+        if isinstance(checkpoint, TaskCheckpoint):
+            data = checkpoint.to_dict()
+        elif isinstance(checkpoint, dict):
+            data = TaskCheckpoint.from_dict(checkpoint).to_dict()
+        else:
+            raise TypeError(
+                f"checkpoint must be TaskCheckpoint or dict, got {type(checkpoint).__name__}"
+            )
+
+        with self._msg_lock:
+            self.task_checkpoints.append(data)
+            if len(self.task_checkpoints) > max_keep:
+                self.task_checkpoints = self.task_checkpoints[-max_keep:]
+        return data
+
+    def latest_task_checkpoint(self, task_id: str | None = None) -> dict | None:
+        """返回最近一条检查点；若给出 task_id，则限定该任务。"""
+        with self._msg_lock:
+            for ckpt in reversed(self.task_checkpoints):
+                if task_id is None or ckpt.get("task_id") == task_id:
+                    return ckpt
+        return None
+
+    def append_compaction_checkpoint(self, checkpoint: dict, *, max_keep: int = 20) -> dict:
+        """Mirror a durable compaction checkpoint into the session document."""
+        data = deepcopy(checkpoint)
+        with self._msg_lock:
+            self.compaction_checkpoints.append(data)
+            self.compaction_checkpoints = self.compaction_checkpoints[-max_keep:]
+            self.summary = str(data.get("summary") or self.summary or "")
+            self.workspace_snapshot_id = str(data.get("workspace_snapshot_id") or "")
+        return data
+
+    def latest_compaction_checkpoint(self) -> dict | None:
+        with self._msg_lock:
+            for checkpoint in reversed(self.compaction_checkpoints):
+                if checkpoint.get("status") == "completed":
+                    return deepcopy(checkpoint)
+        return None
+
+    def to_dict(self) -> dict:
+        """序列化"""
+        with self._msg_lock:
+            return deepcopy(
+                {
+                    "messages": self.messages,
+                    "variables": self.variables,
+                    "current_task": self.current_task,
+                    "memory_scope": self.memory_scope,
+                    "summary": self.summary,
+                    "topic_boundaries": self.topic_boundaries,
+                    "current_topic_start": self.current_topic_start,
+                    "agent_profile_id": self.agent_profile_id,
+                    "agent_switch_history": self.agent_switch_history,
+                    "working_facts": self.working_facts,
+                    "handoff_events": self.handoff_events,
+                    "active_agents": self.active_agents,
+                    "delegation_chain": self.delegation_chain,
+                    "sub_agent_records": self.sub_agent_records,
+                    "task_checkpoints": self.task_checkpoints,
+                    "focus_terms": self.focus_terms,
+                    "focus_updated_at": self.focus_updated_at,
+                    "precompact_snapshot": self.precompact_snapshot,
+                    "compaction_checkpoints": self.compaction_checkpoints,
+                    "context_epoch": self.context_epoch,
+                    "workspace_snapshot_id": self.workspace_snapshot_id,
+                }
+            )
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SessionContext":
+        """反序列化"""
+        return cls(
+            messages=data.get("messages", []),
+            variables=data.get("variables", {}),
+            current_task=data.get("current_task"),
+            memory_scope=data.get("memory_scope"),
+            summary=data.get("summary"),
+            topic_boundaries=data.get("topic_boundaries", []),
+            current_topic_start=data.get("current_topic_start", 0),
+            agent_profile_id=data.get("agent_profile_id", "default"),
+            agent_switch_history=data.get("agent_switch_history", []),
+            working_facts=data.get("working_facts", {}),
+            handoff_events=data.get("handoff_events", []),
+            active_agents=data.get("active_agents", []),
+            delegation_chain=data.get("delegation_chain", []),
+            sub_agent_records=data.get("sub_agent_records", []),
+            task_checkpoints=data.get("task_checkpoints", []),
+            focus_terms=data.get("focus_terms", []),
+            focus_updated_at=data.get("focus_updated_at"),
+            precompact_snapshot=data.get("precompact_snapshot", {}),
+            compaction_checkpoints=data.get("compaction_checkpoints", []),
+            context_epoch=data.get("context_epoch", {}),
+            workspace_snapshot_id=data.get("workspace_snapshot_id", ""),
+        )
+
+
+@dataclass
+class Session:
+    """
+    会话对象
+
+    代表一个独立的对话上下文，关联:
+    - 来源通道（telegram/feishu/...）
+    - 聊天 ID（私聊/群聊/话题）
+    - 用户 ID
+    """
+
+    id: str
+    channel: str  # 来源通道
+    chat_id: str  # 聊天 ID（群/私聊）
+    user_id: str  # 用户 ID
+    bot_instance_id: str = ""  # 机器人实例 ID（为空时兼容旧数据，回退 channel）
+    thread_id: str | None = None  # 话题/线程 ID（飞书话题等）
+    chat_type: str = "private"  # "group" | "private"
+    display_name: str = ""  # 用户昵称（用于 UI 展示）
+    chat_name: str = ""  # 聊天/群组名称（群名、频道名等）
+    # User-file execution root. OpenKitsune configuration and state continue to
+    # live under settings.project_root; this path is immutable for a logical
+    # conversation after creation.
+    working_directory: str = ""
+
+    # 状态
+    state: SessionState = SessionState.ACTIVE
+    created_at: datetime = field(default_factory=datetime.now)
+    last_active: datetime = field(default_factory=datetime.now)
+
+    # 上下文
+    context: SessionContext = field(default_factory=SessionContext)
+
+    # 配置（可覆盖全局）
+    config: SessionConfig = field(default_factory=SessionConfig)
+
+    # 元数据
+    metadata: dict = field(default_factory=dict)
+
+    # PolicyV2 正交两层 mode（C8 §2.2 新增）
+    # ``session_role``: SessionRole 枚举字符串 ("agent" / "plan" / "ask" / "coordinator")
+    # ``confirmation_mode_override``: 若非 None，覆盖全局 ConfirmationMode（"default"
+    # / "trust" / "strict" / "accept_edits" / "dont_ask"）。switch_mode 工具写入
+    # ``session_role``；UI/handler 后续可对个别 session 单独覆盖 confirmation_mode。
+    # 用 ``str`` 而非 ``Enum`` 是为了让旧 sessions.json（无字段）反序列化时可
+    # ``getattr(session, "session_role", "agent")`` 兼容；adapter.build_policy_context
+    # 把字符串 coerce 回 SessionRole 枚举。
+    session_role: str = "agent"
+    confirmation_mode_override: str | None = None
+
+    # C12 §14.2: PolicyV2 unattended fields. Promoted from `metadata` to
+    # first-class fields so scheduler / spawn_agent / webhook callers can set
+    # them at session creation without metadata fishing. PolicyContext.from_session
+    # reads first-class fields when present (with metadata fallback for
+    # back-compat with sessions persisted before C12).
+    #
+    # ``is_unattended``: True for sessions where no human is interactively
+    # responding (cron task / webhook / autonomous spawn). PolicyEngineV2
+    # step 11 routes through ``_handle_unattended`` only when this is True.
+    #
+    # ``unattended_strategy``: empty → engine uses
+    # ``config.unattended.default_strategy`` ("ask_owner" by default).
+    # Explicit values: "deny" / "auto_approve" / "defer_to_owner" /
+    # "defer_to_inbox" / "ask_owner".  Per-session override of config default.
+    is_unattended: bool = False
+    unattended_strategy: str = ""
+
+    @classmethod
+    def create(
+        cls,
+        channel: str,
+        chat_id: str,
+        user_id: str,
+        bot_instance_id: str = "",
+        thread_id: str | None = None,
+        config: SessionConfig | None = None,
+        chat_type: str = "private",
+        display_name: str = "",
+        chat_name: str = "",
+        working_directory: str | None = None,
+    ) -> "Session":
+        """创建新会话"""
+        session_id = (
+            f"{channel}_{chat_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        )
+        from ..core.working_directory import (
+            config_workspace,
+            normalize_working_directory,
+            working_directory_feature_enabled,
+        )
+
+        if working_directory is None or not working_directory_feature_enabled():
+            working_directory = str(config_workspace())
+        else:
+            working_directory = str(normalize_working_directory(working_directory, must_exist=True))
+        return cls(
+            id=session_id,
+            channel=channel,
+            chat_id=chat_id,
+            user_id=user_id,
+            bot_instance_id=bot_instance_id or channel,
+            thread_id=thread_id,
+            chat_type=chat_type,
+            display_name=display_name,
+            chat_name=chat_name,
+            working_directory=working_directory,
+            config=config or SessionConfig(),
+        )
+
+    def touch(self) -> None:
+        """更新活跃时间
+
+        仅在**真实会话活动**（新增消息等）时调用，使 ``last_active`` 反映
+        用户最后一次交互的时间。纯读取/查询（拉历史、仪表盘轮询、改 UI
+        配置）不得调用本方法，否则 ``last_active`` 会被刷成"刚被访问"的时间，
+        导致会话列表时间与排序失真（见 issue #628）。读取场景请用
+        :meth:`reactivate`。
+        """
+        self.last_active = datetime.now()
+        if self.state == SessionState.IDLE:
+            self.state = SessionState.ACTIVE
+
+    def reactivate(self) -> None:
+        """把空闲或旧版过期会话标回活跃，但**不**改动 ``last_active``。
+
+        供 ``get_session`` 等查询路径使用：被访问的会话可以从 IDLE 恢复成
+        ACTIVE，但"被访问"本身不算一次新的会话活动，不应改写它在会话列表
+        里的时间与排序位置。
+        """
+        if self.state in (SessionState.IDLE, SessionState.EXPIRED):
+            self.state = SessionState.ACTIVE
+
+    def is_expired(self) -> bool:
+        """Return whether this loaded object is eligible for cold-memory eviction."""
+        elapsed = (datetime.now() - self.last_active).total_seconds() / 60
+        return elapsed > 60 * 24 * 30
+
+    def mark_expired(self) -> None:
+        """标记为过期"""
+        self.state = SessionState.EXPIRED
+
+    def mark_idle(self) -> None:
+        """标记为空闲"""
+        self.state = SessionState.IDLE
+
+    def close(self) -> None:
+        """关闭会话"""
+        self.state = SessionState.CLOSED
+
+    # ==================== 元数据管理 ====================
+
+    def set_metadata(self, key: str, value: Any) -> None:
+        """设置元数据"""
+        self.metadata[key] = value
+
+    def get_metadata(self, key: str, default: Any = None) -> Any:
+        """获取元数据"""
+        return self.metadata.get(key, default)
+
+    # ==================== 任务管理 ====================
+
+    def set_task(self, task_id: str, description: str) -> None:
+        """
+        设置当前任务
+
+        Args:
+            task_id: 任务 ID
+            description: 任务描述
+        """
+        self.context.current_task = task_id
+        self.context.set_variable("task_description", description)
+        self.context.set_variable("task_status", "in_progress")
+        self.context.set_variable("task_started_at", datetime.now().isoformat())
+        self.touch()
+        logger.debug(f"Session {self.id}: set task {task_id}")
+
+    def complete_task(self, success: bool = True, result: str = "") -> None:
+        """
+        完成当前任务
+
+        Args:
+            success: 是否成功
+            result: 结果描述
+        """
+        self.context.set_variable("task_status", "completed" if success else "failed")
+        self.context.set_variable("task_result", result)
+        self.context.set_variable("task_completed_at", datetime.now().isoformat())
+
+        task_id = self.context.current_task
+        self.context.current_task = None
+
+        self.touch()
+        logger.debug(
+            f"Session {self.id}: completed task {task_id} ({'success' if success else 'failed'})"
+        )
+
+    def get_task_status(self) -> dict:
+        """
+        获取当前任务状态
+
+        Returns:
+            任务状态字典
+        """
+        return {
+            "task_id": self.context.current_task,
+            "description": self.context.get_variable("task_description"),
+            "status": self.context.get_variable("task_status"),
+            "started_at": self.context.get_variable("task_started_at"),
+            "completed_at": self.context.get_variable("task_completed_at"),
+            "result": self.context.get_variable("task_result"),
+        }
+
+    def has_active_task(self) -> bool:
+        """是否有正在进行的任务"""
+        return self.context.current_task is not None
+
+    @property
+    def session_key(self) -> str:
+        """会话唯一标识"""
+        namespace = self.bot_instance_id or self.channel
+        key = f"{namespace}:{self.chat_id}:{self.user_id}"
+        if self.thread_id:
+            key += f":{self.thread_id}"
+        return key
+
+    # 重型元数据键（思考链、工具摘要、代码产物），对旧消息裁剪以控制体积。
+    #
+    # ``todo`` 计划快照刻意 *不* 列入：它体积很小（id + summary + steps），且是
+    # 计划卡跨重载/多窗口回显（#615）的持久来源，裁掉会让老消息的计划卡再次消失。
+    # ``parts`` 也不在此：它是由扁平字段派生的渲染投影（见 api/message_parts.py），
+    # 从不入库，故不会撑大 sessions.json，也无需裁剪。
+    _HEAVY_METADATA_KEYS = ("chain_summary", "tool_summary", "artifacts", "chain_timeline")
+    # 保留最近 N 条消息的完整元数据（前端展示思考链等），更早的仅保留 base content
+    _METADATA_PRESERVE_WINDOW = 50
+
+    def append_marker(self, role: str, content: str, **metadata) -> None:
+        """直接追加一条消息（绕过去重）；用于 cancel/preempt marker。
+
+        v1.27.14 (plan v1.28, S1.8). 详见 :meth:`SessionContext.append_marker`.
+
+        FIX 5 (vs v1.27.14 first cut): also persist to SqliteTurnStore so
+        markers survive a process restart.  Without persistence, after a
+        backend restart the frontend timeline silently looks "as if the
+        previous answer finished normally" — defeating the whole point
+        of writing the marker.  We mirror ``Session.add_message``'s
+        best-effort persistence path (history_db_merge_v1 feature-gated,
+        skip on transient_for_llm, swallow exceptions to never block
+        the chat loop).
+        """
+        self.context.append_marker(role, content, **metadata)
+        self.touch()
+
+        # Best-effort SQLite persistence, identical guards to ``add_message``.
+        try:
+            if role in ("user", "assistant", "tool") and not metadata.get("transient_for_llm"):
+                msg_metadata = dict(metadata)
+                if self.context.messages:
+                    msg_metadata.setdefault("timestamp", self.context.messages[-1].get("timestamp"))
+                self._write_turn_to_store(role, content, msg_metadata)
+        except Exception as exc:
+            logger.debug(f"[Session] append_marker write_turn_to_store skipped: {exc}")
+
+    def add_message(self, role: str, content: str, **metadata) -> bool:
+        """添加消息并更新活跃时间。返回 True 表示消息被添加，False 表示被去重跳过。"""
+        added = self.context.add_message(role, content, **metadata)
+        self.touch()
+
+        if added:
+            self._trim_old_metadata()
+            if len(self.context.messages) > self.config.max_history:
+                self._truncate_history()
+            # PR-D3: best-effort 同步写 SqliteTurnStore，避免崩溃丢历史。
+            # 仅持久化主对话角色（user/assistant），且 transient_for_llm 的
+            # 临时消息（如 RiskGate 确认应答）不写盘。
+            try:
+                if role in ("user", "assistant", "tool") and not metadata.get("transient_for_llm"):
+                    msg_metadata = dict(metadata)
+                    if self.context.messages:
+                        msg_metadata.setdefault("timestamp", self.context.messages[-1].get("timestamp"))
+                    self._write_turn_to_store(role, content, msg_metadata)
+            except Exception as exc:
+                logger.debug(f"[Session] write_turn_to_store skipped: {exc}")
+        return added
+
+    def _write_turn_to_store(self, role: str, content: str, metadata: dict) -> None:
+        """Persist a single turn to SQLite via session_manager._turn_writer."""
+        try:
+            from ..core.feature_flags import is_enabled as _ff_enabled
+
+            if not _ff_enabled("history_db_merge_v1"):
+                return
+        except Exception:
+            return
+
+        manager = getattr(self, "_manager", None)
+        writer = getattr(manager, "_turn_writer", None) if manager else None
+        if writer is None:
+            return
+
+        try:
+            import re as _re
+
+            safe_id = (self.session_key or "").replace(":", "__")
+            safe_id = _re.sub(r'[/\\+=%?*<>|"\x00-\x1f]', "_", safe_id)
+            turn_index = max(0, len(self.context.messages) - 1)
+            writer(
+                safe_id,
+                turn_index,
+                role,
+                content,
+                metadata,
+            )
+        except Exception as exc:
+            logger.debug(f"[Session] turn writer failed: {exc}")
+
+    def _trim_old_metadata(self) -> None:
+        """裁剪旧消息的重型元数据以控制内存与序列化体积。
+
+        保留所有消息的 base content（role, content, timestamp），仅移除
+        chain_summary / tool_summary / artifacts 等重型字段。
+        这是日常的体积控制机制，不会删除任何消息——用户永远不会丢失聊天记录。
+        """
+        with self.context._msg_lock:
+            messages = self.context.messages
+            trim_end = len(messages) - self._METADATA_PRESERVE_WINDOW
+            if trim_end <= 0:
+                return
+            for msg in messages[:trim_end]:
+                for key in self._HEAVY_METADATA_KEYS:
+                    msg.pop(key, None)
+
+    _RULE_SIGNAL_WORDS = (
+        "不要",
+        "必须",
+        "禁止",
+        "每次",
+        "规则",
+        "永远不要",
+        "务必",
+        "永远",
+        "always",
+        "never",
+        "must",
+        "rule",
+    )
+
+    def _truncate_history(self) -> None:
+        """硬安全网：仅当消息数超过 max_history（默认 2000）时触发。
+
+        日常体积控制由 _trim_old_metadata 负责（不删消息），本方法仅在极端情况
+        下删除最老 5% 的消息。正常使用几乎不会触发。
+        """
+        with self.context._msg_lock:
+            keep_count = int(self.config.max_history * 95 / 100)
+            messages = self.context.messages
+            dropped = messages[:-keep_count]
+            kept = messages[-keep_count:]
+
+            logger.warning(
+                f"Session {self.id}: HARD CAP truncation — "
+                f"total {len(messages)}, dropping {len(dropped)}, "
+                f"keeping {len(kept)} (max_history={self.config.max_history})"
+            )
+
+            self._mark_dropped_for_extraction(dropped)
+
+            max_summary_len = 300
+            max_rules_len = 500
+            keywords: list[str] = []
+            rule_snippets: list[str] = []
+            rules_len = 0
+
+            for msg in dropped:
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content", "")
+                if not isinstance(content, str) or not content:
+                    continue
+
+                from openkitsune.agent.tools import smart_truncate
+
+                is_rule = any(w in content for w in self._RULE_SIGNAL_WORDS)
+                if is_rule and rules_len < max_rules_len:
+                    snippet, _ = smart_truncate(
+                        content.replace("\n", " ").strip(),
+                        300,
+                        save_full=False,
+                        label="rule_hist",
+                    )
+                    rule_snippets.append(snippet)
+                    rules_len += len(snippet)
+                else:
+                    preview, _ = smart_truncate(
+                        content.replace("\n", " ").strip(),
+                        150,
+                        save_full=False,
+                        label="msg_hist",
+                    )
+                    keywords.append(preview)
+
+            header_parts: list[str] = []
+            if rule_snippets:
+                header_parts.append("[用户规则（必须遵守）]\n" + "\n".join(rule_snippets))
+            if keywords:
+                header = "[历史背景，非当前任务]\n"
+                body = ""
+                for kw in keywords:
+                    candidate = (body + "\n" + kw).strip() if body else kw
+                    if len(header) + len(candidate) > max_summary_len:
+                        break
+                    body = candidate
+                if body:
+                    header_parts.append(header + body)
+
+            if header_parts:
+                kept.insert(0, {"role": "system", "content": "\n\n".join(header_parts)})
+
+            self.context.messages = kept
+            logger.info(
+                f"Session {self.id}: truncated — "
+                f"dropped {len(dropped)}, kept {len(kept)} messages, "
+                f"preserved {len(rule_snippets)} rule snippets"
+            )
+
+    def _mark_dropped_for_extraction(self, dropped: list[dict]) -> None:
+        """v2: 将被截断的消息标记为需要提取。
+
+        通过 metadata["_memory_manager"] 或回调机制通知记忆系统。
+        如果记忆系统不可用, 静默跳过 (不影响截断流程)。
+        """
+        memory_manager = self.metadata.get("_memory_manager")
+        if memory_manager is None:
+            return
+        store = getattr(memory_manager, "store", None)
+        if store is None:
+            return
+        try:
+            from ..memory.session_identity import memory_session_id, memory_session_user
+            from ..memory.workspace_resolver import resolve_memory_workspace_id
+
+            safe_id = memory_session_id(self, self.id)
+            owner = memory_session_user(self)
+            workspace = resolve_memory_workspace_id(self)
+            # This may execute outside the chat task. Never borrow the mutable
+            # manager's current owner; the session being trimmed is authoritative.
+            store.upsert_session_tenant(safe_id, owner, workspace)
+            store.upsert_session_tenant(self.id, owner, workspace)
+            for i, msg in enumerate(dropped):
+                content = msg.get("content", "")
+                if not content or not isinstance(content, str) or len(content) < 10:
+                    continue
+                store.enqueue_extraction(
+                    session_id=safe_id,
+                    turn_index=i,
+                    content=content,
+                    tool_calls=msg.get("tool_calls"),
+                    tool_results=msg.get("tool_results"),
+                )
+        except Exception as e:
+            logger.warning(f"Failed to enqueue dropped messages for extraction: {e}")
+
+    def to_dict(self) -> dict:
+        """序列化"""
+        # 过滤掉以 _ 开头的私有 metadata（如 _gateway, _session_key 等运行时数据）
+        serializable_metadata = {
+            k: v
+            for k, v in self.metadata.items()
+            if not k.startswith("_") and self._is_json_serializable(v)
+        }
+
+        return {
+            "id": self.id,
+            "channel": self.channel,
+            "bot_instance_id": self.bot_instance_id or self.channel,
+            "chat_id": self.chat_id,
+            "user_id": self.user_id,
+            "thread_id": self.thread_id,
+            "chat_type": self.chat_type,
+            "display_name": self.display_name,
+            "chat_name": self.chat_name,
+            "working_directory": self.working_directory,
+            "state": self.state.value,
+            "created_at": self.created_at.isoformat(),
+            "last_active": self.last_active.isoformat(),
+            "context": self.context.to_dict(),
+            "config": {
+                "max_history": self.config.max_history,
+                "language": self.config.language,
+                "model": self.config.model,
+                "custom_prompt": self.config.custom_prompt,
+                "auto_summarize": self.config.auto_summarize,
+            },
+            "metadata": serializable_metadata,
+            "session_role": self.session_role,
+            "confirmation_mode_override": self.confirmation_mode_override,
+            "is_unattended": self.is_unattended,
+            "unattended_strategy": self.unattended_strategy,
+        }
+
+    def _is_json_serializable(self, value: Any) -> bool:
+        """检查值是否可以 JSON 序列化"""
+        import json
+
+        try:
+            json.dumps(value)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Session":
+        """反序列化"""
+        config_data = data.get("config", {})
+        # C8: session_role / confirmation_mode_override 旧 sessions.json 没有，
+        # 走默认 "agent" / None。读取时容错任意非法值（None/类型错） → 默认。
+        sr_raw = data.get("session_role", "agent")
+        session_role = sr_raw if isinstance(sr_raw, str) and sr_raw else "agent"
+        cm_raw = data.get("confirmation_mode_override")
+        confirmation_mode_override = cm_raw if isinstance(cm_raw, str) and cm_raw else None
+        # C12 §14.2: is_unattended / unattended_strategy. 旧 sessions.json 没有
+        # → 默认 False / "" (= use config.unattended.default_strategy)
+        is_unattended_raw = data.get("is_unattended", False)
+        is_unattended = bool(is_unattended_raw) if is_unattended_raw is not None else False
+        us_raw = data.get("unattended_strategy", "")
+        unattended_strategy = us_raw if isinstance(us_raw, str) else ""
+        working_directory = str(data.get("working_directory") or "")
+        if not working_directory:
+            from ..core.working_directory import config_workspace
+
+            working_directory = str(config_workspace())
+        return cls(
+            id=data["id"],
+            channel=data["channel"],
+            bot_instance_id=data.get("bot_instance_id") or data.get("channel", ""),
+            chat_id=data["chat_id"],
+            user_id=data["user_id"],
+            thread_id=data.get("thread_id"),
+            chat_type=data.get("chat_type", "private"),
+            display_name=data.get("display_name", ""),
+            chat_name=data.get("chat_name", ""),
+            working_directory=working_directory,
+            state=SessionState(data.get("state", "active")),
+            created_at=datetime.fromisoformat(data["created_at"]),
+            last_active=datetime.fromisoformat(data["last_active"]),
+            context=SessionContext.from_dict(data.get("context") or {}),
+            config=SessionConfig(
+                max_history=max(config_data.get("max_history", 2000), 500),
+                language=config_data.get("language", "zh"),
+                model=config_data.get("model"),
+                custom_prompt=config_data.get("custom_prompt"),
+                auto_summarize=config_data.get("auto_summarize", True),
+            ),
+            metadata=data.get("metadata", {}),
+            session_role=session_role,
+            confirmation_mode_override=confirmation_mode_override,
+            is_unattended=is_unattended,
+            unattended_strategy=unattended_strategy,
+        )

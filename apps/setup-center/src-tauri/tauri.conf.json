@@ -1,0 +1,85 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "OpenKitsuneDesktop",
+  "mainBinaryName": "openkitsune-desktop",
+  "version": "1.27.42",
+  "identifier": "com.openkitsune.setupcenter",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "bundle": {
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ],
+    "resources": [
+      "resources/bootstrap/"
+    ],
+    "createUpdaterArtifacts": true,
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/openkitsune.desktop.hbs"
+      }
+    },
+    "macOS": {
+      "entitlements": "Entitlements.plist",
+      "signingIdentity": "-",
+      "minimumSystemVersion": "10.15"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/logo.ico",
+        "installerHooks": "./windows/hooks.nsh",
+        "template": "./windows/installer.nsi",
+        "displayLanguageSelector": false,
+        "languages": [
+          "SimpChinese",
+          "English"
+        ]
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["openkitsune"]
+      }
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ1RTQ1NjM2RkMxQ0Y4MDMKUldRRCtCejhObGJrUmR2VWdtbDMwSmhqdlE2RURSYTJKUTIxV25wRE1mcFA0Sy82Vi9zbUo3YWQK",
+      "endpoints": [
+        "https://admin.openkitsune.cn/updater/release.json?version={{current_version}}&platform={{target}}",
+        "https://dl-openkitsune.fzstack.com/api/release.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
+  "app": {
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:* http://localhost:* https://* ws://127.0.0.1:* ws://localhost:* wss://*; img-src 'self' data: blob: http: https: asset: http://asset.localhost https://asset.localhost; media-src 'self' blob: http://127.0.0.1:* http://localhost:* asset: http://asset.localhost https://asset.localhost; object-src 'self' blob: http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline' https://*.alicdn.com; font-src 'self' data: https://*.alicdn.com; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://o.alicdn.com https://g.alicdn.com; frame-src 'self' blob: http://127.0.0.1:* http://localhost:* https://*.alibaba.com",
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "**"
+        ]
+      }
+    },
+    "windows": [
+      {
+        "title": "OpenKitsune",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true
+      }
+    ]
+  }
+}

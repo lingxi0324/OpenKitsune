@@ -1,0 +1,71 @@
+{
+  "test_time": "2026-06-19 12:31",
+  "test_label": "四层框架 v3.7.0 全量回测",
+  "baseline": {
+    "label": "A: 胜复校正(旧基线)",
+    "version": "wuyun_only",
+    "strict_rate": 0.36363636363636365,
+    "strict_correct": 8,
+    "strict_total": 22,
+    "loose_rate": 0.5714285714285714,
+    "loose_correct": 8,
+    "loose_total": 14
+  },
+  "with_capital": {
+    "label": "B: 胜复+资本行为",
+    "version": "with_capital",
+    "strict_rate": 0.36363636363636365,
+    "strict_correct": 8,
+    "strict_total": 22,
+    "loose_rate": 0.5714285714285714,
+    "loose_correct": 8,
+    "loose_total": 14
+  },
+  "four_layer": {
+    "label": "C: 四层框架(胜复+资本+奇门)",
+    "version": "four_layer",
+    "strict_rate": 0.5454545454545454,
+    "strict_correct": 12,
+    "strict_total": 22,
+    "loose_rate": 0.6,
+    "loose_correct": 12,
+    "loose_total": 20
+  },
+  "stock_results": [
+    {
+      "stock": "寒武纪",
+      "primary": "火",
+      "accuracy": 0.45454545454545453,
+      "correct": 5,
+      "total": 11
+    },
+    {
+      "stock": "宁德时代",
+      "primary": "木",
+      "accuracy": 0.1,
+      "correct": 1,
+      "total": 10
+    },
+    {
+      "stock": "贵州茅台",
+      "primary": "土",
+      "accuracy": 0.0,
+      "correct": 0,
+      "total": 2
+    },
+    {
+      "stock": "工商银行",
+      "primary": "金",
+      "accuracy": 1.0,
+      "correct": 2,
+      "total": 2
+    },
+    {
+      "stock": "长江电力",
+      "primary": "水",
+      "accuracy": 0,
+      "correct": 0,
+      "total": 0
+    }
+  ]
+}

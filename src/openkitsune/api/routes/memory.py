@@ -1,0 +1,1250 @@
+"""
+Memory management routes: CRUD + LLM review for semantic memories.
+
+Provides HTTP API for the frontend Memory Management Panel.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import re
+import time
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel
+
+from openkitsune.memory.retention import apply_retention
+from openkitsune.memory.session_identity import DESKTOP_USER_ID
+from openkitsune.memory.types import MemoryPriority, MemoryType, SemanticMemory
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/memories", tags=["memory"])
+
+# Upper bound on a single memory's content length. Prevents a single oversized
+# entry (exploratory testing accepted 57 KB) from polluting the DB and later
+# blowing up prompt-context budgets. 16 KB is generous for a fact/rule/summary.
+_MAX_MEMORY_CONTENT_LEN = 16384
+
+# In-process review task state (single-task, no need for DB persistence)
+_review_task: asyncio.Task | None = None
+_review_cancel: asyncio.Event | None = None
+_review_progress: dict = {}
+_review_lock = asyncio.Lock()
+
+
+def _get_store(request: Request):
+    agent = getattr(request.app.state, "agent", None)
+    if agent is None:
+        return None
+    mm = getattr(agent, "memory_manager", None)
+    if mm:
+        return mm.store
+    local = getattr(agent, "_local_agent", None)
+    if local:
+        mm = getattr(local, "memory_manager", None)
+        if mm:
+            return mm.store
+    return None
+
+
+def _get_manager(request: Request):
+    agent = getattr(request.app.state, "agent", None)
+    if agent is None:
+        return None
+    mm = getattr(agent, "memory_manager", None)
+    if mm:
+        return mm
+    local = getattr(agent, "_local_agent", None)
+    if local:
+        return getattr(local, "memory_manager", None)
+    return None
+
+
+def _sync_json(request: Request):
+    """Force a full cache reload from SQLite.
+
+    Historically every mutation route called this so the in-memory cache
+    on ``MemoryManager`` did not lag behind the DB. As of v4.1, the cache
+    is kept coherent automatically through a store-observer registered in
+    ``MemoryManager.__init__`` — single-row creates / updates / deletes
+    NO LONGER need this O(N) full-reload, and the cheap routes have
+    stopped calling it.
+
+    The function is retained for the few legitimate callers that perform
+    bulk multi-step writes through the LLM review pipeline (which still
+    benefit from a single reload at the end as a defensive resync) and
+    for any out-of-tree callers that still depend on it.
+    """
+    mm = _get_manager(request)
+    if mm and hasattr(mm, "_reload_from_sqlite"):
+        mm._reload_from_sqlite()
+
+
+def _get_lifecycle(request: Request):
+    mm = _get_manager(request)
+    if not mm:
+        return None
+    try:
+        from openkitsune.config import settings
+        from openkitsune.memory.lifecycle import LifecycleManager
+
+        return LifecycleManager(
+            store=mm.store,
+            extractor=mm.extractor,
+            identity_dir=settings.identity_path,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to create LifecycleManager: {e}")
+        return None
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: str | None = None
+    importance_score: float | None = None
+    tags: list[str] | None = None
+
+
+class MemoryCreateRequest(BaseModel):
+    type: str = "fact"
+    content: str
+    subject: str = ""
+    predicate: str = ""
+    importance_score: float = 0.8
+    tags: list[str] = []
+
+
+class ClaimLegacyRequest(BaseModel):
+    include_inactive: bool = True
+    include_default_graph_nodes: bool = True
+
+
+class MigrateWorkspaceRequest(BaseModel):
+    """Phase 2a：把当前 user 在 ``from_workspace_id`` 里的记忆迁到
+    ``to_workspace_id``。空 ``to_workspace_id`` 时取当前 session 的
+    workspace_id（一般是用户切到 project 模式后的项目哈希值）。"""
+
+    from_workspace_id: str = "default"
+    to_workspace_id: str = ""
+    scope: str = "user"
+
+
+class MergeOwnerRequest(BaseModel):
+    """Merge one owner (``user_id``) bucket's memories into the canonical one.
+
+    Resolves the historical ``default`` bucket residue left by the earlier
+    owner-scoping fix into the desktop canonical identity (``desktop_user``).
+
+    - ``from_owner`` defaults to the legacy ``default`` bucket.
+    - ``to_owner`` empty → the caller's current canonical owner (desktop panel
+      resolves to ``desktop_user`` via ``_current_owner``).
+    - ``dry_run`` defaults to ``True``: report counts/samples only, no writes.
+    """
+
+    from_owner: str = "default"
+    to_owner: str = ""
+    from_workspace_id: str = "default"
+    to_workspace_id: str = ""
+    scope: str = "user"
+    dry_run: bool = True
+
+
+IDENTITY_SLOT_ALIASES: dict[str, str] = {
+    "姓名": "user.name",
+    "名字": "user.name",
+    "称呼": "user.name",
+    "name": "user.name",
+    "年龄": "user.age",
+    "age": "user.age",
+    "城市": "user.city",
+    "所在地": "user.city",
+    "位置": "user.city",
+    "居住地": "user.city",
+    "location": "user.city",
+    "city": "user.city",
+    "职业": "user.job",
+    "工作": "user.job",
+    "职位": "user.job",
+    "job": "user.job",
+    "profession": "user.job",
+    "宠物": "user.pet",
+    "pet": "user.pet",
+}
+
+TASK_LOG_PATTERNS = (
+    "本轮",
+    "工具调用",
+    "调用了",
+    "执行了",
+    "读取了",
+    "创建了文件",
+    "写入了文件",
+    "测试报告",
+    "trace_",
+    "llm_request",
+    "llm_response",
+)
+
+
+def _serialize(mem: Any) -> dict:
+    return {
+        "id": mem.id,
+        "type": mem.type.value if hasattr(mem.type, "value") else str(mem.type),
+        "priority": mem.priority.value if hasattr(mem.priority, "value") else str(mem.priority),
+        "content": mem.content,
+        "source": mem.source,
+        "subject": mem.subject or "",
+        "predicate": mem.predicate or "",
+        "tags": mem.tags or [],
+        "importance_score": mem.importance_score,
+        "confidence": mem.confidence,
+        "access_count": mem.access_count,
+        "created_at": mem.created_at.isoformat() if mem.created_at else None,
+        "updated_at": mem.updated_at.isoformat() if mem.updated_at else None,
+        "last_accessed_at": mem.last_accessed_at.isoformat() if mem.last_accessed_at else None,
+        "expires_at": mem.expires_at.isoformat() if mem.expires_at else None,
+        "scope": getattr(mem, "scope", "user"),
+        "scope_owner": getattr(mem, "scope_owner", ""),
+        "user_id": getattr(mem, "user_id", "default"),
+        "workspace_id": getattr(mem, "workspace_id", "default"),
+    }
+
+
+def _current_owner(request: Request) -> tuple[str, str]:
+    # 1) Explicit override for (future) multi-user REST clients: an upstream
+    #    proxy / caller can pin the tenant via headers without relying on any
+    #    request-context state.
+    user_hdr = (request.headers.get("X-OpenKitsune-User") or "").strip()
+    ws_hdr = (request.headers.get("X-OpenKitsune-Workspace") or "").strip()
+    if user_hdr:
+        return user_hdr, (ws_hdr or "default")
+
+    # 2) Honour a real owner already bound to *this* request context (e.g. tests
+    #    or a future path that starts a memory session before hitting the route).
+    user_id, workspace_id = "default", "default"
+    mm = _get_manager(request)
+    if mm and hasattr(mm, "_current_owner"):
+        try:
+            user_id, workspace_id = mm._current_owner()
+        except Exception:
+            user_id, workspace_id = "default", "default"
+
+    # 3) The /api/memories management panel is the desktop single-user surface.
+    #    It hits this route directly, WITHOUT a memory session bound to the
+    #    request context, so the manager's per-request ContextVar falls back to
+    #    "default". The desktop *chat* path, however, binds owner to
+    #    "desktop_user" (see chat.py get_session(user_id="desktop_user")). Those
+    #    two buckets never overlap, so memories created in the panel were
+    #    invisible to the agent's conversation recall and vice-versa (Domain3
+    #    P1-1). Align the REST fallback to the same canonical desktop identity so
+    #    the panel and the chat share one owner bucket.
+    #
+    #    We deliberately do NOT trust the memory manager's *mutable singleton*
+    #    owner across contexts here: on a multi-user backend it reflects whoever
+    #    (possibly an IM user) chatted most recently, and leaking that onto the
+    #    desktop admin surface would be a cross-tenant read. Only the per-request
+    #    ContextVar value above is trusted; when it is the generic fallback we
+    #    resolve to the desktop identity.
+    if user_id in ("default", "", "anonymous"):
+        user_id = DESKTOP_USER_ID
+
+    return user_id, workspace_id
+
+
+def _owner_counts(store: Any) -> dict[str, Any]:
+    db = getattr(store, "db", None)
+    conn = getattr(db, "_conn", None)
+    if conn is None:
+        return {"total": 0, "by_scope": {}, "by_owner": []}
+
+    by_scope = {
+        (row[0] or "global"): row[1]
+        for row in conn.execute(
+            "SELECT COALESCE(scope, 'global') AS scope, COUNT(*) FROM memories GROUP BY scope"
+        ).fetchall()
+    }
+    by_owner = [
+        {
+            "scope": row[0] or "global",
+            "scope_owner": row[1] or "",
+            "user_id": row[2] or "default",
+            "workspace_id": row[3] or "default",
+            "count": row[4],
+        }
+        for row in conn.execute(
+            """
+            SELECT COALESCE(scope, 'global'),
+                   COALESCE(scope_owner, ''),
+                   COALESCE(user_id, 'default'),
+                   COALESCE(workspace_id, 'default'),
+                   COUNT(*)
+            FROM memories
+            GROUP BY scope, scope_owner, user_id, workspace_id
+            ORDER BY COUNT(*) DESC
+            """
+        ).fetchall()
+    ]
+    total = sum(by_scope.values())
+    return {"total": total, "by_scope": by_scope, "by_owner": by_owner}
+
+
+def _graph_owner_counts(mm: Any) -> dict[str, Any]:
+    if not mm or not mm._ensure_relational() or not mm.relational_store:
+        return {"total_nodes": 0, "by_owner": []}
+    conn = getattr(mm.relational_store, "_conn", None)
+    if conn is None:
+        return {"total_nodes": 0, "by_owner": []}
+    try:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(user_id, 'default'),
+                   COALESCE(workspace_id, 'default'),
+                   COUNT(*)
+            FROM mdrm_nodes
+            GROUP BY user_id, workspace_id
+            ORDER BY COUNT(*) DESC
+            """
+        ).fetchall()
+    except Exception:
+        return {"total_nodes": 0, "by_owner": []}
+    by_owner = [
+        {"user_id": row[0] or "default", "workspace_id": row[1] or "default", "count": row[2]}
+        for row in rows
+    ]
+    return {"total_nodes": sum(row["count"] for row in by_owner), "by_owner": by_owner}
+
+
+def _claim_graph_nodes(
+    mm: Any,
+    *,
+    memory_ids: set[str],
+    user_id: str,
+    workspace_id: str,
+    include_default_graph_nodes: bool,
+) -> int:
+    if not mm or not mm._ensure_relational() or not mm.relational_store:
+        return 0
+    conn = getattr(mm.relational_store, "_conn", None)
+    if conn is None:
+        return 0
+    updated = 0
+    try:
+        if memory_ids:
+            placeholders = ",".join("?" for _ in memory_ids)
+            cur = conn.execute(
+                f"""
+                UPDATE mdrm_nodes
+                SET user_id = ?, workspace_id = ?
+                WHERE id IN ({placeholders})
+                """,
+                [user_id, workspace_id, *memory_ids],
+            )
+            updated += cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[MemoryAPI] Claim graph nodes failed: {e}")
+        return updated
+    return updated
+
+
+def _memory_type_value(mem: Any) -> str:
+    return mem.type.value if hasattr(mem.type, "value") else str(mem.type)
+
+
+def _normalize_legacy_tags(mem: Any, *extra: str) -> list[str]:
+    existing = getattr(mem, "tags", None) or []
+    return sorted({str(t) for t in [*existing, *extra] if str(t).strip()})
+
+
+def _is_reviewed_legacy(mem: Any) -> bool:
+    if getattr(mem, "superseded_by", None):
+        return True
+    tags = {str(t) for t in (getattr(mem, "tags", None) or [])}
+    return "legacy_pending_review" in tags or any(t.startswith("legacy_reason:") for t in tags)
+
+
+_LEGACY_BANNER_DISMISSED_KEY = "legacy_banner_dismissed"
+"""_schema_meta 里的 sentinel 键：用户点过"不再提醒"。"""
+
+
+def _legacy_review_counts(store: Any) -> dict[str, int]:
+    """统计真实的 legacy_quarantine（v1/v2 历史旧数据），用于决定 UI 是否再次提示用户。
+
+    v4 改动：
+    - 只统计 ``scope='legacy_quarantine'`` 且 ``user_id='legacy'`` 的桶；
+    - lifecycle 后台合成产物现在落到 ``pending_consolidation`` 桶，
+      单独计数（pending_consolidation 字段），UI 不再用它去推 banner。
+    """
+    legacy = store.load_all_memories(
+        scope="legacy_quarantine",
+        scope_owner="",
+        user_id="legacy",
+        workspace_id=None,
+        include_inactive=True,
+    )
+    pending = sum(1 for mem in legacy if not _is_reviewed_legacy(mem))
+    reviewed = len(legacy) - pending
+    try:
+        pending_consolidation = len(
+            store.load_all_memories(
+                scope="pending_consolidation",
+                scope_owner="",
+                user_id=None,
+                workspace_id=None,
+                include_inactive=True,
+            )
+        )
+    except Exception:
+        pending_consolidation = 0
+    return {
+        "total": len(legacy),
+        "pending": pending,
+        "reviewed": reviewed,
+        "pending_consolidation": pending_consolidation,
+    }
+
+
+def _identity_slot_for(subject: str, predicate: str) -> str:
+    if (subject or "").strip().lower() not in {"用户", "user", "当前用户", "我"}:
+        return ""
+    pred = (predicate or "").strip().lower()
+    for alias, slot in IDENTITY_SLOT_ALIASES.items():
+        if alias.lower() == pred:
+            return slot
+    if pred.startswith("preference.") or pred.startswith("偏好."):
+        return f"user.preference.{pred.split('.', 1)[1]}"
+    return ""
+
+
+def _infer_legacy_subject_predicate(mem: Any) -> tuple[str, str]:
+    subject = (getattr(mem, "subject", "") or "").strip()
+    predicate = (getattr(mem, "predicate", "") or "").strip()
+    if subject and predicate:
+        return subject, predicate
+    content = (getattr(mem, "content", "") or "").strip()
+    patterns = [
+        (r"^(?:用户|我)(?:叫|名叫|名字是|姓名是)\s*([^，。；\s]{1,30})", "姓名"),
+        (r"^(?:用户|我)(?:年龄是|今年)\s*(\d{1,3})\s*岁?", "年龄"),
+        (r"^(?:用户|我)(?:住在|居住在|所在地是|城市是|来自)\s*([^，。；]{1,30})", "城市"),
+        (r"^(?:用户|我)(?:喜欢|偏好)\s*([^，。；]{1,80})", "偏好"),
+    ]
+    for pattern, pred in patterns:
+        if re.search(pattern, content):
+            return "用户", pred
+    return subject, predicate
+
+
+def _looks_like_task_log(mem: Any) -> bool:
+    content = (getattr(mem, "content", "") or "").strip().lower()
+    if any(p.lower() in content for p in TASK_LOG_PATTERNS):
+        return True
+    if re.search(r"\b(read_file|write_file|run_shell|pytest|npm run|git diff)\b", content):
+        return True
+    return False
+
+
+def _legacy_candidate_reason(mem: Any, subject: str, predicate: str) -> str:
+    content = (getattr(mem, "content", "") or "").strip()
+    if not content:
+        return "empty_content"
+    if len(content) > 800:
+        return "too_long"
+    if _looks_like_task_log(mem):
+        return "task_log"
+    mem_type = _memory_type_value(mem)
+    if mem_type not in {t.value for t in MemoryType}:
+        return "unknown_type"
+    if mem_type == MemoryType.FACT.value and not (subject and predicate):
+        return "unstructured_fact"
+    return ""
+
+
+def _legacy_sort_key(mem: Any) -> tuple[str, str]:
+    updated = getattr(mem, "updated_at", None) or getattr(mem, "created_at", None)
+    created = getattr(mem, "created_at", None)
+    return (
+        updated.isoformat() if hasattr(updated, "isoformat") else str(updated or ""),
+        created.isoformat() if hasattr(created, "isoformat") else str(created or ""),
+    )
+
+
+def _active_slot_index(store: Any, user_id: str, workspace_id: str) -> set[str]:
+    active = store.load_all_memories(
+        scope="user",
+        scope_owner="",
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+    return {
+        slot
+        for mem in active
+        if (slot := _identity_slot_for(getattr(mem, "subject", ""), getattr(mem, "predicate", "")))
+    }
+
+
+def _mark_legacy_reviewed(
+    store: Any, mem: Any, reason: str, superseded_by: str | None = None
+) -> None:
+    updates: dict[str, Any] = {
+        "tags": _normalize_legacy_tags(mem, "legacy_pending_review", f"legacy_reason:{reason}"),
+    }
+    if superseded_by:
+        updates["superseded_by"] = superseded_by
+    # Route through ``update_semantic`` so the store observer fires and the
+    # FTS index gets reindexed on tag changes. The pre-Path-A bypass via
+    # ``store.db.update_memory`` left both stale and was only saved by the
+    # ``_sync_json`` reload at the end of the claim-legacy route.
+    store.update_semantic(mem.id, updates)
+
+
+def _safe_import_legacy_memories(
+    store: Any,
+    legacy: list[Any],
+    *,
+    user_id: str,
+    workspace_id: str,
+) -> dict[str, Any]:
+    identity_groups: dict[str, list[tuple[Any, str, str]]] = {}
+    accepted_general: list[tuple[Any, str, str]] = []
+    rejected = 0
+    conflict_skipped = 0
+    active_slots = _active_slot_index(store, user_id, workspace_id)
+
+    for mem in legacy:
+        if _is_reviewed_legacy(mem):
+            continue
+        subject, predicate = _infer_legacy_subject_predicate(mem)
+        reason = _legacy_candidate_reason(mem, subject, predicate)
+        if reason:
+            _mark_legacy_reviewed(store, mem, reason)
+            rejected += 1
+            continue
+        slot = _identity_slot_for(subject, predicate)
+        if slot:
+            identity_groups.setdefault(slot, []).append((mem, subject, predicate))
+        else:
+            accepted_general.append((mem, subject, predicate))
+
+    to_promote: list[tuple[Any, str, str]] = []
+    for slot, items in identity_groups.items():
+        items.sort(key=lambda item: _legacy_sort_key(item[0]), reverse=True)
+        winner = items[0]
+        if slot in active_slots:
+            for mem, _subject, _predicate in items:
+                _mark_legacy_reviewed(store, mem, "conflicts_with_current_user")
+                conflict_skipped += 1
+            continue
+        to_promote.append(winner)
+        for mem, _subject, _predicate in items[1:]:
+            _mark_legacy_reviewed(
+                store, mem, "legacy_identity_conflict", superseded_by=winner[0].id
+            )
+            conflict_skipped += 1
+
+    to_promote.extend(accepted_general)
+
+    promoted_ids: set[str] = set()
+    for mem, subject, predicate in to_promote:
+        importance = min(max(float(getattr(mem, "importance_score", 0.5) or 0.5), 0.2), 0.65)
+        updates = {
+            "scope": "user",
+            "scope_owner": "",
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+            "subject": subject,
+            "predicate": predicate,
+            "importance_score": importance,
+            "priority": _priority_for_importance(
+                mem.type
+                if isinstance(mem.type, MemoryType)
+                else MemoryType(_memory_type_value(mem)),
+                importance,
+            ).value,
+            "confidence": min(float(getattr(mem, "confidence", 0.5) or 0.5), 0.7),
+            "tags": _normalize_legacy_tags(mem, "legacy_imported"),
+        }
+        # See ``_mark_legacy_reviewed`` rationale — go through update_semantic
+        # so the observer + search-index reindex run uniformly.
+        if store.update_semantic(mem.id, updates):
+            promoted_ids.add(mem.id)
+
+    return {
+        "promoted_ids": promoted_ids,
+        "promoted": len(promoted_ids),
+        "rejected": rejected,
+        "conflict_skipped": conflict_skipped,
+        "reviewed": len(legacy),
+    }
+
+
+def _priority_for_importance(mem_type: MemoryType, importance: float) -> MemoryPriority:
+    if importance >= 0.85 or mem_type == MemoryType.RULE:
+        return MemoryPriority.PERMANENT
+    if importance >= 0.6:
+        return MemoryPriority.LONG_TERM
+    return MemoryPriority.SHORT_TERM
+
+
+@router.post("")
+async def create_memory(request: Request, body: MemoryCreateRequest):
+    """Create a new memory entry from the chat UI."""
+    store = _get_store(request)
+    if not store:
+        raise HTTPException(503, "Memory store not available")
+    try:
+        content = body.content.strip()
+        if not content:
+            raise HTTPException(400, "Memory content cannot be empty")
+        if len(content) > _MAX_MEMORY_CONTENT_LEN:
+            raise HTTPException(
+                413,
+                f"Memory content too long: {len(content)} chars "
+                f"(max {_MAX_MEMORY_CONTENT_LEN})",
+            )
+        try:
+            mem_type = MemoryType(body.type)
+        except ValueError:
+            raise HTTPException(400, f"Invalid memory type: {body.type}") from None
+        mem = SemanticMemory(
+            type=mem_type,
+            priority=_priority_for_importance(mem_type, body.importance_score),
+            content=content,
+            source="chat_ui",
+            subject=body.subject or "",
+            predicate=body.predicate or "",
+            importance_score=body.importance_score,
+            tags=body.tags or [],
+        )
+        apply_retention(mem)
+        # Route the write through the SAME owner resolution the read paths use
+        # (_current_owner), otherwise the manager's per-request ContextVar owner
+        # defaults to "default" on the REST panel surface and the created memory
+        # lands in the "default" bucket while list/stats read "desktop_user" —
+        # re-splitting the buckets that fix #2 (P1) was meant to unify.
+        user_id, workspace_id = _current_owner(request)
+        mm = _get_manager(request)
+        if mm and hasattr(mm, "save_user_memory"):
+            mem_id = mm.save_user_memory(
+                mem, scope="user", user_id=user_id, workspace_id=workspace_id
+            )
+        else:
+            mem_id = store.save_semantic(
+                mem,
+                scope="user",
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+        # Cache coherence is handled by the store observer; no manual reload.
+        return {"status": "ok", "id": mem_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Failed to save memory: {e}")
+
+
+@router.get("")
+async def list_memories(
+    request: Request,
+    type: str | None = None,
+    search: str | None = None,
+    q: str | None = None,
+    min_score: float = 0.0,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    sort_by: str = "importance_score",
+    sort_order: str = "desc",
+    include_inactive: bool = False,
+):
+    store = _get_store(request)
+    if not store:
+        raise HTTPException(503, "Memory store not available")
+
+    # 兼容别名：?q= 与 ?search= 等价；search 优先，避免同时给两个值时行为不一致
+    search = search or q
+
+    if search:
+        user_id, workspace_id = _current_owner(request)
+        results = store.search_semantic(
+            search,
+            limit=limit,
+            filter_type=type,
+            scope="user",
+            user_id=user_id,
+            workspace_id=workspace_id,
+            include_inactive=include_inactive,
+        )
+        return {
+            "memories": [_serialize(m) for m in results],
+            "total": len(results),
+            "limit": limit,
+            "offset": 0,
+        }
+
+    user_id, workspace_id = _current_owner(request)
+    results, total = store.query_paged(
+        memory_type=type,
+        min_importance=min_score if min_score > 0 else None,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        limit=limit,
+        offset=offset,
+        scope="user",
+        scope_owner="",
+        user_id=user_id,
+        workspace_id=workspace_id,
+        include_inactive=include_inactive,
+    )
+    return {
+        "memories": [_serialize(m) for m in results],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.get("/stats")
+async def memory_stats(request: Request):
+    store = _get_store(request)
+    if not store:
+        raise HTTPException(503, "Memory store not available")
+
+    user_id, workspace_id = _current_owner(request)
+    all_mems = store.load_all_memories(
+        scope="user",
+        scope_owner="",
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+    by_type: dict[str, int] = {}
+    total_score = 0.0
+    for m in all_mems:
+        t = m.type.value if hasattr(m.type, "value") else str(m.type)
+        by_type[t] = by_type.get(t, 0) + 1
+        total_score += m.importance_score
+
+    return {
+        "total": len(all_mems),
+        "by_type": by_type,
+        "avg_score": round(total_score / len(all_mems), 2) if all_mems else 0,
+    }
+
+
+@router.get("/migration-status")
+async def memory_migration_status(request: Request):
+    """Diagnose legacy memory visibility after owner-scoped migration."""
+    store = _get_store(request)
+    if not store:
+        raise HTTPException(503, "Memory store not available")
+
+    user_id, workspace_id = _current_owner(request)
+    current_visible = store.count_memories(
+        scope="user",
+        scope_owner="",
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+    legacy_counts = _legacy_review_counts(store)
+    all_counts = _owner_counts(store)
+    graph_counts = _graph_owner_counts(_get_manager(request))
+
+    # Phase 4：show_banner 是前端**唯一**应该信的字段，把 banner 决策完整收敛到后端。
+    # - 只有真历史 legacy_quarantine 还有待 review 条目 (`pending > 0`)；
+    # - 且用户没显式按过"不再提醒"（_schema_meta 里 legacy_banner_dismissed != '1'）。
+    # pending_consolidation 是 v4 新桶（lifecycle 后台合成产物），用户不可见，
+    # **不**触发 banner。这就是为什么修了 Phase 0 之后 banner 不会再反复弹。
+    has_pending_legacy = legacy_counts["pending"] > 0
+    try:
+        dismissed = store.get_meta(_LEGACY_BANNER_DISMISSED_KEY) == "1"
+    except Exception:
+        dismissed = False
+    show_banner = has_pending_legacy and not dismissed
+
+    return {
+        "api_version": "v4",
+        "current_owner": {"user_id": user_id, "workspace_id": workspace_id},
+        "current_visible": current_visible,
+        "legacy_quarantine": legacy_counts["total"],
+        "legacy_pending": legacy_counts["pending"],
+        "legacy_reviewed": legacy_counts["reviewed"],
+        # v4 字段：lifecycle 后台合成产物的独立桶计数，仅供 DevOps 排查用。
+        "pending_consolidation": legacy_counts.get("pending_consolidation", 0),
+        "semantic": all_counts,
+        "graph": graph_counts,
+        # 旧字段保留，老前端继续可读。
+        "has_recoverable_legacy": has_pending_legacy,
+        # Phase 4：banner 显示与否的唯一权威字段。
+        "show_banner": show_banner,
+        "banner_dismissed": dismissed,
+    }
+
+
+@router.post("/legacy/dismiss")
+async def dismiss_legacy_banner(request: Request):
+    """Phase 4：用户点"不再提醒 legacy 记忆"按钮的端点。
+
+    幂等：重复调用只会重设 timestamp，不会产生副作用。
+    通过 _schema_meta 持久化，跨进程 / 跨重启都生效。
+    取消"不再提醒"目前没有专用按钮 —— 用户重新触发"导入旧记忆"成功后，
+    后端会顺手清除该 sentinel。
+    """
+    store = _get_store(request)
+    if not store:
+        raise HTTPException(503, "Memory store not available")
+    store.set_meta(_LEGACY_BANNER_DISMISSED_KEY, "1")
+    return {"ok": True, "dismissed": True}
+
+
+@router.post("/claim-legacy")
+async def claim_legacy_memories(request: Request, body: ClaimLegacyRequest | None = None):
+    """Safely import quarantined legacy memories into the current desktop owner."""
+    store = _get_store(request)
+    if not store:
+        raise HTTPException(503, "Memory store not available")
+    body = body or ClaimLegacyRequest()
+    user_id, workspace_id = _current_owner(request)
+    legacy = store.load_all_memories(
+        scope="legacy_quarantine",
+        scope_owner="",
+        user_id="legacy",
+        workspace_id=None,
+        include_inactive=body.include_inactive,
+    )
+    report = _safe_import_legacy_memories(
+        store,
+        legacy,
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+
+    graph_updated = _claim_graph_nodes(
+        _get_manager(request),
+        memory_ids=report["promoted_ids"],
+        user_id=user_id,
+        workspace_id=workspace_id,
+        include_default_graph_nodes=body.include_default_graph_nodes,
+    )
+    _sync_json(request)
+    # Phase 4：用户主动整理过 legacy 后，重置 dismissed sentinel。
+    # 这样如果未来又出现新的 legacy_quarantine（比如导入了别人的旧 db），banner 还会再提醒一次。
+    try:
+        store.set_meta(_LEGACY_BANNER_DISMISSED_KEY, "0")
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "claimed": report["promoted"],
+        "promoted": report["promoted"],
+        "reviewed": report["reviewed"],
+        "rejected": report["rejected"],
+        "conflict_skipped": report["conflict_skipped"],
+        "graph_nodes_updated": graph_updated,
+        "current_owner": {"user_id": user_id, "workspace_id": workspace_id},
+    }
+
+
+@router.post("/migrate-workspace")
+async def migrate_workspace(request: Request, body: MigrateWorkspaceRequest):
+    """Phase 2a：把当前 user 在某个 workspace_id 下的记忆迁到另一个 workspace_id。
+
+    典型场景：用户启用了项目专属工作区（``OPENKITSUNE_DESKTOP_PROJECT_WORKSPACE=1``
+    或 session metadata ``memory_workspace_mode='project'``）之后，想把原来
+    在共享 ``"default"`` 工作区里的记忆"携过来"。
+
+    安全约束：
+    - 只动当前请求会话身份所属 ``user_id`` 的记忆，不会跨用户搬运；
+    - 默认 scope='user'，不动 legacy_quarantine / pending_consolidation / session 桶；
+    - 操作有事务保护，失败 ROLLBACK；
+    - 每条迁徙记录写入 ``_memory_scope_audit`` 表，可审计。
+    """
+    store = _get_store(request)
+    if not store:
+        raise HTTPException(503, "Memory store not available")
+    user_id, current_workspace_id = _current_owner(request)
+
+    from_workspace_id = (body.from_workspace_id or "").strip() or "default"
+    to_workspace_id = (body.to_workspace_id or "").strip() or current_workspace_id
+    if not to_workspace_id:
+        raise HTTPException(400, "to_workspace_id is required (and current session has none)")
+    if from_workspace_id == to_workspace_id:
+        return {
+            "ok": True,
+            "moved": 0,
+            "reason": "from and to workspace are identical",
+            "from_workspace_id": from_workspace_id,
+            "to_workspace_id": to_workspace_id,
+            "user_id": user_id,
+        }
+
+    moved = store.migrate_workspace_id(
+        from_workspace_id=from_workspace_id,
+        to_workspace_id=to_workspace_id,
+        user_id=user_id,
+        scope=body.scope or "user",
+    )
+
+    # 刷新内存缓存，让 UI 立即看到迁过来的记忆。
+    mm = _get_manager(request)
+    if mm and hasattr(mm, "_reload_from_sqlite"):
+        with contextlib.suppress(Exception):
+            mm._reload_from_sqlite()
+
+    return {
+        "ok": True,
+        "moved": moved,
+        "from_workspace_id": from_workspace_id,
+        "to_workspace_id": to_workspace_id,
+        "user_id": user_id,
+        "scope": body.scope or "user",
+    }
+
+
+@router.post("/merge-owner")
+async def merge_owner(request: Request, body: MergeOwnerRequest | None = None):
+    """Merge a historical owner bucket (``from_owner``) into the canonical one.
+
+    Motivation: the earlier owner-scoping fix aligned REST reads/writes to the
+    desktop canonical identity (``desktop_user``) but left ~150 legacy memories
+    stranded in the ``user_id='default'`` bucket — invisible to the panel and
+    to conversation recall. ``migrate-workspace`` only rewrites ``workspace_id``
+    and ``claim-legacy`` only handles the ``legacy_quarantine`` scope, so
+    neither can perform an owner (``user_id``) merge. This endpoint does it
+    safely by routing every source memory through ``save_user_memory`` so the
+    existing content-dedup + identity-slot supersede logic applies.
+
+    Safety:
+    - ``dry_run=true`` (default) writes nothing; it returns the counts/samples a
+      real run would produce so the operator can inspect before executing.
+    - Content duplicates are skipped (never duplicated); identity-slot conflicts
+      (same ``subject``/``predicate``) keep the newer value and retire the loser
+      via ``superseded_by`` rather than raising or double-activating a slot.
+    - Idempotent: moved rows leave the source bucket and retired rows go
+      inactive, so re-running returns all-zero counts.
+    """
+    mm = _get_manager(request)
+    if mm is None or not hasattr(mm, "merge_owner_memories"):
+        raise HTTPException(503, "Memory manager not available")
+
+    body = body or MergeOwnerRequest()
+    # Canonical owner for defaulting to_owner / to_workspace_id (desktop panel
+    # resolves to desktop_user via _current_owner).
+    canon_user, canon_workspace = _current_owner(request)
+    from_user = (body.from_owner or "default").strip() or "default"
+    to_user = (body.to_owner or "").strip() or canon_user
+    from_workspace = (body.from_workspace_id or "default").strip() or "default"
+    to_workspace = (body.to_workspace_id or "").strip() or canon_workspace
+    scope = (body.scope or "user").strip() or "user"
+
+    if not to_user:
+        raise HTTPException(400, "to_owner is required (and no canonical owner is bound)")
+
+    report = mm.merge_owner_memories(
+        from_user_id=from_user,
+        to_user_id=to_user,
+        from_workspace_id=from_workspace,
+        to_workspace_id=to_workspace,
+        scope=scope,
+        dry_run=body.dry_run,
+    )
+    return {"ok": True, **report}
+
+
+@router.post("/review")
+async def trigger_review(request: Request):
+    """Start async LLM-driven memory review. Returns immediately with task status."""
+    global _review_task, _review_cancel, _review_progress
+
+    async with _review_lock:
+        if _review_task and not _review_task.done():
+            return {"ok": True, "status": "already_running", "progress": _review_progress}
+
+        lifecycle = _get_lifecycle(request)
+        if not lifecycle:
+            raise HTTPException(503, "Lifecycle manager not available")
+
+        _review_cancel = asyncio.Event()
+        _review_progress = {
+            "status": "running",
+            "batch": 0,
+            "total_batches": 0,
+            "total_memories": 0,
+            "processed": 0,
+            "report": {"deleted": 0, "updated": 0, "merged": 0, "kept": 0, "errors": 0},
+            "started_at": time.time(),
+        }
+
+        def on_progress(data: dict) -> None:
+            _review_progress.update(data)
+
+        async def _run_review() -> None:
+            global _review_progress
+            try:
+                result = await lifecycle.review_memories_with_llm(
+                    progress_callback=on_progress,
+                    cancel_event=_review_cancel,
+                )
+
+                _review_progress["status"] = (
+                    "cancelled" if _review_progress.get("cancelled") else "done"
+                )
+                _review_progress["report"] = result
+                _review_progress["finished_at"] = time.time()
+
+                try:
+                    if lifecycle.identity_dir:
+                        lifecycle.refresh_memory_md(lifecycle.identity_dir)
+                    lifecycle._sync_vector_store()
+                    _sync_json(request)
+                except Exception as e:
+                    logger.warning(f"[MemoryAPI] Post-review sync failed: {e}")
+            except Exception as e:
+                logger.error(f"[MemoryAPI] Background review failed: {e}")
+                _review_progress["status"] = "error"
+                _review_progress["error"] = str(e)
+                _review_progress["finished_at"] = time.time()
+
+        _review_task = asyncio.create_task(_run_review())
+
+    return {"ok": True, "status": "started", "progress": _review_progress}
+
+
+@router.get("/review/status")
+async def review_status():
+    """Poll current review task progress."""
+    if not _review_task:
+        return {"status": "idle"}
+    return {"status": _review_progress.get("status", "unknown"), "progress": _review_progress}
+
+
+@router.post("/review/cancel")
+async def cancel_review():
+    """Request cancellation of the running review task."""
+    if not _review_task or _review_task.done():
+        return {"ok": False, "reason": "no_running_task"}
+    if _review_cancel:
+        _review_cancel.set()
+    return {"ok": True}
+
+
+@router.post("/batch-delete")
+async def batch_delete(request: Request):
+    data = await request.json()
+    ids = data.get("ids", [])
+    if not ids:
+        raise HTTPException(400, "No IDs provided")
+
+    store = _get_store(request)
+    if not store:
+        raise HTTPException(503, "Memory store not available")
+
+    deleted = 0
+    for mid in ids:
+        if store.delete_semantic(mid):
+            deleted += 1
+
+    # Observer fires per-id during the loop above; no full reload needed.
+    return {"deleted": deleted, "total": len(ids)}
+
+
+@router.get("/graph")
+async def get_memory_graph(request: Request, limit: int = 500):
+    """Return the relational memory graph for 3D visualization."""
+    mm = _get_manager(request)
+    if not mm:
+        raise HTTPException(503, "Memory manager not available")
+
+    nodes_out: list[dict] = []
+    links_out: list[dict] = []
+    mode = "mode1"
+
+    mode_cfg = mm._get_memory_mode()
+    if mode_cfg != "mode1" and mm._ensure_relational() and mm.relational_store:
+        rs = mm.relational_store
+        mode = "mode2"
+        user_id, workspace_id = _current_owner(request)
+        raw_nodes = rs.get_all_nodes(limit=limit, user_id=user_id, workspace_id=workspace_id)
+        node_ids = {n.id for n in raw_nodes}
+
+        for n in raw_nodes:
+            ents = [{"name": e.name, "type": e.type} for e in n.entities[:5]]
+            group = f"entity:{ents[0]['name']}" if ents else f"type:{n.node_type.value}"
+            nodes_out.append(
+                {
+                    "id": n.id,
+                    "content": n.content[:200],
+                    "node_type": n.node_type.value.upper(),
+                    "importance": n.importance,
+                    "entities": ents,
+                    "action_category": n.action_category,
+                    "occurred_at": n.occurred_at.isoformat() if n.occurred_at else None,
+                    "session_id": n.session_id,
+                    "project": n.project,
+                    "group": group,
+                }
+            )
+
+        raw_edges = rs.get_all_edges(node_ids)
+        for e in raw_edges:
+            if e.source_id in node_ids and e.target_id in node_ids:
+                links_out.append(
+                    {
+                        "source": e.source_id,
+                        "target": e.target_id,
+                        "edge_type": e.edge_type.value,
+                        "dimension": e.dimension.value,
+                        "weight": e.weight,
+                    }
+                )
+    else:
+        store = _get_store(request)
+        if store:
+            import json as _json
+            from collections import defaultdict
+
+            user_id, workspace_id = _current_owner(request)
+            all_mems = store.load_all_memories(
+                scope="user",
+                scope_owner="",
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )[:limit]
+            subject_map: dict[str, list[str]] = defaultdict(list)
+            for m in all_mems:
+                nodes_out.append(
+                    {
+                        "id": m.id,
+                        "content": (m.content or "")[:200],
+                        "node_type": (m.type.value if hasattr(m.type, "value") else "FACT").upper(),
+                        "importance": m.importance_score,
+                        "entities": [],
+                        "action_category": "",
+                        "occurred_at": m.created_at.isoformat() if m.created_at else None,
+                        "session_id": "",
+                        "project": "",
+                        "group": f"type:{m.type.value if hasattr(m.type, 'value') else 'fact'}",
+                    }
+                )
+                if m.subject:
+                    subject_map[m.subject].append(m.id)
+
+                linked_ids = getattr(m, "linked_memory_ids", None)
+                if not linked_ids:
+                    meta = getattr(m, "metadata", {}) or {}
+                    if isinstance(meta, str):
+                        try:
+                            meta = _json.loads(meta)
+                        except Exception:
+                            meta = {}
+                    linked_ids = meta.get("linked_memory_ids", [])
+                if isinstance(linked_ids, list):
+                    node_set = {n["id"] for n in nodes_out}
+                    for lid in linked_ids:
+                        if lid in node_set:
+                            links_out.append(
+                                {
+                                    "source": m.id,
+                                    "target": lid,
+                                    "edge_type": "linked",
+                                    "dimension": "context",
+                                    "weight": 0.5,
+                                }
+                            )
+
+            for _subj, ids in subject_map.items():
+                if len(ids) >= 2:
+                    for i in range(len(ids)):
+                        for j in range(i + 1, min(i + 3, len(ids))):
+                            links_out.append(
+                                {
+                                    "source": ids[i],
+                                    "target": ids[j],
+                                    "edge_type": "same_subject",
+                                    "dimension": "entity",
+                                    "weight": 0.4,
+                                }
+                            )
+
+    return {
+        "nodes": nodes_out,
+        "links": links_out,
+        "meta": {
+            "total_nodes": len(nodes_out),
+            "total_edges": len(links_out),
+            "mode": mode,
+        },
+    }
+
+
+@router.get("/{memory_id}")
+async def get_memory(request: Request, memory_id: str):
+    store = _get_store(request)
+    if not store:
+        raise HTTPException(503, "Memory store not available")
+
+    mem = store.get_semantic(memory_id)
+    if not mem:
+        raise HTTPException(404, "Memory not found")
+    return _serialize(mem)
+
+
+@router.put("/{memory_id}")
+async def update_memory(request: Request, memory_id: str, body: MemoryUpdateRequest):
+    store = _get_store(request)
+    if not store:
+        raise HTTPException(503, "Memory store not available")
+
+    updates: dict = {}
+    if body.content is not None:
+        content = body.content.strip()
+        if not content:
+            raise HTTPException(400, "Memory content cannot be empty")
+        updates["content"] = content
+    if body.importance_score is not None:
+        updates["importance_score"] = body.importance_score
+    if body.tags is not None:
+        updates["tags"] = body.tags
+
+    if not updates:
+        raise HTTPException(400, "No fields to update")
+
+    ok = store.update_semantic(memory_id, updates)
+    if not ok:
+        raise HTTPException(404, "Memory not found")
+    # Observer keeps MemoryManager._memories in sync.
+    return {"ok": True}
+
+
+@router.delete("/{memory_id}")
+async def delete_memory(request: Request, memory_id: str):
+    # Route through MemoryManager.delete_memory so the cache mirror, vector
+    # index, and any plugin-attached vector store are all touched through a
+    # single chokepoint. Falls back to direct store.delete_semantic only when
+    # the manager is unavailable (degraded mode).
+    mm = _get_manager(request)
+    if mm is not None and hasattr(mm, "delete_memory"):
+        if not mm.delete_memory(memory_id):
+            raise HTTPException(404, "Memory not found")
+        return {"ok": True}
+
+    store = _get_store(request)
+    if not store:
+        raise HTTPException(503, "Memory store not available")
+    if not store.delete_semantic(memory_id):
+        raise HTTPException(404, "Memory not found")
+    return {"ok": True}
+
+
+@router.post("/refresh-md")
+async def refresh_md(request: Request):
+    """Regenerate MEMORY.md from current DB state."""
+    lifecycle = _get_lifecycle(request)
+    if not lifecycle:
+        raise HTTPException(503, "Lifecycle manager not available")
+
+    if not lifecycle.identity_dir:
+        raise HTTPException(500, "Identity directory not configured")
+
+    lifecycle.refresh_memory_md(lifecycle.identity_dir)
+    return {"ok": True}

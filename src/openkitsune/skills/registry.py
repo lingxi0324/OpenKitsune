@@ -1,0 +1,1151 @@
+"""
+技能注册中心
+
+遵循 Agent Skills 规范 (agentskills.io/specification)
+存储和管理技能元数据，支持渐进式披露
+"""
+
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional
+
+# Import from the canonical home (``agent.capabilities``) rather than the
+# ``core.capabilities`` re-export shim: the shim is loaded lazily via
+# ``agent`` package init, and routing this library-internal import through it
+# creates a partially-initialized-module circular import when the capabilities
+# chain is entered before the skills chain (surfaced by ``import
+# openkitsune.api.server`` after the upstream merge reordered the agents imports).
+from openkitsune.agent.capabilities import (
+    CapabilityDescriptor,
+    CapabilityKind,
+    CapabilityOrigin,
+    CapabilityVisibility,
+    build_capability_id,
+    build_namespace,
+)
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from ..core.policy_v2.enums import ApprovalClass, DecisionSource
+    from .parser import ParsedSkill
+
+logger = logging.getLogger(__name__)
+
+_MARKETPLACE_HOSTS = {"github.com/openkitsune", "openkitsune.com", "skill.openkitsune.com"}
+
+_RESTRICTED_TOOLS_FOR_UNTRUSTED = frozenset(
+    {
+        "run_shell",
+        "run_command",
+        "execute_command",
+        "write_file",
+        "delete_file",
+        "run_skill_script",
+        "execute_skill",
+    }
+)
+
+
+def _infer_trust_level(skill: "ParsedSkill", source_url: str | None) -> str:
+    """Infer trust level from skill metadata and origin."""
+    if getattr(skill.metadata, "system", False):
+        return "builtin"
+    if not source_url:
+        # Check if the skill is from the builtin directory
+        if skill.path:
+            from pathlib import Path
+
+            path_str = str(Path(skill.path)).replace("\\", "/").lower()
+            if "/builtin/" in path_str or "/site-packages/" in path_str:
+                return "builtin"
+        return "local"
+    url_lower = source_url.lower()
+    for host in _MARKETPLACE_HOSTS:
+        if host in url_lower:
+            return "marketplace"
+    return "remote"
+
+
+def _infer_origin(
+    skill: "ParsedSkill",
+    source_url: str | None,
+    plugin_source: str | None,
+) -> CapabilityOrigin:
+    if plugin_source:
+        return CapabilityOrigin.PLUGIN
+    if getattr(skill.metadata, "system", False):
+        return CapabilityOrigin.SYSTEM
+    trust_level = _infer_trust_level(skill, source_url)
+    if trust_level == "marketplace":
+        return CapabilityOrigin.MARKETPLACE
+    if trust_level == "remote":
+        return CapabilityOrigin.REMOTE
+    return CapabilityOrigin.PROJECT
+
+
+@dataclass
+class SkillEntry:
+    """
+    技能注册条目
+
+    存储技能的元数据和引用
+    支持渐进式披露:
+    - Level 1: 元数据 (name, description) - 总是可用
+    - Level 2: body (完整指令) - 激活时加载
+    - Level 3: scripts/references/assets - 按需加载
+
+    系统技能额外字段:
+    - system: 是否为系统技能
+    - handler: 处理器模块名
+    - tool_name: 原工具名称
+    - category: 工具分类
+    """
+
+    skill_id: str  # 唯一标识（= 目录名），用作注册 key、allowlist key、tool name key
+    name: str  # SKILL.md 声明的显示名（可重复），仅用于展示和搜索
+    description: str
+    version: str | None = None
+    license: str | None = None
+    compatibility: str | None = None
+    metadata: dict[str, str] = field(default_factory=dict)
+    allowed_tools: list[str] = field(default_factory=list)
+    disable_model_invocation: bool = False
+
+    # 系统技能专用字段
+    system: bool = False
+    handler: str | None = None
+    tool_name: str | None = None
+    category: str | None = None
+
+    # metadata.openkitsune structured fields
+    supported_os: list[str] = field(default_factory=list)
+    required_bins: list[str] = field(default_factory=list)
+    required_env: list[str] = field(default_factory=list)
+    python_env: str = ""
+    python_dependencies: list[str] = field(default_factory=list)
+
+    # 技能路径 (用于延迟加载)
+    skill_path: str | None = None
+
+    # 技能来源 URL（来自 .openkitsune-source 文件，用于区分同名技能）
+    source_url: str | None = None
+
+    # 插件来源标识（如 "plugin:translate-skill"），非插件技能为 None
+    plugin_source: str | None = None
+
+    # 统一 capability 元数据
+    origin: str = CapabilityOrigin.PROJECT.value
+    namespace: str = CapabilityOrigin.PROJECT.value
+    visibility: str = CapabilityVisibility.PUBLIC.value
+    permission_profile: str = ""
+    capability_id: str = ""
+
+    # 国际化（由 agents/openai.yaml i18n 字段注入，兼容旧的 .openkitsune-i18n.json）
+    name_i18n: dict[str, str] = field(default_factory=dict)
+    marketplace_name: str | None = None
+    description_i18n: dict[str, str] = field(default_factory=dict)
+
+    # 技能配置 schema（从 SKILL.md frontmatter 传递）
+    config: list[dict] = field(default_factory=list)
+
+    # Exposure level for profile-aware filtering
+    exposure_level: str = "recommended"  # "core" | "recommended" | "hidden"
+
+    # F1: 扩展 frontmatter 字段
+    when_to_use: str = ""
+    keywords: list[str] = field(default_factory=list)
+    arguments: list[dict] = field(default_factory=list)
+    argument_hint: str = ""
+    execution_context: str = "inline"
+    agent_profile: str | None = None
+    paths: list[str] = field(default_factory=list)
+    hooks: dict = field(default_factory=dict)
+    model: str | None = None
+    fallback_for_toolsets: list[str] = field(default_factory=list)
+
+    # F12: 信任等级 ("builtin" | "local" | "marketplace" | "remote")
+    # builtin: 随安装包分发的内置技能
+    # local: 用户本地创建的技能
+    # marketplace: 从官方市场安装的技能
+    # remote: 从第三方 URL/Git 安装的技能（不可信）
+    trust_level: str = "local"
+
+    # C10：技能自报 ApprovalClass（policy_v2.ApprovalClass.value）。
+    # ``None`` 时分类器回退到 handler.TOOL_CLASSES / 启发式（与 v1 行为一致）。
+    # 详见 docs/policy_v2_research.md §4.21.4。
+    approval_class: str | None = None
+
+    # 全局启用 / 禁用标记
+    # 用户通过 UI / skills.json 禁用的技能在注册表中保留但标记 disabled=True，
+    # 这样 SkillCatalog 和 list_skills 工具会过滤它们，
+    # 而子 Agent INCLUSIVE 模式仍可通过 profile.skills 显式引用并重新启用。
+    disabled: bool = False
+
+    # L1 目录隐藏标记（渐进式披露控制）
+    # INCLUSIVE 模式下未勾选的技能标记 catalog_hidden=True，
+    # 不出现在系统提示词目录（L1）中，但仍保留在注册表中，
+    # LLM 可通过 list_skills / get_skill_info 发现并按需加载（L2+）。
+    catalog_hidden: bool = False
+
+    # 完整技能对象引用 (延迟加载)
+    _parsed_skill: Optional["ParsedSkill"] = field(default=None, repr=False)
+
+    def get_display_name(self, lang: str = "zh") -> str:
+        """按语言返回显示名称，找不到则回退到 name"""
+        return self.marketplace_name or self.name_i18n.get(lang, self.name)
+
+    def get_display_description(self, lang: str = "zh") -> str:
+        """按语言返回显示描述，找不到则回退到 description"""
+        return self.description_i18n.get(lang, self.description)
+
+    @property
+    def skill_dir(self) -> "Path":
+        """Return the skill's directory path."""
+        from pathlib import Path
+
+        if self.skill_path:
+            p = Path(self.skill_path)
+            return p.parent if p.name.upper() == "SKILL.MD" else p
+        return Path(".")
+
+    @property
+    def is_trusted(self) -> bool:
+        """Whether this skill comes from a trusted source."""
+        return self.trust_level in ("builtin", "local", "marketplace")
+
+    def get_restricted_tools(self) -> frozenset[str]:
+        """Return tools that should be blocked for untrusted skills."""
+        if self.is_trusted:
+            return frozenset()
+        return _RESTRICTED_TOOLS_FOR_UNTRUSTED
+
+    @classmethod
+    def from_parsed_skill(
+        cls,
+        skill: "ParsedSkill",
+        skill_id: str | None = None,
+        *,
+        plugin_source: str | None = None,
+    ) -> "SkillEntry":
+        """从 ParsedSkill 创建条目
+
+        Args:
+            skill: 解析后的技能对象
+            skill_id: 唯一标识（通常为目录名）。未提供时回退到 metadata.name。
+        """
+        meta = skill.metadata
+
+        source_url: str | None = None
+        if skill.path:
+            from pathlib import Path
+
+            source_file = Path(skill.path).parent / ".openkitsune-source"
+            try:
+                source_url = source_file.read_text(encoding="utf-8").strip() or None
+            except Exception:
+                pass
+
+        # F12: determine trust level
+        trust_level = _infer_trust_level(skill, source_url)
+        origin = _infer_origin(skill, source_url, plugin_source)
+        effective_skill_id = skill_id or meta.name
+        namespace = build_namespace(origin, plugin_id=plugin_source or "")
+        permission_profile = (
+            "trusted" if trust_level in ("builtin", "local", "marketplace") else "restricted"
+        )
+
+        # Infer exposure_level from metadata or trust level
+        _exposure = getattr(meta, "exposure_level", "") or ""
+        if not _exposure:
+            _exposure = "core" if meta.system or trust_level == "builtin" else "recommended"
+
+        return cls(
+            exposure_level=_exposure,
+            skill_id=effective_skill_id,
+            name=meta.name,
+            description=meta.description,
+            version=meta.version,
+            license=meta.license,
+            compatibility=meta.compatibility,
+            metadata=meta.metadata,
+            allowed_tools=meta.allowed_tools,
+            disable_model_invocation=meta.disable_model_invocation,
+            system=meta.system,
+            handler=meta.handler,
+            tool_name=meta.tool_name,
+            category=meta.category,
+            supported_os=list(meta.supported_os),
+            required_bins=list(meta.required_bins),
+            required_env=list(meta.required_env),
+            python_env=meta.python_env,
+            python_dependencies=list(meta.python_dependencies),
+            config=list(meta.config) if meta.config else [],
+            when_to_use=meta.when_to_use,
+            keywords=list(meta.keywords),
+            arguments=list(meta.arguments),
+            argument_hint=meta.argument_hint,
+            execution_context=meta.execution_context,
+            agent_profile=meta.agent_profile,
+            paths=list(meta.paths),
+            hooks=dict(meta.hooks) if meta.hooks else {},
+            model=meta.model,
+            fallback_for_toolsets=list(meta.fallback_for_toolsets),
+            approval_class=meta.approval_class,
+            trust_level=trust_level,
+            skill_path=str(skill.path),
+            source_url=source_url,
+            plugin_source=plugin_source,
+            origin=origin.value,
+            namespace=namespace,
+            visibility=CapabilityVisibility.PUBLIC.value,
+            permission_profile=permission_profile,
+            capability_id=build_capability_id(
+                CapabilityKind.SKILL,
+                effective_skill_id,
+                origin=origin,
+                plugin_id=plugin_source or "",
+            ),
+            name_i18n=dict(meta.name_i18n),
+            description_i18n=dict(meta.description_i18n),
+            _parsed_skill=skill,
+        )
+
+    def get_body(self) -> str | None:
+        """获取技能 body (Level 2)"""
+        if self._parsed_skill:
+            get_body = getattr(self._parsed_skill, "get_body", None)
+            if callable(get_body):
+                return get_body()
+            return getattr(self._parsed_skill, "body", None)
+        return None
+
+    def to_capability_descriptor(self) -> CapabilityDescriptor:
+        return CapabilityDescriptor(
+            id=self.capability_id
+            or build_capability_id(
+                CapabilityKind.SKILL,
+                self.skill_id,
+                origin=self.origin,
+                plugin_id=self.plugin_source or "",
+            ),
+            kind=CapabilityKind.SKILL,
+            origin=CapabilityOrigin(self.origin),
+            namespace=self.namespace,
+            display_name=self.name,
+            description=self.description,
+            version=self.version or "",
+            visibility=CapabilityVisibility(self.visibility),
+            permission_profile=self.permission_profile,
+            source_ref=self.source_url or self.skill_path or "",
+            i18n={
+                "name": dict(self.name_i18n),
+                "description": dict(self.description_i18n),
+            },
+            metadata={
+                "system": self.system,
+                "tool_name": self.tool_name or "",
+                "handler": self.handler or "",
+                "trust_level": self.trust_level,
+                "plugin_source": self.plugin_source or "",
+                "python_env": self.python_env,
+                "python_dependencies": list(self.python_dependencies),
+                "approval_class": self.approval_class or "",
+            },
+        )
+
+    def get_exposed_tool_name(self) -> str:
+        """Return the tool name surfaced to the LLM for this skill.
+
+        Mirrors :meth:`to_tool_schema` exactly so that ``SkillRegistry``'s
+        ApprovalClass lookup keys line up with whatever the model actually
+        calls. Centralising the rule here avoids the C7 lesson — silent
+        drift between schema name and lookup key — re-emerging.
+        """
+        if self.system and self.tool_name:
+            return self.tool_name
+        safe = re.sub(r"[^a-zA-Z0-9_]", "_", self.skill_id)
+        return f"skill_{safe}"
+
+    def to_tool_schema(self) -> dict:
+        """
+        转换为 LLM 工具调用 schema
+
+        用于将技能作为工具提供给 LLM
+        系统技能使用原 tool_name，外部技能使用 skill_ 前缀
+        """
+        if self.system and self.tool_name:
+            return {
+                "name": self.tool_name,
+                "description": self.description,
+                "input_schema": self._get_input_schema(),
+                "x-capability-origin": self.origin,
+            }
+
+        safe = re.sub(r"[^a-zA-Z0-9_]", "_", self.skill_id)
+        desc = f"[Skill] {self.description}"
+        body = self.get_body() or ""
+        input_schema = self._parse_parameters_from_body(body)
+
+        if input_schema is None:
+            body_preview = body[:200].strip() if body else ""
+            if body_preview:
+                desc = f"[Skill] {self.description}\n\n{body_preview}"
+            input_schema = {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "要执行的操作",
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "操作参数",
+                    },
+                },
+                "required": ["action"],
+            }
+
+        return {
+            "name": f"skill_{safe}",
+            "description": desc,
+            "input_schema": input_schema,
+            "x-capability-origin": self.origin,
+        }
+
+    @staticmethod
+    def _parse_parameters_from_body(body: str) -> dict | None:
+        """Try to extract structured inputSchema from ## Parameters / ## 参数 section."""
+        if not body:
+            return None
+        param_match = re.search(
+            r"^##\s+(?:Parameters|参数)\s*\n(.*?)(?=\n##\s|\Z)",
+            body,
+            re.MULTILINE | re.DOTALL,
+        )
+        if not param_match:
+            return None
+
+        section = param_match.group(1).strip()
+        props: dict = {}
+        required: list[str] = []
+        for line in section.splitlines():
+            m = re.match(
+                r"^[-*]\s+`(\w+)`\s*(?:\((\w+)\))?\s*(?:\*\*required\*\*|必填)?\s*[:\-—]\s*(.+)",
+                line.strip(),
+            )
+            if not m:
+                continue
+            name, ptype, desc = m.group(1), m.group(2) or "string", m.group(3).strip()
+            props[name] = {"type": ptype, "description": desc}
+            if "required" in line.lower() or "必填" in line:
+                required.append(name)
+
+        if not props:
+            return None
+        schema: dict = {"type": "object", "properties": props}
+        if required:
+            schema["required"] = required
+        return schema
+
+    def _get_input_schema(self) -> dict:
+        """
+        获取系统技能的 input_schema
+
+        从 SKILL.md 的 body 中解析参数定义，或使用默认 schema
+        """
+        # 默认返回空 object schema
+        # 实际参数定义应该在 SKILL.md 的 body 中或单独的元数据中
+        return {
+            "type": "object",
+            "properties": {},
+        }
+
+
+class SkillRegistry:
+    """
+    技能注册中心
+
+    管理所有已注册的技能，提供:
+    - 注册/注销
+    - 搜索/查找
+    - 渐进式加载
+
+    内部以 skill_id（目录名）做唯一 key，对外查找方法同时接受
+    skill_id 和 name（向后兼容：先匹配 skill_id，未命中则回退到 name）。
+    """
+
+    def __init__(self):
+        self._skills: dict[str, SkillEntry] = {}  # key = skill_id
+        # Conflict log: each entry records that a *new* registration shadowed
+        # or was rejected against an *existing* one. The UI's Skill panel uses
+        # this to surface "winner" vs "shadowed" without scraping log files.
+        self._conflicts: list[dict] = []
+        self._conflicts_max = 100
+
+    def _resolve(self, key: str) -> SkillEntry | None:
+        """按 skill_id 查找，未命中时回退到 name 匹配（向后兼容）。"""
+        entry = self._skills.get(key)
+        if entry is not None:
+            return entry
+        matches = self.name_candidates(key)
+        if len(matches) > 1:
+            logger.warning(
+                "Ambiguous skill name '%s' matches %d entries: %s — refusing fuzzy resolution",
+                key,
+                len(matches),
+                [m.skill_id for m in matches],
+            )
+            return None
+        return matches[0] if matches else None
+
+    def _resolve_id(self, key: str) -> str | None:
+        """将 key 解析为实际的 skill_id。"""
+        entry = self._resolve(key)
+        return entry.skill_id if entry else None
+
+    def name_candidates(self, key: str) -> list[SkillEntry]:
+        """Exact IDs take priority; display-name collisions require an explicit ID."""
+        if key in self._skills:
+            return [self._skills[key]]
+        return sorted(
+            [
+                entry for entry in self._skills.values()
+                if key == entry.name or (entry.marketplace_name and key == entry.marketplace_name)
+            ],
+            key=lambda entry: entry.skill_id,
+        )
+
+    def register(
+        self,
+        skill: "ParsedSkill",
+        skill_id: str | None = None,
+        *,
+        plugin_source: str | None = None,
+        force: bool = False,
+    ) -> bool:
+        """
+        注册技能
+
+        Args:
+            skill: 解析后的技能对象
+            skill_id: 唯一标识（通常为目录名）。未提供时回退到 metadata.name。
+            plugin_source: 插件来源标识
+            force: 允许覆盖已有条目（仅 reload 场景使用）
+
+        Returns:
+            True if registered, False if rejected due to conflict.
+        """
+        entry = SkillEntry.from_parsed_skill(
+            skill,
+            skill_id=skill_id,
+            plugin_source=plugin_source,
+        )
+
+        existing = self._skills.get(entry.skill_id)
+        if existing is not None and not force:
+            logger.warning(
+                "Skill '%s' already registered (origin=%s, plugin=%s). "
+                "Rejecting new registration from plugin=%s. "
+                "Use force=True or unregister first.",
+                entry.skill_id,
+                existing.origin,
+                existing.plugin_source or "none",
+                plugin_source or "none",
+            )
+            self._record_conflict(action="rejected", winner=existing, loser=entry)
+            return False
+
+        if (
+            existing is not None
+            and force
+            and not self._is_same_registration_source(existing, entry)
+        ):
+            self._record_conflict(action="overridden", winner=entry, loser=existing)
+
+        self._skills[entry.skill_id] = entry
+        if entry.skill_path and not entry.system:
+            from pathlib import Path
+
+            from .marketplace import installed_marketplace_names
+
+            if (Path(entry.skill_path).parent / "manifest.json").is_file():
+                entry.marketplace_name = installed_marketplace_names([entry.skill_path]).get(
+                    str(entry.skill_path)
+                )
+        # C10: this skill's exposed tool name may have a freshly-declared
+        # approval_class. Invalidate the classifier's cached entry (if any)
+        # so the next classify() picks up SKILL_METADATA instead of a stale
+        # heuristic / FALLBACK_UNKNOWN result. Per-tool invalidation is
+        # cheap and keeps other tools' caches warm.
+        if entry.approval_class:
+            self._invalidate_policy_classifier_cache(entry.get_exposed_tool_name())
+        logger.debug("Registered skill descriptor: %s (name=%s)", entry.skill_id, entry.name)
+        return True
+
+    @staticmethod
+    def _is_same_registration_source(existing: "SkillEntry", new_entry: "SkillEntry") -> bool:
+        """Return true when a force reload is just refreshing the same skill on disk."""
+
+        def _norm_path(value: str | None) -> str:
+            text = (value or "").replace("\\", "/").rstrip("/")
+            return text.lower() if text else ""
+
+        return (
+            _norm_path(existing.skill_path) == _norm_path(new_entry.skill_path)
+            and (existing.source_url or "") == (new_entry.source_url or "")
+            and (existing.plugin_source or "") == (new_entry.plugin_source or "")
+            and str(existing.origin or "") == str(new_entry.origin or "")
+        )
+
+    def _record_conflict(self, *, action: str, winner: "SkillEntry", loser: "SkillEntry") -> None:
+        """Append a structured conflict record (capped at ``_conflicts_max``)."""
+
+        def _origin(entry: SkillEntry) -> str:
+            origin = getattr(entry, "origin", None)
+            if origin is None:
+                return "unknown"
+            value = getattr(origin, "value", None)
+            return str(value) if value is not None else str(origin)
+
+        record = {
+            "skill_id": winner.skill_id,
+            "name": winner.name,
+            "action": action,
+            "winner": {
+                "origin": _origin(winner),
+                "plugin_source": winner.plugin_source or "",
+                "path": str(getattr(winner, "skill_path", "") or ""),
+            },
+            "shadowed": {
+                "origin": _origin(loser),
+                "plugin_source": loser.plugin_source or "",
+                "path": str(getattr(loser, "skill_path", "") or ""),
+            },
+        }
+        self._conflicts.append(record)
+        if len(self._conflicts) > self._conflicts_max:
+            self._conflicts = self._conflicts[-self._conflicts_max :]
+
+    def get_conflicts(self) -> list[dict]:
+        """Return a snapshot of recent skill registration conflicts."""
+        return list(self._conflicts)
+
+    def clear_conflicts(self) -> None:
+        self._conflicts.clear()
+
+    def unregister(self, key: str) -> bool:
+        """
+        注销技能
+
+        Args:
+            key: skill_id 或 name（向后兼容）
+
+        Returns:
+            是否成功
+        """
+        sid = self._resolve_id(key)
+        if sid is not None:
+            entry = self._skills[sid]
+            del self._skills[sid]
+            # C10: drop classifier cache for this skill's exposed tool name
+            # so a future re-registration (e.g., uninstall→install with a
+            # changed approval_class) is reflected immediately.
+            if entry.approval_class:
+                self._invalidate_policy_classifier_cache(entry.get_exposed_tool_name())
+            logger.info(f"Unregistered skill: {sid}")
+            return True
+        return False
+
+    def get(self, key: str) -> SkillEntry | None:
+        """
+        获取技能
+
+        Args:
+            key: skill_id 或 name（向后兼容）
+
+        Returns:
+            SkillEntry 或 None
+        """
+        return self._resolve(key)
+
+    def has(self, key: str) -> bool:
+        """检查技能是否存在（接受 skill_id 或 name）"""
+        return self._resolve(key) is not None
+
+    def set_disabled(self, key: str, disabled: bool = True) -> bool:
+        """设置技能的 disabled 标记。接受 skill_id 或 name。"""
+        skill = self._resolve(key)
+        if skill is not None:
+            skill.disabled = disabled
+            return True
+        return False
+
+    def set_catalog_hidden(self, key: str, hidden: bool = True) -> bool:
+        """设置技能的 catalog_hidden 标记（L1 渐进式披露控制）。
+
+        catalog_hidden 的技能不出现在系统提示词目录中，
+        但仍可通过 list_skills / get_skill_info 按需发现和加载。
+        """
+        skill = self._resolve(key)
+        if skill is not None:
+            skill.catalog_hidden = hidden
+            return True
+        return False
+
+    def count_catalog_hidden(self) -> int:
+        """统计被 catalog_hidden 但仍启用的技能数量。"""
+        return sum(1 for s in self._skills.values() if not s.disabled and s.catalog_hidden)
+
+    def list_all(self, include_disabled: bool = True) -> list[SkillEntry]:
+        """列出所有技能。
+
+        Args:
+            include_disabled: 是否包含被用户禁用的技能，默认 True 保持向后兼容。
+        """
+        if include_disabled:
+            return list(self._skills.values())
+        return [s for s in self._skills.values() if not s.disabled]
+
+    def list_enabled(self) -> list[SkillEntry]:
+        """列出所有已启用的技能（排除 disabled=True）。"""
+        return [s for s in self._skills.values() if not s.disabled]
+
+    def list_metadata(self) -> list[dict]:
+        """
+        列出已启用技能元数据 (Level 1)
+
+        用于启动时向 LLM 展示可用技能
+        """
+        return [
+            {
+                "skill_id": skill.skill_id,
+                "capability_id": skill.capability_id,
+                "namespace": skill.namespace,
+                "origin": skill.origin,
+                "name": skill.name,
+                "marketplace_name": skill.marketplace_name,
+                "description": skill.description,
+                "auto_invoke": not skill.disable_model_invocation,
+            }
+            for skill in self._skills.values()
+            if not skill.disabled
+        ]
+
+    def search(
+        self,
+        query: str,
+        include_disabled: bool = False,
+    ) -> list[SkillEntry]:
+        """
+        搜索技能
+
+        Args:
+            query: 搜索词 (匹配 skill_id、名称或描述)
+            include_disabled: 是否包含禁用自动调用的技能
+
+        Returns:
+            匹配的技能列表
+        """
+        query_lower = query.strip().lower()
+        if not query_lower:
+            return []
+
+        results = []
+        for skill in self._skills.values():
+            if not include_disabled and (skill.disabled or skill.disable_model_invocation):
+                continue
+
+            if (
+                query_lower in skill.skill_id.lower()
+                or query_lower in skill.name.lower()
+                or query_lower in skill.description.lower()
+            ):
+                results.append(skill)
+
+        return results
+
+    _STOP_WORDS = frozenset(
+        {
+            "the",
+            "a",
+            "an",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "have",
+            "has",
+            "had",
+            "do",
+            "does",
+            "did",
+            "will",
+            "would",
+            "could",
+            "should",
+            "may",
+            "might",
+            "shall",
+            "can",
+            "need",
+            "dare",
+            "ought",
+            "used",
+            "to",
+            "of",
+            "in",
+            "for",
+            "on",
+            "with",
+            "at",
+            "by",
+            "from",
+            "as",
+            "into",
+            "through",
+            "during",
+            "before",
+            "after",
+            "above",
+            "below",
+            "between",
+            "out",
+            "off",
+            "over",
+            "under",
+            "again",
+            "further",
+            "then",
+            "once",
+            "here",
+            "there",
+            "when",
+            "where",
+            "why",
+            "how",
+            "all",
+            "each",
+            "every",
+            "both",
+            "few",
+            "more",
+            "most",
+            "other",
+            "some",
+            "such",
+            "no",
+            "nor",
+            "not",
+            "only",
+            "own",
+            "same",
+            "so",
+            "than",
+            "too",
+            "very",
+            "just",
+            "about",
+            "also",
+            "and",
+            "but",
+            "or",
+            "if",
+            "this",
+            "that",
+            "these",
+            "those",
+            "it",
+            "its",
+            "file",
+            "files",
+            "tool",
+            "tools",
+            "use",
+            "using",
+            "data",
+            "work",
+            "make",
+            "like",
+            "new",
+            "way",
+            "help",
+            "get",
+            "set",
+            "的",
+            "了",
+            "和",
+            "是",
+            "在",
+            "有",
+            "不",
+            "与",
+            "或",
+            "及",
+            "对",
+            "将",
+            "从",
+            "到",
+            "等",
+            "用",
+            "为",
+            "把",
+            "被",
+            "让",
+            "可以",
+            "使用",
+            "通过",
+            "支持",
+            "提供",
+            "进行",
+            "功能",
+            "操作",
+        }
+    )
+
+    def find_relevant(self, context: str) -> list[SkillEntry]:
+        """
+        根据上下文查找相关技能
+
+        用于 Agent 决定是否激活某个技能
+
+        Args:
+            context: 上下文文本 (如用户输入)
+
+        Returns:
+            可能相关的技能列表，按相关度降序
+        """
+        if not context or not context.strip():
+            return []
+
+        context_lower = context.lower()
+        scored: list[tuple[SkillEntry, int]] = []
+
+        for skill in self._skills.values():
+            if skill.disabled or skill.disable_model_invocation:
+                continue
+
+            score = 0
+            sid = skill.skill_id.lower()
+            sname = skill.name.lower()
+
+            if (
+                sid in context_lower
+                or sname in context_lower
+                or skill.marketplace_name and skill.marketplace_name.lower() in context_lower
+            ):
+                score += 10
+
+            for kw in skill.keywords:
+                if kw.lower() in context_lower:
+                    score += 5
+
+            if skill.when_to_use and any(
+                w in context_lower
+                for w in skill.when_to_use.lower().split()
+                if len(w) > 3 and w not in self._STOP_WORDS
+            ):
+                score += 3
+
+            desc_words = set(skill.description.lower().split()) - self._STOP_WORDS
+            for word in desc_words:
+                if len(word) > 3 and word in context_lower:
+                    score += 1
+
+            if score > 0:
+                scored.append((skill, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [s for s, _ in scored]
+
+    def get_tool_schemas(self) -> list[dict]:
+        """
+        获取已启用技能的工具 schema
+
+        用于将技能作为工具提供给 LLM（排除 disabled 技能）
+        """
+        return [skill.to_tool_schema() for skill in self._skills.values() if not skill.disabled]
+
+    def list_system_skills(self) -> list[SkillEntry]:
+        """列出所有系统技能"""
+        return [s for s in self._skills.values() if s.system]
+
+    def list_external_skills(self) -> list[SkillEntry]:
+        """列出所有外部技能（非系统技能）"""
+        return [s for s in self._skills.values() if not s.system]
+
+    def get_by_tool_name(self, tool_name: str) -> SkillEntry | None:
+        """
+        根据原工具名称查找技能
+
+        Args:
+            tool_name: 原工具名称（如 'browser_navigate'）
+
+        Returns:
+            SkillEntry 或 None
+        """
+        for skill in self._skills.values():
+            if skill.tool_name == tool_name:
+                return skill
+        return None
+
+    def get_by_handler(self, handler: str) -> list[SkillEntry]:
+        """
+        根据处理器名称获取所有相关技能
+
+        Args:
+            handler: 处理器名称（如 'browser'）
+
+        Returns:
+            技能列表
+        """
+        return [s for s in self._skills.values() if s.handler == handler]
+
+    def get_tool_class(self, tool_name: str) -> tuple["ApprovalClass", "DecisionSource"] | None:
+        """C10：技能 → ApprovalClass 查表（PolicyEngineV2 ``skill_lookup`` 入口）。
+
+        匹配顺序：
+        1) 系统技能：``tool_name`` 等于 ``SkillEntry.tool_name``
+        2) 外部技能：``tool_name`` 形如 ``skill_<safe-id>``，反查 ``skill_id``
+
+        都未命中或技能未声明 ``approval_class`` 时返回 ``None``，分类器按
+        chain 继续往下走（mcp/plugin/handler/启发式）。**绝不抛异常**——
+        SKILL.md 是用户文件，错误必须降级而非崩溃 PolicyEngine 启动。
+
+        C15 §17.3 strictness rule
+        -------------------------
+        Once a declared class is parsed, route it through
+        :func:`policy_v2.declared_class_trust.compute_effective_class`.
+        Trusted sources (``trust_level ∈ {builtin, local, marketplace}``)
+        honor the declaration verbatim; untrusted sources (``remote``)
+        take ``most_strict([declared, heuristic(tool_name)])`` so a
+        skill claiming ``readonly_global`` for a tool named
+        ``delete_workspace`` still ends up :class:`ApprovalClass.DESTRUCTIVE`.
+        """
+        try:
+            from ..core.policy_v2.declared_class_trust import (
+                compute_effective_class,
+                infer_skill_declared_trust,
+            )
+            from ..core.policy_v2.enums import ApprovalClass, DecisionSource
+        except Exception:
+            return None
+
+        entry: SkillEntry | None = None
+        for s in self._skills.values():
+            if s.system and s.tool_name == tool_name:
+                entry = s
+                break
+        if entry is None and tool_name.startswith("skill_"):
+            for s in self._skills.values():
+                if s.system:
+                    continue
+                if s.get_exposed_tool_name() == tool_name:
+                    entry = s
+                    break
+        if entry is None or not entry.approval_class:
+            return None
+
+        try:
+            declared = ApprovalClass(entry.approval_class)
+        except ValueError:
+            return None
+
+        # C15 §17.3 — pick the right name for the heuristic check:
+        #
+        # - System skills' exposed name **is** the underlying tool name
+        #   (e.g. ``write_file`` for a built-in filesystem skill), so the
+        #   heuristic prefix table fires directly on ``tool_name``.
+        # - External skills are namespaced ``skill_<safe_id>``; running
+        #   the heuristic on that prefix would never match because every
+        #   tool starts with ``skill_``. Use the skill_id transformed to
+        #   underscore form so a tool whose skill_id is
+        #   ``delete-everything`` still trips the ``delete_`` heuristic.
+        #
+        # This keeps the audit/source value as SKILL_METADATA — the
+        # declaration is still the origin; the heuristic is only the
+        # safety floor.
+        heuristic_name = tool_name if entry.system else entry.skill_id.replace("-", "_").lower()
+
+        trust = infer_skill_declared_trust(trust_level=entry.trust_level)
+        try:
+            return compute_effective_class(
+                heuristic_name,
+                declared,
+                trust,
+                source=DecisionSource.SKILL_METADATA,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(
+                "[C15] compute_effective_class failed for skill tool %s: %s",
+                tool_name,
+                exc,
+            )
+            return declared, DecisionSource.SKILL_METADATA
+
+    @staticmethod
+    def _invalidate_policy_classifier_cache(tool_name: str | None = None) -> None:
+        """C10：技能注册 / 注销时通知 PolicyEngineV2 classifier 失效。
+
+        per-tool 失效（不全清）保持其它工具缓存温度，热路径无负担。
+        引擎未初始化时静默 no-op；任何异常吞掉——技能注册不能被 audit
+        子系统拖垮。
+        """
+        try:
+            from ..core.policy_v2.global_engine import invalidate_classifier_cache
+
+            invalidate_classifier_cache(tool_name)
+        except Exception as exc:
+            logger.debug("Skill classifier invalidate skipped: %s", exc)
+
+    @property
+    def count(self) -> int:
+        """技能数量"""
+        return len(self._skills)
+
+    @property
+    def system_count(self) -> int:
+        """系统技能数量"""
+        return len(self.list_system_skills())
+
+    @property
+    def external_count(self) -> int:
+        """外部技能数量"""
+        return len(self.list_external_skills())
+
+    def __contains__(self, key: str) -> bool:
+        return self.has(key)
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __iter__(self):
+        return iter(self._skills.values())
+
+    def __bool__(self) -> bool:
+        """确保空 registry 不被误判为 falsy"""
+        return True
+
+    def items(self):
+        return self._skills.items()
+
+    def pop(self, key: str, default=None):
+        return self._skills.pop(key, default)
+
+
+# 全局注册中心
+default_registry = SkillRegistry()
+
+
+def register_skill(skill: "ParsedSkill", skill_id: str | None = None) -> None:
+    """注册技能到默认注册中心"""
+    default_registry.register(skill, skill_id=skill_id)
+
+
+def get_skill(key: str) -> SkillEntry | None:
+    """从默认注册中心获取技能（接受 skill_id 或 name）"""
+    return default_registry.get(key)

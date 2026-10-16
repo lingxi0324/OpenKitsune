@@ -1,0 +1,30 @@
+"""Agent-package exceptions for the v2 stack.
+
+Only one exception lives here: :class:`UserCancelledError`. The richer
+:class:`openkitsune.tools.errors.ToolError` taxonomy is unrelated and
+stays in :mod:`openkitsune.tools.errors`.
+"""
+
+from __future__ import annotations
+
+__all__ = ["UserCancelledError"]
+
+
+class UserCancelledError(Exception):
+    """User actively stopped the running task.
+
+    Raised when a user sends a stop instruction (e.g. "停止", "stop",
+    "cancel"). The exception lets long-running LLM calls and tool
+    executions unwind cleanly through their normal except paths.
+
+    Attributes:
+        reason: human-readable cancel reason, typically the user's
+            verbatim instruction.
+        source: stage where the cancel was observed
+            (``"llm_call"`` or ``"tool_exec"``).
+    """
+
+    def __init__(self, reason: str = "", source: str = "") -> None:
+        self.reason = reason
+        self.source = source
+        super().__init__(f"User cancelled ({source}): {reason}")

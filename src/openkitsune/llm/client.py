@@ -1,0 +1,3036 @@
+"""
+LLM 统一客户端
+
+提供统一的 LLM 调用接口，支持：
+- 多端点配置
+- 自动故障切换
+- 能力分流（根据请求自动选择合适的端点）
+- 健康检查
+- 动态模型切换（临时/永久）
+- 消息规范化管线
+- 请求级可观测性 (TTFT、stall 检测、结构化指标)
+- 指数退避重试 + Retry-After + 429/529 区分
+"""
+
+import asyncio
+import logging
+import time
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from openkitsune.agent.errors import UserCancelledError
+
+from .config import get_default_config_path, load_endpoints_config
+from .normalize import normalize_messages_for_api
+from .providers.anthropic import AnthropicProvider
+from .providers.base import LLMProvider
+from .providers.openai import OpenAIProvider
+from .providers.openai_responses import OpenAIResponsesProvider
+from .retry import calculate_retry_delay
+from .types import (
+    AllEndpointsFailedError,
+    AudioBlock,
+    AuthenticationError,
+    ContentBlock,
+    DocumentBlock,
+    EndpointConfig,
+    ImageBlock,
+    ImageContent,
+    LLMError,
+    LLMRequest,
+    LLMResponse,
+    Message,
+    RateLimitError,
+    TextBlock,
+    ThinkingBlock,
+    Tool,
+    ToolResultBlock,
+    ToolUseBlock,
+    VideoBlock,
+)
+
+logger = logging.getLogger(__name__)
+
+# [整改 2026-10-10] 生成端点判定：故障切换候选必须能用文本/工具生成输出。
+# embedding 专用端点（capabilities 仅含 'embedding'）不是生成端点，不能被
+# 生成（chat）请求选中，否则 chat 请求打到 embedding 模型上会因上下文窗口
+# 与输出预留不匹配而必然失败（error.log 实证 28 处）。
+_GENERATION_CAPABILITIES = {"text", "tools", "vision", "thinking", "audio", "video", "pdf"}
+
+
+def _is_generation_endpoint(provider) -> bool:
+    """True 表示该端点可作为生成（chat）请求的故障切换目标。"""
+    caps = getattr(provider.config, "capabilities", None) or []
+    if not caps:
+        return True  # 未知能力默认放行（保持旧行为）
+    return bool(set(caps) & _GENERATION_CAPABILITIES)
+
+
+def _friendly_error_hint(failed_providers: list | None = None, last_error: str = "") -> str:
+    """根据失败端点的错误分类生成用户友好的提示信息。
+
+    返回一段面向用户的中文提示，帮助用户理解问题并采取行动。
+    """
+    from .error_types import FailoverReason
+
+    hints: list[str] = []
+    categories: set[str] = set()
+
+    provider_errors: list[str] = []
+    if failed_providers:
+        for p in failed_providers:
+            cat = getattr(p, "error_category", "")
+            if cat:
+                categories.add(cat)
+            err = getattr(p, "_last_error", "")
+            if err:
+                provider_errors.append(str(err))
+
+    # last_error 字符串中的关键字也参与分类（chat_stream 路径下 provider 上
+    # 可能没来得及打 _error_category 标记，但错误消息里仍保留 data_inspection 关键字）
+    err_l = "\n".join([last_error or "", *provider_errors]).lower()
+    if (
+        "data_inspection" in err_l
+        or "datainspectionfailed" in err_l
+        or "inappropriate content" in err_l
+        or "content_filter" in err_l
+    ):
+        categories.add(FailoverReason.CONTENT_SAFETY)
+    if (
+        "quota_exhausted" in err_l
+        or "insufficient_quota" in err_l
+        or "insufficient balance" in err_l
+        or "payment required" in err_l
+        or "api error (402)" in err_l
+        or "http 402" in err_l
+        or "(402)" in err_l
+        or "余额不足" in err_l
+        or "额度不足" in err_l
+        or "额度已用尽" in err_l
+    ):
+        categories.add(FailoverReason.QUOTA)
+    if "invalid function response" in err_l:
+        categories.add(FailoverReason.STRUCTURAL)
+
+    if FailoverReason.CONTENT_SAFETY in categories:
+        hints.append(
+            "🛡️ 云端模型的内容安全审核未通过。可能是对话历史、系统提示词或本次输入"
+            "包含被平台判定为敏感的内容。建议：①使用 /clear 清空对话后重新开始；"
+            "②换一种表述；③切换到对内容审核更宽松的模型端点。"
+        )
+    if FailoverReason.QUOTA in categories:
+        hints.append("💳 检测到 API 配额耗尽，请前往对应平台充值或升级套餐，充值后会自动恢复。")
+    if FailoverReason.AUTH in categories:
+        hints.append("🔑 检测到 API 认证失败，请检查 API Key 是否正确、是否过期。")
+    if FailoverReason.TRANSIENT in categories:
+        _has_rate_limit = failed_providers and any(
+            any(
+                kw in (getattr(p, "_last_error", "") or "").lower()
+                for kw in ["rate limit", "rate_limit", "too many requests"]
+            )
+            for p in failed_providers
+            if getattr(p, "error_category", "") == FailoverReason.TRANSIENT
+        )
+        if _has_rate_limit:
+            hints.append("⏱️ 检测到 API 请求频率超限（限速），请稍后重试或降低请求频率。")
+        else:
+            hints.append("🌐 检测到网络超时/连接失败，请检查网络连接和代理设置。")
+    if FailoverReason.STRUCTURAL in categories:
+        if "tool names must be unique" in err_l:
+            hints.append("⚙️ 检测到内部工具定义重复，请升级到修复版本后重试。")
+        elif "invalid function response" in err_l or "messages with role 'tool'" in err_l:
+            hints.append("⚙️ 工具调用上下文格式异常，OpenKitsune 会清理工具历史后重试。")
+        elif (
+            "exceed_context_size" in err_l
+            or "exceeds the available context" in err_l
+            or "context window" in err_l
+            or "maximum context length" in err_l
+            or "too many tokens" in err_l
+        ):
+            hints.append(
+                "🧠 当前模型上下文窗口偏小，刚才的系统提示词、工具清单或对话内容超出了模型可接收范围。"
+                "OpenKitsune 会优先尝试减少提示词和工具清单后继续；如果仍失败，请在本地模型服务中调大 context size，"
+                "或切换到上下文更大的模型。"
+            )
+        else:
+            hints.append("⚙️ 检测到请求格式异常，OpenKitsune 会优先尝试兼容模式继续执行。")
+
+    if not hints:
+        # 无法分类时的通用提示
+        hints.append("请检查 API Key、网络连接和账户余额。")
+
+    return " ".join(hints)
+
+
+def _classification_error_text(exc: Exception) -> str:
+    """Return display error plus raw upstream body for robust internal classification."""
+    text = str(exc)
+    raw_body = getattr(exc, "raw_body", None)
+    if raw_body:
+        return f"{text}\n{raw_body}"
+    return text
+
+
+# ==================== 动态切换相关数据结构 ====================
+
+
+@dataclass
+class EndpointOverride:
+    """端点临时覆盖配置"""
+
+    endpoint_name: str  # 覆盖到的端点名称
+    expires_at: datetime  # 过期时间
+    created_at: datetime = field(default_factory=datetime.now)
+    reason: str = ""  # 切换原因（可选）
+    policy: str = "prefer"  # prefer=优先使用，require=必须使用且不自动切换
+
+    @property
+    def is_expired(self) -> bool:
+        """检查是否已过期"""
+        return datetime.now() >= self.expires_at
+
+    @property
+    def remaining_hours(self) -> float:
+        """剩余有效时间（小时）"""
+        if self.is_expired:
+            return 0.0
+        delta = self.expires_at - datetime.now()
+        return delta.total_seconds() / 3600
+
+    def to_dict(self) -> dict:
+        """转换为字典（用于序列化）"""
+        return {
+            "endpoint_name": self.endpoint_name,
+            "expires_at": self.expires_at.isoformat(),
+            "created_at": self.created_at.isoformat(),
+            "reason": self.reason,
+            "policy": self.policy,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "EndpointOverride":
+        """从字典创建（用于反序列化）"""
+        return cls(
+            endpoint_name=data["endpoint_name"],
+            expires_at=datetime.fromisoformat(data["expires_at"]),
+            created_at=datetime.fromisoformat(data["created_at"]),
+            reason=data.get("reason", ""),
+            policy=data.get("policy", "prefer") or "prefer",
+        )
+
+
+@dataclass
+class ModelInfo:
+    """模型信息（用于列表展示）"""
+
+    name: str  # 端点名称
+    model: str  # 模型名称
+    provider: str  # 提供商
+    priority: int  # 优先级
+    is_healthy: bool  # 健康状态
+    is_current: bool  # 是否当前使用
+    is_override: bool  # 是否临时覆盖
+    capabilities: list[str]  # 支持的能力
+    note: str = ""  # 备注
+
+
+class LLMClient:
+    """统一 LLM 客户端"""
+
+    # 默认临时切换有效期（小时）
+    DEFAULT_OVERRIDE_HOURS = 12
+
+    # 全局 LLM 并发控制：限制同时在飞的请求数，防止并发风暴打爆 event loop
+    DEFAULT_MAX_CONCURRENT = 20
+    _global_semaphore: asyncio.Semaphore | None = None
+    _global_semaphore_loop_id: int | None = None
+    _global_semaphore_value: int = 0
+    # PR-K1: inflight 改成 {loop_id: counter} 字典 + 自愈。
+    # 旧实现是单个 int 类变量，在 pytest-asyncio 反复创建 / 销毁 event loop、
+    # 或 Tauri 子进程被 kill 后重启的场景下会"残留"到新 loop —— 健康面板里
+    # 永远显示在飞 N 个请求，触发假阳性扩容/告警。改成按 loop 维度记录后，
+    # 旧 loop 的计数自动随 semaphore 重建而清零，新 loop 从 0 开始；同时
+    # 仍提供 cls._global_inflight 兼容 property 给老调用方（比如外部监控
+    # 抓取代码）。
+    _global_inflight_by_loop: dict[int | None, int] = {}
+
+    # 认证失败的端点在进程生命周期内永久跳过（需修改配置后重启或 reload 才恢复）
+    _auth_failed_endpoints: set[str] = set()
+    _auth_logged_endpoints: set[str] = set()  # 只记录一次告警
+
+    @staticmethod
+    def _current_loop_id() -> int | None:
+        try:
+            return id(asyncio.get_running_loop())
+        except RuntimeError:
+            return None
+
+    @classmethod
+    def _get_semaphore(cls, max_concurrent: int = 0) -> asyncio.Semaphore:
+        """获取或创建全局并发信号量（绑定到当前 event loop）。"""
+        target = max_concurrent or cls.DEFAULT_MAX_CONCURRENT
+        loop_id = cls._current_loop_id()
+        if (
+            cls._global_semaphore is None
+            or cls._global_semaphore_loop_id != loop_id
+            or cls._global_semaphore_value != target
+        ):
+            cls._global_semaphore = asyncio.Semaphore(target)
+            # 自愈：semaphore 换了，旧 loop 的计数已经无意义，全部清掉
+            if cls._global_semaphore_loop_id is not None:
+                cls._global_inflight_by_loop.pop(cls._global_semaphore_loop_id, None)
+            cls._global_semaphore_loop_id = loop_id
+            cls._global_semaphore_value = target
+            cls._global_inflight_by_loop[loop_id] = 0
+        return cls._global_semaphore
+
+    @classmethod
+    def _inflight_inc(cls) -> None:
+        loop_id = cls._current_loop_id()
+        cls._global_inflight_by_loop[loop_id] = cls._global_inflight_by_loop.get(loop_id, 0) + 1
+
+    @classmethod
+    def _inflight_dec(cls) -> None:
+        loop_id = cls._current_loop_id()
+        cur = cls._global_inflight_by_loop.get(loop_id, 0)
+        if cur > 0:
+            cls._global_inflight_by_loop[loop_id] = cur - 1
+        else:
+            # 自愈：若计数已经异常归零，不要扣到负数（旧实现会出现 -1, -2 …）
+            cls._global_inflight_by_loop[loop_id] = 0
+
+    # ── 兼容旧字段：外部监控可能直接读 _global_inflight ─
+    class _InflightDescriptor:
+        def __get__(self, instance, owner):
+            loop_id = LLMClient._current_loop_id()
+            return LLMClient._global_inflight_by_loop.get(loop_id, 0)
+
+        def __set__(self, instance, value):
+            loop_id = LLMClient._current_loop_id()
+            LLMClient._global_inflight_by_loop[loop_id] = int(value)
+
+    _global_inflight = _InflightDescriptor()  # type: ignore[assignment]
+
+    @classmethod
+    def get_concurrency_stats(cls) -> dict:
+        """返回当前并发统计（供健康监控 API 使用）。"""
+        loop_id = cls._current_loop_id()
+        return {
+            "inflight": cls._global_inflight_by_loop.get(loop_id, 0),
+            "max_concurrent": cls._global_semaphore_value or cls.DEFAULT_MAX_CONCURRENT,
+            "tracked_loops": len(cls._global_inflight_by_loop),
+        }
+
+    def __init__(
+        self,
+        config_path: Path | None = None,
+        endpoints: list[EndpointConfig] | None = None,
+    ):
+        """
+        初始化 LLM 客户端
+
+        Args:
+            config_path: 配置文件路径
+            endpoints: 直接传入端点配置（优先于 config_path）
+        """
+        self._endpoints: list[EndpointConfig] = []
+        self._providers: dict[str, LLMProvider] = {}
+        self._settings: dict = {}
+        self._config_path: Path | None = config_path
+
+        # 动态切换相关
+        self._endpoint_override: EndpointOverride | None = None
+        # per-conversation 临时覆盖（用于并发隔离）
+        self._conversation_overrides: dict[str, EndpointOverride] = {}
+
+        # 端点亲和性：记录上一次成功的端点名称
+        # 有工具上下文时，优先使用上次成功的端点（避免 failover 后又回到高优先级的故障端点）
+        self._last_success_endpoint: str | None = None
+        self._endpoint_lock = asyncio.Lock()
+
+        if endpoints:
+            self._endpoints = sorted(endpoints, key=lambda x: x.priority)
+        elif config_path or get_default_config_path().exists():
+            self._config_path = config_path or get_default_config_path()
+            self._endpoints, _, _, self._settings = load_endpoints_config(self._config_path)
+
+        # 创建 Provider 实例
+        self._init_providers()
+
+    def reload(self) -> bool:
+        """热重载：重新读取配置文件并重建所有 Provider。
+
+        Returns:
+            True 表示成功重载，False 表示配置文件不可用。
+        """
+        # 后端可能在配置文件尚不存在时启动（如自动启动），此时 _config_path 为 None。
+        # 用户随后通过 Setup Center 创建了配置文件并触发 reload，
+        # 这里需要重新检测默认路径，否则 reload 会永久失效。
+        if not self._config_path:
+            default = get_default_config_path()
+            if default.exists():
+                self._config_path = default
+                logger.info(f"reload(): discovered config at {default}")
+            else:
+                logger.warning("reload() called but no config_path available")
+                return False
+        if not self._config_path.exists():
+            logger.warning("reload() called but config file not found: %s", self._config_path)
+            return False
+        try:
+            new_endpoints, _, _, new_settings = load_endpoints_config(self._config_path)
+            self._endpoints = new_endpoints
+            self._settings = new_settings
+            self._providers.clear()
+            self._init_providers()
+            self._last_success_endpoint = None  # 重载后重置端点亲和性
+            LLMClient._auth_failed_endpoints.clear()  # 重载后清除认证失败记录
+            LLMClient._auth_logged_endpoints.clear()
+            logger.info(
+                f"LLMClient reloaded from {self._config_path}: "
+                f"{len(self._endpoints)} endpoints, {len(self._providers)} providers"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"LLMClient reload failed: {e}", exc_info=True)
+            return False
+
+    def _init_providers(self):
+        """初始化所有 Provider"""
+        for ep in self._endpoints:
+            provider = self._create_provider(ep)
+            if provider:
+                self._providers[ep.name] = provider
+
+    async def startup_health_check(self) -> dict[str, str]:
+        """启动时对所有端点做轻量健康检查。
+
+        对每个端点发送极小请求（1 token），检测认证和网络问题。
+        认证失败的端点立即加入 _auth_failed_endpoints。
+
+        Returns:
+            {endpoint_name: "ok" | "auth_failed" | "error: ..."}
+        """
+        results: dict[str, str] = {}
+        for name, provider in self._providers.items():
+            try:
+                request = LLMRequest(
+                    messages=[Message(role="user", content="hi")],
+                    system="Respond with 'ok'",
+                    max_tokens=1,
+                )
+                response = await asyncio.wait_for(provider.chat(request), timeout=15.0)
+                if response.usage.output_tokens > 0 and not response.content:
+                    raise RuntimeError("endpoint returned output tokens but no visible content")
+                results[name] = "ok"
+                logger.info(f"[HealthCheck] endpoint={name} status=ok")
+            except AuthenticationError as e:
+                LLMClient._auth_failed_endpoints.add(name)
+                if name not in LLMClient._auth_logged_endpoints:
+                    LLMClient._auth_logged_endpoints.add(name)
+                    logger.error(
+                        f"[HealthCheck] endpoint={name} auth_failed: {e}. "
+                        f"Permanently disabled until config reload."
+                    )
+                results[name] = "auth_failed"
+            except TimeoutError:
+                results[name] = "error: timeout (15s)"
+                logger.warning(f"[HealthCheck] endpoint={name} timed out (15s)")
+            except Exception as e:
+                err_msg = str(e)[:200]
+                results[name] = f"error: {err_msg}"
+                logger.warning(f"[HealthCheck] endpoint={name} failed: {err_msg}")
+        return results
+
+    def _create_provider(self, config: EndpointConfig) -> LLMProvider | None:
+        """根据配置创建 Provider — 先查插件注册表，再走内置 fallback"""
+        try:
+            from ..plugins import PLUGIN_PROVIDER_MAP
+
+            plugin_cls = PLUGIN_PROVIDER_MAP.get(config.api_type)
+            if plugin_cls:
+                try:
+                    return plugin_cls(config)
+                except Exception as e:
+                    logger.error(
+                        f"Plugin provider '{config.api_type}' failed to init: {e}, "
+                        f"skipping endpoint '{config.name}'"
+                    )
+                    return None
+        except ImportError:
+            pass
+
+        try:
+            if config.api_type == "anthropic":
+                return AnthropicProvider(config)
+            elif config.api_type == "openai":
+                return OpenAIProvider(config)
+            elif config.api_type == "openai_responses":
+                return OpenAIResponsesProvider(config)
+            else:
+                logger.warning(f"Unknown api_type '{config.api_type}' for endpoint '{config.name}'")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to create provider for '{config.name}': {e}")
+            return None
+
+    @property
+    def endpoints(self) -> list[EndpointConfig]:
+        """获取所有端点配置"""
+        return self._endpoints
+
+    @property
+    def providers(self) -> dict[str, LLMProvider]:
+        """获取所有 Provider"""
+        return self._providers
+
+    async def chat(
+        self,
+        messages: list[Message],
+        system: str = "",
+        tools: list[Tool] | None = None,
+        max_tokens: int = 0,
+        temperature: float = 1.0,
+        enable_thinking: bool = False,
+        thinking_depth: str | None = None,
+        conversation_id: str | None = None,
+        cancel_event: asyncio.Event | None = None,
+        endpoint_name: str | None = None,
+        endpoint_policy: str | None = None,
+        **kwargs,
+    ) -> LLMResponse:
+        """
+        统一聊天接口
+
+        自动处理：
+        1. 根据请求内容推断所需能力
+        2. 筛选支持所需能力的端点
+        3. 按优先级尝试调用
+        4. 自动故障切换
+
+        Args:
+            messages: 消息列表
+            system: 系统提示
+            tools: 工具定义列表
+            max_tokens: 最大输出 token
+            temperature: 温度
+            enable_thinking: 是否启用思考模式
+            thinking_depth: 思考深度 ('low'/'medium'/'high'/'max')
+            **kwargs: 额外参数
+
+        Returns:
+            统一响应格式
+
+        Raises:
+            UnsupportedMediaError: 视频内容但没有支持视频的端点
+            AllEndpointsFailedError: 所有端点都失败
+        """
+        sem = self._get_semaphore(self._settings.get("max_concurrent", 0))
+        async with sem:
+            LLMClient._inflight_inc()
+            try:
+                return await self._chat_impl(
+                    messages=messages,
+                    system=system,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    enable_thinking=enable_thinking,
+                    thinking_depth=thinking_depth,
+                    conversation_id=conversation_id,
+                    cancel_event=cancel_event,
+                    endpoint_name=endpoint_name,
+                    endpoint_policy=endpoint_policy,
+                    **kwargs,
+                )
+            finally:
+                LLMClient._inflight_dec()
+
+    async def _chat_impl(
+        self,
+        messages: list[Message],
+        system: str = "",
+        tools: list[Tool] | None = None,
+        max_tokens: int = 0,
+        temperature: float = 1.0,
+        enable_thinking: bool = False,
+        thinking_depth: str | None = None,
+        conversation_id: str | None = None,
+        cancel_event: asyncio.Event | None = None,
+        endpoint_name: str | None = None,
+        endpoint_policy: str | None = None,
+        **kwargs,
+    ) -> LLMResponse:
+        # 消息规范化: 发送前统一格式
+        normalized_msgs = self._normalize_messages(messages)
+
+        request = LLMRequest(
+            messages=normalized_msgs,
+            system=system,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            enable_thinking=enable_thinking,
+            thinking_depth=thinking_depth,
+            extra_params=kwargs.get("extra_params"),
+        )
+
+        # 推断所需能力
+        require_tools = bool(tools)
+        require_vision = self._has_images(messages)
+        require_video = self._has_videos(messages)
+        require_audio = self._has_audio(messages)
+        require_pdf = self._has_documents(messages)
+        require_thinking = bool(enable_thinking)
+
+        request_endpoint = str(endpoint_name or "").strip() or None
+        request_policy = str(
+            endpoint_policy or ("prefer" if request_endpoint else "inherit")
+        ).strip().lower()
+        if request_policy not in {"inherit", "prefer", "require"}:
+            raise ValueError("endpoint_policy must be 'inherit', 'prefer', or 'require'")
+        if request_endpoint and request_policy == "inherit":
+            raise ValueError("endpoint_policy='inherit' cannot specify endpoint_name")
+        if not request_endpoint and request_policy != "inherit":
+            raise ValueError(f"endpoint_policy={request_policy!r} requires endpoint_name")
+        if request_endpoint and request_endpoint not in self._providers:
+            available = ", ".join(sorted(self._providers))
+            raise AllEndpointsFailedError(
+                f"Requested endpoint '{request_endpoint}' is not configured. "
+                f"Available endpoints: {available or '(none)'}"
+            )
+
+        # 检测工具上下文：对 failover 需要更保守
+        #
+        # 关键原因：
+        # - 工具链的“连续性”不仅是消息格式兼容（OpenAI-compatible / Anthropic）
+        # - 还包含模型特定的思维链/元数据连续性（例如 MiniMax M2.1 的 interleaved thinking）
+        #   这类信息若未完整保留/回传，或中途切换到另一模型，工具调用质量会明显下降
+        #
+        # 因此默认：只要检测到工具上下文，就禁用 failover（保持同一端点/同一模型）
+        # 但允许通过配置显式开启“同协议内 failover”（默认不开启）。
+        has_tool_context = self._has_tool_context(messages)
+        allow_failover = not has_tool_context and request_policy != "require"
+
+        if has_tool_context:
+            logger.debug(
+                "[LLM] Tool context detected in messages; failover disabled by default "
+                "(set settings.allow_failover_with_tool_context=true to override)."
+            )
+
+        # 筛选支持所需能力的端点
+        # 有工具上下文时传入端点亲和性：优先使用上次成功的端点
+        eligible = self._filter_eligible_endpoints(
+            require_tools=require_tools,
+            require_vision=require_vision,
+            require_video=require_video,
+            require_thinking=require_thinking,
+            require_audio=require_audio,
+            require_pdf=require_pdf,
+            conversation_id=conversation_id,
+            prefer_endpoint=(
+                request_endpoint
+                if request_endpoint
+                else self._last_success_endpoint
+                if has_tool_context
+                else None
+            ),
+            request_endpoint=request_endpoint,
+            request_policy=request_policy,
+        )
+
+        # 可选：工具上下文下启用 failover（显式配置才开启）
+        if has_tool_context and eligible and request_policy != "require":
+            if self._settings.get("allow_failover_with_tool_context", False):
+                # 默认只允许同协议内切换；避免 anthropic/openai 混用导致 tool message 不兼容
+                api_types = {p.config.api_type for p in eligible}
+                if len(api_types) == 1:
+                    allow_failover = True
+                    logger.debug(
+                        "[LLM] Tool context failover explicitly enabled; "
+                        f"api_type={next(iter(api_types))}."
+                    )
+                else:
+                    allow_failover = False
+                    logger.debug(
+                        "[LLM] Tool context failover requested but eligible endpoints have mixed "
+                        f"api_types={sorted(api_types)}; failover remains disabled."
+                    )
+
+        if eligible:
+            return await self._try_endpoints(
+                eligible, request, allow_failover=allow_failover, cancel_event=cancel_event
+            )
+
+        # eligible 为空 — 使用公共降级策略
+        providers = await self._resolve_providers_with_fallback(
+            request=request,
+            require_tools=require_tools,
+            require_vision=require_vision,
+            require_video=require_video,
+            require_thinking=require_thinking,
+            require_audio=require_audio,
+            require_pdf=require_pdf,
+            conversation_id=conversation_id,
+            prefer_endpoint=(
+                request_endpoint
+                if request_endpoint
+                else self._last_success_endpoint
+                if has_tool_context
+                else None
+            ),
+            request_endpoint=request_endpoint,
+            request_policy=request_policy,
+            cancel_event=cancel_event,
+        )
+        return await self._try_endpoints(
+            providers, request, allow_failover=allow_failover, cancel_event=cancel_event
+        )
+
+    async def chat_stream(
+        self,
+        messages: list[Message],
+        system: str = "",
+        tools: list[Tool] | None = None,
+        max_tokens: int = 0,
+        temperature: float = 1.0,
+        enable_thinking: bool = False,
+        thinking_depth: str | None = None,
+        conversation_id: str | None = None,
+        cancel_event: asyncio.Event | None = None,
+        **kwargs,
+    ) -> AsyncIterator[dict]:
+        """
+        流式聊天接口（带完整降级策略）
+
+        与 chat() 共用降级逻辑：thinking 软降级、冷静期等待、多端点轮询。
+        流式特殊处理：一旦开始产出事件（yielded=True），中途失败不再切换端点
+        （避免向客户端发送混合的部分响应）。
+
+        Args:
+            messages: 消息列表
+            system: 系统提示
+            tools: 工具定义列表
+            max_tokens: 最大输出 token
+            temperature: 温度
+            enable_thinking: 是否启用思考模式
+            thinking_depth: 思考深度 ('low'/'medium'/'high'/'max')
+            conversation_id: 对话 ID
+            cancel_event: 取消事件（与 chat() 签名一致）
+            **kwargs: 额外参数
+
+        Yields:
+            流式事件
+        """
+        sem = self._get_semaphore(self._settings.get("max_concurrent", 0))
+        async with sem:
+            LLMClient._inflight_inc()
+            try:
+                async for event in self._chat_stream_impl(
+                    messages=messages,
+                    system=system,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    enable_thinking=enable_thinking,
+                    thinking_depth=thinking_depth,
+                    conversation_id=conversation_id,
+                    cancel_event=cancel_event,
+                    **kwargs,
+                ):
+                    yield event
+            finally:
+                LLMClient._inflight_dec()
+
+    async def _chat_stream_impl(
+        self,
+        messages: list[Message],
+        system: str = "",
+        tools: list[Tool] | None = None,
+        max_tokens: int = 0,
+        temperature: float = 1.0,
+        enable_thinking: bool = False,
+        thinking_depth: str | None = None,
+        conversation_id: str | None = None,
+        cancel_event: asyncio.Event | None = None,
+        **kwargs,
+    ) -> AsyncIterator[dict]:
+        """chat_stream() 的内部实现（已在 semaphore 保护下运行）。"""
+        normalized_msgs = self._normalize_messages(messages)
+
+        request = LLMRequest(
+            messages=normalized_msgs,
+            system=system,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            enable_thinking=enable_thinking,
+            thinking_depth=thinking_depth,
+            extra_params=kwargs.get("extra_params"),
+        )
+
+        require_tools = bool(tools)
+        require_vision = self._has_images(messages)
+        require_video = self._has_videos(messages)
+        require_audio = self._has_audio(messages)
+        require_pdf = self._has_documents(messages)
+        require_thinking = bool(enable_thinking)
+
+        eligible = self._filter_eligible_endpoints(
+            require_tools=require_tools,
+            require_vision=require_vision,
+            require_video=require_video,
+            require_thinking=require_thinking,
+            require_audio=require_audio,
+            require_pdf=require_pdf,
+            conversation_id=conversation_id,
+        )
+
+        if not eligible:
+            eligible = await self._resolve_providers_with_fallback(
+                request=request,
+                require_tools=require_tools,
+                require_vision=require_vision,
+                require_video=require_video,
+                require_thinking=require_thinking,
+                require_audio=require_audio,
+                require_pdf=require_pdf,
+                conversation_id=conversation_id,
+                cancel_event=cancel_event,
+            )
+
+        prefer_switch_meta = self._build_prefer_switch_meta(
+            eligible,
+            require_tools=require_tools,
+            require_vision=require_vision,
+            require_video=require_video,
+            require_thinking=require_thinking,
+            require_audio=require_audio,
+            require_pdf=require_pdf,
+            conversation_id=conversation_id,
+        )
+
+        _413_retried = False
+        _token_range_retried = False
+        last_error: Exception | None = None
+        for i, provider in enumerate(eligible):
+            if cancel_event and cancel_event.is_set():
+                raise UserCancelledError(reason="用户请求停止", source="llm_stream")
+
+            yielded = False
+            _stream_started = time.monotonic()
+            _stream_events = 0
+            _stream_text_chars = 0
+            try:
+                if request.enable_thinking and not provider.config.has_capability("thinking"):
+                    request.enable_thinking = False
+                    logger.info(
+                        f"[LLM-Stream] endpoint={provider.name} thinking soft-disabled "
+                        f"(endpoint lacks thinking capability)"
+                    )
+                logger.info(
+                    f"[LLM-Stream] endpoint={provider.name} model={provider.model} "
+                    f"action=stream_request"
+                )
+                if i == 0 and prefer_switch_meta:
+                    yield prefer_switch_meta
+                if i > 0 and eligible:
+                    yield {
+                        "type": "endpoint_meta",
+                        "endpoint_name": provider.name,
+                        "failover_from": eligible[0].name,
+                    }
+                # 发射一次端点元信息：vision 降级时让上层（reasoning_engine）能
+                # 转换为 endpoint_notice 给前端显示系统气泡。
+                try:
+                    if not provider.config.has_capability("vision") and self._has_images(
+                        request.messages
+                    ):
+                        yield {
+                            "type": "endpoint_meta",
+                            "endpoint_name": provider.name,
+                            "vision_degraded": True,
+                        }
+                        yielded = True
+                except Exception:
+                    pass
+                async for event in provider.chat_stream(request):
+                    if cancel_event and cancel_event.is_set():
+                        raise UserCancelledError(
+                            reason="用户请求停止",
+                            source="llm_stream_mid",
+                        )
+                    yielded = True
+                    _stream_events += 1
+                    if isinstance(event, dict):
+                        _delta = event.get("delta")
+                        if event.get("type") == "content_block_delta" and isinstance(_delta, dict):
+                            _text = _delta.get("text") or ""
+                            if _delta.get("type") == "text" and _text:
+                                _stream_text_chars += len(_text)
+                    yield event
+                async with self._endpoint_lock:
+                    self._last_success_endpoint = provider.name
+                return
+
+            except (UserCancelledError, asyncio.CancelledError):
+                raise
+
+            except LLMError as e:
+                last_error = e
+                if yielded:
+                    _elapsed = time.monotonic() - _stream_started
+                    _cat = getattr(provider, "error_category", "") or "unknown"
+                    _conn = bool(getattr(e, "connection_closed", False))
+                    # 连接中断类 mid-stream 失败：上游进程崩溃/重启，防御性标记
+                    # 短暂冷却（transient），避免后续请求在服务恢复前反复打向它。
+                    # 已由 provider 标记过时此处幂等无副作用。
+                    if _conn:
+                        try:
+                            provider.mark_unhealthy(
+                                f"Stream connection closed mid-response: {e}",
+                                category="transient",
+                            )
+                        except Exception:
+                            pass
+                    logger.error(
+                        f"[LLM-Stream] endpoint={provider.name} mid-stream failure "
+                        f"after {_stream_events} event(s)/{_stream_text_chars} chars "
+                        f"({_elapsed:.1f}s elapsed): {e}. "
+                        f"Cannot failover (partial response already sent). "
+                        f"category={_cat} connection_closed={_conn}"
+                        + (
+                            " — upstream closed the connection (server likely "
+                            "crashed/restarting; partial content is preserved as "
+                            "truncated by the caller)"
+                            if _conn
+                            else ""
+                        )
+                    )
+                    raise
+
+                # ── Content safety 早期熔断（必须在 status code 分支之前）──
+                # DashScope DataInspectionFailed 等内容审核错误是输入触发的确定性失败，
+                # 换端点重试也会失败。直接抛 is_structural=True 让 reasoning_engine
+                # 走方案 D（剥离 tool_results 重试）或优雅终止。
+                err_lower = str(e).lower()
+                if (
+                    "data_inspection" in err_lower
+                    or "datainspectionfailed" in err_lower
+                    or "inappropriate content" in err_lower
+                    or "content_filter" in err_lower
+                ):
+                    from .error_types import FailoverReason as _FR
+
+                    logger.error(
+                        f"[LLM-Stream] endpoint={provider.name} content-safety error "
+                        f"(skip cooldown, skip failover): {str(e)[:200]}"
+                    )
+                    provider._content_error = True
+                    try:
+                        provider._error_category = _FR.CONTENT_SAFETY
+                    except Exception:
+                        pass
+                    hint = _friendly_error_hint(eligible, last_error=str(e))
+                    raise AllEndpointsFailedError(
+                        f"Stream: content safety check failed. {hint} Last error: {e}",
+                        is_structural=True,
+                        error_categories={"content_safety"},
+                    ) from e
+
+                sc = e.status_code
+
+                if (
+                    sc == 400
+                    and not _token_range_retried
+                    and self._apply_output_token_range_feedback(
+                        request,
+                        e,
+                        log_prefix="[LLM-Stream]",
+                        endpoint_name=provider.name,
+                    )
+                ):
+                    _token_range_retried = True
+                    try:
+                        async for event in provider.chat_stream(request):
+                            if cancel_event and cancel_event.is_set():
+                                raise UserCancelledError(
+                                    reason="用户请求停止",
+                                    source="llm_stream_token_range_retry",
+                                )
+                            yielded = True
+                            yield event
+                        async with self._endpoint_lock:
+                            self._last_success_endpoint = provider.name
+                        return
+                    except (UserCancelledError, asyncio.CancelledError):
+                        raise
+                    except LLMError as retry_e:
+                        last_error = retry_e
+                        logger.warning(
+                            f"[LLM-Stream] endpoint={provider.name} "
+                            f"max_tokens range retry also failed: {retry_e}"
+                        )
+                        # 内部重试已产出部分内容后失败：不能再切下一个端点，
+                        # 否则会把两个端点的部分响应拼给客户端。交给外层
+                        # LLMError 分支按 mid-stream failure 处理。
+                        if yielded:
+                            raise
+
+                # 413 auto-recovery: reduce max_tokens and retry same provider
+                if sc == 413 and not _413_retried:
+                    _413_retried = True
+                    current = request.max_tokens or 16384
+                    request.max_tokens = max(current // 2, 1024)
+                    logger.info(
+                        f"[LLM-Stream] endpoint={provider.name} status=413, "
+                        f"reducing max_tokens {current} → {request.max_tokens}, "
+                        f"retrying same endpoint"
+                    )
+                    try:
+                        async for event in provider.chat_stream(request):
+                            if cancel_event and cancel_event.is_set():
+                                raise UserCancelledError(
+                                    reason="用户请求停止",
+                                    source="llm_stream_413_retry",
+                                )
+                            yielded = True
+                            yield event
+                        async with self._endpoint_lock:
+                            self._last_success_endpoint = provider.name
+                        return
+                    except (UserCancelledError, asyncio.CancelledError):
+                        raise
+                    except LLMError as retry_e:
+                        last_error = retry_e
+                        logger.warning(
+                            f"[LLM-Stream] endpoint={provider.name} "
+                            f"413 retry also failed: {retry_e}"
+                        )
+                        # 同 400 内部重试：部分内容已产出时禁止切换端点。
+                        if yielded:
+                            raise
+
+                # 429/529/503: backoff before trying next provider
+                if sc in (429, 529, 503) and i < len(eligible) - 1:
+                    delay = self._get_retry_delay(1, e)
+                    logger.info(
+                        f"[LLM-Stream] endpoint={provider.name} status={sc}, "
+                        f"backoff {delay:.1f}s before next endpoint"
+                    )
+                    if cancel_event:
+                        try:
+                            await asyncio.wait_for(
+                                cancel_event.wait(),
+                                timeout=delay,
+                            )
+                            raise UserCancelledError(
+                                reason="用户请求停止",
+                                source="llm_stream_backoff",
+                            )
+                        except TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(delay)
+                else:
+                    logger.warning(
+                        f"[LLM-Stream] endpoint={provider.name} error={e}"
+                        + (", trying next endpoint..." if i < len(eligible) - 1 else "")
+                    )
+
+            except Exception as e:
+                last_error = e
+                if yielded:
+                    raise
+                provider.mark_unhealthy(str(e))
+                logger.warning(
+                    f"[LLM-Stream] endpoint={provider.name} unexpected_error={e}"
+                    + (", trying next endpoint..." if i < len(eligible) - 1 else ""),
+                    exc_info=True,
+                )
+
+        hint = _friendly_error_hint(eligible, last_error=str(last_error or ""))
+        # 当所有端点都因结构性/内容安全错误失败时，标记 is_structural=True，
+        # 让 reasoning_engine._handle_llm_error 能走方案 B/C/D 而不是普通重试。
+        last_err_lower = str(last_error or "").lower()
+        is_structural = (
+            "data_inspection" in last_err_lower
+            or "datainspectionfailed" in last_err_lower
+            or "inappropriate content" in last_err_lower
+            or "content_filter" in last_err_lower
+        )
+        _cats = {getattr(p, "error_category", "") for p in eligible if not p.is_healthy}
+        _cats.discard("")
+        raise AllEndpointsFailedError(
+            f"Stream: all {len(eligible)} endpoints failed. {hint} Last error: {last_error}",
+            is_structural=is_structural,
+            error_categories=_cats or None,
+        )
+
+    # ==================== 公共降级策略 ====================
+
+    async def _resolve_providers_with_fallback(
+        self,
+        request: LLMRequest,
+        require_tools: bool = False,
+        require_vision: bool = False,
+        require_video: bool = False,
+        require_thinking: bool = False,
+        require_audio: bool = False,
+        require_pdf: bool = False,
+        conversation_id: str | None = None,
+        prefer_endpoint: str | None = None,
+        request_endpoint: str | None = None,
+        request_policy: str = "prefer",
+        cancel_event: asyncio.Event | None = None,
+    ) -> list[LLMProvider]:
+        """公共分层降级策略 — 供 chat() 和 chat_stream() 复用
+
+        当 _filter_eligible_endpoints() 返回空列表时调用此方法，
+        按以下顺序逐级降级，直到找到可用端点：
+
+        1. thinking 软降级：放弃 thinking 要求，用非 thinking 端点
+        2. 等待冷静期恢复：等最短的瞬时冷静期（最多等 35s）
+        3. 强制重试：忽略冷静期，强制调用匹配基础能力的端点
+        4. 最终兜底：所有端点都试一遍
+
+        副作用：
+            - 可能修改 request.enable_thinking = False（thinking 降级时）
+
+        Raises:
+            UnsupportedMediaError: 需要视频但无视频能力端点
+            AllEndpointsFailedError: 所有端点均为结构性错误
+
+        Returns:
+            按优先级排序的端点列表（至少包含一个端点）
+        """
+        providers_sorted = sorted(self._providers.values(), key=lambda p: p.config.priority)
+        # [整改 2026-10-10] 排除纯 embedding 端点：生成（chat）类请求的故障切换
+        # 绝不能落到 embedding 端点（context_window 8192 + max_tokens 0），否则
+        # 必然报 "Final provider request exceeds context window including output
+        # reserve" 并中断任务（error.log 2026-10-10 07:15-07:36 28 处实证）。
+        providers_sorted = [p for p in providers_sorted if _is_generation_endpoint(p)]
+        if not providers_sorted:
+            providers_sorted = sorted(
+                self._providers.values(), key=lambda p: p.config.priority
+            )
+
+        if request_endpoint and request_policy == "require":
+            provider = self._providers.get(request_endpoint)
+            if provider is None:
+                raise AllEndpointsFailedError(
+                    f"Required endpoint '{request_endpoint}' is no longer configured."
+                )
+            missing = self._missing_required_capabilities(
+                provider,
+                require_tools=require_tools,
+                require_vision=require_vision,
+                require_video=require_video,
+                require_audio=require_audio,
+                require_pdf=require_pdf,
+            )
+            if missing:
+                raise AllEndpointsFailedError(
+                    f"Required endpoint '{request_endpoint}' does not support this request "
+                    f"capability: {', '.join(missing)}."
+                )
+            if require_thinking and not provider.config.has_capability("thinking"):
+                request.enable_thinking = False
+            return [provider]
+
+        effective_override = None
+        if not request_endpoint:
+            if conversation_id and conversation_id in self._conversation_overrides:
+                effective_override = self._conversation_overrides.get(conversation_id)
+            elif self._endpoint_override:
+                effective_override = self._endpoint_override
+
+        if effective_override and effective_override.policy == "require":
+            endpoint_name = effective_override.endpoint_name
+            provider = self._providers.get(endpoint_name)
+            if provider is None:
+                raise AllEndpointsFailedError(
+                    f"Required endpoint '{endpoint_name}' is no longer configured. "
+                    "Please choose another model endpoint."
+                )
+
+            missing = self._missing_required_capabilities(
+                provider,
+                require_tools=require_tools,
+                require_vision=require_vision,
+                require_video=require_video,
+                require_audio=require_audio,
+                require_pdf=require_pdf,
+            )
+            if missing:
+                raise AllEndpointsFailedError(
+                    f"Required endpoint '{endpoint_name}' does not support this request "
+                    f"capability: {', '.join(missing)}. "
+                    "Please choose a compatible endpoint or switch the model policy to prefer."
+                )
+
+            if require_thinking and not provider.config.has_capability("thinking"):
+                logger.info(
+                    f"[LLM] Required endpoint {endpoint_name} has no thinking capability; "
+                    "disabling thinking instead of falling back."
+                )
+                request.enable_thinking = False
+
+            if not provider.is_healthy:
+                logger.warning(
+                    f"[LLM] Required endpoint {endpoint_name} is unhealthy. "
+                    "Bypassing cooldown and trying only this endpoint."
+                )
+                provider.reset_cooldown()
+            return [provider]
+
+        # ── 降级 1: thinking 软降级 ──
+        # thinking 不同于 tools/vision/video：没有它请求仍能正常工作
+        # 如果因为 thinking 要求导致无可用端点，降级到无 thinking 模式
+        if require_thinking:
+            eligible_no_thinking = self._filter_eligible_endpoints(
+                require_tools=require_tools,
+                require_vision=require_vision,
+                require_video=require_video,
+                require_thinking=False,
+                require_audio=require_audio,
+                require_pdf=require_pdf,
+                conversation_id=conversation_id,
+                prefer_endpoint=prefer_endpoint,
+                request_endpoint=request_endpoint,
+                request_policy=request_policy,
+            )
+            if eligible_no_thinking:
+                logger.info(
+                    f"[LLM] No healthy thinking-capable endpoint. "
+                    f"Falling back to non-thinking mode "
+                    f"({len(eligible_no_thinking)} endpoints available)."
+                )
+                request.enable_thinking = False
+                return eligible_no_thinking
+
+        # ── 降级 2+3+4: 所有端点都在冷静期 ──
+        # 构建基础能力匹配列表（不含 thinking 要求，忽略健康状态）
+        base_capability_matched = [
+            p
+            for p in providers_sorted
+            if (not require_tools or p.config.has_capability("tools"))
+            and (not require_vision or p.config.has_capability("vision"))
+            and (not require_video or p.config.has_capability("video"))
+            and (not require_audio or p.config.has_capability("audio"))
+            and (not require_pdf or p.config.has_capability("pdf"))
+        ]
+
+        # 多模态软降级: 视频/音频/PDF 端点不匹配时不硬失败
+        if not base_capability_matched:
+            degraded = []
+            if require_video:
+                degraded.append("video")
+                require_video = False
+            if require_audio:
+                degraded.append("audio")
+                require_audio = False
+            if require_pdf:
+                degraded.append("pdf")
+                require_pdf = False
+            if degraded:
+                logger.warning(
+                    f"[LLM] No endpoint supports {'/'.join(degraded)}. "
+                    "Content will be degraded (keyframes/text/STT)."
+                )
+                base_capability_matched = [
+                    p
+                    for p in providers_sorted
+                    if (not require_tools or p.config.has_capability("tools"))
+                    and (not require_vision or p.config.has_capability("vision"))
+                ]
+
+        # thinking 降级标记 — 不立即修改 request，等确认确实需要降级时再改 (#327)
+        _thinking_downgraded = False
+        if require_thinking:
+            logger.info(
+                "[LLM] All endpoints in cooldown, attempting recovery before disabling thinking."
+            )
+
+        if base_capability_matched:
+            unhealthy = [p for p in base_capability_matched if not p.is_healthy]
+            unhealthy_count = len(unhealthy)
+
+            if unhealthy_count > 0:
+                # 按错误类型分组
+                structural = [p for p in unhealthy if p.error_category == "structural"]
+                quota_or_auth = [p for p in unhealthy if p.error_category in ("quota", "auth")]
+                non_structural = [p for p in unhealthy if p.error_category != "structural"]
+
+                # ── 降级 2: 等待瞬时冷静期恢复 ──
+                transient_like = [
+                    p for p in non_structural if p.error_category not in ("quota", "auth")
+                ]
+                if transient_like:
+                    min_transient_cd = min(p.cooldown_remaining for p in transient_like)
+                    if 0 < min_transient_cd <= 35:
+                        if cancel_event and cancel_event.is_set():
+                            raise UserCancelledError(
+                                reason="用户请求停止", source="llm_cooldown_wait"
+                            )
+                        logger.info(
+                            f"[LLM] All endpoints in cooldown. "
+                            f"Waiting {min_transient_cd}s for transient recovery..."
+                        )
+                        wait_seconds = min(min_transient_cd + 1, 35)
+                        if cancel_event:
+                            try:
+                                await asyncio.wait_for(
+                                    cancel_event.wait(),
+                                    timeout=wait_seconds,
+                                )
+                                raise UserCancelledError(
+                                    reason="用户请求停止",
+                                    source="llm_cooldown_wait",
+                                )
+                            except TimeoutError:
+                                pass
+                        else:
+                            await asyncio.sleep(wait_seconds)
+                        # 等待后重新筛选 — 先尝试保留 thinking (#327)
+                        if require_thinking:
+                            eligible = self._filter_eligible_endpoints(
+                                require_tools=require_tools,
+                                require_vision=require_vision,
+                                require_video=require_video,
+                                require_thinking=True,
+                                require_audio=require_audio,
+                                require_pdf=require_pdf,
+                                conversation_id=conversation_id,
+                                prefer_endpoint=prefer_endpoint,
+                                request_endpoint=request_endpoint,
+                                request_policy=request_policy,
+                            )
+                            if eligible:
+                                logger.info(
+                                    f"[LLM] Recovery detected: "
+                                    f"{len(eligible)} endpoints available after wait "
+                                    f"(thinking preserved)"
+                                )
+                                return eligible
+                        # 降级 thinking 再试
+                        eligible = self._filter_eligible_endpoints(
+                            require_tools=require_tools,
+                            require_vision=require_vision,
+                            require_video=require_video,
+                            require_thinking=False,
+                            require_audio=require_audio,
+                            require_pdf=require_pdf,
+                            conversation_id=conversation_id,
+                            prefer_endpoint=prefer_endpoint,
+                            request_endpoint=request_endpoint,
+                            request_policy=request_policy,
+                        )
+                        if eligible:
+                            if require_thinking:
+                                request.enable_thinking = False
+                                _thinking_downgraded = True
+                            logger.info(
+                                f"[LLM] Recovery detected: "
+                                f"{len(eligible)} endpoints available after wait"
+                                + (" (thinking disabled)" if _thinking_downgraded else "")
+                            )
+                            return eligible
+
+                # ── 全部是结构性错误（400 参数错误等），重试无意义 → 报错 ──
+                if structural and len(structural) == unhealthy_count:
+                    last_err = structural[0]._last_error or "unknown structural error"
+                    min_cd = min(p.cooldown_remaining for p in structural)
+                    hint = _friendly_error_hint(structural)
+                    raise AllEndpointsFailedError(
+                        f"All endpoints failed with structural errors "
+                        f"(cooldown {min_cd}s). {hint} Last error: {last_err}",
+                        is_structural=True,
+                        error_categories={"structural"},
+                    )
+
+                # ── 全部是配额/认证错误，重试无意义 → 快速报错 ──
+                if quota_or_auth and len(quota_or_auth) == unhealthy_count:
+                    last_err = quota_or_auth[0]._last_error or "unknown auth/quota error"
+                    categories = sorted(
+                        {p.error_category for p in quota_or_auth if p.error_category}
+                    )
+                    hint = _friendly_error_hint(quota_or_auth)
+                    raise AllEndpointsFailedError(
+                        f"All endpoints failed with {'/'.join(categories)} errors. "
+                        f"{hint} Last error: {last_err}",
+                        error_categories=set(categories),
+                    )
+
+            # ── 降级 3: "最后防线旁路" — 绕过冷静期（对齐 Portkey） ──
+            # Portkey 核心规则：当没有健康目标时，绕过 circuit breaker 尝试所有目标
+            # 排除 quota/auth 错误的端点（这类错误重试无意义）
+            retryable = [
+                p
+                for p in base_capability_matched
+                if p.is_healthy or p.error_category not in ("quota", "auth")
+            ]
+            if retryable:
+                logger.warning(
+                    f"[LLM] No healthy endpoint available. "
+                    f"Bypassing cooldowns for {len(retryable)} endpoints "
+                    f"(last resort, Portkey-style)."
+                )
+                for p in retryable:
+                    if not p.is_healthy:
+                        p.reset_cooldown()
+                return retryable
+
+            # 所有端点都是 quota/auth → 直接报错，不再送回 _try_endpoints 浪费 API 调用
+            last_err = base_capability_matched[0]._last_error or "unknown error"
+            categories = sorted(
+                {p.error_category for p in base_capability_matched if p.error_category}
+            )
+            hint = _friendly_error_hint(base_capability_matched)
+            raise AllEndpointsFailedError(
+                f"All endpoints failed with {'/'.join(categories)} errors. "
+                f"{hint} Last error: {last_err}",
+                error_categories=set(categories),
+            )
+
+        # ── 降级 4: 最终兜底 — 尝试所有端点 ──
+        logger.warning(
+            f"[LLM] No endpoint matches required capabilities "
+            f"(tools={require_tools}, vision={require_vision}, video={require_video}). "
+            f"Trying all {len(providers_sorted)} endpoints as last resort."
+        )
+        return providers_sorted
+
+    def _get_effective_override(
+        self, conversation_id: str | None = None
+    ) -> EndpointOverride | None:
+        """Return the active endpoint override for this request, if any."""
+        if conversation_id:
+            ov = self._conversation_overrides.get(conversation_id)
+            if ov and not ov.is_expired:
+                return ov
+            if ov and ov.is_expired:
+                self._conversation_overrides.pop(conversation_id, None)
+
+        ov = self._endpoint_override
+        if ov and not ov.is_expired:
+            return ov
+        if ov and ov.is_expired:
+            logger.info("[LLM] Override expired, restoring default")
+            self._endpoint_override = None
+        return None
+
+    def _build_prefer_switch_meta(
+        self,
+        eligible: list[LLMProvider],
+        *,
+        require_tools: bool = False,
+        require_vision: bool = False,
+        require_video: bool = False,
+        require_thinking: bool = False,
+        require_audio: bool = False,
+        require_pdf: bool = False,
+        conversation_id: str | None = None,
+    ) -> dict | None:
+        """Build stream metadata when prefer mode does not use the selected endpoint."""
+        override = self._get_effective_override(conversation_id)
+        if not override or override.policy != "prefer" or not eligible:
+            return None
+
+        selected_endpoint = override.endpoint_name
+        actual_endpoint = eligible[0].name
+        if not selected_endpoint or actual_endpoint == selected_endpoint:
+            return None
+
+        selected_provider = self._providers.get(selected_endpoint)
+        switch_reason = "auto_selection"
+        missing: list[str] = []
+        if selected_provider is None:
+            switch_reason = "selected_endpoint_missing"
+        elif not selected_provider.is_healthy:
+            switch_reason = "selected_endpoint_unhealthy"
+        else:
+            cfg = selected_provider.config
+            if require_tools and not cfg.has_capability("tools"):
+                missing.append("tools")
+            if require_vision and not cfg.has_capability("vision"):
+                missing.append("vision")
+            if require_video and not cfg.has_capability("video"):
+                missing.append("video")
+            if require_thinking and not cfg.has_capability("thinking"):
+                missing.append("thinking")
+            if require_audio and not cfg.has_capability("audio"):
+                missing.append("audio")
+            if require_pdf and not cfg.has_capability("pdf"):
+                missing.append("pdf")
+            if missing:
+                switch_reason = "capability_mismatch"
+
+        return {
+            "type": "endpoint_meta",
+            "endpoint_name": actual_endpoint,
+            "selected_endpoint": selected_endpoint,
+            "prefer_switched": True,
+            "switch_reason": switch_reason,
+            "missing_capabilities": missing,
+        }
+
+    # ==================== 端点筛选 ====================
+
+    def _filter_eligible_endpoints(
+        self,
+        require_tools: bool = False,
+        require_vision: bool = False,
+        require_video: bool = False,
+        require_thinking: bool = False,
+        require_audio: bool = False,
+        require_pdf: bool = False,
+        conversation_id: str | None = None,
+        prefer_endpoint: str | None = None,
+        request_endpoint: str | None = None,
+        request_policy: str = "prefer",
+    ) -> list[LLMProvider]:
+        """筛选支持所需能力的端点
+
+        注意：
+        - enable_thinking=True 时，优先/要求端点具备 thinking 能力（避免能力/格式退化）
+        - 如果有临时覆盖且覆盖端点支持所需能力，优先使用覆盖端点
+        - prefer_endpoint: 端点亲和性，有工具上下文时传入上次成功的端点名称，
+          将其提升到队列前端（优先于 priority 排序，但低于 override）
+        """
+        # 清理过期的 override
+        # 1) 清理当前 conversation 的过期 override
+        if conversation_id:
+            ov = self._conversation_overrides.get(conversation_id)
+            if ov and ov.is_expired:
+                self._conversation_overrides.pop(conversation_id, None)
+        # 2) 清理全局 override
+        if self._endpoint_override and self._endpoint_override.is_expired:
+            logger.info("[LLM] Override expired, restoring default")
+            self._endpoint_override = None
+        # 3) 定期清理所有过期的 conversation overrides（防止内存泄漏）
+        #    仅当积累超过阈值时触发，避免每次调用都遍历
+        if len(self._conversation_overrides) > 50:
+            expired_keys = [k for k, v in self._conversation_overrides.items() if v.is_expired]
+            for k in expired_keys:
+                self._conversation_overrides.pop(k, None)
+            if expired_keys:
+                logger.debug(f"[LLM] Cleaned {len(expired_keys)} expired conversation overrides")
+
+        eligible = []
+        override_provider = None
+
+        if request_endpoint and request_policy == "require":
+            provider = self._providers.get(request_endpoint)
+            if provider is None:
+                return []
+            missing = self._missing_required_capabilities(
+                provider,
+                require_tools=require_tools,
+                require_vision=require_vision,
+                require_video=require_video,
+                require_audio=require_audio,
+                require_pdf=require_pdf,
+            )
+            if missing:
+                return []
+            return [provider]
+
+        # 如果有临时覆盖，检查覆盖端点（conversation > global）
+        effective_override = None
+        if not request_endpoint:
+            if conversation_id and conversation_id in self._conversation_overrides:
+                effective_override = self._conversation_overrides.get(conversation_id)
+            else:
+                effective_override = self._endpoint_override
+
+        if effective_override:
+            override_name = effective_override.endpoint_name
+            if override_name in self._providers:
+                provider = self._providers[override_name]
+                if effective_override.policy == "require":
+                    missing = self._missing_required_capabilities(
+                        provider,
+                        require_tools=require_tools,
+                        require_vision=require_vision,
+                        require_video=require_video,
+                        require_audio=require_audio,
+                        require_pdf=require_pdf,
+                    )
+                    if missing:
+                        logger.warning(
+                            f"[LLM] Required endpoint {override_name} lacks capability: "
+                            f"{', '.join(missing)}. Not falling back to other endpoints."
+                        )
+                        return []
+                    if require_thinking and not provider.config.has_capability("thinking"):
+                        logger.info(
+                            f"[LLM] Required endpoint {override_name} lacks thinking capability; "
+                            "thinking will be disabled for this request."
+                        )
+                    if not provider.is_healthy:
+                        logger.warning(
+                            f"[LLM] Required endpoint {override_name} is unhealthy; "
+                            "trying it anyway and not falling back."
+                        )
+                    return [provider]
+                if provider.is_healthy:
+                    override_provider = provider
+                    logger.info(f"[LLM] Using user-selected endpoint: {override_name}")
+                else:
+                    cooldown = provider.cooldown_remaining
+                    logger.warning(
+                        f"[LLM] User-selected endpoint {override_name} is unhealthy "
+                        f"(cooldown: {cooldown}s), falling back to other endpoints"
+                    )
+
+        for name, provider in self._providers.items():
+            # 永久跳过认证失败的端点
+            if name in LLMClient._auth_failed_endpoints:
+                continue
+
+            # 检查健康状态（包括冷静期）
+            if not provider.is_healthy:
+                cooldown = provider.cooldown_remaining
+                if cooldown > 0:
+                    logger.debug(f"[LLM] endpoint={name} skipped (cooldown: {cooldown}s remaining)")
+                continue
+
+            config = provider.config
+
+            if require_tools and not config.has_capability("tools"):
+                continue
+            if require_vision and not config.has_capability("vision"):
+                continue
+            if require_video and not config.has_capability("video"):
+                continue
+            if require_thinking and not config.has_capability("thinking"):
+                continue
+            if require_audio and not config.has_capability("audio"):
+                continue
+            if require_pdf and not config.has_capability("pdf"):
+                continue
+
+            # Relay capability filter: if the user ran "Sync models" and
+            # the relay's catalog does NOT include this endpoint's
+            # configured model, drop it early instead of letting the
+            # request blow up with a 404 several seconds later. When
+            # no catalog has ever been probed, supports_model() returns
+            # True so legacy / first-run setups still work.
+            if not config.supports_model(config.model):
+                logger.info(
+                    "[LLM] endpoint=%s skipped: relay catalog does not "
+                    "include model %r (last synced at %s). Run Sync "
+                    "Models again or change the model.",
+                    name,
+                    config.model,
+                    config.models_synced_at,
+                )
+                continue
+
+            eligible.append(provider)
+
+        # 按优先级排序
+        eligible.sort(key=lambda p: p.config.priority)
+
+        # ── Directed fallback chain ────────────────────────────────────
+        # When an endpoint configures ``fallback_enabled=True`` and
+        # ``fallback_endpoint=<name>``, promote that named endpoint to
+        # be tried IMMEDIATELY AFTER this one (overriding the priority
+        # order for that one slot). This lets the user say "if my relay
+        # fails, prefer official Anthropic" without juggling priorities
+        # against every other endpoint in the list. The chain is one
+        # hop deep on purpose — multi-hop fallback is almost always a
+        # configuration smell that hides a real availability problem.
+        # No-op when no endpoint opts in, so legacy behaviour is the
+        # default and the next-eligible-by-priority path is unaffected.
+        if any(p.config.fallback_enabled and p.config.fallback_endpoint for p in eligible):
+            by_name = {p.name: p for p in eligible}
+            seen: set[str] = set()
+            ordered: list = []
+            for prov in eligible:
+                if prov.name in seen:
+                    continue
+                ordered.append(prov)
+                seen.add(prov.name)
+                fb = (prov.config.fallback_endpoint or "").strip()
+                if prov.config.fallback_enabled and fb and fb in by_name and fb not in seen:
+                    ordered.append(by_name[fb])
+                    seen.add(fb)
+            eligible = ordered
+
+        # 端点亲和性：有工具上下文时，将上次成功的端点提升到队列前端
+        # 这样 failover 后的下一次调用会继续使用成功的端点，而不是回到高优先级的故障端点
+        if prefer_endpoint:
+            prefer_provider = next((p for p in eligible if p.name == prefer_endpoint), None)
+            if prefer_provider:
+                eligible.remove(prefer_provider)
+                eligible.insert(0, prefer_provider)
+                logger.debug(
+                    f"[LLM] Endpoint affinity: prefer {prefer_endpoint} "
+                    f"(last successful endpoint with tool context)"
+                )
+
+        # 如果有有效的 override，将其放到最前面（override 优先于亲和性）
+        if override_provider and override_provider in eligible:
+            eligible.remove(override_provider)
+            eligible.insert(0, override_provider)
+        elif override_provider and override_provider not in eligible:
+            # 用户显式选择的端点因能力推断被排除。
+            # 只有当缺失的仅是 thinking 能力时才追加为 fallback（thinking 推断最不可靠）。
+            # 缺失 tools/vision 等硬能力时不追加，避免每次请求都先失败再 fallback 导致延迟。
+            missing = []
+            cfg = override_provider.config
+            if require_tools and not cfg.has_capability("tools"):
+                missing.append("tools")
+            if require_thinking and not cfg.has_capability("thinking"):
+                missing.append("thinking")
+            if require_vision and not cfg.has_capability("vision"):
+                missing.append("vision")
+            if require_video and not cfg.has_capability("video"):
+                missing.append("video")
+            if require_audio and not cfg.has_capability("audio"):
+                missing.append("audio")
+            if require_pdf and not cfg.has_capability("pdf"):
+                missing.append("pdf")
+
+            hard_missing = [m for m in missing if m != "thinking"]
+            if not hard_missing:
+                # 仅缺 thinking — 追加为 fallback（末尾），不影响正常端点优先级
+                eligible.append(override_provider)
+                logger.info(
+                    f"[LLM] User-selected endpoint {override_provider.name} "
+                    f"lacks thinking capability; appended as non-thinking fallback"
+                )
+            elif not eligible:
+                # 无其他可用端点，只能用这个
+                eligible.append(override_provider)
+                logger.warning(
+                    f"[LLM] User-selected endpoint {override_provider.name} "
+                    f"may lack capability: {', '.join(missing)}. "
+                    f"No alternatives available, using it as last resort."
+                )
+            else:
+                logger.warning(
+                    f"[LLM] User-selected endpoint {override_provider.name} "
+                    f"lacks hard capabilities: {', '.join(hard_missing)}. "
+                    f"Skipping to avoid unnecessary API failures. "
+                    f"Using {eligible[0].name} instead."
+                )
+
+        return eligible
+
+    @staticmethod
+    def _missing_required_capabilities(
+        provider: LLMProvider,
+        *,
+        require_tools: bool = False,
+        require_vision: bool = False,
+        require_video: bool = False,
+        require_audio: bool = False,
+        require_pdf: bool = False,
+    ) -> list[str]:
+        """Return hard capabilities missing from a provider.
+
+        Thinking is intentionally excluded because it can be disabled per request
+        without preventing the user's actual task from running.
+        """
+        config = provider.config
+        missing = []
+        if require_tools and not config.has_capability("tools"):
+            missing.append("tools")
+        if require_vision and not config.has_capability("vision"):
+            missing.append("vision")
+        if require_video and not config.has_capability("video"):
+            missing.append("video")
+        if require_audio and not config.has_capability("audio"):
+            missing.append("audio")
+        if require_pdf and not config.has_capability("pdf"):
+            missing.append("pdf")
+        return missing
+
+    @staticmethod
+    async def _race_with_cancel(
+        awaitable,
+        cancel_event: asyncio.Event,
+    ) -> LLMResponse:
+        """Race an awaitable against a cancellation event.
+
+        Returns the awaitable's result if it completes first.
+        Raises UserCancelledError if cancel_event fires first,
+        after cleanly cancelling the in-flight task.
+        """
+        task = asyncio.ensure_future(awaitable)
+        cancel_waiter = asyncio.ensure_future(cancel_event.wait())
+        try:
+            done, pending = await asyncio.wait(
+                [task, cancel_waiter],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for p in pending:
+                p.cancel()
+                try:
+                    await p
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            if task in done:
+                return task.result()
+
+            raise UserCancelledError(
+                reason="用户请求停止",
+                source="llm_request_cancelled",
+            )
+        except BaseException:
+            for t in (task, cancel_waiter):
+                if not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+            raise
+
+    def _apply_output_token_range_feedback(
+        self,
+        request: LLMRequest,
+        error: LLMError,
+        *,
+        log_prefix: str,
+        endpoint_name: str,
+    ) -> bool:
+        """Apply upstream-declared output token limits to the next retry."""
+        from .retry import extract_output_token_upper_bound
+
+        suggested_max = extract_output_token_upper_bound(error)
+        if not suggested_max:
+            return False
+        if request.max_tokens > 0 and request.max_tokens <= suggested_max:
+            return False
+
+        current = request.max_tokens or 0
+        request.max_tokens = suggested_max
+        logger.info(
+            f"{log_prefix} endpoint={endpoint_name} max_tokens range rejected, "
+            f"adjusting {current or 'auto'} → {request.max_tokens} and retrying"
+        )
+        return True
+
+    async def _try_with_retry(
+        self,
+        operation,
+        *,
+        cancel_event: asyncio.Event | None = None,
+        max_attempts: int = 3,
+        request: LLMRequest | None = None,
+        provider_name: str = "",
+    ):
+        """统一重试包装器，基于结构化 HTTP 状态码决策。
+
+        - 413: 自动将 max_tokens 减半并重试一次
+        - 429/529/503: 指数退避 + jitter（cancel-aware）
+        - cancel_event: 与取消事件赛跑
+        - 无 status_code 的错误（超时/连接）: 退回旧版字符串匹配重试判定
+
+        不处理（抛给调用方）:
+        - AuthenticationError
+        - 非瞬时性错误（结构性、内容级等）
+        """
+        from .retry import should_retry as _legacy_should_retry
+
+        _413_retried = False
+        _token_range_retried = False
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            if cancel_event and cancel_event.is_set():
+                raise UserCancelledError(reason="用户请求停止", source="llm_retry")
+
+            try:
+                if cancel_event:
+                    return await self._race_with_cancel(operation(), cancel_event)
+                return await operation()
+
+            except (UserCancelledError, asyncio.CancelledError):
+                raise
+            except AuthenticationError:
+                raise
+
+            except LLMError as e:
+                last_error = e
+                sc = e.status_code
+
+                if (
+                    sc == 400
+                    and request
+                    and not _token_range_retried
+                    and self._apply_output_token_range_feedback(
+                        request,
+                        e,
+                        log_prefix="[LLM]",
+                        endpoint_name=provider_name,
+                    )
+                ):
+                    _token_range_retried = True
+                    continue
+
+                # 413 Payload Too Large → 自动缩减 max_tokens 50%，仅一次
+                if sc == 413 and request and not _413_retried:
+                    _413_retried = True
+                    current = request.max_tokens or 16384
+                    request.max_tokens = max(current // 2, 1024)
+                    logger.info(
+                        f"[LLM] endpoint={provider_name} status=413, "
+                        f"reducing max_tokens {current} → {request.max_tokens}"
+                    )
+                    continue
+
+                # 判定是否可重试（优先 status_code，回退字符串匹配）
+                if sc is not None:
+                    is_retryable = sc in (429, 529, 503)
+                else:
+                    is_retryable = _legacy_should_retry(e, attempt, max_attempts)
+
+                if is_retryable and attempt < max_attempts:
+                    delay = self._get_retry_delay(attempt, e)
+                    logger.info(
+                        f"[LLM] endpoint={provider_name} "
+                        f"{'status=' + str(sc) if sc else 'transient'} "
+                        f"retry {attempt}/{max_attempts} after {delay:.1f}s"
+                    )
+                    if cancel_event:
+                        try:
+                            await asyncio.wait_for(
+                                cancel_event.wait(),
+                                timeout=delay,
+                            )
+                            raise UserCancelledError(
+                                reason="用户请求停止",
+                                source="llm_retry_backoff",
+                            )
+                        except TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(delay)
+                    continue
+
+                raise
+
+        if last_error:
+            raise last_error
+
+    async def _try_endpoints(
+        self,
+        providers: list[LLMProvider],
+        request: LLMRequest,
+        allow_failover: bool = True,
+        cancel_event: asyncio.Event | None = None,
+    ) -> LLMResponse:
+        """尝试多个端点，通过 _try_with_retry 实现每端点重试。
+
+        策略可配置：
+        - retry_same_endpoint_first: True 时，即使有备选也先在当前端点重试
+        - retry_count: 重试次数
+
+        Args:
+            providers: 端点列表（按优先级排序）
+            request: LLM 请求
+            allow_failover: 控制端点切换策略
+                - True: 无工具上下文，快速切换（每个端点只试 1 次）
+                - False: 有工具上下文，先重试当前端点多次再切到下一个
+
+        默认策略：有备选端点时快速切换，不重试同一个端点（提高响应速度）
+        工具上下文：每个端点重试 retry_count 次后才切到下一个（保持连续性）
+        所有端点都按优先级依次尝试，无论 allow_failover 值
+        """
+        from .providers.base import COOLDOWN_GLOBAL_FAILURE
+
+        errors: list[str] = []
+        failed_providers: list[LLMProvider] = []
+        for p in providers:
+            p._content_error = False
+        retry_count = self._settings.get("retry_count", 2)
+        retry_same_first = self._settings.get("retry_same_endpoint_first", False)
+
+        has_fallback = len(providers) > 1
+        # 本地模型端点（local-* 前缀或回环地址）：即使有备选也要先在当前端点
+        # 重试。本地模型冷启动/显存协调期间返回 503 model_loading /
+        # model_suppressed 是加载完成后必然恢复的瞬时错误，按上游
+        # retry_after_sec 等待重试，比立即切换端点更有效（切换同样要等加载）。
+        _has_local_endpoint = any(
+            p.name.startswith("local-")
+            or "127.0.0.1" in (p.base_url or "")
+            or "localhost" in (p.base_url or "").lower()
+            for p in providers
+        )
+        if retry_same_first or not allow_failover or _has_local_endpoint:
+            max_attempts = retry_count + 1
+        else:
+            max_attempts = 1 if (has_fallback and allow_failover) else (retry_count + 1)
+
+        for i, provider in enumerate(providers):
+            if cancel_event and cancel_event.is_set():
+                raise UserCancelledError(reason="用户请求停止", source="llm_try_endpoints")
+
+            _thinking_downgraded = False
+            if request.enable_thinking and not provider.config.has_capability("thinking"):
+                request.enable_thinking = False
+                _thinking_downgraded = True
+                logger.info(
+                    f"[LLM] endpoint={provider.name} thinking soft-disabled "
+                    f"(endpoint lacks thinking capability)"
+                )
+
+            try:
+                tools_count = len(request.tools) if request.tools else 0
+                logger.info(
+                    f"[LLM] endpoint={provider.name} model={provider.model} "
+                    f"action=request tools={tools_count}"
+                )
+
+                response = await self._try_with_retry(
+                    lambda p=provider: p.chat(request),
+                    cancel_event=cancel_event,
+                    max_attempts=max_attempts,
+                    request=request,
+                    provider_name=provider.name,
+                )
+
+                provider.record_success()
+                logger.info(
+                    f"[LLM] endpoint={provider.name} model={provider.model} "
+                    f"action=response tokens_in={response.usage.input_tokens} "
+                    f"tokens_out={response.usage.output_tokens}"
+                )
+                async with self._endpoint_lock:
+                    self._last_success_endpoint = provider.name
+                response.endpoint_name = provider.name
+                # 标记 failover 信息供上层（reasoning_engine）发送通知
+                if i > 0 and providers:
+                    response._failover_from = providers[0].name  # type: ignore[attr-defined]
+                # Vision 降级标记：消息含图片但所选端点不支持 vision，
+                # 此时图片已在 converter 中被替换为占位文本，给上层一个
+                # endpoint_notice 钩子，让前端能渲染系统气泡告知用户。
+                try:
+                    if not provider.config.has_capability("vision") and self._has_images(
+                        request.messages
+                    ):
+                        response._vision_degraded = True  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+                # ── 自愈: thinking 模式静默失败（HTTP 200 但内容为空） ──
+                # 部分 API 代理/中转接受 thinking 参数但在响应中剥离推理内容，
+                # 导致 output_tokens > 0 但 content 为空。
+                # 策略：仅对当前请求降级重试一次，不永久禁用 thinking。
+                # 必须在 content lost failover 块之前执行，否则 endpoint 会被切换掉。
+                if (
+                    not response.content
+                    and response.usage.output_tokens > 0
+                    and request.enable_thinking
+                    and not getattr(request, "_thinking_silent_retried", False)
+                ):
+                    logger.warning(
+                        f"[LLM] endpoint={provider.name}: thinking mode produced "
+                        f"{response.usage.output_tokens} output tokens but 0 visible content "
+                        f"(proxy may strip reasoning_content). "
+                        f"Retrying once with thinking disabled."
+                    )
+                    request._thinking_silent_retried = True  # type: ignore[attr-defined]
+                    _saved_thinking = request.enable_thinking
+                    _saved_depth = request.thinking_depth
+                    request.enable_thinking = False
+                    request.thinking_depth = None
+                    try:
+                        response = await self._try_with_retry(
+                            lambda p=provider: p.chat(request),
+                            cancel_event=cancel_event,
+                            max_attempts=max_attempts,
+                            request=request,
+                            provider_name=provider.name,
+                        )
+                        response.endpoint_name = provider.name
+                        if i > 0 and providers:
+                            response._failover_from = providers[0].name  # type: ignore[attr-defined]
+                        response._thinking_fallback = True  # type: ignore[attr-defined]
+                        logger.info(
+                            f"[LLM] endpoint={provider.name}: thinking fallback succeeded, "
+                            f"tokens_out={response.usage.output_tokens} "
+                            f"content_blocks={len(response.content)}"
+                        )
+                        return response
+                    except Exception as retry_err:
+                        logger.warning(
+                            f"[LLM] endpoint={provider.name}: thinking fallback retry "
+                            f"also failed: {retry_err}"
+                        )
+                        request.enable_thinking = _saved_thinking
+                        request.thinking_depth = _saved_depth
+                        # 落到下面 content lost failover 兜底
+
+                # ── 结构性失败: 有 token 但无内容 → 切换端点 (#418) ──
+                # 部分代理返回 content:null 但 output_tokens>0，
+                # 应视为端点异常而非成功，触发 failover。
+                # PR-C2: 如果 provider 已经从 reasoning_content / data.output 等字段
+                # 自愈了 content，``response.recovered_from`` 非空，本端点视为成功，
+                # 不触发 failover、不进 cooldown。
+                if not response.content and response.usage.output_tokens > 0:
+                    if getattr(response, "recovered_from", ""):
+                        # 不应该到这一行（content 应已被 fallback 填充），保险起见兜底
+                        logger.info(
+                            f"[LLM] endpoint={provider.name} content recovered from "
+                            f"{response.recovered_from}, treating as success"
+                        )
+                        return response
+                    logger.warning(
+                        f"[LLM] CONTENT LOST: endpoint={provider.name} "
+                        f"tokens_out={response.usage.output_tokens} but content is empty "
+                        f"(enable_thinking={request.enable_thinking}, "
+                        f"stream_only={getattr(provider, '_stream_only', False)}, "
+                        f"reasoning={bool(getattr(response, 'reasoning_content', None))})"
+                    )
+                    provider._content_error = True
+                    errors.append(
+                        f"{provider.name}: Content lost "
+                        f"({response.usage.output_tokens} output tokens, 0 content)"
+                    )
+                    # 如果还有其他端点，切换过去尝试
+                    if i < len(providers) - 1:
+                        logger.info(f"[LLM] Content lost on {provider.name}, trying next endpoint")
+                        failed_providers.append(provider)
+                        continue
+                    # 最后一个端点也失败了，返回空响应（让上层处理兜底文案）
+                    logger.warning(
+                        f"[LLM] Content lost on ALL endpoints, "
+                        f"returning empty response from {provider.name}"
+                    )
+                    return response
+
+                return response
+
+            except (UserCancelledError, asyncio.CancelledError):
+                raise
+
+            except RateLimitError as e:
+                # 429 限速：短冷静期，立即切换到下一端点（重试同一端点无意义）#324
+                # 所有端点都限速时 _resolve 的 transient 等待路径会处理
+                error_str = _classification_error_text(e)
+                logger.warning(
+                    f"[LLM] endpoint={provider.name} rate_limited, "
+                    f"switching to next endpoint. Error: {error_str[:200]}"
+                )
+                errors.append(f"{provider.name}: {e}")
+                provider.report_upstream_rate_limit(error_str)
+                provider.mark_unhealthy(error_str, category="transient")
+                failed_providers.append(provider)
+                continue
+
+            except AuthenticationError as e:
+                error_str = _classification_error_text(e)
+                from .providers.base import LLMProvider as _BaseProvider
+
+                error_cat = _BaseProvider._classify_error(error_str)
+                if error_cat == "quota":
+                    logger.error(f"[LLM] endpoint={provider.name} quota_exhausted={e}")
+                    provider.mark_unhealthy(error_str, category="quota")
+                else:
+                    LLMClient._auth_failed_endpoints.add(provider.name)
+                    provider.mark_unhealthy(error_str, category="auth")
+                    if provider.name not in LLMClient._auth_logged_endpoints:
+                        LLMClient._auth_logged_endpoints.add(provider.name)
+                        logger.error(
+                            f"[LLM] endpoint={provider.name} permanently disabled "
+                            f"(auth failure). Fix the API key in settings and reload/restart."
+                        )
+                errors.append(f"{provider.name}: {e}")
+                failed_providers.append(provider)
+
+            except LLMError as e:
+                error_str = _classification_error_text(e)
+                logger.warning(f"[LLM] endpoint={provider.name} action=error error={e}")
+                errors.append(f"{provider.name}: {e}")
+
+                from .providers.base import LLMProvider as _BaseProvider
+
+                auto_category = _BaseProvider._classify_error(error_str)
+
+                if auto_category == "quota":
+                    logger.error(
+                        f"[LLM] endpoint={provider.name} quota exhausted detected in LLMError, "
+                        f"skipping. Error: {error_str[:200]}"
+                    )
+                    provider.mark_unhealthy(error_str, category="quota")
+                    failed_providers.append(provider)
+
+                elif self._try_self_heal(e, request, provider):
+                    # Self-healing modified request; retry with healed params
+                    try:
+                        response = await self._try_with_retry(
+                            lambda p=provider: p.chat(request),
+                            cancel_event=cancel_event,
+                            max_attempts=max_attempts,
+                            request=request,
+                            provider_name=provider.name,
+                        )
+                        provider.record_success()
+                        logger.info(
+                            f"[LLM] endpoint={provider.name} model={provider.model} "
+                            f"action=response (healed) tokens_in={response.usage.input_tokens} "
+                            f"tokens_out={response.usage.output_tokens}"
+                        )
+                        async with self._endpoint_lock:
+                            self._last_success_endpoint = provider.name
+                        response.endpoint_name = provider.name
+                        return response
+                    except (UserCancelledError, asyncio.CancelledError):
+                        raise
+                    except Exception as heal_err:
+                        logger.warning(
+                            f"[LLM] endpoint={provider.name} self-heal retry failed: {heal_err}"
+                        )
+                        provider.mark_unhealthy(str(heal_err))
+                        failed_providers.append(provider)
+
+                else:
+                    _err_lower = error_str.lower()
+                    non_retryable_patterns = [
+                        "invalid_request_error",
+                        "invalid function response",
+                        "invalid_parameter",
+                        "messages with role",
+                        "must be a response to a preceeding message",
+                        "does not support",
+                        "not supported",
+                        "reasoning_content is missing",
+                        "missing reasoning_content",
+                        "missing 'reasoning_content'",
+                        "data_inspection_failed",
+                        "inappropriate content",
+                        "(413)",
+                        "payload too large",
+                        "request entity too large",
+                        "larger than allowed",
+                    ]
+                    is_non_retryable = any(p in _err_lower for p in non_retryable_patterns)
+
+                    if is_non_retryable:
+                        _content_error_patterns = [
+                            "exceeded limit",
+                            "max bytes",
+                            "payload too large",
+                            "request entity too large",
+                            "content too large",
+                            "larger than allowed",
+                            "(413)",
+                            "context length",
+                            "too many tokens",
+                            "string too long",
+                            "data_inspection",
+                            "inappropriate content",
+                        ]
+                        if any(p in _err_lower for p in _content_error_patterns):
+                            logger.error(
+                                f"[LLM] endpoint={provider.name} content-level error "
+                                f"(NOT cooling down endpoint): {error_str[:200]}"
+                            )
+                            provider._content_error = True
+                        else:
+                            logger.error(
+                                f"[LLM] endpoint={provider.name} non-retryable structural error: "
+                                f"{error_str[:200]}"
+                            )
+                            provider.mark_unhealthy(error_str, category="structural")
+                        failed_providers.append(provider)
+                    else:
+                        provider.mark_unhealthy(error_str)
+                        failed_providers.append(provider)
+                        logger.warning(
+                            f"[LLM] endpoint={provider.name} "
+                            f"cooldown={provider.cooldown_remaining}s "
+                            f"(category={provider.error_category})"
+                        )
+
+            except Exception as e:
+                logger.error(
+                    f"[LLM] endpoint={provider.name} unexpected_error={e}",
+                    exc_info=True,
+                )
+                provider.mark_unhealthy(str(e))
+                errors.append(f"{provider.name}: {e}")
+                failed_providers.append(provider)
+                logger.warning(
+                    f"[LLM] endpoint={provider.name} "
+                    f"cooldown={provider.cooldown_remaining}s "
+                    f"(category={provider.error_category})"
+                )
+
+            finally:
+                if _thinking_downgraded:
+                    request.enable_thinking = True
+
+            if i < len(providers) - 1:
+                next_provider = providers[i + 1]
+                logger.warning(
+                    f"[LLM] endpoint={provider.name} action=failover target={next_provider.name}"
+                    + (" (tool_context, retried same endpoint first)" if not allow_failover else "")
+                )
+
+        # ── 全局故障检测 ──
+        if len(failed_providers) >= 2:
+            transient_count = sum(1 for fp in failed_providers if fp.error_category == "transient")
+            if transient_count >= len(failed_providers) * 0.5:
+                shortened = 0
+                for fp in failed_providers:
+                    if fp.error_category == "transient" and not fp.is_extended_cooldown:
+                        fp.shorten_cooldown(COOLDOWN_GLOBAL_FAILURE)
+                        shortened += 1
+                if shortened:
+                    logger.warning(
+                        f"[LLM] Global failure detected: {len(failed_providers)} endpoints failed "
+                        f"({transient_count} transient). Likely network issue on host. "
+                        f"Shortened {shortened} endpoint cooldowns to {COOLDOWN_GLOBAL_FAILURE}s "
+                        f"(skipped {transient_count - shortened} with progressive backoff)."
+                    )
+
+        if not allow_failover:
+            logger.warning(
+                "[LLM] Tool context detected. All endpoints exhausted (each retried before failover). "
+                "Upper layer (Agent/TaskMonitor) may restart with a different strategy."
+            )
+
+        hint = _friendly_error_hint(failed_providers)
+        has_content_error = any(getattr(fp, "_content_error", False) for fp in failed_providers)
+        all_structural = has_content_error or all(
+            fp.error_category == "structural" for fp in failed_providers
+        )
+        raise AllEndpointsFailedError(
+            f"All endpoints failed: {'; '.join(errors)}\n{hint}",
+            is_structural=all_structural,
+            error_categories={fp.error_category for fp in failed_providers if fp.error_category},
+        )
+
+    def _try_self_heal(self, error: LLMError, request: LLMRequest, provider) -> bool:
+        """尝试基于错误信息自愈请求参数。
+
+        修改 request 原地属性，返回 True 表示已修复、应重试。
+        每种自愈类型仅触发一次（通过 request 上的标记位防循环）。
+        """
+        error_str = _classification_error_text(error).lower()
+
+        # ── 自愈: 端点实际不接受 image_url ──
+        # 模型能力表和用户配置只是先验；中转站/自定义模型常会到运行时才
+        # 返回 "image_url not supported"。此时不让整轮任务失败，也不永久
+        # 改写配置，只在当前 provider 上标记并重建请求体，让转换器把图片
+        # 降级为短文本占位后重试一次。
+        _vision_reject_patterns = (
+            "image_url",
+            "image input",
+            "image content",
+            "vision",
+        )
+        _unsupported_patterns = (
+            "not supported",
+            "does not support",
+            "unsupported",
+            "message type",
+        )
+        if any(p in error_str for p in _vision_reject_patterns) and any(
+            p in error_str for p in _unsupported_patterns
+        ):
+            if not getattr(request, "_vision_payload_stripped", False):
+                request._vision_payload_stripped = True  # type: ignore[attr-defined]
+                provider._vision_payload_unsupported = True  # type: ignore[attr-defined]
+                logger.info(
+                    f"[LLM] endpoint={provider.name} rejected image payload, "
+                    "self-healing: degrading images to text for this endpoint"
+                )
+                return True
+
+        # ── 自愈 0: OpenAI-compatible 工具消息链错序 ──
+        _tool_sequence_patterns = [
+            "messages with role 'tool'",
+            'messages with role "tool"',
+            "must be a response to a preceding message with 'tool_calls'",
+            "must be a response to a preceeding message with 'tool_calls'",
+            "tool_call_id",
+        ]
+        if any(p in error_str for p in _tool_sequence_patterns):
+            if not getattr(request, "_tool_sequence_healed", False):
+                request._tool_sequence_healed = True  # type: ignore[attr-defined]
+                request.messages = self._downgrade_tool_protocol_messages(request.messages)
+                logger.info(
+                    f"[LLM] endpoint={provider.name} tool message sequence error, "
+                    "self-healing: downgraded tool protocol history to text context"
+                )
+                return True
+
+        # ── 自愈 1: reasoning_content 缺失 ──
+        _reasoning_patterns = [
+            "reasoning_content is missing",
+            "missing reasoning_content",
+            "missing `reasoning_content`",
+            "missing 'reasoning_content'",
+            "thinking is enabled but reasoning_content is missing",
+        ]
+        if any(p in error_str for p in _reasoning_patterns):
+            if not getattr(request, "_reasoning_healed", False):
+                request._reasoning_healed = True  # type: ignore[attr-defined]
+                request.enable_thinking = True
+                logger.info(
+                    f"[LLM] endpoint={provider.name} reasoning_content error, "
+                    f"self-healing: enable_thinking=True"
+                )
+                return True
+
+        # ── 自愈 2: 端点拒绝 thinking / reasoning_effort 参数 ──
+        _reject_patterns = [
+            "extra_forbidden",
+            "extra inputs are not permitted",
+            "unsupported parameter",
+            "invalid params",
+        ]
+        if any(p in error_str for p in _reject_patterns) and (
+            "thinking" in error_str or "reasoning_effort" in error_str
+        ):
+            if not getattr(request, "_thinking_stripped", False):
+                request._thinking_stripped = True  # type: ignore[attr-defined]
+                request.enable_thinking = False
+                request.thinking_depth = None
+                provider._thinking_params_unsupported = True  # type: ignore[attr-defined]
+                logger.info(
+                    f"[LLM] endpoint={provider.name} rejected thinking params, "
+                    f"self-healing: disabling thinking mode"
+                )
+                return True
+
+        return False
+
+    @staticmethod
+    def _downgrade_tool_protocol_messages(messages: list[Message]) -> list[Message]:
+        """Convert tool protocol blocks to plain context for one retry.
+
+        This is only used after an upstream API rejects the tool message chain.
+        It preserves useful evidence for the model without sending ``role=tool``
+        messages or assistant ``tool_calls`` again.
+        """
+        downgraded: list[Message] = []
+        for msg in messages:
+            if isinstance(msg.content, str):
+                downgraded.append(msg)
+                continue
+
+            rebuilt: list[ContentBlock] = []
+            tool_call_names: list[str] = []
+            for block in msg.content:
+                if isinstance(block, ToolUseBlock):
+                    tool_call_names.append(block.name or block.id or "unknown")
+                    continue
+                if isinstance(block, ToolResultBlock):
+                    content = block.content
+                    if not isinstance(content, str):
+                        content = str(content)
+                    rebuilt.append(
+                        TextBlock(text=f"[工具结果记录: {block.tool_use_id}]\n{content}")
+                    )
+                    continue
+                rebuilt.append(block)
+
+            if tool_call_names:
+                rebuilt.append(
+                    TextBlock(
+                        text=(f"[工具调用记录已转为普通上下文: {', '.join(tool_call_names)}]")
+                    )
+                )
+
+            if rebuilt:
+                downgraded.append(
+                    Message(
+                        role=msg.role,
+                        content=rebuilt,
+                        reasoning_content=msg.reasoning_content,
+                    )
+                )
+
+        return downgraded
+
+    def _normalize_messages(self, messages: list[Message]) -> list[Message]:
+        """消息规范化管线：发送前统一格式。
+
+        将内部消息转为 dict 进行规范化，然后转回 Message 对象。
+        """
+        try:
+            msg_dicts = [m.to_dict() for m in messages]
+            normalized = normalize_messages_for_api(msg_dicts)
+            return [self._dict_to_message(m) for m in normalized]
+        except Exception as e:
+            logger.debug("Message normalization skipped: %s", e)
+            return messages
+
+    @staticmethod
+    def _dict_to_message(m: dict) -> Message:
+        """Convert a normalized dict back to a Message with proper ContentBlock types."""
+        content = m["content"]
+        if isinstance(content, str):
+            return Message(role=m["role"], content=content)
+
+        rebuilt: list = []
+        for block in content:
+            if isinstance(block, ContentBlock):
+                rebuilt.append(block)
+                continue
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type", "")
+            if btype == "text":
+                rebuilt.append(TextBlock(text=block.get("text", "")))
+            elif btype == "tool_use":
+                rebuilt.append(
+                    ToolUseBlock(
+                        id=block.get("id", ""),
+                        name=block.get("name", ""),
+                        input=block.get("input", {}),
+                        provider_extra=block.get("provider_extra"),
+                    )
+                )
+            elif btype == "tool_result":
+                rebuilt.append(
+                    ToolResultBlock(
+                        tool_use_id=block.get("tool_use_id", ""),
+                        content=block.get("content", ""),
+                        is_error=block.get("is_error", False),
+                    )
+                )
+            elif btype == "image":
+                source = block.get("source", {})
+                rebuilt.append(
+                    ImageBlock(
+                        image=ImageContent(
+                            media_type=source.get("media_type", "image/png"),
+                            data=source.get("data", ""),
+                        )
+                    )
+                )
+            elif btype == "thinking":
+                rebuilt.append(ThinkingBlock(thinking=block.get("thinking", "")))
+            else:
+                rebuilt.append(TextBlock(text=str(block)))
+
+        return Message(role=m["role"], content=rebuilt if rebuilt else content)
+
+    def _get_retry_delay(self, attempt: int, error: Exception | None = None) -> float:
+        """计算重试延迟（秒）。使用指数退避 + jitter。"""
+        retry_after = None
+        if error:
+            retry_after = getattr(error, "retry_after_seconds", None)
+        delay_ms = calculate_retry_delay(attempt, retry_after)
+        return delay_ms / 1000
+
+    def _has_images(self, messages: list[Message]) -> bool:
+        """检查消息中是否包含图片"""
+        for msg in messages:
+            if isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, ImageBlock):
+                        return True
+        return False
+
+    def _has_videos(self, messages: list[Message]) -> bool:
+        """检查消息中是否包含视频"""
+        for msg in messages:
+            if isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, VideoBlock):
+                        return True
+        return False
+
+    def _has_audio(self, messages: list[Message]) -> bool:
+        """检查消息中是否包含音频"""
+        for msg in messages:
+            if isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, AudioBlock):
+                        return True
+        return False
+
+    def _has_documents(self, messages: list[Message]) -> bool:
+        """检查消息中是否包含文档（PDF 等）"""
+        for msg in messages:
+            if isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, DocumentBlock):
+                        return True
+        return False
+
+    def has_any_endpoint_with_capability(self, capability: str) -> bool:
+        """检查是否有任何端点支持指定能力（供 Agent 查询）"""
+        return any(p.config.has_capability(capability) for p in self._providers.values())
+
+    def _has_tool_context(self, messages: list[Message]) -> bool:
+        """检查消息中是否包含工具调用上下文（tool_use 或 tool_result）
+
+        用于判断是否允许 failover：
+        - 无工具上下文：可以安全 failover 到其他端点
+        - 有工具上下文：禁止 failover，因为不同模型对工具调用格式可能不兼容
+
+        Returns:
+            True 表示包含工具上下文，应禁止 failover
+        """
+        from .types import ToolResultBlock, ToolUseBlock
+
+        for msg in messages:
+            if isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, (ToolUseBlock, ToolResultBlock)):
+                        return True
+                    # 兼容字典格式（某些转换后的消息可能是字典）
+                    if isinstance(block, dict):
+                        block_type = block.get("type", "")
+                        if block_type in ("tool_use", "tool_result"):
+                            return True
+        return False
+
+    def reset_endpoint_cooldown(self, endpoint_name: str) -> bool:
+        """重置指定端点的冷静期
+
+        用于模型切换前确保目标端点可用。不重置连续失败计数
+        （reset_cooldown 保留 _consecutive_cooldowns，如果端点仍有问题
+        下次失败会继续递增退避）。
+
+        Returns:
+            True 如果成功重置，False 如果端点不存在
+        """
+        provider = self._providers.get(endpoint_name)
+        if not provider:
+            return False
+        if not provider.is_healthy:
+            logger.info(
+                f"[LLM] endpoint={endpoint_name} cooldown force-reset for model switch "
+                f"(was category={provider.error_category}, "
+                f"remaining={provider.cooldown_remaining}s)"
+            )
+            provider.reset_cooldown()
+        return True
+
+    def reset_all_cooldowns(self, *, include_structural: bool = False, force_all: bool = False):
+        """重置端点冷静期
+
+        Args:
+            include_structural: 同时重置结构性错误的冷静期。
+            force_all: 无条件重置所有端点冷静期（用户主动重试时使用）。
+        """
+        reset_count = 0
+        for name, provider in self._providers.items():
+            if not provider.is_healthy:
+                cat = provider.error_category
+                if force_all or cat == "transient" or (include_structural and cat == "structural"):
+                    provider.reset_cooldown()
+                    reset_count += 1
+                    logger.info(
+                        f"[LLM] endpoint={name} cooldown reset (category={cat}, force_all={force_all})"
+                    )
+        if reset_count:
+            logger.info(f"[LLM] Reset cooldowns for {reset_count} endpoints")
+        return reset_count
+
+    async def health_check(self) -> dict[str, bool]:
+        """
+        检查所有端点健康状态
+
+        Returns:
+            {endpoint_name: is_healthy}
+        """
+        results = {}
+
+        tasks = [(name, provider.health_check()) for name, provider in self._providers.items()]
+
+        for name, task in tasks:
+            try:
+                results[name] = await task
+            except Exception as e:
+                logger.error(f"Health check failed for {name}: {e}")
+                results[name] = False
+
+        return results
+
+    def get_provider(self, name: str) -> LLMProvider | None:
+        """获取指定名称的 Provider"""
+        return self._providers.get(name)
+
+    def get_default_endpoint_name(self) -> str | None:
+        """Return the highest-priority endpoint eligible for a text request.
+
+        This intentionally ignores global and conversation overrides. Callers
+        that need a stable endpoint for an isolated operation can resolve the
+        workspace default once, then apply their own per-conversation lock.
+        The regular eligibility filter keeps health, authentication failures,
+        configured model catalogs, and endpoint priority consistent with
+        normal non-thinking text requests.
+        """
+        eligible = self._filter_eligible_endpoints()
+        for provider in eligible:
+            if provider.config.has_capability("text"):
+                return provider.config.name
+        return None
+
+    def add_endpoint(self, config: EndpointConfig):
+        """动态添加端点"""
+        provider = self._create_provider(config)
+        if provider:
+            self._endpoints.append(config)
+            self._endpoints.sort(key=lambda x: x.priority)
+            self._providers[config.name] = provider
+
+    def remove_endpoint(self, name: str):
+        """动态移除端点"""
+        if name in self._providers:
+            del self._providers[name]
+        self._endpoints = [ep for ep in self._endpoints if ep.name != name]
+
+    # ==================== 动态模型切换 ====================
+
+    def switch_model(
+        self,
+        endpoint_name: str,
+        hours: float = DEFAULT_OVERRIDE_HOURS,
+        reason: str = "",
+        conversation_id: str | None = None,
+        policy: str = "prefer",
+    ) -> tuple[bool, str]:
+        """
+        临时切换到指定模型
+
+        Args:
+            endpoint_name: 端点名称
+            hours: 有效时间（小时），默认 12 小时
+            reason: 切换原因
+
+        Returns:
+            (成功, 消息)
+        """
+        # 检查端点是否存在
+        if endpoint_name not in self._providers:
+            available = list(self._providers.keys())
+            return False, f"端点 '{endpoint_name}' 不存在。可用端点: {', '.join(available)}"
+
+        # switch_model 是显式的意图声明（用户选模型 / 系统 failover），
+        # 不应被冷静期阻断。如果端点确实有问题，实际请求时 _try_endpoints
+        # 会 mark_unhealthy 并触发 failover，那里才是正确的健康感知层。
+        provider = self._providers[endpoint_name]
+        if not provider.is_healthy:
+            logger.info(
+                f"[LLM] endpoint={endpoint_name} cooldown reset for switch_model "
+                f"(was category={provider.error_category}, "
+                f"remaining={provider.cooldown_remaining}s, reason={reason!r})"
+            )
+            provider.reset_cooldown()
+
+        normalized_policy = (policy or "prefer").strip().lower()
+        if normalized_policy not in {"prefer", "require"}:
+            normalized_policy = "prefer"
+
+        # 创建覆盖配置
+        expires_at = datetime.now() + timedelta(hours=hours)
+        override = EndpointOverride(
+            endpoint_name=endpoint_name,
+            expires_at=expires_at,
+            reason=reason,
+            policy=normalized_policy,
+        )
+        if conversation_id:
+            self._conversation_overrides[conversation_id] = override
+        else:
+            self._endpoint_override = override
+
+        model = provider.config.model
+        expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(
+            f"[LLM] Model switched to {endpoint_name} ({model}), "
+            f"policy={normalized_policy}, expires at {expires_str}"
+        )
+
+        return True, f"已切换到模型: {model}\n有效期至: {expires_str}"
+
+    def restore_default(self, conversation_id: str | None = None) -> tuple[bool, str]:
+        """
+        恢复默认模型（清除临时覆盖）
+
+        Returns:
+            (成功, 消息)
+        """
+        if conversation_id:
+            if conversation_id not in self._conversation_overrides:
+                return False, "当前会话没有临时切换，已在使用默认模型"
+            self._conversation_overrides.pop(conversation_id, None)
+        else:
+            if not self._endpoint_override:
+                return False, "当前没有临时切换，已在使用默认模型"
+            self._endpoint_override = None
+
+        # 获取当前默认模型
+        default = self.get_current_model()
+        default_model = default.model if default else "未知"
+
+        logger.info(f"[LLM] Restored to default model: {default_model}")
+        return True, f"已恢复默认模型: {default_model}"
+
+    def get_current_model(self, conversation_id: str | None = None) -> ModelInfo | None:
+        """
+        获取当前使用的模型信息
+
+        Args:
+            conversation_id: 对话 ID（传入时会检查 per-conversation override）
+
+        Returns:
+            当前模型信息，无可用模型时返回 None
+        """
+        # 检查并清理过期的 override
+        if self._endpoint_override and self._endpoint_override.is_expired:
+            logger.info("[LLM] Override expired, restoring default")
+            self._endpoint_override = None
+
+        # 确定生效的 override（conversation > global）
+        effective_override = None
+        if conversation_id and conversation_id in self._conversation_overrides:
+            ov = self._conversation_overrides[conversation_id]
+            if ov and not ov.is_expired:
+                effective_override = ov
+            else:
+                self._conversation_overrides.pop(conversation_id, None)
+        if not effective_override and self._endpoint_override:
+            effective_override = self._endpoint_override
+
+        # 如果有生效的覆盖，返回覆盖的端点
+        if effective_override:
+            name = effective_override.endpoint_name
+            if name in self._providers:
+                provider = self._providers[name]
+                config = provider.config
+                return ModelInfo(
+                    name=name,
+                    model=config.model,
+                    provider=config.provider,
+                    priority=config.priority,
+                    is_healthy=provider.is_healthy,
+                    is_current=True,
+                    is_override=True,
+                    capabilities=config.capabilities,
+                    note=config.note,
+                )
+
+        # 否则返回优先级最高的健康端点
+        for provider in sorted(self._providers.values(), key=lambda p: p.config.priority):
+            if provider.is_healthy:
+                config = provider.config
+                return ModelInfo(
+                    name=config.name,
+                    model=config.model,
+                    provider=config.provider,
+                    priority=config.priority,
+                    is_healthy=True,
+                    is_current=True,
+                    is_override=False,
+                    capabilities=config.capabilities,
+                    note=config.note,
+                )
+
+        return None
+
+    def get_next_endpoint(self, conversation_id: str | None = None) -> str | None:
+        """
+        获取下一优先级的健康端点名称（用于 fallback）
+
+        逻辑：找到当前生效端点，按 priority 排序后返回它之后的第一个健康端点。
+        如果当前端点已是最低优先级或无可用端点，返回 None。
+
+        Args:
+            conversation_id: 可选的会话 ID（用于识别 per-conversation override）
+
+        Returns:
+            下一个端点名称，或 None
+        """
+        current = self.get_current_model()
+        if not current:
+            return None
+
+        sorted_providers = sorted(
+            (p for p in self._providers.values() if p.is_healthy),
+            key=lambda p: p.config.priority,
+        )
+
+        found_current = False
+        for p in sorted_providers:
+            if p.config.name == current.name:
+                found_current = True
+                continue
+            if found_current:
+                return p.config.name
+
+        return None
+
+    def list_available_models(self) -> list[ModelInfo]:
+        """
+        列出所有可用模型
+
+        Returns:
+            模型信息列表（按优先级排序）
+        """
+        # 检查并清理过期的 override
+        if self._endpoint_override and self._endpoint_override.is_expired:
+            self._endpoint_override = None
+
+        current_name = None
+        if self._endpoint_override:
+            current_name = self._endpoint_override.endpoint_name
+
+        models = []
+        for provider in sorted(self._providers.values(), key=lambda p: p.config.priority):
+            config = provider.config
+            is_current = False
+            is_override = False
+
+            if current_name:
+                is_current = config.name == current_name
+                is_override = is_current
+            elif provider.is_healthy and not models:
+                # 第一个健康的端点是当前默认
+                is_current = True
+
+            models.append(
+                ModelInfo(
+                    name=config.name,
+                    model=config.model,
+                    provider=config.provider,
+                    priority=config.priority,
+                    is_healthy=provider.is_healthy,
+                    is_current=is_current,
+                    is_override=is_override,
+                    capabilities=config.capabilities,
+                    note=config.note,
+                )
+            )
+
+        return models
+
+    def get_override_status(self) -> dict | None:
+        """
+        获取当前覆盖状态
+
+        Returns:
+            覆盖状态信息，无覆盖时返回 None
+        """
+        if not self._endpoint_override:
+            return None
+
+        if self._endpoint_override.is_expired:
+            self._endpoint_override = None
+            return None
+
+        return {
+            "endpoint_name": self._endpoint_override.endpoint_name,
+            "remaining_hours": round(self._endpoint_override.remaining_hours, 2),
+            "expires_at": self._endpoint_override.expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "reason": self._endpoint_override.reason,
+        }
+
+    def update_priority(self, priority_order: list[str]) -> tuple[bool, str]:
+        """
+        更新端点优先级顺序
+
+        Args:
+            priority_order: 端点名称列表，按优先级从高到低排序
+
+        Returns:
+            (成功, 消息)
+        """
+        # 验证所有端点都存在
+        unknown = [name for name in priority_order if name not in self._providers]
+        if unknown:
+            return False, f"未知端点: {', '.join(unknown)}"
+
+        # 更新优先级
+        for i, name in enumerate(priority_order):
+            for ep in self._endpoints:
+                if ep.name == name:
+                    ep.priority = i
+                    break
+
+        # 重新排序
+        self._endpoints.sort(key=lambda x: x.priority)
+
+        # 保存到配置文件
+        if self._config_path and self._config_path.exists():
+            try:
+                self._save_config()
+                logger.info(f"[LLM] Priority updated and saved: {priority_order}")
+                return True, f"优先级已更新并保存: {' > '.join(priority_order)}"
+            except Exception as e:
+                logger.error(f"[LLM] Failed to save config: {e}")
+                return True, f"优先级已更新（内存），但保存配置文件失败: {e}"
+
+        return True, f"优先级已更新: {' > '.join(priority_order)}"
+
+    def _save_config(self):
+        """保存配置到文件"""
+        if not self._config_path:
+            return
+
+        from ..utils.atomic_io import atomic_json_write, path_transaction_lock, read_json_safe
+
+        with path_transaction_lock(self._config_path):
+            config_data = read_json_safe(self._config_path)
+            if config_data is None:
+                logger.warning("Cannot save config: no existing config to update")
+                return
+
+            name_to_priority = {ep.name: ep.priority for ep in self._endpoints}
+            ep_list = config_data.get("endpoints", [])
+            for ep_data in ep_list:
+                name = ep_data.get("name")
+                if name in name_to_priority:
+                    ep_data["priority"] = name_to_priority[name]
+
+            ep_list.sort(key=lambda e: (int(e.get("priority", 999)), e.get("name", "")))
+            config_data["endpoints"] = ep_list
+            atomic_json_write(self._config_path, config_data)
+
+    async def close(self):
+        """关闭所有 Provider"""
+        for provider in self._providers.values():
+            if hasattr(provider, "close"):
+                await provider.close()
+
+
+# 全局单例
+_default_client: LLMClient | None = None
+
+
+def get_default_client() -> LLMClient:
+    """获取默认客户端实例"""
+    global _default_client
+    if _default_client is None:
+        _default_client = LLMClient()
+    return _default_client
+
+
+def get_default_client_if_initialized() -> LLMClient | None:
+    """Return the process-shared client without creating it."""
+    return _default_client
+
+
+def set_default_client(client: LLMClient):
+    """设置默认客户端实例"""
+    global _default_client
+    _default_client = client
+
+
+async def chat(
+    messages: list[Message],
+    system: str = "",
+    tools: list[Tool] | None = None,
+    **kwargs,
+) -> LLMResponse:
+    """便捷函数：使用默认客户端聊天"""
+    client = get_default_client()
+    return await client.chat(messages, system=system, tools=tools, **kwargs)

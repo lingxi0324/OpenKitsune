@@ -1,0 +1,660 @@
+"""
+每日记忆归纳器
+
+功能:
+1. 每日凌晨归纳当天的对话历史
+2. 使用 LLM 提取精华记忆
+3. 刷新 MEMORY.md 精华摘要
+4. 清理过期历史文件
+"""
+
+import json
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from .consolidator import MemoryConsolidator
+from .extractor import MemoryExtractor
+from .types import MEMORY_MD_MAX_CHARS, Memory, MemoryPriority, MemoryType, truncate_memory_md
+
+logger = logging.getLogger(__name__)
+
+
+class DailyConsolidator:
+    """
+    每日记忆归纳器
+
+    负责:
+    - 读取昨天的所有对话历史
+    - 使用 LLM 归纳精华
+    - 存入长期记忆
+    - 刷新 MEMORY.md
+    """
+
+    # MEMORY.md 最大字符数（引用全局统一常量）
+    MEMORY_MD_MAX_CHARS = MEMORY_MD_MAX_CHARS
+
+    def __init__(
+        self,
+        data_dir: Path,
+        memory_md_path: Path,
+        memory_manager=None,
+        brain=None,
+        identity_dir: Path | None = None,
+    ):
+        """
+        Args:
+            data_dir: 数据目录
+            memory_md_path: MEMORY.md 路径
+            memory_manager: MemoryManager 实例
+            brain: LLM 大脑实例
+            identity_dir: identity 目录路径（用于偏好晋升）
+        """
+        self.data_dir = Path(data_dir)
+        self.memory_md_path = Path(memory_md_path)
+        self.memory_manager = memory_manager
+        self.brain = brain
+        self.identity_dir = Path(identity_dir) if identity_dir else None
+
+        # 子组件
+        self.extractor = MemoryExtractor(brain)
+        self.consolidator = MemoryConsolidator(data_dir, brain, self.extractor)
+
+        # 每日摘要目录
+        self.summaries_dir = self.data_dir / "daily_summaries"
+        self.summaries_dir.mkdir(parents=True, exist_ok=True)
+
+    async def consolidate_daily(self) -> dict:
+        """
+        执行每日归纳
+
+        适合在凌晨 3:00 由定时任务调用
+
+        Returns:
+            归纳结果统计
+        """
+        logger.info("Starting daily memory consolidation...")
+
+        result = {
+            "timestamp": datetime.now().isoformat(),
+            "sessions_processed": 0,
+            "memories_extracted": 0,
+            "memories_added": 0,
+            "duplicates_removed": 0,
+            "memory_md_refreshed": False,
+            "cleanup": {},
+        }
+
+        try:
+            # 1. 整理所有未处理的会话
+            summaries, memories = await self.consolidator.consolidate_all_unprocessed()
+            result["sessions_processed"] = len(summaries)
+            result["memories_extracted"] = len(memories)
+
+            # 2. 添加新记忆到 MemoryManager
+            if self.memory_manager and memories:
+                for memory in memories:
+                    if self.memory_manager.add_memory(memory):
+                        result["memories_added"] += 1
+
+            # 3. 清理重复记忆（使用 LLM 判断语义重复）
+            result["duplicates_removed"] = await self._cleanup_duplicate_memories()
+
+            # 4. 刷新 MEMORY.md
+            await self.refresh_memory_md()
+            result["memory_md_refreshed"] = True
+
+            # 4.5 晋升人格偏好到 identity
+            persona_promoted = await self._promote_persona_traits_to_identity()
+            result["persona_traits_promoted"] = persona_promoted
+
+            # 5. 清理过期历史
+            result["cleanup"] = self.consolidator.cleanup_history()
+
+            # 6. 保存每日摘要
+            self._save_daily_summary(result, summaries)
+
+            logger.info(f"Daily consolidation completed: {result}")
+
+        except Exception as e:
+            logger.error(f"Daily consolidation failed: {e}")
+            result["error"] = str(e)
+
+        return result
+
+    async def refresh_memory_md(self) -> bool:
+        """
+        刷新 MEMORY.md 精华摘要
+
+        从 memories.json 选取最重要的记忆，生成精简的 Markdown
+
+        Returns:
+            是否成功
+        """
+        try:
+            # 获取所有记忆（Phase 1B：通过 iter_cached 排除隔离桶，
+            # 避免 legacy_quarantine / pending_consolidation 内容混进 MEMORY.md）
+            memories = []
+            if self.memory_manager:
+                memories = list(self.memory_manager.iter_cached())
+
+            # 按类型和优先级分组
+            by_type = {
+                "preference": [],
+                "rule": [],
+                "fact": [],
+                "skill": [],
+            }
+
+            for m in memories:
+                # 只选取永久或长期记忆
+                if m.priority not in (MemoryPriority.PERMANENT, MemoryPriority.LONG_TERM):
+                    continue
+
+                type_key = m.type.value.lower()
+                if type_key in by_type:
+                    by_type[type_key].append(m)
+
+            # 按重要性排序，每类最多 3-5 条
+            for key in by_type:
+                by_type[key].sort(key=lambda x: x.importance_score, reverse=True)
+                by_type[key] = by_type[key][: 5 if key == "fact" else 3]
+
+            # 生成 Markdown
+            content = self._generate_memory_md(by_type)
+
+            # 检查长度限制
+            if len(content) > self.MEMORY_MD_MAX_CHARS:
+                # 压缩内容
+                content = await self._compress_memory_md(content)
+
+            # 安全写入文件（先备份再写入）
+            if len(content.strip()) < 10:
+                logger.warning("Generated MEMORY.md content too short, skipping refresh")
+                return False
+            from .lifecycle import _safe_write_with_backup
+
+            _safe_write_with_backup(self.memory_md_path, content)
+            logger.info("MEMORY.md refreshed")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to refresh MEMORY.md: {e}")
+            return False
+
+    def _generate_memory_md(self, by_type: dict) -> str:
+        """生成 MEMORY.md 内容"""
+        lines = [
+            "# Core Memory",
+            "",
+            "> Agent 核心记忆，每次对话都会加载。每日凌晨自动刷新。",
+            f"> 最后更新: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            "",
+        ]
+
+        # 用户偏好
+        if by_type["preference"]:
+            lines.append("## 用户偏好")
+            for m in by_type["preference"]:
+                lines.append(f"- {m.content}")
+            lines.append("")
+
+        # 重要规则
+        if by_type["rule"]:
+            lines.append("## 重要规则")
+            for m in by_type["rule"]:
+                lines.append(f"- {m.content}")
+            lines.append("")
+
+        # 关键事实
+        if by_type["fact"]:
+            lines.append("## 关键事实")
+            for m in by_type["fact"]:
+                lines.append(f"- {m.content}")
+            lines.append("")
+
+        # 成功模式（可选）
+        if by_type["skill"]:
+            lines.append("## 成功模式")
+            for m in by_type["skill"][:2]:  # 最多 2 条
+                lines.append(f"- {m.content}")
+            lines.append("")
+
+        # 如果所有分类都为空
+        if not any(by_type.values()):
+            lines.append("## 记忆")
+            lines.append("[暂无核心记忆]")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    async def _compress_memory_md(self, content: str) -> str:
+        """
+        使用 LLM 压缩 MEMORY.md 内容
+
+        当内容超过限制时调用
+        """
+        if not self.brain:
+            return truncate_memory_md(content, self.MEMORY_MD_MAX_CHARS)
+
+        try:
+            prompt = f"""将以下记忆精简为更短的版本，保留最重要的信息。
+
+当前内容:
+{content}
+
+要求:
+- 总长度不超过 {self.MEMORY_MD_MAX_CHARS} 字符
+- 保持 Markdown 格式
+- 保留最重要的 5-10 条记忆
+- 每条记忆精简为一句话"""
+
+            response = await self.brain.think(
+                prompt,
+                system="你是内容精简专家。输出精简后的 Markdown 内容。",
+                enable_thinking=False,
+            )
+
+            return response.content.strip()
+
+        except Exception as e:
+            logger.error(f"Failed to compress MEMORY.md: {e}")
+            return truncate_memory_md(content, self.MEMORY_MD_MAX_CHARS)
+
+    def _save_daily_summary(self, result: dict, summaries: list) -> None:
+        """保存每日摘要"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        summary_file = self.summaries_dir / f"{today}.json"
+
+        data = {
+            "date": today,
+            "result": result,
+            "sessions": [s.to_dict() for s in summaries] if summaries else [],
+        }
+
+        try:
+            with open(summary_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.debug(f"Saved daily summary: {summary_file}")
+        except Exception as e:
+            logger.error(f"Failed to save daily summary: {e}")
+
+    def get_yesterday_summary(self) -> dict | None:
+        """获取昨天的归纳摘要"""
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        summary_file = self.summaries_dir / f"{yesterday}.json"
+
+        if summary_file.exists():
+            try:
+                with open(summary_file, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+
+        return None
+
+    def get_recent_summaries(self, days: int = 7) -> list[dict]:
+        """获取最近几天的归纳摘要"""
+        summaries = []
+
+        for i in range(days):
+            date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            summary_file = self.summaries_dir / f"{date}.json"
+
+            if summary_file.exists():
+                try:
+                    with open(summary_file, encoding="utf-8") as f:
+                        summaries.append(json.load(f))
+                except Exception:
+                    pass
+
+        return summaries
+
+    # ==================== 人格偏好晋升 ====================
+
+    async def _promote_persona_traits_to_identity(self) -> int:
+        """
+        将高置信度的 PERSONA_TRAIT 记忆晋升到 identity/personas/user_custom.md
+
+        筛选标准:
+        - 记忆类型为 PERSONA_TRAIT
+        - 置信度 >= 0.7 或记忆被访问/强化 >= 3 次
+        - 按维度分组，每维度取置信度最高的
+
+        Returns:
+            晋升的特质数量
+        """
+        if not self.memory_manager or not self.identity_dir:
+            return 0
+
+        persona_dir = self.identity_dir / "personas"
+        persona_dir.mkdir(parents=True, exist_ok=True)
+        user_custom_path = persona_dir / "user_custom.md"
+
+        # 1. 筛选 PERSONA_TRAIT 类型记忆
+        # Phase 1B：用 iter_cached 排除隔离桶，避免 pending_consolidation 里
+        # 未审查的 persona_trait 被注入 user_custom.md
+        persona_memories = []
+        for mem in self.memory_manager.iter_cached():
+            if mem.type == MemoryType.PERSONA_TRAIT:
+                persona_memories.append(mem)
+
+        if not persona_memories:
+            return 0
+
+        # 2. 筛选高置信度或高访问量的
+        qualified = [
+            m for m in persona_memories if m.importance_score >= 0.7 or m.access_count >= 3
+        ]
+
+        if not qualified:
+            return 0
+
+        # 3. 按维度分组（从 tags 中提取 dimension:xxx）
+        by_dimension: dict[str, list[Memory]] = {}
+        for mem in qualified:
+            dimension = None
+            for tag in mem.tags:
+                if tag.startswith("dimension:"):
+                    dimension = tag.split(":", 1)[1]
+                    break
+            if dimension:
+                if dimension not in by_dimension:
+                    by_dimension[dimension] = []
+                by_dimension[dimension].append(mem)
+
+        if not by_dimension:
+            # 尝试从 content 解析
+            for mem in qualified:
+                parts = mem.content.split("=", 1)
+                if len(parts) == 2:
+                    dim = parts[0].strip()
+                    if dim not in by_dimension:
+                        by_dimension[dim] = []
+                    by_dimension[dim].append(mem)
+
+        if not by_dimension:
+            return 0
+
+        # 4. 每个维度取置信度最高的
+        promoted_traits: dict[str, tuple[str, Memory]] = {}  # dim -> (preference, memory)
+        for dim, mems in by_dimension.items():
+            best = max(mems, key=lambda m: m.importance_score)
+            # 提取偏好值
+            pref = None
+            for tag in best.tags:
+                if tag.startswith("preference:"):
+                    pref = tag.split(":", 1)[1]
+                    break
+            if not pref:
+                parts = best.content.split("=", 1)
+                pref = parts[1].strip() if len(parts) == 2 else best.content
+            promoted_traits[dim] = (pref, best)
+
+        # 5. 生成 user_custom.md 内容
+        now = datetime.now()
+        lines = [
+            "# User Custom Persona",
+            "",
+            "> 从用户交互中归集的个性化偏好，每日自动更新。",
+            f"> 最后更新: {now.strftime('%Y-%m-%d %H:%M')}",
+            "",
+        ]
+
+        # 按类别分组
+        style_traits = {}
+        interaction_traits = {}
+        care_traits = {}
+
+        style_dims = {"formality", "humor", "emoji_usage", "reply_length", "address_style"}
+        interaction_dims = {
+            "proactiveness",
+            "emotional_distance",
+            "encouragement",
+            "sticker_preference",
+        }
+        care_dims = {"care_topics"}
+
+        for dim, (pref, mem) in promoted_traits.items():
+            entry = f"- {dim}: {pref}（置信度 {mem.importance_score:.2f}）"
+            if dim in style_dims:
+                style_traits[dim] = entry
+            elif dim in interaction_dims:
+                interaction_traits[dim] = entry
+            elif dim in care_dims:
+                care_traits[dim] = entry
+            else:
+                style_traits[dim] = entry
+
+        if style_traits:
+            lines.append("## 沟通风格偏好")
+            lines.extend(style_traits.values())
+            lines.append("")
+
+        if interaction_traits:
+            lines.append("## 互动偏好")
+            lines.extend(interaction_traits.values())
+            lines.append("")
+
+        if care_traits:
+            lines.append("## 关心话题")
+            lines.extend(care_traits.values())
+            lines.append("")
+
+        content = "\n".join(lines)
+        user_custom_path.write_text(content, encoding="utf-8")
+        logger.info(f"Promoted {len(promoted_traits)} persona traits to {user_custom_path}")
+
+        # 6. 触发重编译
+        try:
+            from ..prompt.compiler import compile_all
+
+            compile_all(self.identity_dir)
+            logger.info("Triggered prompt recompilation after persona trait promotion")
+        except Exception as e:
+            logger.warning(f"Failed to recompile after persona promotion: {e}")
+
+        return len(promoted_traits)
+
+    # ==================== 去重清理 ====================
+
+    # 向量相似度阈值（用于初筛可能的重复）
+    # 0.3 太宽松，改为 0.15，配合 LLM 二次判断
+    DUPLICATE_DISTANCE_THRESHOLD = 0.15
+
+    async def _cleanup_duplicate_memories(self) -> int:
+        """
+        清理重复记忆
+
+        策略:
+        1. 按类型分组遍历所有记忆
+        2. 用向量搜索找相似的记忆对
+        3. 用 LLM 判断是否真的重复
+        4. 如果重复，保留更重要/更新的那条，删除另一条
+
+        Returns:
+            删除的重复记忆数量
+        """
+        if not self.memory_manager:
+            return 0
+
+        # Phase 3：跨租户去重是真 bug —— 多用户 IM 部署上 user A 的记忆和 user B 的
+        # 记忆只要语义相似就会被合掉。这里改成**按 (user_id, workspace_id) 分组**，
+        # 每组内独立去重；找不到任何已知租户时（desktop 单用户场景），退回到全量
+        # 模式，保持原行为。隔离桶（legacy_quarantine / pending_consolidation）依
+        # 然通过 iter_cached 默认排除，不进入任何去重批次。
+        try:
+            tenants_iter = list(self.memory_manager.store.list_known_tenants())
+        except Exception as e:
+            logger.debug("[Consolidator] list_known_tenants failed, fallback to flat dedup: %s", e)
+            tenants_iter = []
+
+        if tenants_iter:
+            tenant_groups: list[tuple[str | None, str | None, list]] = [
+                (
+                    user_id,
+                    workspace_id,
+                    list(
+                        self.memory_manager.iter_cached(user_id=user_id, workspace_id=workspace_id)
+                    ),
+                )
+                for user_id, workspace_id in tenants_iter
+            ]
+        else:
+            tenant_groups = [(None, None, list(self.memory_manager.iter_cached()))]
+
+        # 把 (None, None) 那组也跑一遍以兜底"未登记 session 但写到 default 桶"的旧数据：
+        # 否则升级前已有的 default 桶记忆永远不会被这次循环覆盖到。
+        if tenants_iter and not any(
+            user_id == "default" and workspace_id == "default"
+            for user_id, workspace_id, _ in tenant_groups
+        ):
+            extra = list(self.memory_manager.iter_cached(user_id="default", workspace_id="default"))
+            if extra:
+                tenant_groups.append(("default", "default", extra))
+
+        deleted_ids: set[str] = set()
+        for user_id, workspace_id, memories in tenant_groups:
+            if len(memories) < 2:
+                continue
+            logger.info(
+                "Checking %d memories for duplicates (tenant=%s/%s)...",
+                len(memories),
+                user_id or "*",
+                workspace_id or "*",
+            )
+            checked_pairs: set[tuple[str, str]] = set()
+            for memory in memories:
+                if memory.id in deleted_ids:
+                    continue
+                newly = await self._dedup_one_memory(
+                    memory,
+                    memories,
+                    checked_pairs=checked_pairs,
+                    deleted_ids=deleted_ids,
+                )
+                deleted_ids.update(newly)
+
+        if deleted_ids:
+            logger.info(f"Removed {len(deleted_ids)} duplicate memories")
+
+        return len(deleted_ids)
+
+    async def _dedup_one_memory(
+        self,
+        memory: Memory,
+        memories: list,
+        *,
+        checked_pairs: set[tuple[str, str]],
+        deleted_ids: set[str],
+    ) -> set[str]:
+        """对单条 memory 找重复，返回新删除的 id 集合。
+
+        - 向量库可用 → 向量相似度初筛 + LLM 复核；
+        - 向量库不可用 → 同 tenant_group 内字符串去前缀完全匹配兜底。
+
+        比较范围已被调用方按 tenant 分组限制；这里再做一次显式 (user_id,
+        workspace_id) 兜底检查，因为向量库的 search() 是全库召回。
+        """
+        newly: set[str] = set()
+        mm = self.memory_manager
+        vector_store = getattr(mm, "vector_store", None)
+
+        if vector_store is not None and getattr(vector_store, "enabled", False):
+            similar = vector_store.search(
+                memory.content,
+                limit=5,
+                filter_type=memory.type.value,
+            )
+            for other_id, distance in similar:
+                if other_id == memory.id or other_id in deleted_ids or other_id in newly:
+                    continue
+                pair_key = tuple(sorted([memory.id, other_id]))
+                if pair_key in checked_pairs:
+                    continue
+                checked_pairs.add(pair_key)
+                if distance > self.DUPLICATE_DISTANCE_THRESHOLD:
+                    continue
+                other_memory = mm._memories.get(other_id)
+                if not other_memory:
+                    continue
+                # 不能让隔离桶条目成为合并对象。
+                other_scope = getattr(other_memory, "scope", "user") or "user"
+                if other_scope in {"legacy_quarantine", "pending_consolidation"}:
+                    continue
+                # 兜底 tenant 一致性 —— 向量库 search() 是全库召回，可能跨 tenant。
+                if (getattr(other_memory, "user_id", "default") or "default") != (
+                    getattr(memory, "user_id", "default") or "default"
+                ) or (getattr(other_memory, "workspace_id", "default") or "default") != (
+                    getattr(memory, "workspace_id", "default") or "default"
+                ):
+                    continue
+                is_dup = await mm._check_duplicate_with_llm(memory.content, other_memory.content)
+                if is_dup:
+                    keep, remove = self._decide_which_to_keep(memory, other_memory)
+                    logger.info(
+                        "Duplicate found: '%s' -> keeping '%s'",
+                        remove.content,
+                        keep.content,
+                    )
+                    mm.delete_memory(remove.id)
+                    newly.add(remove.id)
+        else:
+            # 字符串前缀匹配兜底（向量库不可用时）。
+            strip = mm._strip_common_prefix
+            core_a = strip(memory.content)
+            for other in memories:
+                if other.id == memory.id or other.id in deleted_ids or other.id in newly:
+                    continue
+                if other.type != memory.type:
+                    continue
+                pair_key = tuple(sorted([memory.id, other.id]))
+                if pair_key in checked_pairs:
+                    continue
+                checked_pairs.add(pair_key)
+                core_b = strip(other.content)
+                if core_a == core_b:
+                    keep, remove = self._decide_which_to_keep(memory, other)
+                    logger.info(
+                        "Duplicate found (string match): '%s' -> keeping '%s'",
+                        remove.content,
+                        keep.content,
+                    )
+                    mm.delete_memory(remove.id)
+                    newly.add(remove.id)
+
+        return newly
+
+    def _decide_which_to_keep(self, mem1: Memory, mem2: Memory) -> tuple[Memory, Memory]:
+        """
+        决定保留哪条记忆
+
+        规则:
+        1. 优先级: PERMANENT > LONG_TERM > SHORT_TERM > TRANSIENT
+        2. 重要性: importance_score 高的优先
+        3. 时间: 更新的优先
+
+        Returns:
+            (保留的记忆, 删除的记忆)
+        """
+        priority_order = {
+            MemoryPriority.PERMANENT: 4,
+            MemoryPriority.LONG_TERM: 3,
+            MemoryPriority.SHORT_TERM: 2,
+            MemoryPriority.TRANSIENT: 1,
+        }
+
+        # 比较优先级
+        p1 = priority_order.get(mem1.priority, 0)
+        p2 = priority_order.get(mem2.priority, 0)
+
+        if p1 != p2:
+            return (mem1, mem2) if p1 > p2 else (mem2, mem1)
+
+        # 比较重要性
+        if abs(mem1.importance_score - mem2.importance_score) > 0.1:
+            return (mem1, mem2) if mem1.importance_score > mem2.importance_score else (mem2, mem1)
+
+        # 比较更新时间
+        return (mem1, mem2) if mem1.updated_at > mem2.updated_at else (mem2, mem1)

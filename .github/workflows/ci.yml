@@ -1,0 +1,815 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      python_package: ${{ steps.filter.outputs.python_package }}
+      setup_center: ${{ steps.filter.outputs.setup_center }}
+      setup_center_rust: ${{ steps.filter.outputs.setup_center_rust }}
+      tauri_full_build: ${{ steps.filter.outputs.tauri_full_build }}
+      bootstrap: ${{ steps.filter.outputs.bootstrap }}
+      plugin_sdk: ${{ steps.filter.outputs.plugin_sdk }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Classify changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            python:
+              - '.github/workflows/ci.yml'
+              - 'src/**'
+              - 'tests/**'
+              - 'identity/**'
+              - 'skills/**'
+              - 'plugins/**'
+              - 'scripts/**'
+              - 'build/**'
+              - 'openkitsune-plugin-sdk/**'
+              - 'pyproject.toml'
+              - 'requirements.txt'
+              - 'uv.lock'
+              - 'hatch_build.py'
+              - 'VERSION'
+            python_package:
+              - '.github/workflows/ci.yml'
+              - 'src/**'
+              - 'identity/**'
+              - 'skills/**'
+              - 'plugins/**'
+              - 'build/**'
+              - 'apps/setup-center/dist-web/**'
+              - 'pyproject.toml'
+              - 'requirements.txt'
+              - 'uv.lock'
+              - 'hatch_build.py'
+              - 'VERSION'
+              - 'README.md'
+              - 'LICENSE'
+              - 'NOTICE'
+              - 'THIRD_PARTY_NOTICES.md'
+            setup_center:
+              - '.github/workflows/ci.yml'
+              - 'apps/setup-center/**'
+            setup_center_rust:
+              - '.github/workflows/ci.yml'
+              - 'apps/setup-center/src-tauri/**'
+              - 'src/openkitsune/optional_modules.json'
+              - 'identity/**'
+              - 'VERSION'
+            tauri_full_build:
+              - '.github/workflows/ci.yml'
+              - 'apps/setup-center/**'
+              - 'src/**'
+              - 'identity/**'
+              - 'skills/**'
+              - 'plugins/**'
+              - 'openkitsune-plugin-sdk/**'
+              - 'build/**'
+              - 'scripts/**'
+              - 'docs-site/**'
+              - 'pyproject.toml'
+              - 'requirements.txt'
+              - 'uv.lock'
+              - 'hatch_build.py'
+              - 'VERSION'
+            bootstrap:
+              - '.github/workflows/ci.yml'
+              - 'build/**'
+              - 'scripts/**'
+              - 'apps/setup-center/src-tauri/resources/bootstrap/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+            plugin_sdk:
+              - '.github/workflows/ci.yml'
+              - 'openkitsune-plugin-sdk/**'
+
+  python_lint:
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          # SDK 0.7.0 主动收缩到「最小插件壳子」定位 (2026-04-22)：旧
+          # ``openkitsune_plugin_sdk.contrib`` 子包已下沉到 plugins-archive/_shared
+          # 与 openkitsune-plugin-sdk/staging/contrib，src/ 与一等公民插件
+          # (tongyi-image / seedance-video) 都不再 import 它。我们仍 install
+          # 本地 SDK 源码树，以便 lint/type-check 解析最小核心 API。
+          pip install -e ./openkitsune-plugin-sdk
+
+      - name: Check version consistency
+        run: python scripts/version.py check
+      
+      - name: Lint with ruff
+        run: ruff check src/
+      
+      - name: Type check with mypy
+        run: mypy src/
+
+  # ── L0 Smoke (每次 Push/PR, <10s, 6 个根因修复回归挡板) ──
+  # 直接对应 _exploratory_fix_plan_20260417 的 F1~F4 修复，
+  # 任何静默退化（cache 不命中/记忆召回率回到 0/profile 卡白名单等）
+  # 都会立刻 fail，避免 L1~L4 跑完才发现根因回归。
+  smoke_tests:
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install -e ./openkitsune-plugin-sdk
+      - name: Run L0 smoke (root-cause regression guards)
+        run: pytest tests/smoke/ -x -v
+
+  # ── L1 单元测试 (每次 Push/PR) ──
+  unit_tests:
+    needs: [changes, smoke_tests]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install -e ./openkitsune-plugin-sdk
+      - name: Run L1 unit tests
+        run: pytest tests/unit/ -x -v -o faulthandler_timeout=60
+
+  # ── L2 组件测试 (每次 Push/PR, <2min) ──
+  component_tests:
+    runs-on: ubuntu-latest
+    needs: [changes, unit_tests]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install -e ./openkitsune-plugin-sdk
+      - name: Run L2 component tests
+        run: pytest tests/component/ -x -v
+
+  # ── L3 集成测试 (每次 Push/PR, <3min) ──
+  integration_tests:
+    runs-on: ubuntu-latest
+    needs: [changes, component_tests]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install -e ./openkitsune-plugin-sdk
+      - name: Run L3 integration tests
+        run: pytest tests/integration/ -v
+
+  # ── L4 E2E 测试 (仅 main / 手动触发 / 每日, 回放模式) ──
+  e2e_tests:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.ref == 'refs/heads/main' && needs.changes.outputs.python == 'true')
+    runs-on: ubuntu-latest
+    needs: [changes, integration_tests]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install -e ./openkitsune-plugin-sdk
+      - name: Run L4 E2E tests (replay mode)
+        env:
+          LLM_TEST_MODE: replay
+        run: pytest tests/e2e/ -v
+
+  # ── L5 质量评估测试 (仅 main / 手动触发) ──
+  quality_tests:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.ref == 'refs/heads/main' && needs.changes.outputs.python == 'true')
+    runs-on: ubuntu-latest
+    needs: [changes, e2e_tests]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install -e ./openkitsune-plugin-sdk
+      - name: Run L5 quality tests
+        run: pytest tests/quality/ -v
+
+  # ── 全量兼容性测试 (跨平台 + legacy) ──
+  python_test:
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.11', '3.12', '3.13']
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install -e ./openkitsune-plugin-sdk
+
+      - name: Run all tests
+        if: ${{ hashFiles('tests/**') != '' }}
+        run: pytest tests/ -v --cov=src/openkitsune --cov-report=xml -k "not TestVectorStore"
+
+      - name: Skip tests (no tests directory)
+        if: ${{ hashFiles('tests/**') == '' }}
+        run: echo "No tests/ directory in repository; skipping pytest."
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: ${{ hashFiles('coverage.xml') != '' && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11' }}
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+  tool_parallel:
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install -e ./openkitsune-plugin-sdk
+
+      - name: Verify parallel tool execution
+        if: ${{ hashFiles('tests/llm/unit/test_tool_parallel_execution.py') != '' }}
+        run: pytest tests/llm/unit/test_tool_parallel_execution.py -v
+
+      - name: Skip tool_parallel (test file missing)
+        if: ${{ hashFiles('tests/llm/unit/test_tool_parallel_execution.py') == '' }}
+        run: echo "tests/llm/unit/test_tool_parallel_execution.py not found; skipping."
+
+  setup_center_build:
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.setup_center == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        if: ${{ hashFiles('apps/setup-center/package-lock.json') != '' }}
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: apps/setup-center/package-lock.json
+
+      - name: Install dependencies
+        if: ${{ hashFiles('apps/setup-center/package-lock.json') != '' }}
+        working-directory: apps/setup-center
+        run: npm ci
+
+      # PR-J1: 跑 react-hooks lint 阻断 React #310 类回归。
+      # 失败时（rules-of-hooks 检测到条件 hook）必须 fail CI；
+      # exhaustive-deps 是 warn 不会 fail。
+      - name: Lint react-hooks (rules-of-hooks)
+        if: ${{ hashFiles('apps/setup-center/package-lock.json') != '' && hashFiles('apps/setup-center/eslint.config.js') != '' }}
+        working-directory: apps/setup-center
+        run: npm run lint --if-present
+        continue-on-error: false
+
+      - name: Build
+        if: ${{ hashFiles('apps/setup-center/package-lock.json') != '' }}
+        working-directory: apps/setup-center
+        run: npm run build
+
+      - name: Skip setup-center build (project not present)
+        if: ${{ hashFiles('apps/setup-center/package-lock.json') == '' }}
+        run: echo "apps/setup-center not present in repository; skipping."
+
+  setup_center_rust_check:
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.setup_center_rust == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux' && hashFiles('apps/setup-center/src-tauri/Cargo.toml') != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+
+      - name: Set up Rust
+        if: ${{ hashFiles('apps/setup-center/src-tauri/Cargo.toml') != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        if: ${{ hashFiles('apps/setup-center/src-tauri/Cargo.toml') != '' }}
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/setup-center/src-tauri
+          prefix-key: ci-rust-nocachebin-v1
+          cache-bin: false
+
+      - name: Create gitignored placeholders for cargo check
+        if: ${{ hashFiles('apps/setup-center/src-tauri/Cargo.toml') != '' }}
+        shell: bash
+        run: |
+          # user_custom.md is gitignored (personal data); create placeholder for include_str!()
+          mkdir -p identity/personas
+          if [ ! -f identity/personas/user_custom.md ]; then
+            echo "# User Custom Persona (placeholder)" > identity/personas/user_custom.md
+          fi
+
+      # macOS runners ship Homebrew Rust shims that can shadow rustup's real
+      # cargo and make `cargo` invoke an unrelated wrapper (see Release Dry Run
+      # post-mortem). Mirror release-dryrun.yml so CI fails for the same
+      # reasons Dry Run does, instead of greenlighting a broken toolchain.
+      - name: Prefer rustup Cargo on PATH
+        if: ${{ hashFiles('apps/setup-center/src-tauri/Cargo.toml') != '' }}
+        shell: bash
+        run: echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+
+      - name: Cargo check and test
+        if: ${{ hashFiles('apps/setup-center/src-tauri/Cargo.toml') != '' }}
+        working-directory: apps/setup-center/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+          "$CARGO_BIN/cargo" check
+          "$CARGO_BIN/cargo" test --all-targets
+
+      - name: Skip Rust check (project not present)
+        if: ${{ hashFiles('apps/setup-center/src-tauri/Cargo.toml') == '' }}
+        run: echo "apps/setup-center/src-tauri not present in repository; skipping."
+
+  # ── Tauri 完整构建检查（仅 Linux） ──
+  tauri_full_build_check:
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.tauri_full_build == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: apps/setup-center/package-lock.json
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/setup-center/src-tauri
+          prefix-key: ci-tauri-full-nocachebin-v1
+          cache-bin: false
+
+      - name: Install Python build tooling
+        run: |
+          pip install build
+
+      - name: Install frontend dependencies
+        working-directory: apps/setup-center
+        run: npm ci
+
+      - name: Build web and desktop frontend assets
+        working-directory: apps/setup-center
+        run: |
+          npm run build:web
+          npm run build
+
+      - name: Compute exact Rust build fingerprint
+        id: build_keys
+        shell: bash
+        run: |
+          RUST_KEY=$(python scripts/build_cache_key.py rust)
+          echo "rust=${RUST_KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore exact Rust desktop binary
+        id: rust_binary_cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/setup-center/src-tauri/target/release/openkitsune-desktop
+            apps/setup-center/src-tauri/target/release/openkitsune_setup_center.pdb
+          key: desktop-rust-binary-v2-ci-full-ubuntu-latest-${{ runner.os }}-${{ runner.arch }}-${{ steps.build_keys.outputs.rust }}
+
+      - name: Create gitignored placeholders
+        run: |
+          mkdir -p identity/personas
+          if [ ! -f identity/personas/user_custom.md ]; then
+            echo "# User Custom Persona (placeholder)" > identity/personas/user_custom.md
+          fi
+
+      # Tauri's generate_context! macro reads frontendDist at Rust compile time,
+      # so the desktop frontend must exist before this parallel phase starts.
+      - name: Build Rust and docs in parallel
+        shell: bash
+        env:
+          RUST_BINARY_CACHE_HIT: ${{ steps.rust_binary_cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+
+          (
+            if [ "$RUST_BINARY_CACHE_HIT" = "true" ]; then
+              echo "[rust] Reusing exact cached desktop binary"
+            else
+              echo "[rust] Starting release build"
+              cd apps/setup-center/src-tauri
+              cargo build --release --features tauri/custom-protocol
+              echo "[rust] Completed"
+            fi
+          ) &
+          rust_pid=$!
+
+          (
+            echo "[docs] Starting dependency install and build"
+            cd docs-site
+            npm ci
+            npm run build
+            echo "[docs] Completed"
+          ) &
+          docs_pid=$!
+
+          wait_for_build() {
+            local pid="$1"
+            local name="$2"
+            if wait "$pid"; then
+              echo "[$name] Parallel task succeeded"
+            else
+              echo "::error::$name parallel task failed"
+              return 1
+            fi
+          }
+
+          failed=0
+          wait_for_build "$rust_pid" rust || failed=1
+          wait_for_build "$docs_pid" docs || failed=1
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Prepare Cargo binary for Tauri bundler
+        run: python scripts/prepare_tauri_binary.py
+
+      - name: Prepare bootstrap resources (wheel + uv + standalone Python seed)
+        run: |
+          python build/prepare_bootstrap_resources.py \
+            --commit-resources \
+            --clean-output \
+            --require-real-assets \
+            --target-platform linux-x64
+
+      - name: Verify bootstrap manifest resources
+        run: python build/prepare_bootstrap_resources.py --commit-resources --verify-only
+
+      - name: Assert seed Python executable bit
+        run: |
+          set -euo pipefail
+          SEED_DIR="apps/setup-center/src-tauri/resources/bootstrap/python"
+          [ -d "$SEED_DIR" ] || { echo "ERROR: seed dir missing: $SEED_DIR"; exit 1; }
+          fail=0
+          for f in "$SEED_DIR"/bin/*; do
+            [ -e "$f" ] || continue
+            if [ ! -x "$f" ]; then
+              echo "ERROR: missing exec bit: $f" >&2
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ]
+
+      - name: Build Tauri bundles (full build)
+        working-directory: apps/setup-center
+        env:
+          NO_STRIP: true
+        # Fork PRs do not receive repository secrets. Disable updater artifact
+        # signing in CI; release/dryrun workflows still sign updater artifacts.
+        # The desktop frontend and Rust binary were built in parallel above;
+        # this stage only packages the existing binary and resources.
+        run: >
+          npx tauri bundle
+          --bundles "deb"
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Verify Linux DEB URI handoff
+        run: python scripts/verify_linux_deb.py
+
+      - name: Verify bundle exists
+        run: |
+          echo "== bundle tree =="
+          find apps/setup-center/src-tauri/target/release/bundle -maxdepth 4 -type f -print || true
+          ls -la apps/setup-center/src-tauri/target/release/bundle/deb/*.deb
+          echo "Full Tauri build succeeded"
+
+  # ── Unicode 路径 smoke：覆盖 v1.27.10 启动失败收尾修复 §11 ──
+  # 验证 prepare_bootstrap_resources 与 seed Python 在含中文 / 空格 / 非 ASCII
+  # 路径下都能正常工作。这是 enterprise 用户的常见现场（"D:\我的文档\..."），
+  # 既往多次报告 UnicodeDecodeError / [WinError 2 系统找不到指定的文件] 起因
+  # 都是 tarfile 解压 / subprocess args 在 Unicode 路径下行为漂移。
+  #
+  # 与 ASCII 路径用例并行跑（matrix），不延长主流水线时间。
+  # macOS 跑 mac-x64（GitHub-hosted runner 默认 Intel）即可，arm64 由
+  # release-dryrun 实地覆盖。
+  bootstrap_unicode_path_smoke:
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.bootstrap == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target_platform: linux-x64
+            unicode_dir: "测试目录-openkitsune-${{ github.run_id }}"
+          - os: macos-latest
+            target_platform: mac-arm64
+            unicode_dir: "测试目录-openkitsune-${{ github.run_id }}"
+          - os: windows-latest
+            target_platform: win-x64
+            unicode_dir: "测试目录-openkitsune-${{ github.run_id }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      # 关键：把 staging output 放到 Unicode 路径下，覆盖 tarfile / pathlib /
+      # subprocess 的 UTF-8 编解码全链路。HOME 在 Linux/macOS 通常 ASCII，
+      # 所以显式构造一个 Unicode 子目录。
+      - name: Prepare Unicode staging directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="${HOME}/${{ matrix.unicode_dir }}/staging"
+          mkdir -p "${STAGE}"
+          echo "UNICODE_STAGE=${STAGE}" >> "$GITHUB_ENV"
+          ls -la "${HOME}/${{ matrix.unicode_dir }}"
+
+      - name: Build sentinel resources (web + docs placeholders)
+        shell: bash
+        run: |
+          # prepare_bootstrap_resources validates the web/docs asset contract;
+          # this smoke does not care about real frontend output, so placeholders
+          # are allowed explicitly in the prepare step below.
+          echo "Using placeholder web/docs assets for bootstrap contract smoke."
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Prepare bootstrap resources at Unicode path
+        shell: bash
+        env:
+          UNICODE_STAGE: ${{ env.UNICODE_STAGE }}
+        run: |
+          set -euo pipefail
+          python build/prepare_bootstrap_resources.py \
+            --output-dir "${UNICODE_STAGE}" \
+            --clean-output \
+            --allow-placeholder-assets \
+            --target-platform "${{ matrix.target_platform }}"
+
+      - name: Verify manifest at Unicode path
+        shell: bash
+        env:
+          UNICODE_STAGE: ${{ env.UNICODE_STAGE }}
+        run: |
+          set -euo pipefail
+          python build/prepare_bootstrap_resources.py \
+            --output-dir "${UNICODE_STAGE}" \
+            --verify-only
+
+      - name: Smoke run seed Python from Unicode path
+        shell: bash
+        env:
+          UNICODE_STAGE: ${{ env.UNICODE_STAGE }}
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: utf-8
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            SEED="${UNICODE_STAGE}/python/python.exe"
+          else
+            SEED="${UNICODE_STAGE}/python/bin/python3.11"
+          fi
+          echo "Seed binary: ${SEED}"
+          # 直接调，验证 OS loader 能从 Unicode 路径加载 Python，且 Python 自身
+          # stdlib 在非 ASCII sys.executable 下不崩。
+          "${SEED}" -c "import sys, ssl, sqlite3, hashlib, ctypes, zlib, platform; print('python', platform.python_version()); print('exec', sys.executable)"
+
+      - name: Smoke create venv inside Unicode path via uv
+        shell: bash
+        env:
+          UNICODE_STAGE: ${{ env.UNICODE_STAGE }}
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: utf-8
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            UV="${UNICODE_STAGE}/bin/uv.exe"
+            SEED="${UNICODE_STAGE}/python/python.exe"
+          else
+            UV="${UNICODE_STAGE}/bin/uv"
+            SEED="${UNICODE_STAGE}/python/bin/python3.11"
+          fi
+          VENV_DIR="${UNICODE_STAGE}/我的venv"
+          rm -rf "${VENV_DIR}"
+          UV_PYTHON_PREFERENCE=only-managed "${UV}" venv --python "${SEED}" --seed --clear "${VENV_DIR}"
+          # Sanity: venv interpreter starts and pip works.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            VENV_PY="${VENV_DIR}/Scripts/python.exe"
+          else
+            VENV_PY="${VENV_DIR}/bin/python"
+          fi
+          "${VENV_PY}" -c "import sys; assert sys.prefix != sys.base_prefix, 'venv launcher fell back to base'; import pip; print('pip', pip.__version__)"
+
+  # ── Plugin SDK: lint + build + test ──
+  plugin_sdk:
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.plugin_sdk == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build ruff
+
+      - name: Lint SDK
+        working-directory: openkitsune-plugin-sdk
+        run: ruff check src/
+
+      - name: Run SDK tests (core only — excludes staging/ archive _shared/)
+        working-directory: openkitsune-plugin-sdk
+        run: |
+          pip install -e .
+          pip install pytest pytest-asyncio
+          if ! find tests -type f \( -name 'test_*.py' -o -name '*_test.py' \) | grep -q .; then
+            echo "No SDK tests found; skipping pytest."
+            exit 0
+          fi
+          pytest tests/ -v
+
+      - name: Build SDK wheel
+        run: python -m build --wheel openkitsune-plugin-sdk/ --outdir dist-sdk/
+
+      - name: Verify SDK wheel installs
+        run: pip install dist-sdk/*.whl && python -c "from openkitsune_plugin_sdk import SDK_VERSION; print(f'SDK {SDK_VERSION} OK')"
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: dist-sdk
+          path: dist-sdk/
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [changes, python_lint, python_test, unit_tests, component_tests, integration_tests, tool_parallel]
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || needs.changes.outputs.python_package == 'true') &&
+      needs.changes.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    steps:
+      - uses: actions/checkout@v6
+      
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+      
+      - name: Build package
+        run: python -m build
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: dist
+          path: dist/

@@ -1,0 +1,13 @@
+{
+  "timestamp": "2026-06-19T10:49:15.586166",
+  "baseline_accuracy": 44.2,
+  "best_accuracy": 47.9,
+  "best_weights": {
+    "year": 0.513,
+    "month": 0.256,
+    "day": 0.128,
+    "hour": 0.103
+  },
+  "evolution_cycles": 50,
+  "improvement": 3.7
+}

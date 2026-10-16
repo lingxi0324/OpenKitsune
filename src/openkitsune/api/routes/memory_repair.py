@@ -1,0 +1,554 @@
+"""Memory database repair endpoints."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import secrets
+import shutil
+import sqlite3
+import subprocess
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
+
+from openkitsune.config import settings
+from openkitsune.memory.storage import MemoryStorage
+from openkitsune.memory.telemetry import emit_memory_health_event
+
+from .health import mark_memory_repair_completed_restart_required
+
+router = APIRouter(prefix="/api/memory/repair")
+
+_repair_lock = asyncio.Lock()
+_tokens: dict[str, float] = {}
+_TOKEN_TTL_SECONDS = 300
+
+
+class RepairRestoreRequest(BaseModel):
+    source: str
+    confirmation_token: str
+
+
+class RepairTokenRequest(BaseModel):
+    confirmation_token: str
+
+
+class QuarantineRequest(BaseModel):
+    """Body for ``POST /api/memory/repair/quarantine``.
+
+    The ``subsystem`` field is constrained to the set we know how to
+    quiesce + relocate. We intentionally don't accept an arbitrary
+    string so a misnamed subsystem can't cause us to ``shutil.move``
+    something unexpected on disk.
+    """
+
+    subsystem: str
+    confirmation_token: str
+
+
+def _memory_dir() -> Path:
+    return Path(settings.data_dir) / "memory"
+
+
+def _db_path() -> Path:
+    return _memory_dir() / "openkitsune.db"
+
+
+def _audit(action: str, result: str, **extra: Any) -> None:
+    try:
+        path = _memory_dir() / "repair_audit.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "action": action,
+            "result": result,
+            **extra,
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _cleanup_old_recovery_pending(days: int = 30) -> None:
+    root = _memory_dir() / ".recovery_pending"
+    if not root.exists():
+        return
+    cutoff = time.time() - days * 24 * 60 * 60
+    for path in root.iterdir():
+        try:
+            if path.stat().st_mtime < cutoff:
+                shutil.rmtree(path) if path.is_dir() else path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _agent_memory_manager(request: Request):
+    agent = getattr(request.app.state, "agent", None)
+    return getattr(agent, "memory_manager", None) if agent is not None else None
+
+
+def _require_degraded(request: Request):
+    mm = _agent_memory_manager(request)
+    if mm is None or not getattr(mm, "degraded", False):
+        raise HTTPException(status_code=409, detail="memory subsystem is not degraded")
+    return mm
+
+
+def _desktop_token_expected() -> str:
+    return os.environ.get("OPENKITSUNE_DESKTOP_SESSION_TOKEN", "")
+
+
+def _verify_desktop_token(request: Request) -> None:
+    expected = _desktop_token_expected()
+    if not expected:
+        # Dev/web mode compatibility. Confirmation token still prevents accidental
+        # destructive calls, but production desktop should always set this token.
+        return
+    supplied = request.headers.get("X-OpenKitsune-Desktop-Token", "")
+    if not secrets.compare_digest(expected, supplied):
+        raise HTTPException(status_code=403, detail="invalid desktop session token")
+
+
+def _issue_confirmation_token() -> str:
+    now = time.time()
+    for token, expires in list(_tokens.items()):
+        if expires < now:
+            _tokens.pop(token, None)
+    token = secrets.token_urlsafe(32)
+    _tokens[token] = now + _TOKEN_TTL_SECONDS
+    return token
+
+
+def _consume_confirmation_token(token: str) -> str:
+    expires = _tokens.pop(token, None)
+    if expires is None or expires < time.time():
+        raise HTTPException(status_code=403, detail="invalid or expired confirmation token")
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+@contextmanager
+def _file_repair_lock():
+    lock_path = _memory_dir() / ".repair.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if lock_path.exists():
+        try:
+            age = time.time() - lock_path.stat().st_mtime
+            if age > 30 * 60:
+                lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as e:
+        raise HTTPException(status_code=409, detail="repair_in_progress") from e
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+        yield
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _triplet(path: Path) -> list[Path]:
+    return [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]
+
+
+def _move_triplet(src: Path, dst_dir: Path) -> list[tuple[Path, Path]]:
+    moved: list[tuple[Path, Path]] = []
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for item in _triplet(src):
+            if item.exists():
+                target = dst_dir / item.name
+                shutil.move(str(item), str(target))
+                moved.append((item, target))
+        return moved
+    except Exception:
+        for original, target in reversed(moved):
+            try:
+                if target.exists():
+                    shutil.move(str(target), str(original))
+            except Exception:
+                pass
+        raise
+
+
+def _restore_moved_triplet(moved: list[tuple[Path, Path]]) -> None:
+    for original, target in reversed(moved):
+        try:
+            if target.exists():
+                if original.exists():
+                    original.unlink(missing_ok=True)
+                shutil.move(str(target), str(original))
+        except Exception:
+            pass
+
+
+def _remove_wal_shm(path: Path) -> None:
+    for item in _triplet(path)[1:]:
+        item.unlink(missing_ok=True)
+
+
+def _validate_db(path: Path) -> None:
+    tmp = MemoryStorage(path, _register=False)
+    try:
+        tmp.quick_check_or_raise()
+    finally:
+        tmp.close()
+
+
+def _list_candidates(pattern: str) -> list[dict[str, Any]]:
+    out = []
+    for path in sorted(_memory_dir().glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True):
+        integrity = "unchecked"
+        try:
+            with sqlite3.connect(str(path)) as conn:
+                row = conn.execute("PRAGMA quick_check").fetchone()
+                integrity = "ok" if str(row[0] if row else "").lower() == "ok" else "corrupt"
+        except Exception:
+            integrity = "corrupt"
+        out.append(
+            {
+                "filename": path.name,
+                "created_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%S", time.localtime(path.stat().st_mtime)
+                ),
+                "size_bytes": path.stat().st_size,
+                "integrity": integrity,
+            }
+        )
+    return out
+
+
+def _recover_method() -> str:
+    candidates: list[Path] = []
+    if os.environ.get("OPENKITSUNE_SQLITE3_EXE"):
+        candidates.append(Path(os.environ["OPENKITSUNE_SQLITE3_EXE"]))
+    if os.environ.get("LOCALAPPDATA"):
+        candidates.append(
+            Path(os.environ["LOCALAPPDATA"]) / "Programs" / "OpenKitsune" / "sqlite3.exe"
+        )
+    if os.environ.get("PROGRAMFILES"):
+        candidates.append(Path(os.environ["PROGRAMFILES"]) / "OpenKitsune" / "sqlite3.exe")
+    if any(p.exists() for p in candidates):
+        return "bundled_sqlite3"
+    if shutil.which("sqlite3"):
+        return "bundled_sqlite3"
+    return "python_iterdump"
+
+
+def _sqlite3_executable() -> str | None:
+    if (
+        os.environ.get("OPENKITSUNE_SQLITE3_EXE")
+        and Path(os.environ["OPENKITSUNE_SQLITE3_EXE"]).exists()
+    ):
+        return os.environ["OPENKITSUNE_SQLITE3_EXE"]
+    for env_name in ("LOCALAPPDATA", "PROGRAMFILES"):
+        root = os.environ.get(env_name)
+        if not root:
+            continue
+        candidate = Path(root) / "OpenKitsune" / "sqlite3.exe"
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("sqlite3")
+
+
+@router.get("/status")
+async def repair_status(request: Request):
+    mm = _agent_memory_manager(request)
+    degraded = bool(mm is not None and getattr(mm, "degraded", False))
+    db = _db_path()
+    return {
+        "status": "degraded" if degraded else "healthy",
+        "reason": getattr(mm, "degraded_reason", None) if mm else None,
+        "details": getattr(mm, "degraded_details", None) if mm else None,
+        "db_path": str(db),
+        "db_size_bytes": db.stat().st_size if db.exists() else 0,
+        "backups": _list_candidates("openkitsune.db.bak.*"),
+        "snapshots": _list_candidates("openkitsune.db.snapshot.*"),
+        "recover_method": _recover_method(),
+        "desktop_token_required": bool(_desktop_token_expected()),
+        "confirmation_token": _issue_confirmation_token(),
+    }
+
+
+async def _run_repair(request: Request, action: str, token: str, fn):
+    _require_degraded(request)
+    _verify_desktop_token(request)
+    token_hash = _consume_confirmation_token(token)
+    if _repair_lock.locked():
+        raise HTTPException(status_code=409, detail="repair_in_progress")
+    async with _repair_lock:
+        with _file_repair_lock():
+            try:
+                result = await asyncio.to_thread(fn)
+                mm = _agent_memory_manager(request)
+                if mm is not None:
+                    mm.repair_completed_restart_required = True
+                mark_memory_repair_completed_restart_required()
+                _audit(action, "success", token_hash=token_hash)
+                emit_memory_health_event("repair_success", {"action": action})
+                return result
+            except HTTPException:
+                _audit(action, "failed", token_hash=token_hash, error="http_exception")
+                raise
+            except Exception as e:
+                _audit(action, "failed", token_hash=token_hash, error=str(e))
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/restore")
+async def restore_backup(payload: RepairRestoreRequest, request: Request):
+    def work():
+        db = _db_path()
+        source = (_memory_dir() / payload.source).resolve()
+        if source.parent != _memory_dir().resolve() or not source.exists():
+            raise HTTPException(status_code=404, detail="backup not found")
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        quarantine = _memory_dir() / f".quarantine.{stamp}"
+        moved = _move_triplet(db, quarantine)
+        try:
+            shutil.copy2(source, db)
+            _remove_wal_shm(db)
+            _validate_db(db)
+        except Exception:
+            for path in _triplet(db):
+                path.unlink(missing_ok=True)
+            _restore_moved_triplet(moved)
+            raise
+        return {"ok": True, "status": "repair_completed_restart_required"}
+
+    return await _run_repair(request, "restore", payload.confirmation_token, work)
+
+
+@router.post("/recreate")
+async def recreate_database(payload: RepairTokenRequest, request: Request):
+    def work():
+        db = _db_path()
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        quarantine = _memory_dir() / f".quarantine.{stamp}"
+        moved = _move_triplet(db, quarantine)
+        try:
+            tmp = MemoryStorage(db, _register=False)
+            tmp.close()
+        except Exception:
+            for path in _triplet(db):
+                path.unlink(missing_ok=True)
+            _restore_moved_triplet(moved)
+            raise
+        return {"ok": True, "status": "repair_completed_restart_required"}
+
+    return await _run_repair(request, "recreate", payload.confirmation_token, work)
+
+
+@router.post("/run-recover")
+async def run_recover(payload: RepairTokenRequest, request: Request):
+    def work():
+        db = _db_path()
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        recovered = _memory_dir() / f"openkitsune.recovered.{stamp}.db"
+        sqlite3_exe = _sqlite3_executable()
+        if sqlite3_exe:
+            sql_path = _memory_dir() / f"openkitsune.recovered.{stamp}.sql"
+            with sql_path.open("w", encoding="utf-8") as out:
+                subprocess.run([sqlite3_exe, str(db), ".recover"], stdout=out, check=True)
+            with sql_path.open("r", encoding="utf-8") as src:
+                subprocess.run([sqlite3_exe, str(recovered)], stdin=src, check=True)
+        else:
+            with sqlite3.connect(str(db)) as src, sqlite3.connect(str(recovered)) as dst:
+                for line in src.iterdump():
+                    try:
+                        dst.execute(line)
+                    except Exception:
+                        pass
+        _validate_db(recovered)
+        quarantine = _memory_dir() / f".quarantine.{stamp}"
+        moved = _move_triplet(db, quarantine)
+        try:
+            shutil.move(str(recovered), str(db))
+            _remove_wal_shm(db)
+            _validate_db(db)
+        except Exception:
+            for path in _triplet(db):
+                path.unlink(missing_ok=True)
+            if recovered.exists():
+                recovered.unlink(missing_ok=True)
+            _restore_moved_triplet(moved)
+            raise
+        return {"ok": True, "status": "repair_completed_restart_required"}
+
+    return await _run_repair(request, "run_recover", payload.confirmation_token, work)
+
+
+# ---------------------------------------------------------------------------
+# Generic subsystem quarantine — v1.29 boot fault tolerance
+# ---------------------------------------------------------------------------
+#
+# This block extends the existing memory-repair endpoint set with two
+# new operations so the new "degraded subsystem" banner has a fix path:
+#
+#   GET  /api/memory/repair/degraded   -> snapshot + fresh confirmation token
+#   POST /api/memory/repair/quarantine -> quiesce + rename one subsystem
+#
+# Authentication intentionally mirrors the existing memory_repair
+# convention: both ``X-OpenKitsune-Desktop-Token`` (Tauri-injected) AND a
+# single-use ``confirmation_token`` (issued by the GET endpoint, expires
+# in 5 minutes). We deliberately do NOT downgrade to ``is_trusted_local``
+# because this operation renames .db files — equivalent to ``rm -rf``
+# from the user's perspective.
+
+
+_SUBSYSTEM_PATHS: dict[str, str] = {
+    # subsystem name → relative path under ``data/``
+    # Token tracking shares the agent.db file with the rest of the legacy
+    # storage facade. Quarantining it forces token_stats endpoints to
+    # 503 until restart.
+    "token_tracking": "agent.db",
+    "feedback": "feedback.db",
+    "asset_bus": "asset_bus.db",
+}
+
+
+def _data_dir() -> Path:
+    return Path(settings.data_dir)
+
+
+async def _quiesce_subsystem(request: Request, subsystem: str) -> None:
+    """Close any long-lived handle to the subsystem's DB.
+
+    On Windows the rename in ``_move_triplet`` would otherwise fail with
+    a sharing violation. Best-effort: a subsystem whose quiesce raises
+    is logged but not blocked, because the user explicitly opted in to
+    quarantining.
+    """
+    import logging as _logging
+
+    log = _logging.getLogger(__name__)
+    try:
+        if subsystem == "token_tracking":
+            from openkitsune.core.token_tracking import shutdown_token_tracking
+
+            shutdown_token_tracking(timeout=5.0)
+        elif subsystem == "asset_bus":
+            bus = getattr(request.app.state, "asset_bus", None)
+            if bus is not None and hasattr(bus, "quiesce"):
+                await bus.quiesce()
+        elif subsystem == "feedback":
+            # feedback_store opens connections per call; nothing to close.
+            return
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "[memory_repair] quiesce(%s) raised but continuing: %s",
+            subsystem,
+            exc,
+        )
+
+
+@router.get("/degraded")
+async def degraded_subsystems(request: Request):
+    """Return the degraded-subsystem snapshot plus a fresh confirmation token.
+
+    Read-only; no auth required. The confirmation token is single-use
+    and expires after 5 minutes — the UI presents it back to
+    ``POST /quarantine`` so a stale browser tab can't accidentally
+    re-trigger destructive operations.
+    """
+    from openkitsune.storage.degraded import registry as _registry
+
+    return {
+        "subsystems": _registry.snapshot(),
+        "desktop_token_required": bool(_desktop_token_expected()),
+        "confirmation_token": _issue_confirmation_token(),
+    }
+
+
+@router.post("/quarantine")
+async def quarantine_subsystem(payload: QuarantineRequest, request: Request):
+    """Quiesce + relocate one subsystem's DB triplet to ``data/.quarantine.{ts}/``.
+
+    Flow:
+
+    1. Validate the subsystem is one we know how to handle.
+    2. Verify desktop_token + consume confirmation_token (audited).
+    3. Acquire the global ``_repair_lock`` + the on-disk repair lock so
+       concurrent quarantines can't race.
+    4. Call the subsystem-specific ``quiesce()`` so file handles are
+       released (Windows correctness).
+    5. ``shutil.move`` the ``.db`` + ``-wal`` + ``-shm`` triplet.
+    6. Unregister from :mod:`openkitsune.storage.degraded` so the UI banner
+       clears.
+    7. Return ``restart_required=True`` — the subsystem cannot recover
+       in-process; the user must restart backend (Tauri auto-respawn,
+       standalone ``openkitsune serve`` must restart manually).
+    """
+    from openkitsune.storage.degraded import registry as _registry
+
+    subsystem = payload.subsystem
+    if subsystem not in _SUBSYSTEM_PATHS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown subsystem: {subsystem}",
+        )
+
+    _verify_desktop_token(request)
+    token_hash = _consume_confirmation_token(payload.confirmation_token)
+
+    if _repair_lock.locked():
+        raise HTTPException(status_code=409, detail="repair_in_progress")
+
+    async with _repair_lock:
+        with _file_repair_lock():
+            await _quiesce_subsystem(request, subsystem)
+
+            db_path = _data_dir() / _SUBSYSTEM_PATHS[subsystem]
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            quarantine_dir = _data_dir() / f".quarantine.{stamp}"
+
+            moved_paths: list[str] = []
+            if db_path.exists():
+                try:
+                    moved = await asyncio.to_thread(_move_triplet, db_path, quarantine_dir)
+                    moved_paths = [str(target) for _, target in moved]
+                except Exception as e:
+                    _audit(
+                        "quarantine",
+                        "failed",
+                        subsystem=subsystem,
+                        token_hash=token_hash,
+                        error=str(e)[:200],
+                    )
+                    raise HTTPException(status_code=500, detail=str(e)) from e
+
+            _registry.unregister(subsystem)
+            _audit(
+                "quarantine",
+                "success",
+                subsystem=subsystem,
+                token_hash=token_hash,
+                quarantined=moved_paths,
+            )
+            emit_memory_health_event(
+                "quarantine",
+                {"subsystem": subsystem, "quarantined": moved_paths},
+            )
+            mark_memory_repair_completed_restart_required()
+            return {
+                "ok": True,
+                "subsystem": subsystem,
+                "quarantined": moved_paths,
+                "restart_required": True,
+            }

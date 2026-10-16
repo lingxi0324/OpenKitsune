@@ -1,0 +1,114 @@
+# =====================================================
+# OpenKitsune - Dependencies
+# Python version required: >= 3.11
+#
+# Authoritative source: pyproject.toml
+# This file is for `pip install -r` quick install, kept in sync with pyproject.toml.
+# =====================================================
+
+# === Core LLM ===
+anthropic>=0.40.0          # Claude API official client
+openai>=1.0.0              # OpenAI-compatible API (backup endpoint support)
+
+# === MCP (Model Context Protocol) ===
+mcp>=1.0.0                 # MCP protocol support
+
+# === Web Search ===
+ddgs>=8.0.0                # Multi-engine aggregated search (no API key required)
+
+# === CLI and User Interface ===
+rich>=13.7.0               # Rich terminal output
+prompt-toolkit>=3.0.43     # Interactive command line
+typer>=0.12.0              # CLI framework
+
+# === Async and HTTP ===
+httpx[socks]>=0.27.0       # Async HTTP client (with SOCKS proxy support)
+aiofiles>=24.1.0           # Async file operations
+nest-asyncio>=1.5.0        # Nested event loop support
+
+# === Database ===
+aiosqlite>=0.20.0          # Async SQLite
+
+# === Data Validation ===
+pydantic>=2.5.0            # Data model validation
+pydantic-settings>=2.1.0   # Configuration management
+
+# === Git Operations ===
+gitpython>=3.1.40          # Git operations library
+
+# === Browser Automation ===
+browser-use>=0.11.8        # AI browser agent
+langchain-openai>=1.0.0    # LangChain OpenAI adapter (browser-use dependency)
+playwright>=1.40.0         # Browser automation engine
+
+# === Configuration ===
+pyyaml>=6.0.1              # YAML parsing
+python-dotenv>=1.0.0       # Environment variable loading
+
+# === Utilities ===
+tenacity>=8.2.3            # Retry mechanism
+simplejson>=3.19.2         # JSON serialization
+
+# === Image Processing ===
+Pillow>=10.0.0             # Image format conversion/processing
+
+# === HTTP API ===
+fastapi>=0.110.0           # HTTP API framework
+uvicorn>=0.27.0            # ASGI server
+
+# === Credential Store (Account OIDC) ===
+keyring>=25.0.0            # OS credential store (Windows: WinVault backend auto)
+
+# === WebSocket Gateway (serve mode + Desktop Terminal streaming) ===
+websockets>=15.0           # WebSocket protocol support (uvicorn + app gateway)
+
+# === IM Channel - Telegram (default) ===
+python-telegram-bot>=22.7  # Telegram Bot API
+
+# =====================================================
+# Optional Dependencies - IM Channels (pip install openkitsune[all] for all)
+# Uncomment as needed, or use pip install openkitsune[feishu] etc.
+# =====================================================
+
+# Lark / Feishu
+lark-oapi>=1.5.5           # Lark official SDK (WebSocket + card callback)
+
+# WeCom (WeChat Work)
+aiohttp>=3.13.0            # WeCom HTTP callback server (with CVE fixes)
+pycryptodome>=3.23.0       # WeCom message encryption/decryption (AES-256-CBC) + ARM64 wheel
+cryptography>=46.0.7       # WeCom WS encryption (patch-level security update)
+
+# DingTalk (Stream mode)
+dingtalk-stream>=0.24.3    # DingTalk Stream SDK
+
+# OneBot protocol (NapCat/Lagrange etc.)
+websockets>=16.0           # OneBot WebSocket support (2026-01 major release)
+
+# QQ Official Bot
+# websockets>=16.0         # QQ Gateway WebSocket (listed in OneBot above)
+# aiohttp>=3.13.0          # QQ Webhook mode (listed in WeCom above)
+# Note: QQ official API supports silk/wav/mp3/flac direct upload; pilk is no longer needed for sending.
+# pilk is only needed for receiving SILK→WAV decoding (speech-to-text), see below.
+
+# Voice receiving/transcription (QQ + WeChat users sending SILK v3 → WAV)
+pilk>=0.2.1                # SILK decoding: only needed on receive side
+
+# =====================================================
+# Optional Dependencies - Windows Desktop Automation
+# =====================================================
+
+mss>=9.0.0                 # High-performance screenshots
+pyautogui>=0.9.54          # Mouse and keyboard control
+pywinauto>=0.6.8; platform_system == "Windows"  # Windows UIAutomation
+pyperclip>=1.8.2           # Clipboard operations
+psutil>=5.9.0              # Process information
+
+# =====================================================
+# Development Dependencies (optional)
+# =====================================================
+
+# pytest>=8.0.0
+# pytest-asyncio>=0.23.0
+# pytest-cov>=4.1.0
+# ruff>=0.1.9
+# mypy>=1.8.0

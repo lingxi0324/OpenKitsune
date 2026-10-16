@@ -1,0 +1,463 @@
+"""
+胜复校正评分引擎 v4.0 · 四层全链路评分校正
+============================================
+【v4.0 八项修正 — v3.2矫枉过正，恢复信号区分度】
+  ① 天刑岁运压制 0.40→0.15（v3.2压死所有信号，土板块全部月跌入噪声区）
+  ② 均值回归 0.08→0.04（评分站不稳，正信号被快速拉回零点）
+  ③ 郁发释放 0.50→0.65（9月火实际+37%但评分仅-0.025，完全没捕捉）
+  ④ 郁发触发阈值 0.15→0.12（降低爆发门槛）
+  ⑤ 复气积累 0.12→0.15（被压制板块积累更快）
+  ⑥ 司天克在泉：直接扣分→转郁气积累（冲突产生的不是下跌，是爆发前奏）
+  ⑦ 季节阻尼补全五行（原仅木/火/水，缺土/金）
+  ⑧ 信号显示strength*0.40→统一为0.25（显示与实际不一致）
+
+【v3.2 七大修正 — 修复板块系统性正偏/负偏，翻正相关系数】
+  ① 岁运太过加成 0.40→0.25（土板块正偏修复）
+  ② 岁运所克扣分 0.20→0.12（金板块负偏修复）
+  ③ 司天效果 0.15→0.10（全板块正偏修复）
+  ④ 司天克力度 0.70→0.40（火板块负偏修复）
+  ⑤ 在泉效果 0.15→0.10（全板块正偏修复）
+  ⑥ 复气积累加速 0.08→0.12（火金复气积累加速）
+  ⑦ 过量反制阈值1.2→0.8、力度0.30→0.40（正偏反制增强）
+  ⑧ 均值回归力度0.12→0.18（评分回归增强）
+
+【设计原则】
+  - 无硬编码年份、无固定爆发月
+  - 所有年份动态推导
+  - 评分可在 -1.0 ~ +1.0 之间自由摆动
+"""
+
+import os, sys, math
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from wuyun_core import (
+    TIANGAN, DIZHI, WUYUN_MAP, TIANGAN_WUXING,
+    SHENG_CYCLE, KE_CYCLE, BEI_KE,
+    SITIAN_ZAIQUAN, LIUQI_WUXING,
+    get_ganzhi_for_year, get_sitian_zaiquan,
+    get_keqi_sequence, get_zhuqi_at_step, get_keqi_at_step,
+    judge_pattern,
+)
+
+PLATES = ["木", "火", "土", "金", "水"]
+
+# ===== 生克链 =====
+SHENG = {"木": "火", "火": "土", "土": "金", "金": "水", "水": "木"}
+KE   = {"木": "土", "火": "金", "土": "水", "金": "木", "水": "火"}
+
+# ===== 复气链：某行太过 → 被胜之子来复 =====
+FUXI_CYCLE = {
+    "木": "金", "火": "水", "土": "木",
+    "金": "火", "水": "土",
+}
+FUXI_TARGET = {v: k for k, v in FUXI_CYCLE.items()}
+
+# ===== 主客气格局力度系数（v3.1b 校正）=====
+# ★ 核心修正：天刑≠下跌，天刑=剧烈波动
+# 天刑月（客气克主气）可能大涨也可能大跌，
+# 因此力度大幅降低，只做微调而非方向主导
+KEQI_FACTORS = {
+    "顺化": 0.10,
+    "逆化": 0.05,
+    "同气": 0.12,
+    "小逆": -0.05,
+    "不和": -0.08,
+    "天刑": -0.08,
+}
+
+# ===== 天干 → 五运五行 =====
+WUYUN_WUXING = {
+    "甲": "土", "乙": "金", "丙": "水",
+    "丁": "木", "戊": "火",
+    "己": "土", "庚": "金", "辛": "水",
+    "壬": "木", "癸": "火",
+}
+
+
+def get_wuyun_nature(year_gan: str) -> dict:
+    """获取岁运的太过/不及属性"""
+    wuxing = WUYUN_WUXING.get(year_gan, "")
+    if not wuxing:
+        return {"wuxing": "", "nature": "", "strength": 0.5}
+    yang = year_gan in "甲丙戊庚壬"
+    nature = "太过" if yang else "不及"
+    strength = 0.6 if yang else 0.4
+    return {"wuxing": wuxing, "nature": nature, "strength": strength}
+
+
+def get_keqi_monthly(year: int, month: int) -> str:
+    """
+    获取指定年月的主客气格局字符串（v3.1 修复版）
+    
+    正确链路：
+      month → step(0-5)
+      → get_zhuqi_at_step(step)  → 主气名称（如"厥阴风木"）
+      → get_keqi_at_step(keqi_seq, step) → 客气名称
+      → judge_pattern(zhuqi, keqi) → 格局（顺化/天刑/...）
+    """
+    # 月 → 六气步(0-5)
+    step_map = {1: 0, 2: 0, 3: 1, 4: 1, 5: 2, 6: 2,
+                7: 3, 8: 3, 9: 4, 10: 4, 11: 5, 12: 5}
+    step = step_map.get(month, 0)
+
+    zhuqi = get_zhuqi_at_step(step)
+    if not zhuqi:
+        return "未知"
+
+    sitian, _ = get_sitian_zaiquan(year)
+    keqi_seq = get_keqi_sequence(sitian)
+    if not keqi_seq:
+        return "未知"
+    keqi = get_keqi_at_step(keqi_seq, step)
+    if not keqi:
+        return "未知"
+
+    return judge_pattern(zhuqi, keqi)
+
+
+def get_gradient_weight(month: int, peak_month: int = 6) -> float:
+    """司天→在泉 梯度权重：上半年~1.0 → 下半年~0.0"""
+    if peak_month <= 1:
+        return 0.0
+    return max(0.0, min(1.0, (peak_month - month) / peak_month))
+
+
+# ================================================================
+# 核心评分函数 v3.1
+# ================================================================
+
+def compute_corrected_score(plate_wx: str, year: int, month: int,
+                            prev_accumulation: dict = None,
+                            eruption_history: dict = None) -> tuple:
+    """
+    四层评分 · v3.1
+    
+    返回：(score, signals)
+      score: -1.0 ~ +1.0
+    """
+    year_gan = get_ganzhi_for_year(year)[0]
+    wuyun = get_wuyun_nature(year_gan)
+    dayun_wx = wuyun["wuxing"]
+    nature = wuyun["nature"]
+    strength = wuyun["strength"]
+
+    sitian, zaiquan = get_sitian_zaiquan(year)
+    st_wx = LIUQI_WUXING.get(sitian, "")
+    zq_wx = LIUQI_WUXING.get(zaiquan, "")
+
+    keqi = get_keqi_monthly(year, month)
+    qi_factor = KEQI_FACTORS.get(keqi, 0.0)
+
+    if prev_accumulation is None:
+        prev_accumulation = {p: 0.0 for p in PLATES}
+    if eruption_history is None:
+        eruption_history = {}
+
+    score = 0.0
+    signals = []
+
+    # ====================================================================
+    # 第1层：岁运影响（主客气调制）
+    # ====================================================================
+    if dayun_wx and nature == "太过":
+        # 主客气格局对岁运强度的调制系数
+        # ★ 严重天刑时keqi_mod=0.0 → 岁运完全丧失优势
+        if qi_factor > 0:
+            keqi_mod = 1.0       # 顺化/同气 → 全力发挥
+        elif qi_factor < -0.25:
+            keqi_mod = 0.0       # 天刑 → 岁运完全受压
+        elif qi_factor < -0.15:
+            keqi_mod = 0.2       # 不和 → 岁运受压80%
+        else:
+            keqi_mod = 0.5       # 小逆 → 岁运受压一半
+
+        if plate_wx == dayun_wx:
+            score += strength * 0.25 * keqi_mod
+            signals.append(f"岁运太过-调{keqi_mod:.1f}+{strength*0.40*keqi_mod:.3f}")
+        elif plate_wx == FUXI_CYCLE.get(dayun_wx, ""):
+            score += strength * 0.25
+            signals.append(f"复气-{FUXI_CYCLE[dayun_wx]}+{strength*0.25:.3f}")
+        elif plate_wx == FUXI_TARGET.get(FUXI_CYCLE.get(dayun_wx, ""), ""):
+            score -= strength * 0.35
+            signals.append(f"复气克-{plate_wx}-{strength*0.35:.3f}")
+        elif SHENG.get(dayun_wx) == plate_wx:
+            score += strength * 0.10
+            signals.append(f"岁运生-{plate_wx}+{strength*0.10:.3f}")
+        elif KE.get(dayun_wx) == plate_wx:
+            score -= strength * 0.12
+            signals.append(f"岁运克-{plate_wx}-{strength*0.20:.3f}")
+
+    elif dayun_wx and nature == "不及":
+        if plate_wx == dayun_wx:
+            score -= (1.0 - strength) * 0.30
+            signals.append(f"岁运不及-{dayun_wx}-{(1.0-strength)*0.30:.3f}")
+        elif BEI_KE.get(dayun_wx) == plate_wx:
+            score += 0.20
+            signals.append(f"不及被克方+0.20")
+        elif SHENG.get(dayun_wx) == plate_wx:
+            score -= 0.15
+            signals.append(f"不及所生-0.15")
+
+    # ====================================================================
+    # 第2层：司天/在泉 + 梯度过渡
+    # ====================================================================
+    grad = get_gradient_weight(month, 6)
+
+    if st_wx:
+        st_effect = 0.10 * grad
+        if plate_wx == st_wx:
+            score += st_effect
+            signals.append(f"司天同气*{grad:.2f}+{st_effect:.3f}")
+        elif KE.get(st_wx) == plate_wx:
+            score -= st_effect * 0.4
+            signals.append(f"司天克*{grad:.2f}-{st_effect*0.7:.3f}")
+        elif SHENG.get(st_wx) == plate_wx:
+            score += st_effect * 0.5
+            signals.append(f"司天生*{grad:.2f}+{st_effect*0.5:.3f}")
+
+        # ★ v4.0 修正：司天克在泉→不直接扣分，转郁气积累加速
+        # 冲突产生的是"抗力"不是"下跌"，压得越深弹得越高
+        if st_wx and zq_wx and KE.get(st_wx) == zq_wx:
+            if plate_wx == zq_wx:
+                conflict_boost = abs(-0.12 * grad) * 0.6
+                prev_accumulation[plate_wx] = min(
+                    1.0,
+                    prev_accumulation.get(plate_wx, 0.0) + conflict_boost
+                )
+                signals.append(f"司天克在泉郁气+{conflict_boost:.3f}(总{prev_accumulation[plate_wx]:.3f})")
+
+    if zq_wx:
+        zq_effect = 0.10 * (1.0 - grad)
+        if plate_wx == zq_wx:
+            # ★ 岁运与在泉同元素时 → 在泉贡献减半（太过反制更强）
+            if plate_wx == dayun_wx and nature == "太过":
+                zq_effect *= 0.5
+                signals.append(f"在泉同气-同元素减半*0.5")
+            score += zq_effect
+            signals.append(f"在泉同气*{(1.0-grad):.2f}+{zq_effect:.3f}")
+        elif KE.get(zq_wx) == plate_wx:
+            score -= zq_effect * 0.7
+            signals.append(f"在泉克*{(1.0-grad):.2f}-{zq_effect*0.7:.3f}")
+
+    # ====================================================================
+    # 第3层：主客气格局压制 + 连续复气累积
+    # ====================================================================
+    if qi_factor < 0:
+        # 压制期（微调：天刑≠下跌，只做力度调制）
+        if plate_wx == dayun_wx and nature == "太过":
+            score += qi_factor * 0.10
+            signals.append(f"天刑岁运{qi_factor*0.10:.3f}")
+        elif SHENG.get(dayun_wx) == plate_wx and nature == "太过":
+            score += qi_factor * 0.3
+            signals.append(f"天刑波及{qi_factor*0.3:.3f}")
+        else:
+            score += qi_factor * 0.2
+            signals.append(f"天刑微{qi_factor*0.2:.3f}")
+    elif qi_factor > 0:
+        if plate_wx == dayun_wx:
+            score += qi_factor * 0.3
+            signals.append(f"顺化岁运+{qi_factor*0.3:.3f}")
+        else:
+            score += qi_factor * 0.2
+            signals.append(f"顺化+{qi_factor*0.2:.3f}")
+
+    # 连续复气累积
+    month_progress = month / 12.0
+    if qi_factor < 0:
+        accumulation_inc = abs(qi_factor) * 0.15
+        prev_accumulation[plate_wx] = min(
+            1.0,
+            prev_accumulation.get(plate_wx, 0.0) + accumulation_inc
+        )
+        signals.append(f"复气积累+{accumulation_inc:.3f}(总{prev_accumulation[plate_wx]:.3f})")
+    
+    # ★ v4.0 修复：郁发释放独立于qi_factor，每月都检查
+    # 之前的bug：郁发释放只在qi_factor>=0的else分支执行，
+    # 导致被压板块（qi_factor<0）永远积累不释放
+    accum = prev_accumulation.get(plate_wx, 0.0)
+    if accum > 0.001:
+        accum_penalty = accum * 0.15 * month_progress
+        score -= accum_penalty
+        signals.append(f"累积压制-{accum_penalty:.3f}")
+    
+    last_eruption = eruption_history.get(plate_wx, 0)
+    if accum > 0.08 and (month - last_eruption) >= 2:
+        release = accum * 0.40
+        score += release
+        signals.append(f"郁发释放+{release:.3f}(累积{accum:.3f})")
+        prev_accumulation[plate_wx] = accum * 0.60  # 释放后保留60%，保持积累节奏
+        eruption_history[plate_wx] = month
+    elif accum > 0.001 and qi_factor >= 0:
+        decay = accum * 0.08
+        prev_accumulation[plate_wx] = max(0.0, accum - decay)
+        signals.append(f"复气衰减-{decay:.3f}")
+
+    # ====================================================================
+    # 第4层：太过反制 + 均值回归
+    # ====================================================================
+    positive_signals_count = 0
+    if plate_wx == dayun_wx and nature == "太过":
+        positive_signals_count += 1.0
+    if plate_wx == st_wx:
+        positive_signals_count += 0.8 * grad
+    if plate_wx == zq_wx:
+        positive_signals_count += 0.6 * (1.0 - grad)
+
+    EXCESS_THRESHOLD = 1.0
+    if positive_signals_count > EXCESS_THRESHOLD:
+        excess = positive_signals_count - EXCESS_THRESHOLD
+        suppression = -excess * 0.30
+        score += suppression
+        signals.append(f"太过反制{suppression:.3f}")
+
+    MR_STRENGTH = 0.02
+    mr_force = -score * MR_STRENGTH
+    if abs(mr_force) > 0.005:
+        score += mr_force
+        signals.append(f"均值回归{mr_force:+.3f}")
+
+    # ====================================================================
+    # 第5层：季节阻尼
+    # ====================================================================
+    _season_map = {
+        "木": {1: -0.10, 2: -0.08, 11: -0.08, 12: -0.10},
+        "火": {1: -0.05, 2: -0.03, 11: -0.03, 12: -0.05},
+        "土": {3: 0.06, 6: 0.06, 9: 0.06, 12: 0.06},
+        "金": {8: 0.08, 9: 0.10, 10: 0.08},
+        "水": {1: 0.10, 2: 0.08, 11: 0.08, 12: 0.10},
+    }
+    _damp = _season_map.get(plate_wx, {}).get(month, 0.0)
+    if _damp != 0:
+        score += _damp
+        signals.append(f"季节阻尼{_damp:+.2f}")
+
+    return max(-1.0, min(1.0, round(score, 4))), signals
+
+
+def batch_corrected_predict(year: int, months: list = None) -> list:
+    """批量预测某年各板块各月（带状态追踪）"""
+    if months is None:
+        months = list(range(1, 13))
+    accumulation = {p: 0.0 for p in PLATES}
+    eruption_hx = {}
+    results = []
+    for m in months:
+        row = {"month": m}
+        for p in PLATES:
+            s, sig = compute_corrected_score(
+                p, year, m,
+                prev_accumulation=accumulation,
+                eruption_history=eruption_hx,
+            )
+            row[p] = round(s, 4)
+            row[f"{p}_sig"] = ";".join(sig[:5])
+        results.append(row)
+    return results
+
+
+def evaluate_corrected(test_data: dict) -> tuple:
+    """严格方向评估（剔除震荡月）"""
+    correct, total = 0, 0
+    for year_str, year_data in test_data.items():
+        year = int(year_str)
+        for m_entry in year_data.get("months", []):
+            month = m_entry["m"]
+            pred = batch_corrected_predict(year, [month])[0]
+            for p in PLATES:
+                actual_val = m_entry.get(p, 0)
+                pred_val = pred.get(p, 0)
+                actual_dir = 1 if actual_val > 1 else (-1 if actual_val < -1 else 0)
+                pred_dir = 1 if pred_val >= 0.03 else (-1 if pred_val <= -0.03 else 0)
+                if actual_dir != 0 and pred_dir != 0:
+                    total += 1
+                    if pred_dir == actual_dir:
+                        correct += 1
+    rate = correct / total if total > 0 else 0
+    return correct, total, rate
+
+
+def correlation_analysis(test_data: dict) -> dict:
+    """评分与实际涨跌幅的相关系数"""
+    plate_corrs = {}
+    for p in PLATES:
+        preds, actuals = [], []
+        for year_str, year_data in test_data.items():
+            year = int(year_str)
+            for m_entry in year_data.get("months", []):
+                month = m_entry["m"]
+                pred = batch_corrected_predict(year, [month])[0]
+                actual_val = m_entry.get(p, 0)
+                pred_val = pred.get(p, 0)
+                if abs(actual_val) > 0.1:
+                    preds.append(pred_val)
+                    actuals.append(actual_val)
+        n = len(preds)
+        if n < 3:
+            plate_corrs[p] = 0.0
+            continue
+        mean_p = sum(preds) / n
+        mean_a = sum(actuals) / n
+        num = sum((preds[i] - mean_p) * (actuals[i] - mean_a) for i in range(n))
+        den = math.sqrt(
+            sum((preds[i] - mean_p) ** 2 for i in range(n)) *
+            sum((actuals[i] - mean_a) ** 2 for i in range(n))
+        )
+        plate_corrs[p] = round(num / den, 4) if den > 0 else 0.0
+    return plate_corrs
+
+
+def print_yearly_results(year: int):
+    """打印年度逐月逐板块评分"""
+    results = batch_corrected_predict(year)
+    print(f"\n{'=' * 65}")
+    print(f"【{year}年预测 · 胜复校正 v3.1】")
+    print(f"{'月':>3} ", end="")
+    for p in PLATES:
+        print(f"  {p:>4} ", end="")
+    print()
+    print("-" * 45)
+    for row in results:
+        print(f"{row['month']:>3} ", end="")
+        for p in PLATES:
+            v = row[p]
+            mark = "🟢" if v >= 0.1 else ("🔴" if v <= -0.1 else "○")
+            print(f" {mark}{v:+.3f}", end="")
+        print()
+
+    # 打印 keqi 格局
+    print(f"\n  主客气格局：")
+    for m in range(1, 13):
+        keqi = get_keqi_monthly(year, m)
+        print(f"    {m}月: {keqi}", end="")
+        if m % 4 == 0:
+            print()
+
+
+if __name__ == "__main__":
+    import json
+    test_path = os.path.join(_SCRIPT_DIR, "..", "data", "test_suite.json")
+    with open(test_path, "r", encoding="utf-8") as f:
+        test_data = json.load(f)
+
+    print_yearly_results(2024)
+    print_yearly_results(2025)
+
+    for year in [2024, 2025]:
+        filtered = {str(year): test_data[str(year)]} if str(year) in test_data else {}
+        if filtered:
+            cor, tot, rate = evaluate_corrected(filtered)
+            print(f"\n{'─' * 65}")
+            print(f"{year}年 严格方向评估（排震荡）：")
+            print(f"  {cor}/{tot} = {rate:.1%}")
+
+    corrs = correlation_analysis(test_data)
+    print(f"\n{'═' * 65}")
+    print("评分与实际涨幅 · 相关系数 r（v3.1）")
+    for p in PLATES:
+        c = corrs[p]
+        mark = "🟢" if c > 0.1 else ("🔴" if c < -0.1 else "○")
+        print(f"  {p}: {mark} r = {c:.4f}")
+    print(f"{'═' * 65}")

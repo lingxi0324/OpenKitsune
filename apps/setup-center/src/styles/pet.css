@@ -1,0 +1,152 @@
+.pet-root {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  user-select: none;
+  background: transparent;
+  overflow: hidden;
+  position: fixed;
+  top: 0;
+  left: 0;
+}
+
+.pet-img {
+  width: 75%;
+  max-width: 320px;
+  height: auto;
+  pointer-events: none;
+  filter: drop-shadow(0 2px 6px rgba(0,0,0,0.12));
+  will-change: transform;
+}
+
+/* ── Shadow ── */
+.pet-shadow-wrap {
+  position: absolute;
+  bottom: 18%;
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  pointer-events: none;
+}
+
+.pet-shadow {
+  width: 45%;
+  max-width: 100px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.1);
+  transition: transform 0.3s, opacity 0.3s;
+}
+
+.pet-shadow-tool_execution,
+.pet-shadow-completed {
+  animation: shadow-pulse 0.3s ease infinite alternate;
+}
+
+.pet-shadow-error {
+  opacity: 0.06;
+  transform: scaleX(1.15);
+}
+
+/* ── Label ── */
+.pet-label {
+  margin-top: 4px;
+  padding: 3px 10px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+  color: white;
+  transition: background 0.3s, box-shadow 0.3s;
+}
+
+.pet-label-idle { background: rgba(0,0,0,0.45); }
+.pet-label-thinking { background: rgba(59,130,246,0.7); box-shadow: 0 0 10px rgba(59,130,246,0.4); }
+.pet-label-tool_execution { background: rgba(245,158,11,0.7); box-shadow: 0 0 10px rgba(245,158,11,0.4); }
+.pet-label-completed { background: rgba(16,185,129,0.7); box-shadow: 0 0 10px rgba(16,185,129,0.4); }
+.pet-label-error { background: rgba(239,68,68,0.7); box-shadow: 0 0 10px rgba(239,68,68,0.4); }
+
+/* ── Animations ── */
+
+.pet-anim-idle {
+  animation: idle-float 3s ease-in-out infinite;
+}
+
+.pet-anim-thinking {
+  animation: thinking-tilt 2.5s ease-in-out infinite;
+}
+
+.pet-anim-tool_execution {
+  animation: running-bounce 0.35s cubic-bezier(0.28,0.84,0.42,1) infinite;
+}
+
+.pet-anim-completed {
+  animation: happy-jump 0.5s cubic-bezier(0.34,1.56,0.64,1) infinite;
+}
+
+.pet-anim-error {
+  animation: error-shake 0.12s ease-in-out infinite;
+}
+
+@keyframes idle-float {
+  0%, 100% { transform: translateY(0) scale(1) rotate(0deg); }
+  25% { transform: translateY(-3px) scale(1.01) rotate(0.5deg); }
+  50% { transform: translateY(-5px) scale(1.015) rotate(0deg); }
+  75% { transform: translateY(-3px) scale(1.01) rotate(-0.5deg); }
+}
+
+@keyframes thinking-tilt {
+  0%, 100% { transform: rotate(0deg) translateY(0); }
+  20% { transform: rotate(6deg) translateY(-2px); }
+  40% { transform: rotate(4deg) translateY(0); }
+  60% { transform: rotate(-4deg) translateY(-2px); }
+  80% { transform: rotate(-2deg) translateY(0); }
+}
+
+@keyframes running-bounce {
+  0%, 100% { transform: translateY(0) scaleY(1) scaleX(1); }
+  30% { transform: translateY(-14px) scaleY(1.06) scaleX(0.96); }
+  50% { transform: translateY(-18px) scaleY(1.04) scaleX(0.98); }
+  80% { transform: translateY(-4px) scaleY(0.95) scaleX(1.04); }
+}
+
+@keyframes happy-jump {
+  0%, 100% { transform: translateY(0) rotate(0deg) scale(1); }
+  30% { transform: translateY(-22px) rotate(-5deg) scale(1.08); }
+  50% { transform: translateY(-28px) rotate(3deg) scale(1.06); }
+  70% { transform: translateY(-12px) rotate(-2deg) scale(1.02); }
+}
+
+@keyframes error-shake {
+  0%, 100% { transform: translateX(0) rotate(0deg); }
+  25% { transform: translateX(-4px) rotate(-1.5deg); }
+  75% { transform: translateX(4px) rotate(1.5deg); }
+}
+
+@keyframes shadow-pulse {
+  from { transform: scaleX(1); opacity: 0.1; }
+  to { transform: scaleX(0.7); opacity: 0.05; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-anim-idle,
+  .pet-anim-thinking,
+  .pet-anim-tool_execution,
+  .pet-anim-completed,
+  .pet-anim-error {
+    animation: none !important;
+  }
+  .pet-shadow-tool_execution,
+  .pet-shadow-completed {
+    animation: none !important;
+  }
+  .pet-img {
+    will-change: auto;
+  }
+}
+

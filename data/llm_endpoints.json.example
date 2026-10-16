@@ -1,0 +1,109 @@
+{
+  "_doc": "OpenKitsune LLM 端点配置文件 - 复制为 llm_endpoints.json 后使用",
+  "_doc_fields": {
+    "name": "端点名称（唯一标识）",
+    "provider": "供应商标识：anthropic / openai / dashscope / dashscope-intl / kimi-cn / kimi-int / minimax-cn / minimax-int / deepseek / openrouter / siliconflow / siliconflow-intl / volcengine / zhipu-cn / zhipu-int 等",
+    "api_type": "API 协议类型：anthropic 或 openai（OpenAI 兼容格式）",
+    "base_url": "API 基地址",
+    "api_key_env": "API Key 对应的环境变量名（在 .env 中配置实际值）",
+    "model": "模型名称",
+    "priority": "优先级（数字越小优先级越高，1=最高）",
+    "max_tokens": "最大输出 token 数",
+    "timeout": "请求超时时间（秒）",
+    "capabilities": "模型能力：text(文本) / vision(图像) / video(视频) / tools(工具调用) / thinking(深度推理) / audio(音频) / pdf(PDF文档)",
+    "extra_params": "额外参数（传递给 API 的特殊参数）",
+    "note": "备注说明"
+  },
+  "_doc_examples": [
+    {
+      "_doc": "示例 1: OpenAI（主端点，priority=1）",
+      "name": "primary",
+      "provider": "openai",
+      "api_type": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "model": "gpt-4o-mini",
+      "priority": 1,
+      "max_tokens": 8192,
+      "timeout": 180,
+      "capabilities": ["text", "tools"]
+    },
+    {
+      "_doc": "示例 2: DashScope（备份端点，priority=2）。如需思考模式，可设置 capabilities 包含 thinking，并在 extra_params 里打开 enable_thinking。",
+      "name": "backup-dashscope",
+      "provider": "dashscope",
+      "api_type": "openai",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "api_key_env": "DASHSCOPE_API_KEY",
+      "model": "qwen3-max",
+      "priority": 2,
+      "max_tokens": 8192,
+      "timeout": 180,
+      "capabilities": ["text", "tools", "thinking"],
+      "extra_params": {"enable_thinking": true}
+    },
+    {
+      "_doc": "示例 3: 智谱 AI 国内区（GLM-5 旗舰模型）",
+      "name": "zhipu-cn-glm5",
+      "provider": "zhipu-cn",
+      "api_type": "openai",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "api_key_env": "ZHIPU_API_KEY",
+      "model": "glm-5",
+      "priority": 3,
+      "max_tokens": 8192,
+      "timeout": 180,
+      "capabilities": ["text", "tools", "thinking"]
+    },
+    {
+      "_doc": "示例 4: 智谱 AI 国际区 (Z.AI)",
+      "name": "zhipu-int-glm5",
+      "provider": "zhipu-int",
+      "api_type": "openai",
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "api_key_env": "ZHIPU_API_KEY",
+      "model": "glm-5",
+      "priority": 4,
+      "max_tokens": 8192,
+      "timeout": 180,
+      "capabilities": ["text", "tools", "thinking"]
+    }
+  ],
+
+  "endpoints": [],
+
+  "compiler_endpoints": [],
+
+  "_doc_stt_endpoints": "语音识别(STT)端点配置。支持两种协议: 1) OpenAI /audio/transcriptions (whisper-1, gpt-4o-transcribe 等); 2) DashScope Qwen-ASR (qwen3-asr-flash，自动走 /chat/completions 协议)。注意: qwen3-asr-flash-realtime 是 WebSocket 实时流模型，不适用于文件识别。",
+  "_doc_stt_examples": [
+    {
+      "_doc": "示例: OpenAI Whisper API (走 /audio/transcriptions 协议)",
+      "name": "openai-stt",
+      "provider": "openai",
+      "api_type": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "model": "gpt-4o-transcribe",
+      "priority": 1
+    },
+    {
+      "_doc": "示例: DashScope Qwen-ASR (自动走 /chat/completions + base64 协议，≤5分钟音频)",
+      "name": "dashscope-stt",
+      "provider": "dashscope",
+      "api_type": "openai",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "api_key_env": "DASHSCOPE_API_KEY",
+      "model": "qwen3-asr-flash",
+      "priority": 2
+    }
+  ],
+  "stt_endpoints": [],
+
+  "settings": {
+    "retry_count": 2,
+    "retry_delay_seconds": 2,
+    "health_check_interval": 60,
+    "fallback_on_error": true,
+    "allow_failover_with_tool_context": false
+  }
+}

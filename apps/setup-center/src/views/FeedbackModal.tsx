@@ -1,0 +1,953 @@
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { downloadFile, showInFolder, invoke, IS_TAURI, onDragDrop, readFileBase64 } from "../platform";
+import { IconX, IconInfo } from "../icons";
+import { safeFetch } from "../providers";
+import { consumeSseStream } from "../utils/sseStateMachine";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "../components/ui/dialog";
+import { Button } from "../components/ui/button";
+import { Input } from "../components/ui/input";
+import { Textarea } from "../components/ui/textarea";
+import { Label } from "../components/ui/label";
+import { Checkbox } from "../components/ui/checkbox";
+
+export type FeedbackMode = "bug" | "feature";
+
+type SystemInfo = {
+  os?: string;
+  python?: string;
+  openkitsune_version?: string;
+  packages?: Record<string, string>;
+  memory_total_gb?: number;
+  disk_free_gb?: number;
+  im_channels?: string[];
+  [key: string]: unknown;
+};
+
+export type FeedbackPrefill = {
+  mode?: FeedbackMode;
+  title?: string;
+  description?: string;
+};
+
+type FeedbackModalProps = {
+  open: boolean;
+  onClose: () => void;
+  apiBase: string;
+  initialMode?: FeedbackMode;
+  prefill?: FeedbackPrefill | null;
+  onNavigateToMyFeedback?: () => void;
+  serviceRunning?: boolean;
+  currentWorkspaceId?: string | null;
+};
+
+export function FeedbackModal({ open, onClose, apiBase, initialMode = "bug", prefill, onNavigateToMyFeedback, serviceRunning = true, currentWorkspaceId }: FeedbackModalProps) {
+  const { t } = useTranslation();
+
+  const [mode, setMode] = useState<FeedbackMode>(initialMode);
+
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [imageFiles, setImageFiles] = useState<File[]>([]);
+  const [imagePreviews, setImagePreviews] = useState<string[]>([]);
+
+  const [steps, setSteps] = useState("");
+  const [uploadLogs, setUploadLogs] = useState(true);
+  const [uploadDebug, setUploadDebug] = useState(true);
+  const [, setSystemInfo] = useState<SystemInfo | null>(null);
+
+  const [contactEmail, setContactEmail] = useState("");
+  const [contactWechat, setContactWechat] = useState("");
+
+  const [captchaCfg, setCaptchaCfg] = useState<{ scene_id: string; prefix: string } | null>(null);
+
+  const [submitting, setSubmitting] = useState(false);
+  const [submitResult, setSubmitResult] = useState<{ ok: boolean; msg: string; downloadUrl?: string } | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{
+    percent: number;
+    phase: string;
+    detail: string;
+  } | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const captchaTokenRef = useRef("");
+  const captchaNonceRef = useRef("");
+  const captchaContainerRef = useRef<HTMLDivElement>(null);
+  const captchaInstanceRef = useRef<any>(null);
+  const handleSubmitRef = useRef<() => void>(() => {});
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // 同步去重：防止 captcha 校验回调与按钮 onClick 双路径并发触发提交。
+  const submittingRef = useRef(false);
+
+  type Phase = "form" | "uploading" | "success";
+  const [phase, setPhase] = useState<Phase>("form");
+  const [captchaResetKey, setCaptchaResetKey] = useState(0);
+  const [captchaReady, setCaptchaReady] = useState(false);
+  const captchaBoundRef = useRef(false);
+
+  useEffect(() => {
+    if (open) {
+      setSubmitResult(null);
+      setDownloading(false);
+      setUploadProgress(null);
+      setPhase("form");
+      submittingRef.current = false;
+      setCaptchaReady(false);
+      if (prefill) {
+        setMode(prefill.mode ?? initialMode);
+        setTitle(prefill.title ?? "");
+        setDescription(prefill.description ?? "");
+      } else {
+        setMode(initialMode);
+      }
+    }
+  }, [open, initialMode, prefill]);
+
+  const useOfflineIpc = IS_TAURI && !serviceRunning;
+
+  useEffect(() => {
+    if (!open) return;
+
+    if (useOfflineIpc) {
+      setSystemInfo({ os: navigator.userAgent, note: "collected_via_tauri_offline" });
+      const wsId = currentWorkspaceId || "default";
+      invoke<{ captcha_scene_id: string; captcha_prefix: string }>("get_feedback_config_offline", { workspaceId: wsId })
+        .then((cfg) => {
+          if (cfg.captcha_scene_id && cfg.captcha_prefix) {
+            setCaptchaCfg({ scene_id: cfg.captcha_scene_id, prefix: cfg.captcha_prefix });
+          }
+        })
+        .catch(() => {});
+      return;
+    }
+
+    safeFetch(`${apiBase}/api/system-info`, { signal: AbortSignal.timeout(5000) })
+      .then((r) => r.json())
+      .then(setSystemInfo)
+      .catch(() => setSystemInfo(null));
+
+    safeFetch(`${apiBase}/api/feedback-config`, { signal: AbortSignal.timeout(5000) })
+      .then((r) => r.json())
+      .then((cfg: any) => {
+        if (cfg.captcha_scene_id && cfg.captcha_prefix) {
+          setCaptchaCfg({ scene_id: cfg.captcha_scene_id, prefix: cfg.captcha_prefix });
+        }
+      })
+      .catch(() => {});
+  }, [open, apiBase, useOfflineIpc, currentWorkspaceId]);
+
+  useEffect(() => {
+    if (!open || !captchaCfg) return;
+    let destroyed = false;
+
+    // Radix Dialog (modal) sets `pointer-events: none` on <body>, which kills
+    // all interaction on elements outside the dialog portal — including the
+    // Aliyun CAPTCHA popup that renders as a direct child of <body>.
+    // Use a MutationObserver to detect captcha-related elements added to <body>
+    // and force pointer-events / z-index so the slider is draggable.
+    const liftCaptchaNode = (el: HTMLElement) => {
+      el.style.setProperty("z-index", "2147483647", "important");
+      el.style.setProperty("pointer-events", "auto", "important");
+    };
+
+    const isCaptchaNode = (el: HTMLElement): boolean => {
+      const hay = `${el.id} ${el.className}`;
+      return /captcha|slidetounlock|nc[-_]|sm[-_]/i.test(hay);
+    };
+
+    const observer = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const node of m.addedNodes) {
+          if (node instanceof HTMLElement && node.parentElement === document.body && isCaptchaNode(node)) {
+            liftCaptchaNode(node);
+          }
+        }
+      }
+    });
+    observer.observe(document.body, { childList: true });
+
+    // Also fix any captcha elements already in the DOM
+    document.querySelectorAll<HTMLElement>(
+      "body > div[id*='captcha' i], body > div[class*='captcha' i]",
+    ).forEach(liftCaptchaNode);
+
+    const initCaptcha = async () => {
+      const initFn = (window as any).initAliyunCaptcha;
+      if (typeof initFn === "function") {
+        if (destroyed || !captchaContainerRef.current) return;
+        try {
+          captchaContainerRef.current.innerHTML = "";
+          captchaInstanceRef.current = await initFn({
+            SceneId: captchaCfg.scene_id,
+            prefix: captchaCfg.prefix,
+            mode: "popup",
+            element: captchaContainerRef.current,
+            button: "#feedback-submit-btn",
+            captchaVerifyCallback: async (captchaVerifyParam: string) => {
+              captchaTokenRef.current = captchaVerifyParam;
+              captchaNonceRef.current = "";
+              try {
+                const resp = await safeFetch(`${apiBase}/api/captcha/verify`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ captcha_verify_param: captchaVerifyParam }),
+                  signal: AbortSignal.timeout(15000),
+                });
+                const data = await resp.json();
+                if (data.verified) {
+                  captchaNonceRef.current = data.nonce || "";
+                  return { captchaResult: true, bizResult: true };
+                }
+                captchaTokenRef.current = "";
+                return { captchaResult: false, bizResult: false };
+              } catch (err) {
+                if (err instanceof TypeError) {
+                  // Network-level error: token was never sent to the backend, so
+                  // keep it for the Tauri IPC offline submission path.
+                  return { captchaResult: true, bizResult: true };
+                }
+                captchaTokenRef.current = "";
+                return { captchaResult: false, bizResult: false };
+              }
+            },
+            onBizResultCallback: () => {
+              handleSubmitRef.current();
+            },
+            getInstance: (inst: any) => { captchaInstanceRef.current = inst; },
+            language: document.documentElement.lang?.startsWith("zh") ? "cn" : "en",
+          });
+          if (!destroyed) {
+            captchaBoundRef.current = true;
+            setCaptchaReady(true);
+          }
+        } catch {
+          if (!destroyed) setCaptchaReady(true);
+        }
+        return;
+      }
+      if (!document.querySelector('script[src*="AliyunCaptcha"]')) {
+        const s = document.createElement("script");
+        s.src = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
+        s.async = true;
+        s.onload = () => setTimeout(initCaptcha, 200);
+        document.head.appendChild(s);
+      } else {
+        setTimeout(initCaptcha, 300);
+      }
+    };
+
+    const timer = setTimeout(initCaptcha, 150);
+    return () => {
+      destroyed = true;
+      clearTimeout(timer);
+      observer.disconnect();
+      if (captchaInstanceRef.current?.destroy) {
+        try { captchaInstanceRef.current.destroy(); } catch {}
+      }
+      captchaInstanceRef.current = null;
+      captchaTokenRef.current = "";
+      captchaNonceRef.current = "";
+      captchaBoundRef.current = false;
+      setCaptchaReady(false);
+    };
+  }, [open, captchaCfg, captchaResetKey, apiBase]);
+
+  const addImages = useCallback((files: FileList | File[]) => {
+    const newFiles = Array.from(files).filter(
+      (f) => f.type.startsWith("image/") && f.size < 10 * 1024 * 1024,
+    );
+    setImageFiles((prev) => {
+      const combined = [...prev, ...newFiles].slice(0, 10);
+      setImagePreviews((old) => { old.forEach(URL.revokeObjectURL); return combined.map((f) => URL.createObjectURL(f)); });
+      return combined;
+    });
+  }, []);
+
+  const removeImage = useCallback((idx: number) => {
+    setImageFiles((prev) => {
+      const next = prev.filter((_, i) => i !== idx);
+      setImagePreviews((old) => { old.forEach(URL.revokeObjectURL); return next.map((f) => URL.createObjectURL(f)); });
+      return next;
+    });
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    if (e.dataTransfer.files.length) addImages(e.dataTransfer.files);
+  }, [addImages]);
+
+  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const imgs: File[] = [];
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) imgs.push(file);
+      }
+    }
+    if (imgs.length > 0) {
+      addImages(imgs);
+    }
+  }, [addImages]);
+
+  // Tauri-native drag-drop: the webview-level listener captures OS file drops
+  // that never reach HTML5 drag events. Register when the modal is open so
+  // images dragged from the desktop land in the feedback form, not the chat.
+  const [tauriDragOver, setTauriDragOver] = useState(false);
+  useEffect(() => {
+    if (!open || !IS_TAURI) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+
+    const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"]);
+    const MIME_MAP: Record<string, string> = {
+      png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+      gif: "image/gif", webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
+    };
+
+    onDragDrop({
+      onEnter: () => { if (!cancelled) setTauriDragOver(true); },
+      onOver: () => { if (!cancelled) setTauriDragOver(true); },
+      onLeave: () => { if (!cancelled) setTauriDragOver(false); },
+      onDrop: (paths) => {
+        if (cancelled) return;
+        setTauriDragOver(false);
+        for (const filePath of paths) {
+          const name = filePath.split(/[\\/]/).pop() || "image.png";
+          const ext = (name.split(".").pop() || "").toLowerCase();
+          if (!IMAGE_EXTS.has(ext)) continue;
+          readFileBase64(filePath)
+            .then((dataUrl) => {
+              if (cancelled) return;
+              const commaIdx = dataUrl.indexOf(",");
+              const b64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
+              const bin = atob(b64);
+              const bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+              addImages([new File([bytes], name, { type: MIME_MAP[ext] || "image/png" })]);
+            })
+            .catch(() => {});
+        }
+      },
+    }).then((unsub) => { unlisten = unsub; });
+
+    return () => {
+      cancelled = true;
+      setTauriDragOver(false);
+      unlisten?.();
+    };
+  }, [open, addImages]);
+
+  const resetForm = useCallback(() => {
+    setMode(initialMode);
+    setTitle("");
+    setDescription("");
+    setSteps("");
+    setContactEmail("");
+    setContactWechat("");
+    setImageFiles([]);
+    setImagePreviews((old) => { old.forEach(URL.revokeObjectURL); return []; });
+    setUploadLogs(true);
+    setUploadDebug(true);
+    setSubmitResult(null);
+  }, [initialMode]);
+
+  const friendlyErrorMsg = useCallback((data: any): string => {
+    const code = data?.friendly || "";
+    const detail = data?.detail || "";
+    if (code === "feedback_captcha_failed") return t("feedback.captchaFailed");
+    if (code === "feedback_rate_limit") return t("feedback.rateLimited");
+    if (code === "feedback_cloud_network_error") return t("feedback.cloudNetworkError");
+    if (code === "feedback_cloud_error") return t("feedback.cloudError", { detail });
+    return detail || t("feedback.uploadFailedNetwork");
+  }, [t]);
+
+  const handleSseError = useCallback((data: any) => {
+    setUploadProgress(null);
+    setSubmitResult({ ok: false, msg: friendlyErrorMsg(data) });
+    setPhase("form");
+    setCaptchaResetKey((k) => k + 1);
+  }, [friendlyErrorMsg]);
+
+  const handleSubmitViaIpc = useCallback(async (captchaToken: string) => {
+    const reportId = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+    const wsId = currentWorkspaceId || "default";
+
+    setUploadProgress({ percent: 10, phase: "building", detail: t("feedback.progressPacking") });
+
+    const images: { filename: string; dataBase64: string }[] = [];
+    for (const f of imageFiles) {
+      const buf = await f.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      images.push({ filename: f.name, dataBase64: btoa(binary) });
+    }
+
+    const zipPath = await invoke<string>("build_feedback_zip", {
+      workspaceId: wsId,
+      reportId,
+      title: title.trim(),
+      description: description.trim(),
+      reportType: mode,
+      steps: steps.trim() || null,
+      contactEmail: contactEmail.trim() || null,
+      images: images.length > 0 ? images : null,
+    });
+
+    setUploadProgress({ percent: 35, phase: "uploading", detail: "上传反馈数据..." });
+
+    const result = await invoke<{ reportId: string; feedbackToken: string | null; issueUrl: string | null }>(
+      "upload_feedback_to_cloud",
+      {
+        workspaceId: wsId,
+        zipPath,
+        reportId,
+        reportType: mode,
+        title: title.trim(),
+        summary: description.trim().slice(0, 2000),
+        captchaVerifyParam: captchaToken || "none",
+        contactEmail: contactEmail.trim(),
+      },
+    );
+
+    setUploadProgress({ percent: 90, phase: "saving", detail: "保存本地记录..." });
+
+    await invoke("save_pending_feedback", {
+      record: {
+        reportId: result.reportId,
+        feedbackToken: result.feedbackToken,
+        title: title.trim(),
+        reportType: mode,
+        contactEmail: contactEmail.trim(),
+        submittedAt: new Date().toISOString(),
+        issueUrl: result.issueUrl,
+      },
+    });
+
+    return result;
+  }, [currentWorkspaceId, title, description, mode, steps, contactEmail, imageFiles, t]);
+
+  const handleSubmit = useCallback(async () => {
+    if (submittingRef.current) return;
+    if (!title.trim() || !description.trim()) return;
+    if (captchaCfg && captchaBoundRef.current && !captchaTokenRef.current) return;
+
+    // 一次性消费 captcha token：先取出再立即清空，避免任一路径再次进入时复用同一 token。
+    const token = captchaTokenRef.current || "none";
+    const captchaNonce = captchaNonceRef.current || "";
+    captchaTokenRef.current = "";
+    captchaNonceRef.current = "";
+
+    submittingRef.current = true;
+    setSubmitting(true);
+    setSubmitResult(null);
+    setPhase("uploading");
+    setUploadProgress({ percent: 0, phase: "starting", detail: t("feedback.progressPacking") });
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      // Offline IPC path: backend is down, submit via Tauri Rust commands
+      if (useOfflineIpc) {
+        try {
+          await handleSubmitViaIpc(token);
+          setUploadProgress(null);
+          resetForm();
+          setPhase("success");
+        } catch (err: any) {
+          setUploadProgress(null);
+          setSubmitResult({ ok: false, msg: err?.message || err?.toString() || t("feedback.uploadFailedNetwork") });
+          setPhase("form");
+          setCaptchaResetKey((k) => k + 1);
+        }
+        return;
+      }
+
+      const form = new FormData();
+      form.append("title", title.trim());
+      form.append("description", description.trim());
+      form.append("captcha_verify_param", token);
+      if (captchaNonce) {
+        form.append("captcha_nonce", captchaNonce);
+      }
+      for (const img of imageFiles) {
+        form.append("images", img);
+      }
+
+      let url: string;
+      if (mode === "bug") {
+        url = `${apiBase}/api/bug-report`;
+        form.append("steps", steps.trim());
+        form.append("upload_logs", String(uploadLogs));
+        form.append("upload_debug", String(uploadDebug));
+      } else {
+        url = `${apiBase}/api/feature-request`;
+      }
+      form.append("contact_email", contactEmail.trim());
+      form.append("contact_wechat", contactWechat.trim());
+
+      const res = await fetch(url, {
+        method: "POST",
+        body: form,
+        signal: controller.signal,
+      });
+
+      const contentType = res.headers.get("content-type") || "";
+
+      if (contentType.includes("text/event-stream") && res.body) {
+        const reader = res.body.getReader();
+        await consumeSseStream({
+          reader,
+          onFrame: (frame) => {
+            let data: any;
+            try { data = JSON.parse(frame.data); } catch { return; }
+
+            if (frame.event === "progress") {
+              setUploadProgress({
+                percent: data.percent ?? 0,
+                phase: data.phase ?? "",
+                detail: data.detail ?? "",
+              });
+            } else if (frame.event === "complete") {
+              setUploadProgress(null);
+              if (data.status === "upload_failed") {
+                const dlUrl = data.download_url ? `${apiBase}${data.download_url}` : undefined;
+                setSubmitResult({
+                  ok: false,
+                  msg: t("feedback.uploadFailedSaved", { error: data.error || "unknown" }),
+                  downloadUrl: dlUrl,
+                });
+                setPhase("form");
+                setCaptchaResetKey((k) => k + 1);
+              } else {
+                resetForm();
+                setPhase("success");
+              }
+            } else if (frame.event === "error") {
+              handleSseError(data);
+            }
+          },
+        });
+      } else {
+        setUploadProgress(null);
+        const data = await res.json();
+        if (data.status === "upload_failed") {
+          const dlUrl = data.download_url ? `${apiBase}${data.download_url}` : undefined;
+          setSubmitResult({
+            ok: false,
+            msg: t("feedback.uploadFailedSaved", { error: data.error || "unknown" }),
+            downloadUrl: dlUrl,
+          });
+          setPhase("form");
+          setCaptchaResetKey((k) => k + 1);
+        } else {
+          resetForm();
+          setPhase("success");
+        }
+      }
+    } catch (err: any) {
+      setUploadProgress(null);
+      if (err?.name === "AbortError") {
+        setSubmitResult({ ok: false, msg: t("feedback.uploadCancelled") });
+      } else {
+        setSubmitResult({ ok: false, msg: err?.message || t("feedback.uploadFailedNetwork") });
+      }
+      setPhase("form");
+      setCaptchaResetKey((k) => k + 1);
+    } finally {
+      captchaTokenRef.current = "";
+      captchaNonceRef.current = "";
+      abortRef.current = null;
+      setSubmitting(false);
+      // Release the dedup guard so the user can retry in the same open modal
+      // session (otherwise a subsequent click is silently dropped by the
+      // `if (submittingRef.current) return;` check at the top of this handler).
+      submittingRef.current = false;
+    }
+  }, [captchaCfg, mode, title, description, steps, uploadLogs, uploadDebug, contactEmail, contactWechat, imageFiles, apiBase, t, resetForm, useOfflineIpc, handleSubmitViaIpc, handleSseError]);
+
+  handleSubmitRef.current = handleSubmit;
+
+  const handleClose = useCallback(() => {
+    abortRef.current?.abort();
+    setSubmitResult(null);
+    setUploadProgress(null);
+    setPhase("form");
+    onClose();
+  }, [onClose]);
+
+  const isBug = mode === "bug";
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(v) => {
+        if (!v) {
+          if (phase === "uploading") return;
+          if (phase === "success") { onNavigateToMyFeedback?.(); }
+          handleClose();
+        }
+      }}
+    >
+      <DialogContent
+        className={`p-0 gap-0 overflow-hidden ${phase === "form" ? "sm:max-w-[520px]" : "sm:max-w-[380px]"}`}
+        showCloseButton={phase !== "uploading"}
+        onPaste={phase === "form" ? handlePaste : undefined}
+        onPointerDownOutside={(e) => {
+          if (phase === "uploading") { e.preventDefault(); return; }
+          const t = e.target as HTMLElement | null;
+          if (t?.closest?.("[class*='aliyunCaptcha'], [id*='aliyunCaptcha'], [id*='aliyun-captcha']")) {
+            e.preventDefault();
+          }
+        }}
+        onInteractOutside={(e) => {
+          if (phase === "uploading") { e.preventDefault(); return; }
+          const t = e.target as HTMLElement | null;
+          if (t?.closest?.("[class*='aliyunCaptcha'], [id*='aliyunCaptcha'], [id*='aliyun-captcha']")) {
+            e.preventDefault();
+          }
+        }}
+        onEscapeKeyDown={(e) => { if (phase === "uploading") e.preventDefault(); }}
+      >
+        {phase === "form" && (
+          <>
+            <DialogHeader className="sr-only">
+              <DialogTitle>{isBug ? t("bugReport.title") : t("featureRequest.title")}</DialogTitle>
+              <DialogDescription>{isBug ? t("bugReport.title") : t("featureRequest.title")}</DialogDescription>
+            </DialogHeader>
+
+        {/* Tab navigation as header */}
+        <div className="flex items-end gap-0 border-b border-border px-5 pt-4 shrink-0">
+          {(["bug", "feature"] as FeedbackMode[]).map((m) => (
+            <span
+              key={m}
+              onClick={() => { setMode(m); setSubmitResult(null); }}
+              className={`relative mr-6 pb-2.5 text-[15px] cursor-pointer transition-colors select-none ${
+                mode === m
+                  ? "font-semibold text-primary"
+                  : "font-normal text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {m === "bug" ? t("bugReport.tabBug") : t("featureRequest.tabFeature")}
+              {mode === m && (
+                <span className="absolute bottom-0 left-0 right-0 h-[2px] bg-primary rounded-full" />
+              )}
+            </span>
+          ))}
+        </div>
+
+        {/* Scrollable body */}
+        <fieldset disabled={submitting} className="contents">
+        <div className="overflow-y-auto overflow-x-hidden px-5 py-4 space-y-3.5" style={{ maxHeight: "calc(85vh - 180px)" }}>
+          {/* Title */}
+          <div className="space-y-1">
+            <Label className="text-[13px]">
+              {isBug ? t("bugReport.titleLabel") : t("featureRequest.nameLabel")} <span className="text-destructive">*</span>
+            </Label>
+            <Input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder={isBug ? t("bugReport.titlePlaceholder") : t("featureRequest.namePlaceholder")}
+              maxLength={200}
+            />
+          </div>
+
+          {/* Description */}
+          <div className="space-y-1">
+            <Label className="text-[13px]">
+              {isBug ? t("bugReport.descLabel") : t("featureRequest.descLabel")} <span className="text-destructive">*</span>
+            </Label>
+            <Textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder={isBug ? t("bugReport.descPlaceholder") : t("featureRequest.descPlaceholder")}
+              rows={3}
+              className="resize-y"
+            />
+          </div>
+
+          {/* Bug: Repro steps */}
+          {isBug && (
+            <div className="space-y-1">
+              <Label className="text-[13px]">{t("bugReport.stepsLabel")}</Label>
+              <Textarea
+                value={steps}
+                onChange={(e) => setSteps(e.target.value)}
+                placeholder={t("bugReport.stepsPlaceholder")}
+                rows={2}
+                className="resize-y"
+              />
+            </div>
+          )}
+
+          {/* Contact info */}
+          <div className="space-y-1">
+            <Label className="text-[13px]">
+              {isBug ? t("featureRequest.contactLabel") : t("featureRequest.contactLabel")}
+            </Label>
+            {isBug && (
+              <p className="text-[11px] text-muted-foreground/70">{t("bugReport.contactHint")}</p>
+            )}
+            <div className="flex gap-2">
+              <Input
+                value={contactEmail}
+                onChange={(e) => setContactEmail(e.target.value)}
+                placeholder={t("featureRequest.emailPlaceholder")}
+                type="email"
+                className="flex-1"
+              />
+              <Input
+                value={contactWechat}
+                onChange={(e) => setContactWechat(e.target.value)}
+                placeholder={t("featureRequest.wechatPlaceholder")}
+                className="flex-1"
+              />
+            </div>
+          </div>
+
+          {/* Image upload */}
+          <div className="space-y-1">
+            <Label className="text-[13px]">{isBug ? t("bugReport.images") : t("featureRequest.attachments")}</Label>
+            <div
+              onDrop={handleDrop}
+              onDragOver={(e) => e.preventDefault()}
+              onClick={() => fileInputRef.current?.click()}
+              className={`border-2 border-dashed rounded-md py-3 text-center cursor-pointer text-[13px] text-muted-foreground transition-colors hover:border-primary/40 ${
+                tauriDragOver ? "border-primary bg-primary/5" : "border-border"
+              }`}
+              onDragEnter={(e) => { e.currentTarget.classList.add("border-primary"); }}
+              onDragLeave={(e) => { e.currentTarget.classList.remove("border-primary"); }}
+            >
+              {t("bugReport.imageDropHint")}
+            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={(e) => { if (e.target.files) addImages(e.target.files); e.target.value = ""; }}
+            />
+            {imagePreviews.length > 0 && (
+              <div className="flex gap-1.5 flex-wrap mt-1.5">
+                {imagePreviews.map((src, i) => (
+                  <div key={i} className="group relative w-14 h-14 rounded-md overflow-hidden border border-border">
+                    <img src={src} alt="" className="w-full h-full object-cover" />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label={t("bugReport.removeImage")}
+                      title={t("bugReport.removeImage")}
+                      onClick={(e) => { e.stopPropagation(); removeImage(i); }}
+                      className="pointer-events-none absolute top-0.5 right-0.5 size-5 rounded-full border border-destructive/45 bg-transparent p-0 text-destructive opacity-0 shadow-none transition-[opacity,border-color] hover:border-destructive/70 hover:!bg-transparent hover:!text-destructive focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:ring-destructive/30 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 dark:hover:!bg-transparent [&_svg]:drop-shadow-[0_1px_1px_rgb(255_255_255_/_0.9)]"
+                    >
+                      <IconX size={12} strokeWidth={2.5} />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Bug: Checkboxes */}
+          {isBug && (
+            <div className="space-y-2 pt-0.5">
+              <label className="flex items-center gap-2 cursor-pointer" htmlFor="upload-logs">
+                <Checkbox
+                  id="upload-logs"
+                  checked={uploadLogs}
+                  onCheckedChange={(v) => setUploadLogs(v === true)}
+                />
+                <span className="text-[13px]">{t("bugReport.uploadLogs")}</span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer" htmlFor="upload-debug">
+                <Checkbox
+                  id="upload-debug"
+                  checked={uploadDebug}
+                  onCheckedChange={(v) => setUploadDebug(v === true)}
+                />
+                <span className="text-[13px]">{t("bugReport.uploadDebug")}</span>
+              </label>
+              <p className="text-[11px] text-muted-foreground/70 leading-relaxed pl-6">
+                <IconInfo size={10} className="inline align-[-1px] mr-0.5" />
+                {t("bugReport.debugWarning")}
+              </p>
+            </div>
+          )}
+
+          <div ref={captchaContainerRef} id="aliyun-captcha-element" />
+
+          {/* Upload Progress */}
+          {uploadProgress && (
+            <div className="space-y-1.5 px-1">
+              <div className="flex items-center justify-between text-[12px] text-muted-foreground">
+                <span>{uploadProgress.detail}</span>
+                <span>{uploadProgress.percent}%</span>
+              </div>
+              <div className="h-1.5 bg-muted rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-primary rounded-full transition-all duration-300 ease-out"
+                  style={{ width: `${uploadProgress.percent}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Result */}
+          {submitResult && (
+            <div className={`rounded-md p-2.5 text-[13px] leading-relaxed ${
+              submitResult.ok
+                ? "bg-green-500/10 text-green-600 dark:text-green-400"
+                : "bg-destructive/10 text-destructive"
+            }`}>
+              <div className="whitespace-pre-wrap">{submitResult.msg}</div>
+              {submitResult.downloadUrl && (
+                <Button
+                  size="sm"
+                  disabled={downloading}
+                  className="mt-1.5 h-7 text-xs"
+                  onClick={async () => {
+                    if (!submitResult.downloadUrl) return;
+                    setDownloading(true);
+                    const url = submitResult.downloadUrl;
+                    const ts = Math.floor(Date.now() / 1000);
+                    const filename = `openkitsune-feedback-${ts}.zip`;
+                    try {
+                      const dest = await downloadFile(url, filename);
+                      await showInFolder(dest);
+                    } catch (err: unknown) {
+                      const msg = t("feedback.downloadFailed", {
+                        error: err instanceof Error ? err.message : String(err),
+                      });
+                      setSubmitResult((prev) => (prev ? { ...prev, msg: prev.msg + "\n" + msg } : prev));
+                    } finally {
+                      setDownloading(false);
+                    }
+                  }}
+                >
+                  {downloading ? t("feedback.downloading") : t("feedback.saveLocal")}
+                </Button>
+              )}
+              {submitResult.ok && onNavigateToMyFeedback && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="mt-1.5 h-7 text-xs"
+                  onClick={() => {
+                    onClose();
+                    onNavigateToMyFeedback();
+                  }}
+                >
+                  {t("myFeedback.viewFeedback")}
+                </Button>
+              )}
+            </div>
+          )}
+        </div>
+        </fieldset>
+
+        {/* Footer */}
+        <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-border shrink-0">
+          {uploadProgress ? (
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={() => { abortRef.current?.abort(); }}
+            >
+              {t("feedback.cancelUpload")}
+            </Button>
+          ) : (
+            <>
+              <Button variant="outline" size="sm" onClick={handleClose}>
+                {t("common.cancel")}
+              </Button>
+              <Button
+                id="feedback-submit-btn"
+                size="sm"
+                disabled={submitting || !title.trim() || !description.trim() || (!!captchaCfg && !captchaReady)}
+                onClick={captchaBoundRef.current ? undefined : handleSubmit}
+                className="min-w-[100px]"
+              >
+                {submitting
+                  ? t("bugReport.submitting")
+                  : (captchaCfg && !captchaReady)
+                    ? t("feedback.captchaLoading", "验证加载中…")
+                    : isBug ? t("bugReport.submit") : t("featureRequest.submit")}
+              </Button>
+            </>
+          )}
+        </div>
+          </>
+        )}
+
+        {phase === "uploading" && (
+          <>
+            <DialogHeader className="px-5 pt-5 pb-0">
+              <DialogTitle className="text-[15px]">{t("feedback.uploadingTitle")}</DialogTitle>
+              <DialogDescription className="sr-only">{t("feedback.uploadingTitle")}</DialogDescription>
+            </DialogHeader>
+            <div className="px-5 py-6 space-y-4">
+              {uploadProgress && (
+                <>
+                  <div className="flex items-center justify-between text-[13px] text-muted-foreground">
+                    <span>{uploadProgress.detail}</span>
+                    <span>{uploadProgress.percent}%</span>
+                  </div>
+                  <div className="h-2 bg-muted rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-primary rounded-full transition-all duration-300 ease-out"
+                      style={{ width: `${uploadProgress.percent}%` }}
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="flex justify-end px-5 py-3 border-t border-border">
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={() => { abortRef.current?.abort(); }}
+              >
+                {t("feedback.cancelUpload")}
+              </Button>
+            </div>
+          </>
+        )}
+
+        {phase === "success" && (
+          <>
+            <DialogHeader className="px-5 pt-5 pb-0">
+              <DialogTitle className="text-[15px]">{t("feedback.submitSuccessTitle")}</DialogTitle>
+              <DialogDescription className="sr-only">{t("feedback.submitSuccessTitle")}</DialogDescription>
+            </DialogHeader>
+            <div className="px-5 py-4">
+              <p className="text-[14px] text-muted-foreground leading-relaxed">
+                {t("feedback.submitSuccessMessage")}
+              </p>
+            </div>
+            <div className="flex justify-end gap-2 px-5 py-3 border-t border-border">
+              <Button variant="outline" size="sm" onClick={() => { onNavigateToMyFeedback?.(); handleClose(); }}>
+                {t("feedback.close")}
+              </Button>
+              {onNavigateToMyFeedback && (
+                <Button size="sm" onClick={() => { onNavigateToMyFeedback(); handleClose(); }}>
+                  {t("myFeedback.viewFeedback")}
+                </Button>
+              )}
+            </div>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}

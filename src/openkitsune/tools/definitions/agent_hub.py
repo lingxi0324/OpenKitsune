@@ -1,0 +1,101 @@
+"""
+Agent Hub 工具定义
+
+提供与 OpenKitsune Platform Agent Store 交互的工具：
+- search_hub_agents: 搜索平台上的 Agent
+- install_hub_agent: 从平台下载并安装 Agent
+- publish_agent: 发布 Agent 到平台
+- get_hub_agent_detail: 查看 Agent 详情
+"""
+
+AGENT_HUB_TOOLS = [
+    {
+        "name": "search_hub_agents",
+        "category": "Agent Hub",
+        "description": "Search for Agents on the OpenKitsune Platform Agent Store. Returns a list of available Agents with name, description, rating, and download count.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search keyword (empty = browse all)",
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Filter by category (e.g. customer_service, development, business)",
+                },
+                "sort": {
+                    "type": "string",
+                    "enum": ["downloads", "rating", "newest"],
+                    "description": "Sort order (default: downloads)",
+                },
+                "page": {
+                    "type": "integer",
+                    "description": "Page number (default: 1)",
+                },
+            },
+        },
+    },
+    {
+        "name": "install_hub_agent",
+        "category": "Agent Hub",
+        "description": "Download and install an Agent from the OpenKitsune Platform Agent Store. Downloads the .kitsune-agent package and runs the local installer.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "The ID of the Agent to install from the platform",
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Force overwrite if local ID conflict (default: false)",
+                },
+            },
+            "required": ["agent_id"],
+        },
+    },
+    {
+        "name": "publish_agent",
+        "category": "Agent Hub",
+        "description": "Publish a local Agent to the OpenKitsune Platform Agent Store. The Agent is first exported as a .kitsune-agent package, then uploaded.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "profile_id": {
+                    "type": "string",
+                    "description": "The ID of the local Agent profile to publish",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Description for the platform listing",
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Category for the listing",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tags for the listing",
+                },
+            },
+            "required": ["profile_id"],
+        },
+    },
+    {
+        "name": "get_hub_agent_detail",
+        "category": "Agent Hub",
+        "description": "Get detailed information about a specific Agent on the OpenKitsune Platform, including versions, ratings, and readme.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "The ID of the Agent on the platform",
+                },
+            },
+            "required": ["agent_id"],
+        },
+    },
+]

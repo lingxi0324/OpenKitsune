@@ -1,0 +1,21 @@
+{
+  "_comment": "Per-file LOC baseline used by scripts/revamp_loc_audit.py. Update only at phase boundaries (P-RC-X commits) and only to lower the values for agent/* files as their real rewrites land. core/* and orgs/* baselines must never grow \u2014 they are the giants we are shrinking.",
+  "agent_growth_budget": 50,
+  "files": {
+    "src/openkitsune/core/_brain_runtime.py": 1802,
+    "src/openkitsune/core/_tool_runtime.py": 1818,
+    "src/openkitsune/core/_context_runtime.py": 1799,
+    "src/openkitsune/core/_reasoning_runtime.py": 8069,
+    "src/openkitsune/core/_agent_runtime.py": 9211,
+    "src/openkitsune/core/_supervisor_runtime.py": 853,
+    "src/openkitsune/orgs/runtime.py": 6355,
+    "src/openkitsune/orgs/tool_handler.py": 3474,
+    "src/openkitsune/orgs/templates.py": 1266,
+    "src/openkitsune/orgs/messenger.py": 651,
+    "src/openkitsune/agent/core.py": 336,
+    "src/openkitsune/agent/reasoning.py": 352,
+    "src/openkitsune/agent/brain.py": 369,
+    "src/openkitsune/agent/tools.py": 347,
+    "src/openkitsune/agent/context.py": 336
+  }
+}

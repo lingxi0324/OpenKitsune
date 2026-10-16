@@ -1,0 +1,1261 @@
+"""Plugin installation: URL, local path, bundle import, pip dependencies."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import zipfile
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+from .bundles import BundleMapper
+from .manifest import ManifestError, parse_manifest
+
+logger = logging.getLogger(__name__)
+
+_SPEC_NAME_RE = re.compile(r"^\s*([A-Za-z0-9_.-]+)")
+
+
+def _normalise_dist_name(name: str) -> str:
+    """Return the normalised distribution name used by ``*.dist-info`` dirs."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _dist_name_from_spec(spec: str) -> str | None:
+    """Extract a best-effort package name from a pip requirement string."""
+    raw = spec.strip()
+    if not raw or raw.startswith(("-", ".")):
+        return None
+    if " @ " in raw:
+        raw = raw.split(" @ ", 1)[0].strip()
+    raw = raw.split(";", 1)[0].strip()
+    raw = raw.split("[", 1)[0].strip()
+    match = _SPEC_NAME_RE.match(raw)
+    if not match:
+        return None
+    return _normalise_dist_name(match.group(1))
+
+
+def _pip_output_excerpt(proc: subprocess.CompletedProcess[str], *, limit: int = 4000) -> str:
+    """Build a compact pip failure excerpt suitable for logs and API errors."""
+    text = safe_install_error(proc.stderr or proc.stdout or "")
+    if not text:
+        return f"pip exited with code {proc.returncode} and produced no output"
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    excerpt = "\n".join(lines[-40:]) if lines else text
+    if len(excerpt) > limit:
+        excerpt = excerpt[-limit:]
+    return excerpt
+
+
+def _pip_subprocess_env(python_executable: str) -> dict[str, str]:
+    """Environment for plugin dependency installs.
+
+    Delegates to the runtime manager env builder so plugin installs share the
+    same Python/Conda/pip/SSL isolation rules as channel and skill installs.
+    """
+    from openkitsune.runtime_manager import apply_runtime_pip_environment
+
+    return apply_runtime_pip_environment(python_executable=python_executable)
+
+
+def _pip_install_context(
+    *,
+    python_executable: str,
+    deps_dir: Path,
+    specs: list[str],
+    extra_args: list[str],
+) -> str:
+    """Human-readable context for diagnosing packaged plugin installs."""
+    return (
+        f"python={python_executable!r}; target={str(deps_dir)!r}; "
+        f"specs={specs!r}; extra_args={extra_args!r}"
+    )
+
+
+class PluginInstallError(Exception):
+    """Installation could not complete."""
+
+    def __init__(self, message: str, *, reason: str = "") -> None:
+        super().__init__(safe_install_error(message))
+        self.reason = reason
+
+
+def safe_install_error(value: object) -> str:
+    """Bound diagnostic output and remove credentials before persisting/displaying it."""
+    from openkitsune.utils.redaction import redact_text
+
+    text = redact_text(value)
+    text = re.sub(r"(?i)(https?://)[^/\s]*@", r"\1[REDACTED]@", text)
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    return text.strip()[-4000:]
+
+
+def _pip_network_failure(output: str) -> bool:
+    return any(marker in output.lower() for marker in (
+        "incompleteread", "connection broken", "connection reset", "read timed out",
+        "readtimeout", "connection aborted", "temporary failure in name resolution",
+    ))
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 deferred validator (NOT yet active).
+#
+# Roadmap reference: ``docs/follow-ups/skipped-items-roadmap.md`` §A.2.
+# RCA cross-ref: ``_skip_items_rca_v11.md`` §2.5 Phase 3.
+#
+# This is the future enforcement hook for the ``tool_classes`` schema
+# escalation plan. It is intentionally NOT wired into any install path
+# right now (default mode is ``'off'``) — flipping the default to
+# ``'warn'`` then ``'error'`` is a 3-release deprecation cycle that
+# only starts once §A.1 incremental backfill reaches >=95 % coverage.
+#
+# Calling this with ``mode='off'`` returns the list of missing tool
+# names but takes no action. Callers wiring this in Phase N+1 / N+2
+# should pass ``mode='warn'`` / ``'error'`` and act on the returned
+# list (log a warning, raise ``PluginInstallError``, etc.).
+# ---------------------------------------------------------------------------
+
+
+def _validate_tool_classes_completeness(manifest: Any, *, mode: str = "off") -> list[str]:
+    """Return the list of tool names missing ``tool_classes`` declarations.
+
+    Args:
+        manifest: A :class:`~openkitsune.plugins.manifest.PluginManifest`
+            instance (or any object exposing ``provides.tools`` /
+            ``tool_classes`` attributes — duck-typed for testability).
+        mode: ``'off'`` (default), ``'warn'``, or ``'error'``. Currently
+            all install paths pass ``'off'``. Phase 3 of the policy
+            hardening plan will flip the default to ``'warn'`` then
+            ``'error'``.
+
+    Returns:
+        List of tool names declared in ``provides.tools`` but absent
+        from ``tool_classes``. Empty list means fully covered.
+
+    See ``docs/follow-ups/skipped-items-roadmap.md`` §A.2 and
+    ``_skip_items_rca_v11.md`` §2.5 for the full deprecation plan.
+    """
+    if mode not in {"off", "warn", "error"}:
+        raise ValueError(f"_validate_tool_classes_completeness: invalid mode {mode!r}")
+
+    try:
+        provides = getattr(manifest, "provides", None) or {}
+        tools = list(provides.get("tools") or []) if isinstance(provides, dict) else []
+        if not tools:
+            tools = list(getattr(manifest, "tools", []) or [])
+        declared = getattr(manifest, "tool_classes", None) or {}
+        if not isinstance(declared, dict):
+            declared = {}
+    except Exception:  # noqa: BLE001 — defensive against duck-typed inputs
+        return []
+
+    missing = [str(t) for t in tools if str(t) and str(t) not in declared]
+
+    if mode == "off" or not missing:
+        return missing
+    plugin_id = getattr(manifest, "id", "?")
+    message = (
+        f"Plugin '{plugin_id}': {len(missing)} tool(s) missing tool_classes "
+        f"declarations: {missing!r}. See docs/follow-ups/"
+        "skipped-items-roadmap.md §A.2."
+    )
+    if mode == "warn":
+        logger.warning(message)
+    else:
+        raise PluginInstallError(message)
+    return missing
+
+
+# --- Windows-friendly file-system helpers -----------------------------------
+
+_RMTREE_ATTEMPTS = 5
+_RMTREE_BASE_DELAY = 0.2  # seconds; doubled each retry (max ~3.2 s total wait)
+
+
+def _on_rm_error(func: Any, path: str, exc_info: Any) -> None:
+    """``shutil.rmtree`` ``onerror`` hook: clear read-only bit then retry once."""
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        func(path)
+    except OSError:
+        # Re-raise so the outer retry loop in _robust_rmtree can take over.
+        raise
+
+
+def _robust_rmtree(path: Path, *, attempts: int = _RMTREE_ATTEMPTS) -> bool:
+    """Remove a directory tree with Windows-friendly retries.
+
+    Windows often refuses to delete a path immediately after a process closed
+    its handles (the kernel finalises the unlink lazily, especially across
+    SQLite WAL/SHM files). Exponential-backoff retries, plus a ``chmod`` to
+    clear the read-only bit, fix the vast majority of "[WinError 32] file in
+    use" failures during plugin uninstall / hot-reload.
+
+    Returns ``True`` on success; ``False`` if all retries fail. Never raises.
+    """
+    if not path.exists():
+        return True
+    last_err: OSError | None = None
+    for i in range(attempts):
+        try:
+            shutil.rmtree(path, onerror=_on_rm_error)
+        except OSError as e:
+            last_err = e
+        if not path.exists():
+            return True
+        time.sleep(_RMTREE_BASE_DELAY * (2**i))
+    if last_err is not None:
+        logger.warning("Could not remove %s after %d attempts: %s", path, attempts, last_err)
+    return False
+
+
+def _robust_rename(src: Path, dst: Path, *, attempts: int = _RMTREE_ATTEMPTS) -> bool:
+    """Rename a path with Windows-friendly retries. Never raises; returns success."""
+    last_err: OSError | None = None
+    for i in range(attempts):
+        try:
+            src.rename(dst)
+            return True
+        except OSError as e:
+            last_err = e
+            time.sleep(_RMTREE_BASE_DELAY * (2**i))
+    if last_err is not None:
+        logger.warning(
+            "Could not rename %s -> %s after %d attempts: %s",
+            src,
+            dst,
+            attempts,
+            last_err,
+        )
+    return False
+
+
+def _list_locked_files(plugin_dir: Path, *, max_items: int = 10) -> list[str]:
+    """Probe each surviving file under ``plugin_dir`` to find likely locks.
+
+    Used after ``_robust_rmtree`` fails so the user/diagnostics can see
+    which files are actually held (DB vs log vs .pyc), narrowing the root
+    cause without naming the holding process. Pure read-only probe — does
+    NOT modify the filesystem.
+
+    Heuristic: ``os.replace(f, f)`` (rename-to-self) is the correct probe
+    for "can rmtree delete this?" on Windows. Renaming requires the
+    ``DELETE`` access right and ``FILE_SHARE_DELETE`` from any other open
+    handle — exactly the same combination ``os.unlink`` (and therefore
+    ``shutil.rmtree``) needs. SQLite/aiosqlite, Python's ``RotatingFileHandler``,
+    and most "open exclusively for write" handles deny ``FILE_SHARE_DELETE``,
+    so they show up here even though they happily allow ``open(f, "ab")``.
+
+    NOTE: an earlier version probed with ``open(f, "ab")``. That only checks
+    ``FILE_SHARE_WRITE`` and silently missed the most common offender
+    (a still-open SQLite connection from a leaked test/process), making the
+    user-facing 207/409 error a generic "目录无法清理" with no filenames.
+    """
+    locked: list[str] = []
+    try:
+        for f in plugin_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                # Rename-to-self: identity op on success, raises OSError if
+                # any other handle on the file denies DELETE share — i.e.
+                # exactly the rmtree blocker we want to surface.
+                os.replace(f, f)
+            except OSError:
+                try:
+                    rel = f.relative_to(plugin_dir).as_posix()
+                except ValueError:
+                    rel = str(f)
+                locked.append(rel)
+                if len(locked) >= max_items:
+                    break
+    except OSError as e:
+        logger.debug("Could not walk %s for lock probe: %s", plugin_dir, e)
+    return locked
+
+
+def _force_remove_db_files(plugin_dir: Path) -> bool:
+    """Last-resort: delete any SQLite files so a reinstall is not blocked.
+
+    Returns ``True`` if at least one file was removed.
+    """
+    cleaned = False
+    try:
+        for f in plugin_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            name = f.name.lower()
+            if (
+                name.endswith(".db")
+                or name.endswith(".sqlite")
+                or name.endswith(".sqlite3")
+                or ".db-" in name  # *.db-shm, *.db-wal, *.db-journal
+            ):
+                try:
+                    f.unlink()
+                    cleaned = True
+                except OSError as e:
+                    logger.debug("Could not remove %s: %s", f, e)
+    except OSError as e:
+        logger.debug("Could not walk %s: %s", plugin_dir, e)
+    return cleaned
+
+
+class InstallProgress:
+    """Thread-safe installation progress tracker.
+
+    Usage from REST API:
+        progress = InstallProgress()
+        installer.install_from_url(url, dir, progress=progress)
+        # Poll progress.snapshot() from SSE endpoint
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stage = "pending"
+        self._message = ""
+        self._percent = 0.0
+        self._finished = False
+        self._error = ""
+        self._result: dict[str, Any] = {}
+        self._updated_at = time.monotonic()
+        self._dependency = ""
+
+    def update(
+        self, stage: str, message: str, percent: float = -1, *, dependency: str = ""
+    ) -> None:
+        with self._lock:
+            self._stage = stage
+            self._message = message
+            self._dependency = dependency
+            if percent >= 0:
+                self._percent = min(percent, 100.0)
+            self._updated_at = time.monotonic()
+
+    def finish(self, *, error: str = "", result: dict[str, Any] | None = None) -> None:
+        with self._lock:
+            self._finished = True
+            self._error = error
+            self._stage = "error" if error else "done"
+            self._percent = 100.0 if not error else self._percent
+            self._result = result or {}
+            self._updated_at = time.monotonic()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            snap: dict[str, Any] = {
+                "stage": self._stage,
+                "message": self._message,
+                "percent": self._percent,
+                "finished": self._finished,
+                "error": self._error,
+                "dependency": self._dependency,
+            }
+            if self._result:
+                snap["result"] = dict(self._result)
+            return snap
+
+
+_active_installs: dict[str, InstallProgress] = {}
+_active_installs_lock = threading.Lock()
+
+
+def get_install_progress(install_id: str) -> InstallProgress | None:
+    with _active_installs_lock:
+        return _active_installs.get(install_id)
+
+
+def _register_progress(install_id: str, progress: InstallProgress) -> None:
+    with _active_installs_lock:
+        _active_installs[install_id] = progress
+
+
+def _unregister_progress(install_id: str) -> None:
+    with _active_installs_lock:
+        _active_installs.pop(install_id, None)
+
+
+def _sanitize_dir_name(plugin_id: str) -> str:
+    bad = '<>:"/\\|?*'
+    s = "".join(c if c not in bad and ord(c) >= 32 else "_" for c in plugin_id)
+    s = s.strip(". ") or "plugin"
+    return s
+
+
+def _find_plugin_json_root(root: Path) -> Path | None:
+    candidates: list[Path] = []
+    for p in root.rglob("plugin.json"):
+        if p.is_file():
+            candidates.append(p.parent)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda p: len(p.parts))
+
+
+_MAX_EXTRACT_SIZE = 500 * 1024 * 1024  # 500 MB
+_MAX_EXTRACT_FILES = 10_000
+
+
+def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
+    dest = dest.resolve()
+    total_size = 0
+    file_count = 0
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        total_size += info.file_size
+        file_count += 1
+        if total_size > _MAX_EXTRACT_SIZE:
+            raise PluginInstallError(
+                f"Zip archive exceeds size limit ({_MAX_EXTRACT_SIZE // 1024 // 1024} MB)"
+            )
+        if file_count > _MAX_EXTRACT_FILES:
+            raise PluginInstallError(f"Zip archive exceeds file count limit ({_MAX_EXTRACT_FILES})")
+        name = info.filename
+        if name.startswith("/") or ".." in Path(name).parts:
+            raise PluginInstallError(f"Unsafe zip entry: {name!r}")
+        target = (dest / name).resolve()
+        try:
+            target.relative_to(dest)
+        except ValueError as e:
+            raise PluginInstallError(f"Zip slip rejected: {name!r}") from e
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as src, open(target, "wb") as out:
+            shutil.copyfileobj(src, out)
+
+
+def _download_to_file(url: str, dest: Path) -> None:
+    req = Request(url, headers={"User-Agent": "OpenKitsune-PluginInstaller/1.0"})
+    try:
+        with urlopen(req, timeout=120) as resp:
+            dest.write_bytes(resp.read())
+    except HTTPError as e:
+        raise PluginInstallError(f"HTTP {e.code} downloading plugin: {url}") from e
+    except URLError as e:
+        raise PluginInstallError(f"Network error downloading plugin: {e.reason}") from e
+    except OSError as e:
+        raise PluginInstallError(f"Download failed: {e}") from e
+
+
+def _parse_pip_specs(manifest_requires: dict) -> list[str]:
+    """Normalise ``manifest.requires.pip`` into a list of pip-installable specs.
+
+    Returns an empty list when the field is absent or not a string/list, so
+    callers can short-circuit without doing the type-checking themselves.
+    """
+    if not manifest_requires:
+        return []
+    raw = manifest_requires.get("pip")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw] if raw.strip() else []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    logger.warning("requires.pip must be a string or list of strings")
+    return []
+
+
+def _resolve_pip_runner() -> tuple[str, list[str]]:
+    """Pick the Python executable + base pip args for installing plugin deps.
+
+    Returns ``(python_path, extra_install_args)``. ``extra_install_args``
+    carries the configured PyPI mirror so e.g. China users don't time out
+    against the default pypi.org.
+
+    In a PyInstaller-frozen build ``sys.executable`` points at
+    ``openkitsune-server.exe`` which intercepts Click args and refuses
+    ``-m pip``. We must instead use ``runtime_env.get_python_executable()``
+    which resolves to the real ``_internal/python.exe`` (or the workspace /
+    user venv when one was bootstrapped). For source / pip-installed
+    deployments ``sys.executable`` is already a real Python so we keep it.
+    """
+    try:
+        from ..runtime_env import IS_FROZEN, get_python_executable, resolve_pip_index
+    except Exception:
+        return sys.executable, []
+    py = sys.executable
+    if IS_FROZEN:
+        resolved = get_python_executable()
+        if resolved:
+            py = resolved
+    extra: list[str] = []
+    try:
+        index = resolve_pip_index()
+        if index.get("url"):
+            extra.extend(["-i", index["url"]])
+            if index.get("trusted_host"):
+                extra.extend(["--trusted-host", index["trusted_host"]])
+    except Exception:
+        pass
+    return py, extra
+
+
+def _pip_progress_line(line: str, progress: InstallProgress) -> None:
+    # Extract only package names, never forward pip's URLs, local paths or credentials.
+    patterns = (
+        (r"^Collecting ([A-Za-z0-9][A-Za-z0-9_.-]*)(?=[\s<>=!~\[;]|$)", "dependency_resolving"),
+        (
+            r"^\s*(?:Downloading|Using cached) ([A-Za-z0-9][A-Za-z0-9_.-]*)\.(?:whl|tar\.gz|zip)(?:\s|$)",
+            "dependency_downloading",
+        ),
+        (r"^\s*Building wheel for ([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\s|$)", "dependency_building"),
+    )
+    for pattern, stage in patterns:
+        match = re.search(pattern, line)
+        if match:
+            name = (
+                re.split(r"-(?=\d)", match[1], maxsplit=1)[0]
+                if stage == "dependency_downloading"
+                else match[1]
+            )
+            progress.update(stage, "正在准备依赖", dependency=name[:100])
+            return
+    if line.lstrip().startswith(
+        (
+            "Preparing metadata",
+            "Installing build dependencies",
+            "Getting requirements to build wheel",
+        )
+    ):
+        progress.update(
+            "dependency_building", "正在构建依赖", dependency=progress.snapshot()["dependency"]
+        )
+    if line.startswith("Installing collected packages:"):
+        names = line.partition(":")[2].strip()
+        if re.fullmatch(r"[A-Za-z0-9_.-]+(?:, [A-Za-z0-9_.-]+)*", names):
+            progress.update("dependency_installing", "正在安装依赖", dependency=names[:300])
+
+
+def _run_pip_with_progress(
+    cmd: list[str], env: dict[str, str], progress: InstallProgress, *, timeout: float = 600
+) -> subprocess.CompletedProcess[str]:
+    # Separate file handles avoid pipe backpressure and allow a timeout even when
+    # pip is silent. Keep only a bounded tail in memory for failure diagnostics.
+    with tempfile.TemporaryDirectory(prefix="openkitsune-pip-") as temp:
+        path = Path(temp) / "output.log"
+        with (
+            path.open("wb") as output,
+            path.open(encoding="utf-8", errors="replace") as reader,
+            subprocess.Popen(
+                cmd,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                start_new_session=sys.platform != "win32",
+            ) as proc,
+        ):
+            started = time.monotonic()
+            tail = ""
+            pending = ""
+
+            def drain() -> None:
+                nonlocal tail, pending
+                while chunk := reader.read(4096):
+                    tail = (tail + chunk)[-8000:]
+                    lines = (pending + chunk).split("\n")
+                    pending = lines.pop()[-4096:]
+                    for line in lines:
+                        _pip_progress_line(line.rstrip("\r"), progress)
+
+            try:
+                while proc.poll() is None:
+                    drain()
+                    if time.monotonic() - started >= timeout:
+                        raise subprocess.TimeoutExpired(cmd, timeout)
+                    time.sleep(0.2)
+                drain()
+                if pending:
+                    _pip_progress_line(pending, progress)
+                return subprocess.CompletedProcess(cmd, proc.returncode, tail, "")
+            finally:
+                if proc.poll() is None:
+                    # Build backends may spawn children that hold the log and
+                    # target directory open. Stop the whole owned process tree.
+                    try:
+                        if sys.platform == "win32":
+                            subprocess.run(
+                                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                timeout=10,
+                                check=False,
+                                creationflags=subprocess.CREATE_NO_WINDOW,
+                            )
+                        else:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                    if proc.poll() is None:
+                        proc.kill()
+                proc.wait()
+
+
+def install_pip_deps(
+    plugin_dir: Path, manifest_requires: dict, *, progress: InstallProgress | None = None,
+    raise_on_error: bool = False,
+) -> bool:
+    """Install the plugin's ``requires.pip`` packages into ``<plugin_dir>/deps``.
+
+    The deps directory is appended to ``sys.path`` by ``PluginManager._load_python_plugin``
+    when the plugin loads, so packages installed here are private to this
+    plugin and don't leak into the host or other plugins.
+
+    Returns ``False`` on failure for runtime callers. Explicit installation uses
+    ``raise_on_error`` to retain the pip diagnostic through directory rollback.
+    """
+    specs = _parse_pip_specs(manifest_requires)
+    if not specs:
+        return True
+    if progress:
+        progress.update("dependencies", "正在解析依赖")
+
+    deps_dir = plugin_dir / "deps"
+    deps_dir.mkdir(parents=True, exist_ok=True)
+    py, extra_args = _resolve_pip_runner()
+    context = _pip_install_context(
+        python_executable=py,
+        deps_dir=deps_dir,
+        specs=specs,
+        extra_args=extra_args,
+    )
+    cmd = [
+        py,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--prefer-binary",
+        "--target",
+        str(deps_dir),
+        *extra_args,
+        *specs,
+    ]
+    def failed(message: str, reason: str) -> bool:
+        if raise_on_error:
+            raise PluginInstallError(message, reason=reason)
+        return False
+
+    try:
+        deadline = time.monotonic() + 600
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd, 600)
+            attempt_cmd = [*cmd, *(["--no-cache-dir"] if attempt else [])]
+            if progress:
+                proc = _run_pip_with_progress(
+                    [*attempt_cmd, "--progress-bar", "off"],
+                    {**_pip_subprocess_env(py), "PYTHONUNBUFFERED": "1"},
+                    progress, timeout=remaining,
+                )
+            else:
+                proc = subprocess.run(
+                    attempt_cmd, check=False, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", env=_pip_subprocess_env(py),
+                    timeout=remaining,
+                )
+            if proc.returncode == 0:
+                return True
+            excerpt = _pip_output_excerpt(proc)
+            if attempt == 0 and _pip_network_failure(excerpt):
+                logger.warning("Plugin dependency download interrupted; retrying without cache")
+                if progress:
+                    progress.update("dependency_retrying", "依赖下载中断，正在绕过缓存重试")
+                continue
+            break
+    except subprocess.TimeoutExpired as exc:
+        logger.error(
+            "pip install timed out for %s after %ss (%s)",
+            plugin_dir,
+            exc.timeout,
+            context,
+        )
+        return failed("pip dependency installation timed out (600s)", "dependency_timeout")
+    except OSError as exc:
+        logger.error("pip install failed to start for %s: %s (%s)", plugin_dir, exc, context)
+        return failed(f"{type(exc).__name__}: {exc}", "dependency_runtime")
+    if proc.returncode != 0:
+        excerpt = _pip_output_excerpt(proc)
+        logger.error("pip install failed for %s (%s): %s", plugin_dir, context, excerpt)
+        return failed(excerpt, "dependency_network" if _pip_network_failure(excerpt)
+                      else "dependency_install")
+    return True
+
+
+def deps_appear_installed(plugin_dir: Path, manifest_requires: dict) -> bool:
+    """Best-effort check whether ``requires.pip`` packages already live in ``deps/``.
+
+    We match declared requirement names against ``*.dist-info`` directories
+    written by pip's ``--target`` mode. This remains intentionally best effort:
+    pip still owns full version resolution, but a stale unrelated dist-info
+    file should not make the host believe plugin dependencies are present.
+    """
+    if not _parse_pip_specs(manifest_requires):
+        return True
+    deps_dir = plugin_dir / "deps"
+    if not deps_dir.is_dir():
+        return False
+    expected = {
+        name for spec in _parse_pip_specs(manifest_requires) if (name := _dist_name_from_spec(spec))
+    }
+    if not expected:
+        return True
+    found: set[str] = set()
+    try:
+        for child in deps_dir.iterdir():
+            if not child.is_dir() or not child.name.endswith(".dist-info"):
+                continue
+            dist_name = child.name[: -len(".dist-info")]
+            # ``pip --target`` writes e.g. ``openkitsune_plugin_sdk-0.7.0.dist-info``.
+            # Strip the version suffix by scanning from the right for the first
+            # segment that starts with a digit.
+            parts = dist_name.split("-")
+            for idx, part in enumerate(parts):
+                if part[:1].isdigit():
+                    dist_name = "-".join(parts[:idx]) or dist_name
+                    break
+            found.add(_normalise_dist_name(dist_name))
+    except OSError:
+        return False
+    return expected.issubset(found)
+
+
+def _finalize_install(
+    plugin_dir: Path, *, remove_on_failure: bool = True, progress: InstallProgress | None = None
+) -> str:
+    try:
+        manifest = parse_manifest(plugin_dir)
+    except ManifestError as e:
+        if remove_on_failure:
+            shutil.rmtree(plugin_dir, ignore_errors=True)
+        raise PluginInstallError(str(e)) from e
+    try:
+        installed = install_pip_deps(
+            plugin_dir, manifest.requires, progress=progress, raise_on_error=True,
+        )
+    except PluginInstallError:
+        if remove_on_failure:
+            shutil.rmtree(plugin_dir, ignore_errors=True)
+        raise
+    if not installed:
+        if remove_on_failure:
+            shutil.rmtree(plugin_dir, ignore_errors=True)
+        raise PluginInstallError(
+            f"Plugin {manifest.id!r} installed but pip dependencies failed. "
+            "OpenKitsune does not migrate plugin dependency directories in place; "
+            "the isolated plugin directory was removed and reinstall/rebuild is required. "
+            "See openkitsune.plugins.installer logs for the pip error excerpt."
+        )
+    return manifest.id
+
+
+_ARCHIVE_SUFFIXES = (".zip", ".tar.gz", ".tgz", ".tar", ".tar.bz2", ".tar.xz")
+
+
+def _is_git_url(source: str) -> bool:
+    s = source.lower().strip()
+    if s.endswith(".git"):
+        return True
+    if "github.com/" in s or "gitlab.com/" in s or "gitee.com/" in s:
+        if any(s.endswith(ext) for ext in _ARCHIVE_SUFFIXES):
+            return False
+        if "/releases/" in s or "/archive/" in s or "/raw/" in s:
+            return False
+        return True
+    return False
+
+
+def _normalize_git_url(source: str) -> str:
+    """Normalise GitHub/GitLab short URLs → cloneable .git URL.
+
+    Handles: https://github.com/o/r, github.com/o/r, https://github.com/o/r/tree/...
+    """
+    s = source.strip().rstrip("/")
+    if s.endswith(".git"):
+        return s
+    for host in ("github.com/", "gitlab.com/", "gitee.com/"):
+        idx = s.find(host)
+        if idx < 0:
+            continue
+        after_host = s[idx + len(host) :]
+        segments = after_host.split("/")
+        if len(segments) >= 2:
+            owner_repo = s[: idx + len(host)] + "/".join(segments[:2])
+            if not owner_repo.startswith(("http://", "https://", "git@")):
+                owner_repo = "https://" + owner_repo
+            return owner_repo + ".git"
+    return s + ".git"
+
+
+def install_from_git(
+    source: str,
+    plugins_dir: Path,
+    *,
+    branch: str = "",
+    progress: InstallProgress | None = None,
+) -> str:
+    """Clone a Git repository and install the plugin from it."""
+    plugins_dir = plugins_dir.resolve()
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+    if progress:
+        progress.update("cloning", f"正在克隆仓库: {source[:80]}", 10)
+
+    git_url = _normalize_git_url(source)
+
+    with tempfile.TemporaryDirectory(prefix="openkitsune-git-") as tmp:
+        tmp_path = Path(tmp)
+        clone_dir = tmp_path / "repo"
+        cmd = ["git", "clone", "--depth", "1"]
+        if branch:
+            cmd += ["--branch", branch]
+        cmd += [git_url, str(clone_dir)]
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except FileNotFoundError:
+            raise PluginInstallError(
+                "git command not found — please install Git to use repository URLs"
+            )
+        except subprocess.TimeoutExpired:
+            raise PluginInstallError("Git clone timed out (120s)")
+
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()[:300]
+            raise PluginInstallError(f"Git clone failed: {err}")
+
+        if progress:
+            progress.update("validating", "正在验证插件清单", 50)
+
+        plugin_src = _find_plugin_json_root(clone_dir)
+        if plugin_src is None:
+            raise PluginInstallError("No plugin.json found in cloned repository")
+
+        try:
+            manifest = parse_manifest(plugin_src)
+        except ManifestError as e:
+            raise PluginInstallError(str(e)) from e
+
+        if progress:
+            progress.update("installing", f"正在安装插件: {manifest.id}", 65)
+
+        dest = plugins_dir / _sanitize_dir_name(manifest.id)
+        backup = None
+        if dest.exists():
+            backup = dest.with_suffix(".bak")
+            try:
+                if backup.exists():
+                    shutil.rmtree(backup)
+                dest.rename(backup)
+            except OSError as e:
+                raise PluginInstallError(
+                    f"Cannot upgrade: failed to backup existing plugin: {e}"
+                ) from e
+
+        git_internal = plugin_src / ".git"
+        if git_internal.exists():
+            shutil.rmtree(git_internal, ignore_errors=True)
+
+        try:
+            shutil.copytree(plugin_src, dest)
+        except OSError as e:
+            if backup is not None:
+                try:
+                    backup.rename(dest)
+                except OSError:
+                    pass
+            raise PluginInstallError(f"Could not install plugin files: {e}") from e
+
+    if progress:
+        progress.update("dependencies", "正在安装依赖", 80)
+
+    try:
+        result = _finalize_install(dest, progress=progress)
+    except PluginInstallError:
+        if backup is not None and backup.exists():
+            try:
+                if dest.exists():
+                    shutil.rmtree(dest)
+                backup.rename(dest)
+            except OSError:
+                pass
+        raise
+
+    if backup is not None and backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+
+    if progress:
+        progress.update("done", f"插件 {result} 安装完成", 100)
+    return result
+
+
+def install_from_url(
+    url: str,
+    plugins_dir: Path,
+    *,
+    progress: InstallProgress | None = None,
+) -> str:
+    plugins_dir = plugins_dir.resolve()
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+    if progress:
+        progress.update("downloading", f"正在下载: {url[:80]}", 10)
+
+    with tempfile.TemporaryDirectory(prefix="openkitsune-plugin-") as tmp:
+        tmp_path = Path(tmp)
+        archive = tmp_path / "plugin.zip"
+        _download_to_file(url, archive)
+
+        if progress:
+            progress.update("extracting", "正在解压插件包", 40)
+
+        extract_root = tmp_path / "extract"
+        extract_root.mkdir()
+        try:
+            with zipfile.ZipFile(archive, "r") as zf:
+                _safe_extract_zip(zf, extract_root)
+        except zipfile.BadZipFile as e:
+            raise PluginInstallError("Download is not a valid zip archive") from e
+
+        plugin_src = _find_plugin_json_root(extract_root)
+        if plugin_src is None:
+            raise PluginInstallError("No plugin.json found in archive")
+
+        if progress:
+            progress.update("validating", "正在验证插件清单", 55)
+
+        try:
+            manifest = parse_manifest(plugin_src)
+        except ManifestError as e:
+            raise PluginInstallError(str(e)) from e
+
+        if progress:
+            progress.update("installing", f"正在安装插件: {manifest.id}", 65)
+
+        dest = plugins_dir / _sanitize_dir_name(manifest.id)
+        if dest.exists():
+            backup = dest.with_suffix(".bak")
+            try:
+                if backup.exists():
+                    shutil.rmtree(backup)
+                dest.rename(backup)
+            except OSError as e:
+                raise PluginInstallError(
+                    f"Cannot upgrade: failed to backup existing plugin: {e}"
+                ) from e
+        else:
+            backup = None
+
+        try:
+            shutil.copytree(plugin_src, dest)
+        except OSError as e:
+            if backup is not None:
+                try:
+                    backup.rename(dest)
+                except OSError:
+                    pass
+            raise PluginInstallError(f"Could not install plugin files: {e}") from e
+
+    if progress:
+        progress.update("dependencies", "正在安装依赖", 80)
+
+    try:
+        result = _finalize_install(dest, progress=progress)
+    except PluginInstallError:
+        if backup is not None and backup.exists():
+            try:
+                if dest.exists():
+                    shutil.rmtree(dest)
+                backup.rename(dest)
+            except OSError:
+                pass
+        raise
+
+    if backup is not None and backup.exists():
+        shutil.rmtree(backup, ignore_errors=True)
+
+    if progress:
+        progress.update("done", f"插件 {result} 安装完成", 100)
+    return result
+
+
+def install_from_path(
+    source: Path,
+    plugins_dir: Path,
+    *,
+    dev_mode: bool = False,
+    progress: InstallProgress | None = None,
+) -> str:
+    """Install a plugin from a local directory.
+
+    When ``dev_mode`` is ``True`` we **symlink** instead of copying so source
+    edits are immediately visible after a hot-reload — ideal for plugin
+    developers. If the OS refuses the symlink (Windows without dev-mode /
+    admin), we fall back transparently to a regular copy and emit a warning.
+    """
+    source = source.resolve()
+    plugins_dir = plugins_dir.resolve()
+    if progress:
+        progress.update("installing", "正在复制插件文件")
+    if not source.is_dir():
+        raise PluginInstallError(f"Not a directory: {source}")
+
+    try:
+        manifest = parse_manifest(source)
+    except ManifestError as e:
+        raise PluginInstallError(str(e)) from e
+
+    dest = plugins_dir / _sanitize_dir_name(manifest.id)
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+
+    backup = None
+    if dest.exists():
+        try:
+            same = dest.samefile(source)
+        except OSError:
+            same = False
+        if same:
+            return _finalize_install(dest, remove_on_failure=False, progress=progress)
+        # If dest is already a symlink pointing at source, just refresh.
+        if dest.is_symlink():
+            try:
+                if Path(os.readlink(dest)).resolve() == source:
+                    return _finalize_install(dest, remove_on_failure=False, progress=progress)
+            except OSError:
+                pass
+        backup = dest.with_suffix(".bak")
+        if backup.exists():
+            _robust_rmtree(backup)
+        if not _robust_rename(dest, backup):
+            raise PluginInstallError(f"Cannot upgrade: failed to backup existing plugin at {dest}")
+
+    linked = False
+    if dev_mode:
+        try:
+            os.symlink(source, dest, target_is_directory=True)
+            linked = True
+            logger.info("Plugin '%s' linked from %s (dev mode)", manifest.id, source)
+        except (OSError, NotImplementedError) as e:
+            logger.warning(
+                "Plugin '%s' dev-mode symlink failed (%s); falling back to copy",
+                manifest.id,
+                e,
+            )
+
+    if not linked:
+        try:
+            shutil.copytree(source, dest)
+        except OSError as e:
+            if backup is not None:
+                _robust_rename(backup, dest)
+            raise PluginInstallError(f"Could not copy plugin: {e}") from e
+
+    try:
+        result = _finalize_install(dest, progress=progress)
+    except PluginInstallError:
+        if backup is not None and backup.exists():
+            try:
+                if dest.exists():
+                    if dest.is_symlink():
+                        dest.unlink()
+                    else:
+                        _robust_rmtree(dest)
+                _robust_rename(backup, dest)
+            except OSError:
+                pass
+        raise
+
+    if backup is not None and backup.exists():
+        _robust_rmtree(backup)
+    return result
+
+
+def uninstall(
+    plugin_id: str,
+    plugins_dir: Path,
+    *,
+    purge_data: bool = False,
+    data_root: Path | None = None,
+) -> dict[str, Any]:
+    """Remove a plugin from disk and optionally purge its persistent data.
+
+    Returns a structured result dict (no exceptions for "expected" failures —
+    the API layer turns these into HTTP responses with proper error codes):
+
+    .. code-block:: python
+
+        {
+            "removed": bool,        # plugin code dir is gone
+            "partial": bool,        # code dir survived but *.db* files cleaned
+            "purged_data": bool,    # data_root/<plugin_id> also removed
+            "warnings": [str, ...], # human-readable hints (UI surfaces these)
+        }
+
+    A symlinked plugin (dev mode) is unlinked, never recursively deleted.
+    """
+    plugins_dir = plugins_dir.resolve()
+    out: dict[str, Any] = {
+        "removed": False,
+        "partial": False,
+        "purged_data": False,
+        "warnings": [],
+    }
+
+    if not plugins_dir.is_dir():
+        out["warnings"].append(f"plugins dir not found: {plugins_dir}")
+        return out
+
+    target: Path | None = None
+    for child in plugins_dir.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            manifest = parse_manifest(child)
+        except ManifestError:
+            continue
+        if manifest.id == plugin_id:
+            target = child
+            break
+
+    if target is None:
+        out["warnings"].append(f"plugin '{plugin_id}' not installed")
+        return out
+
+    # Symlink fast-path: just unlink, never delete the linked source tree.
+    if target.is_symlink():
+        try:
+            target.unlink()
+            out["removed"] = True
+        except OSError as e:
+            out["warnings"].append(f"failed to unlink {target}: {e}")
+    else:
+        if _robust_rmtree(target):
+            out["removed"] = True
+        else:
+            # Probe which files survived — actionable info for the user
+            # ("the DB is held" vs "a .pyc is held" points to very different
+            # root causes; in practice it's almost always the SQLite WAL or a
+            # log file that the plugin failed to close in on_unload).
+            locked = _list_locked_files(target)
+            if locked:
+                preview = ", ".join(locked[:5])
+                more = f" (+{len(locked) - 5} 更多)" if len(locked) > 5 else ""
+                out["warnings"].append(f"以下文件仍被占用: {preview}{more}")
+            # Graceful degradation: clear DB files so the next install isn't
+            # blocked by a still-locked SQLite file inside the leftover dir.
+            if _force_remove_db_files(target):
+                out["partial"] = True
+                out["warnings"].append(
+                    f"目录 {target} 无法完全删除（可能仍被占用），"
+                    "已清理其中的 *.db / *.db-shm / *.db-wal 文件"
+                )
+            else:
+                out["warnings"].append(f"目录 {target} 完全无法清理")
+
+    if purge_data and data_root is not None:
+        data_root_resolved = data_root.resolve()
+        data_dir = (data_root_resolved / plugin_id).resolve()
+        try:
+            data_dir.relative_to(data_root_resolved)
+        except ValueError:
+            out["warnings"].append("data path traversal check failed; skipping purge_data")
+        else:
+            if data_dir.exists():
+                if _robust_rmtree(data_dir):
+                    out["purged_data"] = True
+                else:
+                    out["warnings"].append(f"plugin_data {data_dir} 无法完全删除")
+            else:
+                out["purged_data"] = True  # nothing to purge → success
+
+    return out
+
+
+def install_bundle(
+    source: str, plugins_dir: Path, *, progress: InstallProgress | None = None
+) -> str:
+    path = Path(source).expanduser().resolve()
+    plugins_dir = plugins_dir.resolve()
+    if not path.is_dir():
+        raise PluginInstallError(f"Not a directory: {path}")
+
+    mapper = BundleMapper()
+    bundle = mapper.detect(path)
+    if bundle is None:
+        raise PluginInstallError(f"No supported bundle format under {path}")
+
+    manifest_dict = mapper.map_to_manifest(bundle)
+    plugin_id = str(manifest_dict.get("id", ""))
+    if not plugin_id:
+        raise PluginInstallError("Bundle mapping produced no plugin ID")
+    dest = plugins_dir / _sanitize_dir_name(plugin_id)
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+
+    if dest.exists():
+        backup = dest.with_suffix(".bak")
+        try:
+            if backup.exists():
+                shutil.rmtree(backup)
+            dest.rename(backup)
+        except OSError as e:
+            raise PluginInstallError(
+                f"Cannot upgrade bundle: failed to backup existing plugin: {e}"
+            ) from e
+    else:
+        backup = None
+
+    try:
+        shutil.copytree(path, dest)
+    except OSError as e:
+        if backup is not None:
+            try:
+                backup.rename(dest)
+            except OSError:
+                pass
+        raise PluginInstallError(f"Could not copy bundle: {e}") from e
+
+    manifest_path = dest / "plugin.json"
+    try:
+        manifest_path.write_text(
+            json.dumps(manifest_dict, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as e:
+        try:
+            shutil.rmtree(dest)
+        except OSError:
+            logger.warning("Could not remove partial install at %s", dest)
+        if backup is not None:
+            try:
+                backup.rename(dest)
+            except OSError:
+                pass
+        raise PluginInstallError(f"Could not write plugin.json: {e}") from e
+
+    if backup is not None:
+        try:
+            shutil.rmtree(backup)
+        except OSError:
+            pass
+
+    return _finalize_install(dest, progress=progress)

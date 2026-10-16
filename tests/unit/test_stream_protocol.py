@@ -1,0 +1,124 @@
+from openkitsune.events import StreamEventType, normalize_stream_event
+
+
+def test_tool_event_normalization_adds_stable_aliases():
+    event = normalize_stream_event(
+        {"type": StreamEventType.TOOL_CALL_START.value, "tool": "run_shell", "id": "abc"}
+    )
+    assert event["protocol_version"] == 1
+    assert event["tool_name"] == "run_shell"
+    assert event["call_id"] == "abc"
+
+
+def test_preparation_stage_is_part_of_canonical_stream_protocol():
+    event = normalize_stream_event(
+        {"type": StreamEventType.PREPARATION_STAGE.value, "stage": "building_context"}
+    )
+
+    assert event["type"] == "preparation_stage"
+    assert event["stage"] == "building_context"
+    assert event["protocol_version"] == 1
+
+
+def test_security_confirm_normalization_adds_confirm_aliases():
+    event = normalize_stream_event(
+        {
+            "type": StreamEventType.SECURITY_CONFIRM.value,
+            "tool": "run_powershell",
+            "id": "confirm-1",
+        }
+    )
+    assert event["tool_name"] == "run_powershell"
+    assert event["confirm_id"] == "confirm-1"
+    assert event["call_id"] == "confirm-1"
+
+
+def test_todo_created_normalization_keeps_legacy_and_stable_fields():
+    event = normalize_stream_event(
+        {
+            "type": StreamEventType.TODO_CREATED.value,
+            "plan": {
+                "id": "plan-1",
+                "taskSummary": "整理任务",
+                "steps": [{"id": "step-1", "description": "第一步"}],
+            },
+        }
+    )
+    assert event["plan"]["taskSummary"] == "整理任务"
+    assert event["plan"]["task_summary"] == "整理任务"
+    assert event["plan"]["steps"][0]["step_id"] == "step-1"
+
+
+def test_source_used_normalization_adds_stable_fields():
+    event = normalize_stream_event(
+        {
+            "type": StreamEventType.SOURCE_USED.value,
+            "tool": "web_fetch",
+            "id": "tool-1",
+            "requested_url": "https://example.com/a",
+        }
+    )
+    assert event["tool_name"] == "web_fetch"
+    assert event["tool_use_id"] == "tool-1"
+    assert event["final_url"] == "https://example.com/a"
+    assert event["from_cache"] is False
+
+
+def test_mcp_call_normalization_adds_stable_fields():
+    event = normalize_stream_event(
+        {
+            "type": StreamEventType.MCP_CALL.value,
+            "id": "tu-1",
+            "server": "github",
+            "tool": "list_repos",
+            "status": "ok",
+        }
+    )
+    assert event["tool_use_id"] == "tu-1"
+    assert event["server"] == "github"
+    assert event["tool"] == "list_repos"
+    assert event["auto_connected"] is False
+    assert event["reconnected"] is False
+    assert event["error"] == ""
+
+
+def test_config_hint_normalization_adds_stable_fields():
+    event = normalize_stream_event(
+        {
+            "type": StreamEventType.CONFIG_HINT.value,
+            "id": "tool-1",
+            "scope": "web_search",
+            "title": "搜索源未配置",
+        }
+    )
+    assert event["tool_use_id"] == "tool-1"
+    assert event["scope"] == "web_search"
+    assert event["error_code"] == "unknown"
+    assert event["title"] == "搜索源未配置"
+    assert event["message"] == ""
+    assert event["actions"] == []
+
+
+def test_compiler_unavailable_config_hint_preserves_diagnostics():
+    event = normalize_stream_event(
+        {
+            "type": StreamEventType.CONFIG_HINT.value,
+            "tool_use_id": "intent-analyzer:session-1",
+            "scope": "prompt_compiler",
+            "error_code": "compiler_unavailable",
+            "title": "提示词编译模型访问失效",
+            "reason_code": "all_disabled",
+            "duration_ms": 6123.4,
+        }
+    )
+
+    assert event["error_code"] == "compiler_unavailable"
+    assert event["reason_code"] == "all_disabled"
+    assert event["duration_ms"] == 6123.4
+
+
+def test_python_stream_events_include_frontend_known_enrichments():
+    assert StreamEventType.ENDPOINT_NOTICE.value == "endpoint_notice"
+    assert StreamEventType.CONFIG_HINT.value == "config_hint"
+    assert StreamEventType.SOURCE_USED.value == "source_used"
+    assert StreamEventType.MCP_CALL.value == "mcp_call"

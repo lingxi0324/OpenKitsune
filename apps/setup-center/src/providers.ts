@@ -1,0 +1,401 @@
+// ─── Provider-related utility functions for Setup Center ───
+
+import { IS_TAURI, proxyFetch } from "./platform";
+import { authFetch, isTauriRemoteMode } from "./platform/auth";
+import type { ProviderInfo, ListedModel } from "./types";
+
+/** 判断服务商是否为本地服务（不需要真实 API Key） */
+export function isLocalProvider(p: ProviderInfo | null | undefined): boolean {
+  return p?.requires_api_key === false || p?.is_local === true;
+}
+
+/** 获取本地服务商的默认 placeholder API key */
+export function localProviderPlaceholderKey(p: ProviderInfo | null | undefined): string {
+  return p?.slug || "local";
+}
+
+/**
+ * 将模型拉取的原始错误转换为用户友好的提示信息。
+ * @param rawError 原始错误字符串
+ * @param t i18n 翻译函数
+ * @param providerName 服务商显示名称（可选，用于本地服务提示）
+ */
+export function friendlyFetchError(rawError: string, t: (k: string, vars?: Record<string, unknown>) => string, providerName?: string): string {
+  const e = rawError.toLowerCase();
+
+  if (e.includes("failed to fetch") || e.includes("networkerror") || e.includes("network error") || e.includes("error sending request") || e.includes("fetch failed")) {
+    if (providerName && (e.includes("localhost") || e.includes("127.0.0.1") || e.includes("0.0.0.0"))) {
+      return t("llm.fetchErrorLocalNotRunning", { provider: providerName });
+    }
+    return t("llm.fetchErrorNetwork");
+  }
+  if (e.includes("401") || e.includes("unauthorized") || e.includes("invalid api key") || e.includes("invalid_api_key") || e.includes("authentication")) {
+    return t("llm.fetchErrorAuth");
+  }
+  if (e.includes("403") || e.includes("forbidden") || e.includes("permission")) {
+    return t("llm.fetchErrorForbidden");
+  }
+  if (e.includes("404") || e.includes("not found")) {
+    return t("llm.fetchErrorNotFound");
+  }
+  if (e.includes("timeout") || e.includes("aborterror") || e.includes("timed out") || e.includes("deadline")) {
+    return t("llm.fetchErrorTimeout");
+  }
+  const detail = rawError.length > 120 ? rawError.slice(0, 120) + "…" : rawError;
+  return t("llm.fetchErrorUnknown", { detail });
+}
+
+/**
+ * 前端版 infer_capabilities：根据模型名推断能力。
+ * 与 Python 端 openkitsune.llm.capabilities.infer_capabilities 的关键词规则保持一致。
+ *
+ * ⚠ 维护提示：如果 Python 端的推断规则有修改，需要同步更新此函数。
+ * 参见: src/openkitsune/llm/capabilities.py → infer_capabilities()
+ */
+export function inferCapabilities(modelName: string, _providerSlug?: string | null): Record<string, boolean> {
+  const m = modelName.toLowerCase();
+  const caps: Record<string, boolean> = { text: true, vision: false, video: false, tools: false, thinking: false, image_generation: false };
+
+  if (isImageGenerationModel(modelName)) {
+    return { ...caps, text: false, image_generation: true };
+  }
+
+  if (["vl", "vision", "visual", "image", "-v-", "4v"].some(kw => m.includes(kw))) caps.vision = true;
+  if (["kimi", "gemini"].some(kw => m.includes(kw))) caps.video = true;
+  if (["thinking", "r1", "qwq", "qvq", "o1", "deepseek-v4-pro"].some(kw => m.includes(kw))) caps.thinking = true;
+  if (["qwen", "gpt", "claude", "deepseek", "kimi", "glm", "gemini", "moonshot", "minimax", "doubao"].some(kw => m.includes(kw))) caps.tools = true;
+  if (m.includes("minimax") && m.includes("m2")) caps.thinking = true;
+  // MiniMax M3 起原生多模态（图像/视频），且支持 thinking
+  if (m.includes("minimax") && m.includes("m3")) { caps.thinking = true; caps.vision = true; caps.video = true; }
+
+  return caps;
+}
+
+export function isImageGenerationModel(modelName: string): boolean {
+  const m = modelName.trim().toLowerCase();
+  return ["qwen-image", "wanx-", "dall-e", "gpt-image"].some(prefix => m.startsWith(prefix));
+}
+
+export function isMiniMaxProvider(providerSlug: string | null, baseUrl: string): boolean {
+  const slug = (providerSlug || "").toLowerCase();
+  const base = (baseUrl || "").toLowerCase();
+  return ["minimax", "minimax-cn", "minimax-int"].includes(slug) || base.includes("minimax") || base.includes("minimaxi");
+}
+
+export function isOpenRouterProvider(providerSlug: string | null, baseUrl: string): boolean {
+  const slug = (providerSlug || "").toLowerCase();
+  const base = (baseUrl || "").toLowerCase();
+  return slug === "openrouter" || base.includes("openrouter.ai");
+}
+
+function openRouterRouterModels(): ListedModel[] {
+  return [
+    {
+      id: "openrouter/auto",
+      name: "OpenRouter Auto Router",
+      capabilities: { ...inferCapabilities("openrouter/auto", "openrouter"), tools: true },
+    },
+    {
+      id: "openrouter/free",
+      name: "OpenRouter Free Models Router",
+      capabilities: { ...inferCapabilities("openrouter/free", "openrouter"), tools: true },
+    },
+  ];
+}
+
+export function isVolcCodingPlanProvider(providerSlug: string | null, baseUrl: string): boolean {
+  const slug = (providerSlug || "").toLowerCase();
+  const base = (baseUrl || "").toLowerCase();
+  const isVolc = slug === "volcengine" || base.includes("volces.com");
+  return isVolc && base.includes("/api/coding");
+}
+
+export function isLongCatProvider(providerSlug: string | null, baseUrl: string): boolean {
+  const slug = (providerSlug || "").toLowerCase();
+  const base = (baseUrl || "").toLowerCase();
+  return slug === "longcat" || base.includes("longcat.chat");
+}
+
+export function isDashScopeCodingPlanProvider(providerSlug: string | null, baseUrl: string): boolean {
+  const slug = (providerSlug || "").toLowerCase();
+  const base = (baseUrl || "").toLowerCase();
+  const isDash = slug === "dashscope" || slug === "dashscope-intl" || base.includes("dashscope.aliyuncs.com");
+  return isDash && base.includes("coding");
+}
+
+export function isQianFanCodingPlanProvider(providerSlug: string | null, baseUrl: string): boolean {
+  const slug = (providerSlug || "").toLowerCase();
+  const base = (baseUrl || "").toLowerCase();
+  const isQf = slug === "qianfan" || base.includes("qianfan.baidubce.com");
+  return isQf && base.includes("coding");
+}
+
+export function isXfyunCodingPlanProvider(providerSlug: string | null, baseUrl: string): boolean {
+  const slug = (providerSlug || "").toLowerCase();
+  const base = (baseUrl || "").toLowerCase();
+  const isXfyun = slug === "xfyun" || base.includes("xf-yun.com");
+  return isXfyun && base.includes("maas-coding-api");
+}
+
+export function xfyunCodingPlanFallbackModels(providerSlug: string | null): ListedModel[] {
+  const ids = [
+    "astron-code-latest",
+  ];
+  return ids.map((id) => ({
+    id,
+    name: id,
+    capabilities: inferCapabilities(id, providerSlug),
+  }));
+}
+
+export function miniMaxFallbackModels(providerSlug: string | null): ListedModel[] {
+  const ids = [
+    "MiniMax-M2.7",
+    "MiniMax-M2.5",
+    "MiniMax-M2.5-highspeed",
+    "MiniMax-M2.1",
+    "MiniMax-M2.1-highspeed",
+    "MiniMax-M2",
+  ];
+  return ids.map((id) => ({
+    id,
+    name: id,
+    capabilities: inferCapabilities(id, providerSlug),
+  }));
+}
+
+export function volcCodingPlanFallbackModels(providerSlug: string | null): ListedModel[] {
+  const ids = [
+    "doubao-seed-2.0-code",
+    "doubao-seed-code",
+    "glm-4.7",
+    "deepseek-v3.2",
+    "kimi-k2-thinking",
+    "kimi-k2.5",
+  ];
+  return ids.map((id) => ({
+    id,
+    name: id,
+    capabilities: inferCapabilities(id, providerSlug),
+  }));
+}
+
+export function longCatFallbackModels(providerSlug: string | null): ListedModel[] {
+  const ids = [
+    "LongCat-Flash-Chat",
+    "LongCat-Flash-Thinking",
+    "LongCat-Flash-Thinking-2601",
+    "LongCat-Flash-Lite",
+  ];
+  return ids.map((id) => ({
+    id,
+    name: id,
+    capabilities: inferCapabilities(id, providerSlug),
+  }));
+}
+
+export function qianFanCodingPlanFallbackModels(providerSlug: string | null): ListedModel[] {
+  const ids = [
+    "kimi-k2.5",
+    "deepseek-v3.2",
+    "glm-5",
+    "minimax-m2.5",
+  ];
+  return ids.map((id) => ({
+    id,
+    name: id,
+    capabilities: inferCapabilities(id, providerSlug),
+  }));
+}
+
+export function dashScopeCodingPlanFallbackModels(providerSlug: string | null): ListedModel[] {
+  const ids = [
+    "qwen3.5-plus",
+    "kimi-k2.5",
+    "glm-5",
+    "MiniMax-M2.5",
+    "qwen3-max-2026-01-23",
+    "qwen3-coder-next",
+    "qwen3-coder-plus",
+    "glm-4.7",
+  ];
+  return ids.map((id) => ({
+    id,
+    name: id,
+    capabilities: inferCapabilities(id, providerSlug),
+  }));
+}
+
+/**
+ * 前端直连服务商 API 拉取模型列表。
+ * 通过 Rust http_proxy_request 命令代理发送，绕过 WebView CORS 限制。
+ */
+export async function fetchModelsDirectly(params: {
+  apiType: string; baseUrl: string; providerSlug: string | null; apiKey: string;
+}): Promise<ListedModel[]> {
+  const { apiType, baseUrl, providerSlug, apiKey } = params;
+  const base = baseUrl.replace(/\/+$/, "");
+
+  if (isVolcCodingPlanProvider(providerSlug, baseUrl)) {
+    return volcCodingPlanFallbackModels(providerSlug);
+  }
+  if (isDashScopeCodingPlanProvider(providerSlug, baseUrl)) {
+    return dashScopeCodingPlanFallbackModels(providerSlug);
+  }
+  if (isQianFanCodingPlanProvider(providerSlug, baseUrl)) {
+    return qianFanCodingPlanFallbackModels(providerSlug);
+  }
+  if (isXfyunCodingPlanProvider(providerSlug, baseUrl)) {
+    return xfyunCodingPlanFallbackModels(providerSlug);
+  }
+  if (isLongCatProvider(providerSlug, baseUrl)) {
+    return longCatFallbackModels(providerSlug);
+  }
+
+  // MiniMax 现已提供 /v1/models 列表端点：在线拉取失败时回退到内置候选
+  // （回退列表不含 M3，因此“列表里有没有 M3”可用于判断在线/内置来源）。
+  const isMiniMax = isMiniMaxProvider(providerSlug, baseUrl);
+
+  if (apiType === "anthropic") {
+    const url = base.endsWith("/v1") ? `${base}/models` : `${base}/v1/models`;
+    try {
+      const resp = await proxyFetch(url, {
+        headers: {
+          "x-api-key": apiKey,
+          Authorization: `Bearer ${apiKey}`,
+          "anthropic-version": "2023-06-01",
+        },
+        timeoutSecs: 30,
+      });
+      if (resp.status >= 400) {
+        if (isMiniMax) return miniMaxFallbackModels(providerSlug);
+        throw new Error(`Anthropic API ${resp.status}: ${resp.body.slice(0, 200)}`);
+      }
+      const data = JSON.parse(resp.body);
+      const list = (data.data ?? [])
+        .map((m: any) => ({
+          id: String(m.id ?? "").trim(),
+          name: String(m.display_name ?? m.id ?? ""),
+          capabilities: inferCapabilities(String(m.id ?? ""), providerSlug),
+        }))
+        .filter((m: ListedModel) => m.id);
+      if (list.length === 0 && isMiniMax) return miniMaxFallbackModels(providerSlug);
+      return list;
+    } catch (e) {
+      if (isMiniMax) return miniMaxFallbackModels(providerSlug);
+      throw e;
+    }
+  }
+
+  // OpenAI-compatible: GET /models
+  const url = `${base}/models`;
+  let resp;
+  try {
+    resp = await proxyFetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      timeoutSecs: 30,
+    });
+  } catch (e) {
+    if (isMiniMax) return miniMaxFallbackModels(providerSlug);
+    throw e;
+  }
+  if (resp.status >= 400) {
+    if (isMiniMax) return miniMaxFallbackModels(providerSlug);
+    throw new Error(`API ${resp.status}: ${resp.body.slice(0, 200)}`);
+  }
+  const data = JSON.parse(resp.body);
+  const routerModels = isOpenRouterProvider(providerSlug, baseUrl) ? openRouterRouterModels() : [];
+  const seen = new Set(routerModels.map((m) => m.id));
+  const apiModels = (data.data ?? [])
+    .map((m: any) => ({
+      id: String(m.id ?? "").trim(),
+      name: String(m.id ?? ""),
+      capabilities: inferCapabilities(String(m.id ?? ""), providerSlug),
+    }))
+    .filter((m: ListedModel) => {
+      if (!m.id || seen.has(m.id)) return false;
+      seen.add(m.id);
+      return true;
+    })
+    .sort((a: ListedModel, b: ListedModel) => a.id.localeCompare(b.id));
+  if (apiModels.length === 0 && isMiniMax) return miniMaxFallbackModels(providerSlug);
+  return [...routerModels, ...apiModels];
+}
+
+/** Auth-aware fetch that preserves HTTP error responses for status-aware callers. */
+export async function safeFetchResponse(url: string, init?: RequestInit): Promise<Response> {
+  const effectiveInit = init?.signal ? init : { ...init, signal: AbortSignal.timeout(10_000) };
+  const useAuth = !IS_TAURI || isTauriRemoteMode();
+  let apiBase = "";
+  if (useAuth && url.startsWith("http")) {
+    try { apiBase = new URL(url).origin; } catch { /* relative url, keep "" */ }
+    if (!apiBase || apiBase === "null" || apiBase === window.location.origin) apiBase = "";
+  }
+  const res = useAuth
+    ? await authFetch(url, effectiveInit, apiBase)
+    : await fetch(url, effectiveInit);
+  // HTTP 428 Precondition Required is the signal from middleware_setup_gate
+  // saying "no web-access password set; complete the setup flow first".
+  // We surface this as a custom event so the App-level effect can switch the
+  // view to SetupView, and re-throw a sentinel error so the caller knows the
+  // current request was *not* fulfilled. The sentinel error message is a
+  // well-known string the caller can detect; the human-visible body is
+  // attached on the error so existing toast handlers won't render gibberish.
+  if (res.status === 428) {
+    let body: { error?: string; detail?: string; setup_url?: string } = {};
+    try {
+      const text = await res.clone().text();
+      if (text) body = JSON.parse(text);
+    } catch { /* ignore parse error */ }
+    if (body?.error === "setup_required") {
+      try {
+        window.dispatchEvent(
+          new CustomEvent("openkitsune:setup-required", { detail: body }),
+        );
+      } catch { /* ignore in non-browser env */ }
+      // The thrown error message may briefly surface in toast handlers
+      // before the App-level listener swaps to SetupView. Use the human
+      // detail from the backend so the user sees an actionable message
+      // ("Setup required…") instead of an internal sentinel.
+      const message = body.detail || "Setup required";
+      const err = new Error(message);
+      (err as Error & { setupRequired?: boolean }).setupRequired = true;
+      throw err;
+    }
+  }
+  return res;
+}
+
+/** Auth-aware fetch that converts HTTP error responses into exceptions. */
+export async function safeFetch(url: string, init?: RequestInit): Promise<Response> {
+  const res = await safeFetchResponse(url, init);
+  if (!res.ok) {
+    let userMessage = res.statusText;
+    try {
+      const body = await res.text();
+      if (body) {
+        try {
+          const parsed = JSON.parse(body);
+          const errObj = parsed?.detail?.error ?? parsed?.detail;
+          if (typeof errObj === "object" && errObj?.message) {
+            userMessage = errObj.message;
+            if (errObj.guidance) userMessage += `\n${errObj.guidance}`;
+          } else if (typeof parsed?.detail === "string") {
+            userMessage = parsed.detail;
+          } else {
+            userMessage = body.slice(0, 200);
+          }
+        } catch {
+          userMessage = body.slice(0, 200);
+        }
+      }
+    } catch { /* ignore */ }
+    throw new Error(userMessage);
+  }
+  return res;
+}
+
+// Re-export proxyFetch from platform layer for backward compatibility.
+// Tauri: proxied through Rust to bypass WebView CORS.
+// Web: direct fetch (same-origin, no CORS issue).
+export { proxyFetch } from "./platform";

@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name={{name}}
+{{#if comment}}
+Comment={{comment}}
+{{/if}}
+# Forward browser install links to the desktop application's argument handler.
+Exec={{exec}} %u
+Icon={{icon}}
+StartupWMClass={{exec}}
+Terminal=false
+Categories={{categories}}
+{{#if mime_type}}
+MimeType={{mime_type}};
+{{/if}}

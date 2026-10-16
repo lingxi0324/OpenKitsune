@@ -1,0 +1,522 @@
+"""
+Identity file management routes: list, read, write, validate, compile, reload.
+
+Provides HTTP API for the frontend Identity Management Panel.
+Supports editing SOUL.md, AGENT.md, USER.md, MEMORY.md, personas, policies,
+and runtime compilation artifacts.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
+
+from openkitsune.api.runtime_response import runtime_operation_response
+from openkitsune.config import settings
+from openkitsune.prompt.budget import estimate_tokens
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/identity", tags=["identity"])
+
+
+# ─── Constants ──────────────────────────────────────────────────────────
+
+_BUDGET_MAP = {
+    "SOUL.md": 3600,
+    "runtime/identity.core.md": 600,
+    "runtime/agent.behavior.md": 450,
+    "runtime/user.profile.core.md": 300,
+    "prompts/policies.md": 1200,
+}
+
+_EDITABLE_SOURCE_FILES = [
+    "SOUL.md",
+    "AGENT.md",
+    "USER.md",
+    "MEMORY.md",
+    "POLICIES.yaml",
+    "prompts/policies.md",
+]
+
+_RESTRICTED_FILES = {
+    "AGENT.md",
+    "MEMORY.md",
+    "POLICIES.yaml",
+    "prompts/policies.md",
+}
+
+_FILE_WARNINGS: dict[str, str] = {
+    "SOUL.md": "soul",
+    "AGENT.md": "agent",
+    "USER.md": "user",
+    "MEMORY.md": "memory",
+    "POLICIES.yaml": "policiesYaml",
+    "prompts/policies.md": "policiesMd",
+}
+
+
+# ─── Helpers ────────────────────────────────────────────────────────────
+
+
+def _identity_dir() -> Path:
+    return settings.identity_path
+
+
+def _resolve_file(name: str) -> Path:
+    """Resolve a relative identity file name to an absolute path, with traversal guard."""
+    identity = _identity_dir()
+    target = (identity / name).resolve()
+    if not str(target).startswith(str(identity.resolve())):
+        raise HTTPException(400, "Path traversal not allowed")
+    return target
+
+
+def _get_agent(request: Request):
+    agent = getattr(request.app.state, "agent", None)
+    if agent is None:
+        raise HTTPException(503, "Agent not initialized")
+    return agent
+
+
+# ─── Validation ─────────────────────────────────────────────────────────
+
+
+def validate_identity_file(name: str, content: str) -> dict[str, list[str]]:
+    """Validate identity file content before saving.
+
+    Returns dict with 'errors' (block save) and 'warnings' (allow with confirmation).
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if name == "POLICIES.yaml":
+        try:
+            import yaml
+
+            data = yaml.safe_load(content)
+            if data is None:
+                pass  # empty file is ok
+            elif not isinstance(data, dict):
+                errors.append("根节点必须是 YAML 字典")
+            else:
+                allowed_keys = {"tool_policies", "scope_policy", "auto_confirm"}
+                unknown = set(data.keys()) - allowed_keys
+                if unknown:
+                    errors.append(f"未知的顶层键: {', '.join(sorted(unknown))}")
+                tp = data.get("tool_policies")
+                if tp is not None:
+                    if not isinstance(tp, list):
+                        errors.append("tool_policies 必须是列表")
+                    else:
+                        for i, item in enumerate(tp):
+                            if not isinstance(item, dict):
+                                errors.append(f"tool_policies[{i}] 必须是字典")
+                            elif "tool_name" not in item:
+                                errors.append(f"tool_policies[{i}] 缺少必需的 tool_name 字段")
+                sp = data.get("scope_policy")
+                if sp is not None and not isinstance(sp, dict):
+                    errors.append("scope_policy 必须是字典")
+                ac = data.get("auto_confirm")
+                if ac is not None and not isinstance(ac, bool):
+                    errors.append("auto_confirm 必须是布尔值")
+        except ImportError:
+            warnings.append("PyYAML 未安装，无法校验 YAML 结构")
+        except Exception as e:
+            errors.append(f"YAML 语法错误: {e}")
+
+    elif name == "MEMORY.md":
+        from openkitsune.memory.types import MEMORY_MD_MAX_CHARS
+
+        if len(content) > MEMORY_MD_MAX_CHARS:
+            warnings.append(
+                f"内容超出 {MEMORY_MD_MAX_CHARS} 字符限制"
+                f"（当前 {len(content)}），保存后将被自动截断"
+            )
+
+    elif name == "USER.md":
+        bold_fields = re.findall(r"\*\*(.+?)\*\*:", content)
+        if content.strip() and not bold_fields:
+            warnings.append("未检测到 **字段名**: 格式，系统自动学习功能可能失效")
+
+    elif name.startswith("personas/") and name.endswith(".md"):
+        known_sections = {"性格特征", "沟通风格", "提示词片段", "表情包配置"}
+        found = re.findall(r"^## (.+)", content, re.MULTILINE)
+        unknown_sections = [s.strip() for s in found if s.strip() not in known_sections]
+        if unknown_sections:
+            warnings.append(
+                f"包含非标准段落: {', '.join(unknown_sections)}，不影响保存但可能不被系统识别"
+            )
+
+    elif name == "prompts/policies.md":
+        system_titles = {
+            "三条红线（必须遵守）",
+            "意图声明（每次纯文本回复必须遵守）",
+            "切换模型的工具上下文隔离",
+        }
+        found = re.findall(r"^## (.+)", content, re.MULTILINE)
+        overridden = [s.strip() for s in found if s.strip() in system_titles]
+        if overridden:
+            warnings.append(f"以下段落会被系统内置策略覆盖: {', '.join(overridden)}")
+
+    return {"errors": errors, "warnings": warnings}
+
+
+# ─── Models ─────────────────────────────────────────────────────────────
+
+
+class FileWriteRequest(BaseModel):
+    name: str
+    content: str
+    force: bool = False  # skip warnings confirmation
+
+
+class ValidateRequest(BaseModel):
+    name: str
+    content: str
+
+
+# ─── Routes ─────────────────────────────────────────────────────────────
+
+
+@router.get("/files")
+async def list_identity_files():
+    """List all editable identity files with metadata."""
+    identity = _identity_dir()
+    files: list[dict[str, Any]] = []
+
+    all_names = list(_EDITABLE_SOURCE_FILES)
+
+    # discover persona files
+    personas_dir = identity / "personas"
+    if personas_dir.exists():
+        for p in sorted(personas_dir.glob("*.md")):
+            rel = f"personas/{p.name}"
+            if rel not in all_names:
+                all_names.append(rel)
+
+    for name in all_names:
+        path = identity / name
+        entry: dict[str, Any] = {
+            "name": name,
+            "exists": path.exists(),
+            "restricted": name in _RESTRICTED_FILES,
+            "warning_key": _FILE_WARNINGS.get(name),
+            "budget_tokens": _BUDGET_MAP.get(name),
+        }
+        if path.exists():
+            stat = path.stat()
+            entry["size"] = stat.st_size
+            entry["modified"] = datetime.fromtimestamp(stat.st_mtime).isoformat()
+            content = path.read_text(encoding="utf-8")
+            entry["tokens"] = estimate_tokens(content)
+        files.append(entry)
+
+    return {"files": files}
+
+
+@router.get("/file")
+async def read_identity_file(name: str | None = None, path: str | None = None):
+    """Read a single identity file.
+
+    The canonical query parameter is ``name`` (the identity-relative
+    path, e.g. ``SOUL.md`` or ``personas/coder.md``). For ergonomic
+    parity with neighbouring endpoints that use ``path`` (``/api/files``,
+    ``/api/workspaces``) we also accept ``path`` as an alias. When both
+    are provided, ``name`` wins so callers can override the alias
+    explicitly. Issue #16 (exploratory v10): callers were getting 422
+    after passing the more conventional ``path`` query string.
+    """
+    target = name if name else path
+    if not target:
+        raise HTTPException(422, "Missing required query parameter 'name' (or alias 'path')")
+    resolved = _resolve_file(target)
+    if not resolved.exists():
+        raise HTTPException(404, f"File not found: {target}")
+    content = resolved.read_text(encoding="utf-8")
+    return {
+        "name": target,
+        "content": content,
+        "tokens": estimate_tokens(content),
+        "budget_tokens": _BUDGET_MAP.get(target),
+    }
+
+
+@router.put("/file")
+async def write_identity_file(req: FileWriteRequest, request: Request):
+    """Write an identity file with validation.
+
+    Returns 400 if validation errors exist.
+    Returns 200 with warnings if there are warnings and force=false.
+    Returns 200 with saved=true when saved.
+    """
+    name = req.name
+
+    # Block writing to .compiled_at or other non-editable paths
+    if name.startswith("runtime/") or name.startswith("compiled/"):
+        raise HTTPException(403, "Cannot write to compiled identity files")
+
+    path = _resolve_file(name)
+
+    # Validate
+    result = validate_identity_file(name, req.content)
+    if result["errors"]:
+        raise HTTPException(
+            400,
+            detail={
+                "message": "格式校验失败",
+                "errors": result["errors"],
+                "warnings": result["warnings"],
+            },
+        )
+    if result["warnings"] and not req.force:
+        return {
+            "saved": False,
+            "needs_confirm": True,
+            "warnings": result["warnings"],
+        }
+
+    # Write
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(req.content, encoding="utf-8")
+
+    from openkitsune.runtime_config_coordinator import get_runtime_config_coordinator
+
+    runtime = get_runtime_config_coordinator(request).refresh_identity(
+        _identity_dir(),
+        reason=f"identity:{name}",
+        refresh_policy=name == "POLICIES.yaml",
+    )
+
+    return runtime_operation_response(
+        runtime,
+        {
+            "saved": True,
+            "name": name,
+            "tokens": estimate_tokens(req.content),
+        },
+    )
+
+
+@router.post("/validate")
+async def validate_file(req: ValidateRequest):
+    """Validate file content without saving."""
+    result = validate_identity_file(req.name, req.content)
+    return result
+
+
+@router.post("/reload")
+async def reload_identity(request: Request):
+    """Hot-reload identity files into the running agent."""
+    from openkitsune.runtime_config_coordinator import get_runtime_config_coordinator
+
+    result = get_runtime_config_coordinator(request).refresh_identity(
+        _identity_dir(),
+        reason="identity:manual_reload",
+        refresh_policy=True,
+    )
+    if result.failed:
+        raise HTTPException(500, detail=result.to_dict())
+    return result.to_dict()
+
+
+@router.post("/compile")
+async def compile_identity(request: Request, mode: str = "rules"):
+    """Trigger identity compilation.
+
+    mode=llm: LLM-assisted (async, higher quality)
+    mode=rules: Rule-based (sync, fast, uses static fallbacks)
+    """
+    identity_dir = _identity_dir()
+    mode_used = mode
+
+    if mode == "llm":
+        agent = _get_agent(request)
+        brain = getattr(agent, "brain", None)
+        if brain is None:
+            local = getattr(agent, "_local_agent", None)
+            if local:
+                brain = getattr(local, "brain", None)
+        if brain:
+            from openkitsune.prompt.compiler import PromptCompiler
+
+            compiler = PromptCompiler(brain=brain)
+            await compiler.compile_all(identity_dir)
+            mode_used = "llm"
+        else:
+            from openkitsune.prompt.compiler import compile_all
+
+            compile_all(identity_dir)
+            mode_used = "rules (LLM not available)"
+    else:
+        from openkitsune.prompt.compiler import compile_all
+
+        compile_all(identity_dir)
+        mode_used = "rules"
+
+    from openkitsune.runtime_config_coordinator import get_runtime_config_coordinator
+
+    runtime = get_runtime_config_coordinator(request).rebuild_agent_prompt()
+
+    from openkitsune.prompt.compiler import get_compiled_content
+
+    compiled = get_compiled_content(identity_dir)
+    _key_rt = {
+        "identity_core": "runtime/identity.core.md",
+        "agent_behavior": "runtime/agent.behavior.md",
+        "user_profile_core": "runtime/user.profile.core.md",
+    }
+    compiled_info = {}
+    for key, text in compiled.items():
+        compiled_info[key] = {
+            "content": text,
+            "tokens": estimate_tokens(text),
+            "budget_tokens": _BUDGET_MAP.get(_key_rt.get(key, "")),
+        }
+
+    return {
+        "status": runtime.status,
+        "mode_used": mode_used,
+        "compiled_files": compiled_info,
+        "runtime": runtime.to_dict(),
+    }
+
+
+@router.get("/compile-status")
+async def compile_status():
+    """Get compilation status: token counts, budget, freshness."""
+    identity_dir = _identity_dir()
+
+    from openkitsune.prompt.compiler import check_compiled_outdated, get_compiled_content
+
+    compiled = get_compiled_content(identity_dir)
+    outdated = check_compiled_outdated(identity_dir)
+
+    runtime_dir = identity_dir / "runtime"
+    timestamp_file = runtime_dir / ".compiled_at"
+    last_compiled = None
+    if timestamp_file.exists():
+        try:
+            last_compiled = timestamp_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+
+    key_to_runtime = {
+        "identity_core": "runtime/identity.core.md",
+        "agent_behavior": "runtime/agent.behavior.md",
+        "user_profile_core": "runtime/user.profile.core.md",
+    }
+    status = {}
+    for key, content in compiled.items():
+        runtime_name = key_to_runtime.get(key, f"runtime/{key}.md")
+        status[key] = {
+            "tokens": estimate_tokens(content),
+            "budget_tokens": _BUDGET_MAP.get(runtime_name),
+            "has_content": bool(content.strip()),
+        }
+
+    return {
+        "outdated": outdated,
+        "last_compiled": last_compiled,
+        "files": status,
+    }
+
+
+# ─── Persona import / template ───────────────────────────────────────────
+
+_PERSONA_TEMPLATE = """\
+# 自定义人格名称
+
+> 预设角色: 用一句话描述这个角色
+
+## 性格特征
+- 特征1：描述
+- 特征2：描述
+- 特征3：描述
+
+## 沟通风格
+- 正式程度: neutral（可选 formal / neutral / casual）
+- 幽默感: occasional（可选 none / occasional / frequent）
+- 回复长度: adaptive（可选 brief / moderate / adaptive / detailed）
+- 情感距离: friendly（可选 professional / friendly / intimate）
+- 称呼: 默认使用用户设定的称呼
+
+## 主动行为
+- 描述角色会主动做哪些事
+- 主动提醒、建议等行为模式
+
+## 活人感配置
+- 主动消息: 低频 / 中频 / 高频（每日最多 N 条）
+- 消息类型: 任务提醒、关心问候等
+- 闲聊问候: 低频主动发起
+
+## 表情包配置
+- 使用频率: rare / occasional / frequent
+- 偏好分类: 通用
+- 使用场景: 任务完成、鼓励等
+
+## 提示词片段
+你是一个[角色描述]，[核心行为准则]。[沟通风格要求]。
+"""
+
+
+@router.get("/persona/template")
+async def download_persona_template():
+    """Download a persona MD template file for users to fill in."""
+    return PlainTextResponse(
+        content=_PERSONA_TEMPLATE,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="persona_template.md"',
+        },
+    )
+
+
+@router.post("/persona/import")
+async def import_persona_file(file: UploadFile = File(...)):
+    """Import a persona MD file. Saves to identity/personas/ with the uploaded filename.
+
+    No strict validation — the file is saved as-is.
+    """
+    if not file.filename:
+        raise HTTPException(400, "文件名不能为空")
+
+    fname = file.filename
+    if not fname.endswith(".md"):
+        fname = fname + ".md"
+
+    safe_name = re.sub(r"[^\w\-.]", "_", fname)
+    if safe_name.startswith(".") or "/" in safe_name or "\\" in safe_name:
+        raise HTTPException(400, "非法文件名")
+
+    content_bytes = await file.read()
+    try:
+        content = content_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "文件编码必须为 UTF-8")
+
+    personas_dir = _identity_dir() / "personas"
+    personas_dir.mkdir(parents=True, exist_ok=True)
+    target = (personas_dir / safe_name).resolve()
+
+    if not str(target).startswith(str(personas_dir.resolve())):
+        raise HTTPException(400, "Path traversal not allowed")
+
+    target.write_text(content, encoding="utf-8")
+
+    persona_id = safe_name.removesuffix(".md")
+    logger.info(f"[Identity API] Imported persona file: {safe_name}")
+
+    return {
+        "saved": True,
+        "name": f"personas/{safe_name}",
+        "persona_id": persona_id,
+        "tokens": estimate_tokens(content),
+    }

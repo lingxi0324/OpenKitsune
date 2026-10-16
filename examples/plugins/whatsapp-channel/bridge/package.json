@@ -1,0 +1,20 @@
+{
+  "name": "openkitsune-whatsapp-bridge",
+  "version": "2.0.0",
+  "description": "Baileys 7-based WhatsApp Web bridge for OpenKitsune",
+  "main": "index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "express": "^4.18.0",
+    "qrcode": "^1.5.0",
+    "pino": "^9.0.0"
+  }
+}
+

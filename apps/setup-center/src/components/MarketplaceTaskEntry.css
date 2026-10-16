@@ -1,0 +1,56 @@
+.install-task-capsule {
+  position: fixed; z-index: 40; display: flex; align-items: center;
+  width: max-content; max-width: calc(100vw - 24px); border: 1px solid var(--line);
+  border-radius: 999px; background: var(--panel, #fff); color: var(--text, #222);
+  box-shadow: 0 4px 18px rgb(0 0 0 / 12%); overflow: hidden;
+}
+.install-task-capsule[data-snapping="true"] { transition: left 160ms ease-out, top 160ms ease-out; }
+.install-task-capsule[data-dragging="true"] { transition: none; }
+.install-task-grip, .install-task-hide {
+  border: 0; background: transparent; color: inherit; display: flex; align-items: center;
+  justify-content: center; min-height: 44px; padding: 0; cursor: pointer;
+}
+.install-task-grip { flex: 1; min-width: 0; gap: 8px; padding: 0 4px 0 14px; touch-action: none; user-select: none; font-size: 13px; font-weight: 500; white-space: nowrap; }
+.install-task-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.install-task-grip > svg, .install-task-count, .install-task-hide { flex-shrink: 0; }
+.install-task-grip:active { cursor: grabbing; }
+.install-task-capsule[data-minimized="true"] .install-task-grip { padding: 0 10px; }
+.install-task-remove { display: flex; align-items: center; gap: 4px; margin: 0 0 12px 34px; padding: 4px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; }
+.install-task-remove:hover { background: var(--hover-bg, rgb(127 127 127 / 10%)); }
+.install-task-hide { min-width: 44px; opacity: .6; }
+.install-task-hide:hover { background: var(--hover-bg, rgb(127 127 127 / 10%)); opacity: 1; }
+.install-task-grip:focus-visible, .install-task-hide:focus-visible { outline: 2px solid var(--brand, #2563eb); outline-offset: -3px; }
+.install-task-count { font-size: 11px; min-width: 18px; border-radius: 12px; padding: 1px 4px; background: rgb(127 127 127 / 12%); text-align: center; }
+.install-task-capsule[data-phase="installing"] .install-task-grip > svg,
+.install-task-capsule[data-phase="checking"] .install-task-grip > svg { color: var(--brand, #2563eb); }
+[data-phase="permissions"] .install-task-icon, [data-phase="setup"] .install-task-icon,
+.install-task-capsule[data-phase="permissions"] .install-task-grip > svg,
+.install-task-capsule[data-phase="setup"] .install-task-grip > svg { color: #b7791f; }
+[data-phase="failed"] .install-task-icon, [data-phase="paused"] .install-task-icon,
+.install-task-capsule[data-phase="failed"] .install-task-grip > svg,
+.install-task-capsule[data-phase="paused"] .install-task-grip > svg { color: #dc4545; }
+.install-task-capsule[data-phase="complete"] .install-task-grip > svg { color: #15966b; }
+.install-task-spin { animation: install-task-spin 1s linear infinite; flex-shrink: 0; }
+@keyframes install-task-spin { to { transform: rotate(360deg); } }
+.install-task-row + .install-task-row { border-top: 1px solid var(--line); }
+.install-task-summary { display: flex; width: 100%; align-items: center; gap: 12px; padding: 14px 4px; background: transparent; border: 0; color: inherit; cursor: pointer; text-align: left; }
+.install-task-summary:hover { background: rgb(127 127 127 / 5%); }
+.install-task-icon { flex-shrink: 0; color: var(--brand, #2563eb); }
+.install-task-copy { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.install-task-copy strong { font-size: 14px; overflow-wrap: anywhere; }
+.install-task-copy span, .install-task-action { font-size: 12px; }
+.install-task-copy small { font-size: 11px; opacity: .6; overflow-wrap: anywhere; }
+.install-task-action { display: flex; align-items: center; gap: 2px; color: var(--brand, #2563eb); flex-shrink: 0; }
+.install-task-progress { padding: 0 4px 14px 34px; }
+.install-task-panel { display: flex; flex-direction: column; max-height: 78dvh; overflow-y: auto; }
+@media (min-width: 769px) {
+  .install-task-panel { top: auto; bottom: 32px; left: auto; right: 24px; translate: none; width: 400px; max-width: calc(100vw - 48px); }
+}
+@media (max-width: 768px) {
+  .install-task-panel { min-height: 42dvh; }
+  .install-task-panel, .install-task-detail { top: auto; bottom: 0; left: 0; translate: none; width: 100%; max-width: 100%; border-radius: 20px 20px 0 0; padding: 20px; padding-bottom: max(20px, env(safe-area-inset-bottom)); }
+  .install-task-handle { display: block; width: 36px; height: 20px; margin: -10px auto 0; border: 0; background: transparent; touch-action: none; }
+  .install-task-handle::after { content: ''; display: block; width: 36px; height: 4px; border-radius: 4px; background: var(--line); }
+}
+@media (min-width: 769px) { .install-task-handle { display: none; } }
+@media (prefers-reduced-motion: reduce) { .install-task-spin { animation: none; } .install-task-capsule { transition: none; } }

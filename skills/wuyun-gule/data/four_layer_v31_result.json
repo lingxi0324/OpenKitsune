@@ -1,0 +1,43 @@
+{
+  "version": "v3.7.1",
+  "layers": [
+    "胜复校正v3.1",
+    "资本行为",
+    "九宫奇门",
+    "四柱"
+  ],
+  "evaluation": {
+    "plate": {
+      "木": {
+        "correct": 3,
+        "total": 12,
+        "rate": 0.25
+      },
+      "火": {
+        "correct": 7,
+        "total": 11,
+        "rate": 0.636
+      },
+      "土": {
+        "correct": 4,
+        "total": 7,
+        "rate": 0.571
+      },
+      "金": {
+        "correct": 4,
+        "total": 5,
+        "rate": 0.8
+      },
+      "水": {
+        "correct": 2,
+        "total": 3,
+        "rate": 0.667
+      }
+    },
+    "overall": {
+      "correct": 20,
+      "total": 38,
+      "rate": 0.526
+    }
+  }
+}

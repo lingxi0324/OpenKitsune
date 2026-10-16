@@ -1,0 +1,76 @@
+[package]
+name = "openkitsune-setup-center"
+version = "1.27.42"
+description = "OpenKitsune Setup Center"
+authors = ["OpenKitsune"]
+license = "AGPL-3.0-only"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.5.5", features = [] }
+base64 = "0.22.1"
+flate2 = "1.0.35"
+
+[dependencies]
+# tao#1180: upstream PR tauri-apps/tao#1188 replaces the panic in
+# move_state_to(Destroyed -> *) with a debug log. Until that PR is merged
+# and released, patch tao from the branch carrying the complete guard.
+# The self-heal logic in main.rs remains as a defence-in-depth fallback.
+tauri = { version = "2.10.1", features = ["protocol-asset", "tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-http = { version = "2", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs-next = "2.0.0"
+reqwest = { version = "0.12.12", features = ["blocking", "json", "multipart", "rustls-tls"] }
+flate2 = "1.0.35"
+tar = "0.4.41"
+zip = "2.2.2"
+base64 = "0.22.1"
+getrandom = "0.3"
+
+once_cell = "1"
+# Direct dep so we can use tokio::time::timeout for backend_fetch chunk
+# inactivity. tokio is already pulled in transitively by reqwest/tauri at
+# 1.50.x; declaring it here just makes the `time` feature explicit.
+tokio = { version = "1", features = ["time"] }
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+tauri-plugin-autostart = "2.5.1"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+tauri-plugin-deep-link = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Used by src/crash_handler.rs to install SetUnhandledExceptionFilter +
+# MiniDumpWriteDump for native crashes (0xc0000005 / 0xc0000374 / 0xc000001d).
+# Dumps land in ~/.openkitsune/crashdumps/openkitsune-{pid}-{ts}.dmp and are
+# auto-packaged by build_feedback_zip so users can submit them via the
+# normal "send feedback" flow without admin rights or HKLM LocalDumps.
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  # CreateFileW is gated by Win32_Security because its signature contains
+  # SECURITY_ATTRIBUTES, even though crash_handler always passes NULL.
+  "Win32_Security",
+  "Win32_Security_Cryptography",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Kernel",
+  "Win32_System_Memory",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+] }
+
+[patch.crates-io]
+tao = { git = "https://github.com/SimYng/tao.git", branch = "fix/no-panic-destroyed-0.34.8" }
+
+[profile.release]
+debug = "line-tables-only"

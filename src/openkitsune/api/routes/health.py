@@ -1,0 +1,1135 @@
+"""
+Health check routes: GET /api/health, POST /api/health/check
+
+POST /api/health/check 使用 dry_run=True 模式执行只读检测，
+不会修改 provider 的健康状态和冷静期计数，避免干扰正在运行的 Agent。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, Request
+
+from ..schemas import HealthCheckRequest, HealthResult
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+_memory_repair_restart_required = False
+
+
+def mark_memory_repair_completed_restart_required() -> None:
+    """Flag the memory subsystem as 'repaired, needs restart'.
+
+    Also clears the matching entry in the cross-subsystem
+    :class:`openkitsune.storage.degraded.DegradedRegistry` so the unified
+    ``DegradedBanner`` stops surfacing memory as degraded (it would
+    otherwise stay yellow until the user restarts the backend, even
+    though they already took the corrective action via the
+    memory_repair flow).
+    """
+    global _memory_repair_restart_required
+    _memory_repair_restart_required = True
+    try:
+        from openkitsune.storage.degraded import registry as _registry
+
+        _registry.unregister("memory")
+    except Exception:
+        # Best-effort: never let registry bookkeeping break the repair flow.
+        pass
+
+
+def clear_memory_repair_restart_required() -> None:
+    global _memory_repair_restart_required
+    _memory_repair_restart_required = False
+
+
+def _memory_subsystem_status(request: Request) -> dict:
+    try:
+        agent = getattr(request.app.state, "agent", None)
+        mm = getattr(agent, "memory_manager", None) if agent is not None else None
+        if _memory_repair_restart_required or getattr(
+            mm, "repair_completed_restart_required", False
+        ):
+            return {
+                "status": "repair_completed_restart_required",
+                "reason": None,
+                "details": "Memory database repair completed; restart backend to reopen storage.",
+                "repair_available": False,
+            }
+        if mm is not None and getattr(mm, "degraded", False):
+            return {
+                "status": "degraded",
+                "reason": getattr(mm, "degraded_reason", "unknown"),
+                "details": getattr(mm, "degraded_details", None),
+                "repair_available": True,
+            }
+        if mm is not None:
+            return {"status": "healthy", "reason": None, "details": None, "repair_available": False}
+    except Exception as e:
+        logger.debug("[Health] memory_subsystem status skipped: %s", e)
+    return {"status": "unknown", "reason": None, "details": None, "repair_available": False}
+
+
+def _frontend_bundle_status(request: Request, backend_version: str) -> dict[str, Any]:
+    """Return a structured view of the SPA bundle vs backend version.
+
+    Exposes the v11 Fix-5 startup signal (which previously lived only
+    in ``logger.warning`` lines) as a JSON field so the frontend can
+    show a "rebuild SPA" hint without scraping logs (exploratory v12
+    §10.2 follow-up).
+
+    Shape::
+
+        {
+            "build_id": "dev-mpgq6mn8" | "1.27.12" | None,
+            "backend_version": "1.27.12",
+            "outdated": True | False,
+        }
+
+    The endpoint never flips ``status`` to non-ok based on this -- the
+    field is purely informational.
+    """
+    try:
+        from .build_info import is_frontend_bundle_outdated
+
+        bundle_id = getattr(request.app.state, "frontend_bundle_build_id", None)
+        return {
+            "build_id": bundle_id,
+            "backend_version": backend_version,
+            "outdated": is_frontend_bundle_outdated(bundle_id, backend_version),
+        }
+    except Exception as exc:  # noqa: BLE001 -- never break /api/health
+        logger.debug("[Health] frontend_bundle status skipped: %s", exc)
+        return {
+            "build_id": None,
+            "backend_version": backend_version,
+            "outdated": False,
+        }
+
+
+def _read_last_shutdown_marker() -> dict:
+    try:
+        from openkitsune.config import settings
+
+        marker = Path(settings.project_root) / "data" / "memory" / ".last_clean_shutdown"
+        if not marker.exists():
+            return {"status": "unclean", "reason": "marker_missing"}
+        data = json.loads(marker.read_text("utf-8"))
+        current_spawn_raw = os.environ.get("OPENKITSUNE_SPAWN_STARTED_AT_MS")
+        marker_ts = int(data.get("ts", 0) or 0)
+        if not current_spawn_raw:
+            return {"status": "clean", **data}
+        current_spawn = int(current_spawn_raw)
+        if marker_ts and marker_ts <= current_spawn:
+            return {"status": "clean", **data}
+        return {"status": "unclean", "reason": "marker_written_after_current_spawn", **data}
+    except Exception as e:
+        logger.debug("[Health] last shutdown marker unreadable: %s", e)
+        return {"status": "unknown"}
+
+
+_lan_ip_cache: tuple[str, float] | None = None
+_LAN_IP_TTL = 60
+
+
+def _get_lan_ip() -> str:
+    """Best-effort LAN IP detection via UDP connect (no traffic sent).
+
+    Result is cached for 60s to avoid creating a socket on every health check
+    (heartbeat polls every 5s).
+    """
+    global _lan_ip_cache
+    now = time.time()
+    if _lan_ip_cache and (now - _lan_ip_cache[1]) < _LAN_IP_TTL:
+        return _lan_ip_cache[0]
+
+    import socket
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        ip = "127.0.0.1"
+    _lan_ip_cache = (ip, now)
+    return ip
+
+
+def _safe_int(val: str, default: int) -> int:
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _resolve_api_host_display(request: Request) -> str:
+    """Return the host the server is actually bound to (best effort).
+
+    Prefers ``app.state.actual_bind_host`` (set by ``start_api_server``) so
+    that headless-detect / api_lan_mode users see the truth instead of the
+    env-var default.
+    """
+    actual = getattr(request.app.state, "actual_bind_host", None)
+    if isinstance(actual, str) and actual:
+        return actual
+    return os.environ.get("API_HOST", "").strip() or "127.0.0.1"
+
+
+def _resolve_api_port_display(request: Request) -> int:
+    actual = getattr(request.app.state, "actual_bind_port", None)
+    if isinstance(actual, int):
+        return actual
+    return _safe_int(os.environ.get("API_PORT", "18900"), 18900)
+
+
+_VIRTUAL_PREFIXES = (
+    "26.",  # Radmin VPN
+    "25.",  # Hamachi
+    "100.64.",  # CGNAT / Tailscale
+    "172.17.",  # Docker default bridge
+    "172.18.",  # Docker user-defined
+    "172.19.",  # Docker user-defined
+)
+
+
+def _ip_score(ip: str) -> int:
+    """Higher score = more likely to be the real LAN IP the user wants.
+
+    - Virtual adapter prefixes (VPN, Docker, etc.)  → 0
+    - Ends in .1 in private range (likely VM host / bridge)  → 1
+    - 172.16-31.x.x (Hyper-V, Docker host range)   → 2
+    - 10.x.x.x (often corporate/real but also VPN)  → 3
+    - 192.168.x.x with DHCP-like last octet         → 4  (best guess)
+    """
+    for prefix in _VIRTUAL_PREFIXES:
+        if ip.startswith(prefix):
+            return 0
+
+    octets = ip.split(".")
+    last = int(octets[3]) if len(octets) == 4 else 0
+    second = int(octets[1]) if len(octets) >= 2 else 0
+
+    if ip.startswith("192.168."):
+        return 2 if last == 1 else 4
+    if ip.startswith("10."):
+        return 2 if last == 1 else 3
+    if ip.startswith("172.") and 16 <= second <= 31:
+        return 1 if last == 1 else 2
+    return 1
+
+
+_all_ips_cache: tuple[list[str], float] | None = None
+
+
+def _get_all_lan_ips() -> list[str]:
+    """Return all non-loopback IPv4 addresses, sorted by likelihood of being
+    the real LAN IP (highest score first). Cached 60s."""
+    global _all_ips_cache
+    now = time.time()
+    if _all_ips_cache and (now - _all_ips_cache[1]) < _LAN_IP_TTL:
+        return _all_ips_cache[0]
+
+    import socket
+
+    raw: list[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addr = info[4][0]
+            if addr.startswith("127.") or addr.startswith("169.254."):
+                continue
+            if addr not in raw:
+                raw.append(addr)
+    except Exception:
+        pass
+
+    primary = _get_lan_ip()
+    if primary not in raw and primary != "127.0.0.1":
+        raw.append(primary)
+
+    ordered = sorted(raw, key=_ip_score, reverse=True)
+
+    _all_ips_cache = (ordered, now)
+    return ordered
+
+
+@router.get("/api/health")
+async def health(request: Request):
+    """Basic health check - returns 200 if the HTTP API is reachable.
+
+    HTTP 200 仅表示 API 可访问；``readiness.chat_ready``（及兼容字段
+    ``ready``）表示聊天所需的 Agent、会话和核心服务已就绪。
+    IM 通道独立使用 ``im_ready`` / ``im_status``，不阻塞桌面聊天。
+    """
+    import os
+
+    from openkitsune import __git_hash__, get_version_string
+    from openkitsune import __version__ as backend_version
+
+    readiness = getattr(request.app.state, "readiness", None)
+    if not isinstance(readiness, dict):
+        gateway = getattr(request.app.state, "gateway", None)
+        agent_ready = getattr(request.app.state, "agent", None) is not None
+        core_ready = getattr(request.app.state, "session_manager", None) is not None
+        chat_ready = agent_ready and core_ready
+        readiness = {
+            "phase": getattr(request.app.state, "startup_phase", "http_ready"),
+            "http_ready": True,
+            "agent_ready": agent_ready,
+            "core_ready": core_ready,
+            "chat_ready": chat_ready,
+            "im_ready": gateway is not None,
+            "ready": chat_ready,
+        }
+
+    # Pull degraded subsystems from the module-level DegradedRegistry. We
+    # use the registry instead of ``app.state`` because token_tracking
+    # (daemon thread) and asset_bus (early lifespan init) register
+    # themselves before ``app.state.*`` is reliably populated. The
+    # registry snapshot is a defensive copy, so callers can mutate it
+    # freely without leaking back into the shared map.
+    from openkitsune.storage.degraded import registry as _degraded_registry
+
+    return {
+        "status": "ok",
+        "service": "openkitsune",
+        "version": backend_version,
+        "git_hash": __git_hash__,
+        "version_full": get_version_string(),
+        "pid": os.getpid(),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "agent_initialized": hasattr(request.app.state, "agent")
+        and request.app.state.agent is not None,
+        "local_ip": _get_lan_ip(),
+        "all_ips": _get_all_lan_ips(),
+        "api_host": _resolve_api_host_display(request),
+        "api_port": _resolve_api_port_display(request),
+        "last_link_diagnostic": getattr(request.app.state, "last_link_diagnostic", None),
+        "startup_phase": readiness.get("phase", "http_ready"),
+        "readiness": readiness,
+        "memory_subsystem": _memory_subsystem_status(request),
+        "frontend_bundle": _frontend_bundle_status(request, backend_version),
+        "degraded_subsystems": _degraded_registry.snapshot(),
+        "last_shutdown": _read_last_shutdown_marker(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# C17 Phase C — Kubernetes-style /healthz + /readyz probes
+# ---------------------------------------------------------------------------
+#
+# Why a second probe family?
+#
+# Existing ``/api/health`` always returns 200 as long as the FastAPI process
+# is alive. That's useful for "is OpenKitsune on at all?" but it tells external
+# monitors nothing about whether the agent can actually serve traffic right
+# now — Policy V2 layer might be in fallback after a malformed YAML, the
+# audit chain might be tampered, the scheduler might be deadlocked. Under
+# those conditions a load balancer / IM gateway / desktop reconnect logic
+# happily routes traffic to a degraded instance.
+#
+# ``/api/healthz`` (liveness): fixed 200 + tiny payload. Designed to be
+# polled at ≤1Hz by orchestrators. Process up → 200. Use this to decide
+# "should I restart the process?".
+#
+# ``/api/readyz`` (readiness): 200 when every internal subsystem is healthy,
+# 503 otherwise with a ``failing[]`` list. Cached for 5 seconds so a hot
+# polling client (e.g. desktop reconnect loop) can't synthesise load on
+# the chain-verify path. Detail level depends on caller:
+#   - localhost / trusted → full ``failing[].details``
+#   - remote untrusted    → only ``failing[].name`` (no path leaks)
+#
+# Borrowed shape from k8s ``readinessProbe`` + claude-code
+# ``ProcessHealth.probe()``. Implementation uses ``asyncio.shield`` so a
+# slow individual check can't block the loop indefinitely.
+
+
+_READYZ_CACHE_TTL_SECONDS = 5.0
+_readyz_cache: dict[str, Any] = {"ts": 0.0, "payload": None, "ready": False}
+_readyz_cache_lock = asyncio.Lock()
+
+
+def _is_localhost(request: Request) -> bool:
+    try:
+        from .auth import get_client_ip
+
+        trust_proxy = os.environ.get("TRUST_PROXY", "").lower() in ("1", "true", "yes")
+        ip = get_client_ip(request, trust_proxy=trust_proxy)
+    except Exception:
+        ip = getattr(request.client, "host", "") if request.client else ""
+    return ip in {"127.0.0.1", "::1", "localhost"} or (
+        isinstance(ip, str) and ip.startswith("::ffff:127.")
+    )
+
+
+async def _check_policy_engine() -> dict[str, Any] | None:
+    """Verify Policy V2 engine loaded and not in degraded fallback mode."""
+    try:
+        from openkitsune.core.policy_v2.global_engine import get_engine_v2
+
+        engine = get_engine_v2()
+        if engine is None:
+            return {"name": "policy_v2", "details": "engine not initialized"}
+        # Engine in LKG-fallback mode is still "ready" but warned, not 503.
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return {"name": "policy_v2", "details": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+async def _check_audit_chain() -> dict[str, Any] | None:
+    """Verify the security audit chain head is not corrupt.
+
+    We *do not* verify the entire chain on every probe (full ``verify_chain``
+    walks the entire JSONL — too slow at scale). Instead we read the tail
+    and require the bottom-most non-blank line to be parseable JSON. Full
+    verification runs only on explicit
+    ``/api/config/security/audit?verify=full``.
+
+    The path resolves through :func:`get_audit_logger` so probe + writer
+    + verifier share the same source of truth. (C17 二轮 audit 修复)
+
+    Earlier C17 hardcoded ``data/policy/audit.jsonl`` which never matched
+    the actual ``AuditConfig.log_path`` default (``data/audit/
+    policy_decisions.jsonl``) — the probe was reading a never-written file
+    and silently degrading to "OK". A vanilla install would report
+    ``audit_chain`` healthy even after the real chain file was deleted or
+    corrupted. We now use the same path the writer uses.
+
+    A second silent-OK trap is "file exists with non-zero size but the tail
+    window is all blank lines / whitespace"; this happens if the file was
+    truncated by an external editor or a half-written write. We now flag
+    those cases instead of returning None.
+    """
+    try:
+        from openkitsune.agent.audit import get_audit_logger
+
+        logger_inst = get_audit_logger()
+        if not getattr(logger_inst, "_enabled", True):
+            # Operator turned audit off on purpose — that's not a 503 case.
+            return None
+        path = Path(getattr(logger_inst, "_path", "") or "")
+        if not path or str(path) == ".":
+            return {"name": "audit_chain", "details": "audit_logger path unresolved"}
+        if not path.exists():
+            return None  # Fresh install — no audit yet, that's fine.
+
+        size = path.stat().st_size
+        if size == 0:
+            return None  # File created but no entries yet.
+
+        # Tail check: read last 8KB and try the bottom-most parseable line.
+        tail_window = min(size, 8192)
+        with path.open("rb") as f:
+            f.seek(size - tail_window)
+            tail = f.read().decode("utf-8", errors="replace").splitlines()
+        saw_content = False
+        for line in reversed(tail):
+            line = line.strip()
+            if not line:
+                continue
+            saw_content = True
+            json.loads(line)  # raises on corrupt tail
+            return None
+        if saw_content:
+            # tail had bytes but none survived strip — usually wiped file.
+            return {"name": "audit_chain", "details": "tail contains only blank lines"}
+        # No content in the tail window for a non-empty file.
+        return {"name": "audit_chain", "details": "tail window empty despite non-zero size"}
+    except Exception as exc:  # noqa: BLE001
+        return {"name": "audit_chain", "details": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def _check_scheduler(request: Request) -> dict[str, Any] | None:
+    """Scheduler ready iff the singleton exists and ``_running`` is True."""
+    try:
+        scheduler = getattr(request.app.state, "scheduler", None)
+        if scheduler is None:
+            # Not all deployments enable scheduler — skip rather than fail.
+            return None
+        if not getattr(scheduler, "_running", False):
+            return {"name": "scheduler", "details": "scheduler not running"}
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return {"name": "scheduler", "details": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+async def _check_event_loop_lag() -> dict[str, Any] | None:
+    """Probe event loop responsiveness; >500ms → degraded."""
+    try:
+        loop = asyncio.get_running_loop()
+        ev = asyncio.Event()
+        t0 = time.monotonic()
+        loop.call_soon(ev.set)
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=2.0)
+        except TimeoutError:
+            return {"name": "event_loop", "details": "wait timed out"}
+        lag_ms = (time.monotonic() - t0) * 1000
+        if lag_ms > 500:
+            return {"name": "event_loop", "details": f"lag {lag_ms:.0f}ms"}
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return {"name": "event_loop", "details": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def _check_gateway(request: Request) -> dict[str, Any] | None:
+    """Gateway is optional but, when configured, must be alive."""
+    try:
+        gateway = getattr(request.app.state, "gateway", None)
+        if gateway is None:
+            # No IM gateway configured (e.g. headless server). Not 503.
+            return None
+        if not getattr(gateway, "running", True):
+            return {"name": "gateway", "details": "gateway stopped"}
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return {"name": "gateway", "details": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+async def _compute_readiness(request: Request) -> dict[str, Any]:
+    """Run every readiness check; return ``{ready, failing, ts}``.
+
+    Each check returns ``None`` (ok) or ``{name, details}`` (failing).
+
+    NOTE: ``_check_event_loop_lag`` is intentionally *not* in the gather.
+    Lag measurement makes sense only when the loop is otherwise idle —
+    bundling it with the I/O checks (audit tail-read, policy engine
+    introspection) would let those checks' own scheduling cost show up
+    as "lag", producing false alarms under normal load. We run it after
+    everything else and treat its result as best-effort. (C17 二轮)
+    """
+    failing: list[dict[str, Any]] = []
+    results = await asyncio.gather(
+        _check_policy_engine(),
+        _check_audit_chain(),
+        return_exceptions=True,
+    )
+    for r in results:
+        if isinstance(r, dict):
+            failing.append(r)
+        elif isinstance(r, BaseException):
+            failing.append({"name": "internal", "details": f"check raised: {r}"})
+    # Sync checks (these are O(1) attribute reads).
+    for sync_check in (_check_scheduler(request), _check_gateway(request)):
+        if sync_check is not None:
+            failing.append(sync_check)
+    # Event-loop lag runs last and standalone for a clean measurement.
+    lag_result = await _check_event_loop_lag()
+    if lag_result is not None:
+        failing.append(lag_result)
+    return {
+        "ready": not failing,
+        "failing": failing,
+        "ts": time.time(),
+    }
+
+
+@router.get("/api/healthz")
+async def healthz():
+    """Liveness probe: fixed 200 + minimal payload.
+
+    Use this in orchestrator restart policies. Never returns 503 — if the
+    HTTP server can answer this, the process is alive.
+    """
+    return {"status": "ok", "ts": time.time(), "pid": os.getpid()}
+
+
+@router.get("/api/readyz")
+async def readyz(request: Request):
+    """Readiness probe: 200 when every subsystem is healthy, 503 otherwise.
+
+    Cached for 5s to keep cost bounded under hot polling. Detail level
+    depends on caller IP — only localhost gets the full ``details`` field
+    so remote callers can't fingerprint internal file paths.
+    """
+    from fastapi.responses import JSONResponse
+
+    now = time.time()
+    async with _readyz_cache_lock:
+        if (
+            _readyz_cache["payload"] is not None
+            and (now - _readyz_cache["ts"]) < _READYZ_CACHE_TTL_SECONDS
+        ):
+            payload = _readyz_cache["payload"]
+            ready = _readyz_cache["ready"]
+        else:
+            computed = await _compute_readiness(request)
+            payload = computed
+            ready = computed["ready"]
+            _readyz_cache["ts"] = computed["ts"]
+            _readyz_cache["payload"] = computed
+            _readyz_cache["ready"] = ready
+
+    # Sanitize for remote callers — drop the ``details`` strings.
+    if not _is_localhost(request):
+        sanitized = {
+            "ready": payload["ready"],
+            "failing": [{"name": f["name"]} for f in payload.get("failing", [])],
+            "ts": payload["ts"],
+        }
+        body = sanitized
+    else:
+        body = payload
+
+    return JSONResponse(content=body, status_code=200 if ready else 503)
+
+
+@router.get("/api/logs/health-summary")
+async def logs_health_summary():
+    """Aggregate repeated background warnings into a UI-friendly summary."""
+    from openkitsune.core.log_health import get_log_health_registry
+
+    return get_log_health_registry().summary()
+
+
+@router.get("/api/diagnostics/last-link")
+async def last_link_diagnostic(request: Request, conversation_id: str | None = None):
+    """Return the latest runtime record, or only the requested conversation's record."""
+    if conversation_id is not None:
+        return getattr(request.app.state, "link_diagnostics", {}).get(conversation_id, {})
+    return getattr(request.app.state, "last_link_diagnostic", None) or {}
+
+
+@router.get("/api/diagnostics/legacy-shim-stats")
+async def deprecated_redirect_stats() -> dict[str, Any]:
+    """Read-only counter for legacy 308 shim hits.
+
+    Used to decide whether the
+    ``src/openkitsune/api/routes/_orgs_v2_deprecated_redirects.py`` shim can
+    be removed in the 2.1.0 minor. See
+    ``docs/follow-ups/skipped-items-roadmap.md`` §A.3 for the full
+    exit criterion. RCA cross-ref: ``_skip_items_rca_v11.md`` §3.
+
+    The counter is in-process and resets on restart — pair this
+    endpoint with log scraping for long-window evidence.
+    """
+    from openkitsune.api.routes._orgs_v2_deprecated_redirects import (
+        get_deprecated_redirect_stats,
+    )
+
+    return {
+        "hits": get_deprecated_redirect_stats(),
+        "removal_target": "2.1.0",
+        "sunset_header": "2026-12-01",
+        "advice": (
+            "Only POST /api/v2/orgs/templates/{id}/instantiate is "
+            "reachable today (the other 8 shim routes are shadowed by "
+            "the v2 runtime router registered first in server.py). "
+            "When hits for that one path stay 0 for >=30 days post the "
+            "Sunset marker, the shim file can be removed. See "
+            "docs/follow-ups/skipped-items-roadmap.md §A.3 and "
+            "_exploratory_test_report_v12.md §10.4."
+        ),
+    }
+
+
+@router.get("/api/diagnostics/cache-targets")
+async def cache_targets(request: Request):
+    """List existing runtime instances independently of web-read diagnostics."""
+    pool = getattr(request.app.state, "agent_pool", None)
+    if pool is not None:
+        targets = [
+            {"conversation_id": session["session_id"], "profile_id": agent["profile_id"]}
+            for session in pool.get_stats().get("sessions", [])
+            for agent in session.get("agents", [])
+        ]
+        session_manager = getattr(request.app.state, "session_manager", None)
+
+        def resolve_labels():
+            from openkitsune.agents.profile import get_profile_store
+
+            from .sessions import _session_list_item
+
+            titles = {}
+            names = {}
+            for target in targets:
+                conversation_id = target["conversation_id"]
+                profile_id = target["profile_id"]
+                if conversation_id not in titles:
+                    titles[conversation_id] = ""
+                    if session_manager is not None:
+                        session = session_manager.get_session(
+                            channel="desktop", chat_id=conversation_id,
+                            user_id="desktop_user", create_if_missing=False,
+                        ) or session_manager.get_session_by_id(conversation_id)
+                        if session is not None:
+                            titles[conversation_id] = _session_list_item(session)["title"]
+                if profile_id not in names:
+                    profile = get_profile_store().get(profile_id)
+                    names[profile_id] = profile.name if profile else ""
+                target["conversation_title"] = titles[conversation_id]
+                target["profile_name"] = names[profile_id]
+
+        # Session recovery may read disk; labels never change the runtime target keys.
+        await asyncio.to_thread(resolve_labels)
+        return {"targets": targets}
+    return {
+        "targets": [{"conversation_id": "", "profile_id": ""}]
+        if getattr(request.app.state, "agent", None) is not None
+        else []
+    }
+
+
+@router.post("/api/diagnostics/clear-session-caches")
+async def clear_session_caches_endpoint(
+    request: Request,
+    conversation_id: str | None = None,
+    profile_id: str | None = None,
+    require_runtime: bool = False,
+):
+    """Clear runtime caches for an explicitly selected agent, preserving access rules.
+
+    Web caches are shared; tool/navigation caches belong to the resolved agent.
+    Never fall back to another agent when an explicit conversation has expired.
+    """
+    from openkitsune.core.session_caches import clear_session_caches
+
+    actual_agent = None
+    try:
+        from .chat import _get_existing_agent, _resolve_agent
+
+        pool = getattr(request.app.state, "agent_pool", None)
+        if conversation_id and pool is not None:
+            agent = (
+                pool.get_existing(conversation_id, profile_id)
+                if profile_id
+                else pool.get_existing(conversation_id)
+            )
+            if agent is None:
+                from fastapi import HTTPException
+
+                raise HTTPException(status_code=404, detail="Conversation runtime has expired")
+        else:
+            agent = _get_existing_agent(request, conversation_id or "")
+            if conversation_id and agent is not None:
+                active_id = getattr(agent, "_current_conversation_id", None) or getattr(
+                    agent, "_current_session_id", None
+                )
+                if active_id != conversation_id:
+                    from fastapi import HTTPException
+
+                    raise HTTPException(status_code=404, detail="Conversation runtime unavailable")
+        actual_agent = _resolve_agent(agent) if agent else None
+    except ImportError:
+        actual_agent = None
+
+    if (conversation_id or require_runtime) and actual_agent is None:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=404, detail="Conversation runtime unavailable")
+
+    cleared = clear_session_caches(
+        actual_agent,
+        conversation_id=conversation_id,
+        preserve_domain_rules=True,
+        preserve_diagnostics=True,
+    )
+    return {"ok": True, "cleared": cleared}
+
+
+@router.get("/api/diagnostics/domain-rules")
+async def domain_rules(conversation_id: str = ""):
+    """Return blocked / approved hosts for a conversation."""
+    from openkitsune.agent.domain_allowlist import get_domain_allowlist
+
+    return {"conversation_id": conversation_id, **get_domain_allowlist().list_for(conversation_id)}
+
+
+@router.post("/api/diagnostics/domain-block")
+async def domain_block(conversation_id: str, host: str):
+    from openkitsune.agent.domain_allowlist import get_domain_allowlist
+
+    if not conversation_id or not host:
+        return {"ok": False, "error": "conversation_id and host are required"}
+    added = get_domain_allowlist().block(conversation_id, host)
+    return {"ok": True, "changed": added, **get_domain_allowlist().list_for(conversation_id)}
+
+
+@router.post("/api/diagnostics/domain-unblock")
+async def domain_unblock(conversation_id: str, host: str):
+    from openkitsune.agent.domain_allowlist import get_domain_allowlist
+
+    if not conversation_id or not host:
+        return {"ok": False, "error": "conversation_id and host are required"}
+    removed = get_domain_allowlist().unblock(conversation_id, host)
+    return {"ok": True, "changed": removed, **get_domain_allowlist().list_for(conversation_id)}
+
+
+def _get_llm_client(agent: object):
+    """Resolve LLMClient from Agent."""
+    from openkitsune.agent.core import Agent
+
+    actual = agent if isinstance(agent, Agent) else None
+    if actual is None:
+        return None
+    brain = getattr(actual, "brain", None)
+    if brain is None:
+        return None
+    return getattr(brain, "_llm_client", None)
+
+
+def _probe_command_version(command: str, *args: str) -> dict[str, str | bool]:
+    import subprocess
+    import sys
+
+    from openkitsune.runtime_manager import resolve_toolchain_command
+
+    path = resolve_toolchain_command(command)
+    if not path:
+        return {"available": False, "path": "", "version": "unavailable"}
+    kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": 5,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        proc = subprocess.run([path, *(args or ("--version",))], **kwargs)
+    except Exception as exc:
+        return {"available": False, "path": path, "version": f"probe failed: {exc}"}
+    output = (proc.stdout or proc.stderr or "").strip().splitlines()
+    return {
+        "available": proc.returncode == 0,
+        "path": path,
+        "version": output[-1] if output else f"exit {proc.returncode}",
+    }
+
+
+async def _check_endpoint_readonly(name: str, provider) -> HealthResult:
+    """Check an endpoint in dry_run mode: test connectivity without modifying provider state."""
+    t0 = time.time()
+    try:
+        await provider.health_check(dry_run=True)
+        latency = round((time.time() - t0) * 1000)
+        return HealthResult(
+            name=name,
+            status="healthy",
+            latency_ms=latency,
+            last_checked_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+    except Exception as e:
+        latency = round((time.time() - t0) * 1000)
+        error_msg = str(e)
+        raw = error_msg.lower()
+        if "connect" in raw or "connection refused" in raw or "unreachable" in raw:
+            try:
+                from openkitsune.llm.providers.proxy_utils import format_proxy_hint
+
+                hint = format_proxy_hint()
+                if hint:
+                    error_msg += hint
+            except Exception:
+                pass
+        return HealthResult(
+            name=name,
+            status="unhealthy",
+            latency_ms=latency,
+            error=error_msg[:800],
+            consecutive_failures=getattr(provider, "consecutive_cooldowns", 0),
+            cooldown_remaining=getattr(provider, "cooldown_remaining", 0),
+            is_extended_cooldown=getattr(provider, "is_extended_cooldown", False),
+            last_checked_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
+
+async def _check_with_timeout(name: str, provider, timeout: float = 30) -> HealthResult:
+    """Wrap _check_endpoint_readonly with a per-endpoint timeout."""
+    try:
+        return await asyncio.wait_for(
+            _check_endpoint_readonly(name, provider),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        return HealthResult(
+            name=name,
+            status="unhealthy",
+            error=f"Health check timed out ({timeout}s)",
+            last_checked_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
+
+@router.get("/api/debug/pool-stats")
+async def pool_stats(request: Request):
+    """Diagnostic: return AgentInstancePool statistics."""
+    pool = getattr(request.app.state, "agent_pool", None)
+    if pool is None:
+        return {"error": "AgentInstancePool not available", "pool_enabled": False}
+    stats = pool.get_stats()
+    stats["pool_enabled"] = True
+    return stats
+
+
+@router.get("/api/debug/orchestrator-state")
+async def orchestrator_state(request: Request):
+    """Diagnostic: return orchestrator internal sub-agent states and active tasks."""
+    orchestrator = getattr(request.app.state, "orchestrator", None)
+    if orchestrator is None:
+        try:
+            from openkitsune.main import _orchestrator
+
+            orchestrator = _orchestrator
+        except (ImportError, AttributeError):
+            pass
+    if orchestrator is None:
+        return {"error": "Orchestrator not available", "enabled": False}
+    return {
+        "enabled": True,
+        "sub_agent_states": dict(getattr(orchestrator, "_sub_agent_states", {})),
+        "active_tasks": list(getattr(orchestrator, "_active_tasks", {}).keys()),
+        "health_stats": {
+            k: {"total": v.total_requests, "success": v.successful, "failed": v.failed}
+            for k, v in getattr(orchestrator, "_health_stats", {}).items()
+        },
+    }
+
+
+@router.get("/api/diagnostics")
+async def diagnostics():
+    """Self-check: the backend reports its own runtime health.
+
+    Called by the desktop app's environment diagnostic panel instead of
+    trying to invoke _internal/python3 externally.
+    """
+    import os
+    import platform
+    import sys
+    from pathlib import Path
+
+    from openkitsune import __version__ as backend_version
+    from openkitsune.runtime_manager import (
+        get_runtime_environment_report,
+        get_workspace_dependency_cache_root,
+    )
+
+    checks: list[dict] = []
+
+    # C1: Runtime
+    runtime_type = "bundled" if getattr(sys, "frozen", False) else "venv"
+    checks.append(
+        {
+            "id": "C1_BUNDLED_RUNTIME",
+            "title": "内置运行时",
+            "status": "pass",
+            "code": "RUNTIME_OK",
+            "evidence": [f"Python {platform.python_version()}, {runtime_type}"],
+            "autoFix": False,
+            "fixHint": None,
+        }
+    )
+
+    # C2: pip availability
+    try:
+        import pip
+
+        pip_ver = pip.__version__
+        checks.append(
+            {
+                "id": "C2_PIP",
+                "title": "包管理器",
+                "status": "pass",
+                "code": "PIP_OK",
+                "evidence": [f"pip {pip_ver}"],
+                "autoFix": False,
+                "fixHint": None,
+            }
+        )
+    except Exception:
+        checks.append(
+            {
+                "id": "C2_PIP",
+                "title": "包管理器",
+                "status": "warn",
+                "code": "PIP_UNAVAILABLE",
+                "evidence": ["pip not importable — optional module installation disabled"],
+                "autoFix": False,
+                "fixHint": None,
+            }
+        )
+
+    # C3: Core package integrity
+    try:
+        from openkitsune.setup_center import bridge  # noqa: F401
+
+        checks.append(
+            {
+                "id": "C3_CORE",
+                "title": "核心引擎",
+                "status": "pass",
+                "code": "CORE_OK",
+                "evidence": [f"openkitsune {backend_version}"],
+                "autoFix": False,
+                "fixHint": None,
+            }
+        )
+    except Exception as exc:
+        checks.append(
+            {
+                "id": "C3_CORE",
+                "title": "核心引擎",
+                "status": "fail",
+                "code": "CORE_IMPORT_ERROR",
+                "evidence": [str(exc)[:300]],
+                "autoFix": False,
+                "fixHint": "核心模块损坏，建议重装 OpenKitsune",
+            }
+        )
+
+    failing = [c for c in checks if c["status"] not in ("pass", "warn")]
+    summary = "broken" if failing else "healthy"
+
+    runtime_report = get_runtime_environment_report()
+    node_toolchain = {
+        "managed_node": runtime_report.get("toolchain_node"),
+        "managed_bin": runtime_report.get("toolchain_node_bin"),
+        "node": _probe_command_version("node"),
+        "npm": _probe_command_version("npm"),
+        "corepack": _probe_command_version("corepack"),
+        "pnpm": _probe_command_version("pnpm"),
+        "yarn": _probe_command_version("yarn"),
+        "npm_prefix": str(get_workspace_dependency_cache_root() / "npm-prefix"),
+        "npm_cache": str(get_workspace_dependency_cache_root() / "npm-cache"),
+        "corepack_home": str(get_workspace_dependency_cache_root() / "corepack"),
+        "workspace_cache": str(get_workspace_dependency_cache_root()),
+    }
+    package_paths: dict[str, str] = {}
+    for mod_name in ("openkitsune", "pydantic", "pydantic_core", "certifi"):
+        try:
+            mod = __import__(mod_name)
+            package_paths[mod_name] = str(Path(getattr(mod, "__file__", "") or "").resolve())
+        except Exception as exc:
+            package_paths[mod_name] = f"unavailable: {type(exc).__name__}: {exc}"
+
+    return {
+        "summary": summary,
+        "checks": checks,
+        "environment": {
+            "platform": f"{sys.platform}-{platform.machine()}",
+            "pythonVersion": platform.python_version(),
+            "runtimeType": runtime_type,
+            "openkitsuneVersion": backend_version,
+            "pid": os.getpid(),
+            "runtime": runtime_report,
+            "toolchain": {
+                "python": {
+                    "app": runtime_report.get("app_python"),
+                    "agent": runtime_report.get("agent_python"),
+                    "managed": runtime_report.get("toolchain_python"),
+                    "seedPackaged": runtime_report.get("bootstrap_python_seed_packaged"),
+                    "abi": runtime_report.get("python_abi"),
+                    "wheelTag": runtime_report.get("wheel_tag"),
+                },
+                "node": {
+                    **node_toolchain,
+                    "seedPackaged": runtime_report.get("bootstrap_node_seed_packaged"),
+                },
+            },
+            "sysPrefix": sys.prefix,
+            "sysBasePrefix": sys.base_prefix,
+            "sysPathSummary": sys.path[:20],
+            "packagePaths": package_paths,
+            "envTrustSource": os.environ.get("OPENKITSUNE_ENV_TRUST_SOURCE", ""),
+            "subprocessSecretScrub": os.environ.get("OPENKITSUNE_SUBPROCESS_SECRET_SCRUB") == "1",
+        },
+    }
+
+
+async def _do_health_check(request: Request, body: HealthCheckRequest):
+    """共享 GET / POST 的实际探测逻辑。"""
+    agent = getattr(request.app.state, "agent", None)
+    if agent is None:
+        return {"error": "Agent not initialized"}
+
+    llm_client = _get_llm_client(agent)
+    if llm_client is None:
+        return {"error": "LLM client not available"}
+
+    results: list[HealthResult] = []
+
+    if body.endpoint_name:
+        provider = llm_client._providers.get(body.endpoint_name)
+        if not provider:
+            return {"error": f"Endpoint not found: {body.endpoint_name}"}
+        result = await _check_with_timeout(body.endpoint_name, provider)
+        results.append(result)
+    else:
+        tasks = [_check_with_timeout(name, p) for name, p in llm_client._providers.items()]
+        results = list(await asyncio.gather(*tasks))
+
+    return {"results": [r.model_dump() for r in results]}
+
+
+@router.post("/api/health/check")
+async def health_check_post(request: Request, body: HealthCheckRequest):
+    """
+    Check health of a specific LLM endpoint or all endpoints (POST).
+
+    Uses dry_run mode: sends a real test request but does NOT modify
+    the provider's healthy/cooldown state, ensuring no interference
+    with ongoing Agent LLM calls.
+    """
+    return await _do_health_check(request, body)
+
+
+# PR-S1: 新增 GET 版本，便于浏览器 / curl / 监控脚本一键探测，
+# 不必每次都构造 POST 请求体。endpoint_name 通过 query string 传入；
+# 不带参数则探测全部端点。
+@router.get("/api/health/check")
+async def health_check_get(request: Request, endpoint_name: str = ""):
+    """
+    Check health of a specific LLM endpoint or all endpoints (GET).
+
+    GET /api/health/check                 → 探测全部端点
+    GET /api/health/check?endpoint_name=x → 探测指定端点
+
+    与 POST /api/health/check 行为一致；前端 / 监控集成可任选其一。
+    """
+    body = HealthCheckRequest(endpoint_name=endpoint_name or None)
+    return await _do_health_check(request, body)
+
+
+@router.get("/api/health/loop")
+async def health_loop(request: Request):
+    """Event loop 健康状态与 LLM 并发统计。"""
+    from openkitsune.llm.client import LLMClient
+
+    loop = asyncio.get_running_loop()
+
+    # 测量 event loop 延迟：调度一个 callback 看实际执行需要多久
+    lag_event = asyncio.Event()
+    t0 = time.monotonic()
+    loop.call_soon(lag_event.set)
+    await lag_event.wait()
+    lag_ms = round((time.monotonic() - t0) * 1000, 1)
+
+    llm_stats = LLMClient.get_concurrency_stats()
+
+    org_runtime = getattr(request.app.state, "org_runtime", None)
+    org_stats = {}
+    if org_runtime:
+        for oid, sem in org_runtime._org_semaphores.items():
+            active = org_runtime.max_concurrent_nodes_per_org - sem._value
+            org_stats[oid] = {
+                "active_nodes": active,
+                "max": org_runtime.max_concurrent_nodes_per_org,
+            }
+
+    from openkitsune.core.engine_bridge import is_dual_loop
+
+    return {
+        "dual_loop": is_dual_loop(),
+        "api_loop_lag_ms": lag_ms,
+        "llm_concurrent": llm_stats,
+        "org_concurrency": org_stats,
+    }

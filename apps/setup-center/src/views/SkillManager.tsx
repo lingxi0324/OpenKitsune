@@ -1,0 +1,3187 @@
+// ─── SkillManager: 技能管理页面 ───
+// 支持已安装技能列表、配置表单自动生成、启用/禁用、技能市场浏览与安装
+
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
+import { invoke, IS_TAURI } from "../platform";
+import { useTranslation } from "react-i18next";
+import type {
+  SkillInfo,
+  SkillConfigField,
+  MarketplaceResponse,
+  MarketplaceSkillView,
+  EnvMap,
+} from "../types";
+import { envGet, envSet } from "../utils";
+import { consumeSseStream } from "../utils/sseStateMachine";
+import { IconGear, IconZap, IconPackage, IconStar, IconCheck, IconX, IconDownload, IconSearch, IconFolderOpen, IconEdit, IconTrash, IconEye } from "../icons";
+import { Loader2, ChevronDown, ChevronRight, History, RotateCw, MoreHorizontal, X } from "lucide-react";
+import { safeFetch } from "../providers";
+import { toast } from "sonner";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { Card, CardContent } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel,
+  AlertDialogContent, AlertDialogDescription, AlertDialogFooter,
+  AlertDialogHeader, AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter,
+  DialogHeader, DialogTitle,
+} from "@/components/ui/dialog";
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { ModalOverlay } from "../components/ModalOverlay";
+import { SkillConflictsPanel, useSkillConflicts } from "../components/SkillConflictsPanel";
+import { OfficialSkillMarketplace } from "./OfficialSkillMarketplace";
+
+type SkillTab = "installed" | "official" | "marketplace";
+
+function skillTabFromHash(): SkillTab {
+  const [path, query] = window.location.hash.replace(/^#\/?/, "").split("?");
+  if (path !== "skills") return "installed";
+  const source = new URLSearchParams(query).get("source");
+  return source === "official" ? "official" : source === "skillhub" ? "marketplace" : "installed";
+}
+
+// ─── i18n 辅助：按当前语言优先显示中文名/描述 ───
+
+function getSkillDisplayName(skill: SkillInfo, lang: string): string {
+  const key = lang.startsWith("zh") ? "zh" : lang;
+  return skill.marketplaceName || skill.name_i18n?.[key] || skill.name;
+}
+
+function getSkillDisplayDesc(skill: SkillInfo, lang: string): string {
+  const key = lang.startsWith("zh") ? "zh" : lang;
+  return skill.description_i18n?.[key] || skill.description;
+}
+
+// ─── 错误消息友好化 ───
+
+type ErrorContext = "load" | "save" | "install" | "uninstall" | "reload" | "general";
+
+function friendlyError(e: unknown, t: (key: string) => string, context: ErrorContext = "general"): string {
+  const raw = e instanceof Error ? e.message : String(e);
+
+  if (/外部技能不可移动到系统分类|external skills? cannot be moved to system categor(?:y|ies)/i.test(raw)) {
+    return t("skills.category.moveSystemCategoryDenied");
+  }
+  if (/AbortError|signal timed out|timeout/i.test(raw)) {
+    return t("skills.errorTimeout");
+  }
+  if (/Failed to fetch|NetworkError|ECONNREFUSED|net::|ERR_CONNECTION|Load failed/i.test(raw)) {
+    return t("skills.errorNetwork");
+  }
+  if (/\b50[0-9]\b|Internal Server Error/i.test(raw)) {
+    return t("skills.errorServer");
+  }
+  if (context === "save" && raw && raw !== "[object Object]") {
+    return raw.replace(/^Error:\s*/i, "");
+  }
+  if (context === "install" && raw && raw !== "[object Object]") {
+    return raw.replace(/^Error:\s*/i, "");
+  }
+
+  const contextMap: Record<ErrorContext, string> = {
+    load: "skills.errorLoadFailed",
+    save: "skills.errorSaveFailed",
+    install: "skills.errorInstallFailed",
+    uninstall: "skills.errorUninstallFailed",
+    reload: "skills.errorReloadFailed",
+    general: "skills.errorUnknown",
+  };
+  return t(contextMap[context]);
+}
+
+type CategoryMassAction = "enable" | "disable";
+
+type CategoryMassActionResult = {
+  status?: string;
+  name?: string;
+  added?: number;
+  removed?: number;
+  system_count?: number;
+  total?: number;
+  processed?: number;
+  error?: string;
+  detail?: string;
+};
+
+type CategoryMassProgressEvent = {
+  stage?: string;
+  message?: string;
+  percent?: number;
+  total?: number;
+  processed?: number;
+  finished?: boolean;
+  error?: string;
+  result?: CategoryMassActionResult;
+};
+
+type CategoryMassProgressState = {
+  category: string;
+  action: CategoryMassAction;
+  stage: string;
+  message: string;
+  percent: number;
+  total: number;
+  processed: number;
+};
+
+// ─── 分类对话框（新建 / 编辑） ───
+
+type CategoryDialogState = {
+  mode: "create";
+} | {
+  mode: "edit";
+  originalName: string;
+  currentDescription: string | null;
+} | null;
+
+function CategoryDialog({
+  state,
+  onClose,
+  onSubmit,
+  t,
+}: {
+  state: CategoryDialogState;
+  onClose: () => void;
+  onSubmit: (mode: "create" | "edit", data: { name: string; description: string; originalName?: string }) => Promise<void>;
+  t: (key: string) => string;
+}) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (!state) return;
+    if (state.mode === "edit") {
+      setName(state.originalName);
+      setDescription(state.currentDescription ?? "");
+    } else {
+      setName("");
+      setDescription("");
+    }
+  }, [state]);
+
+  const handleSubmit = async () => {
+    if (!name.trim()) return;
+    setSubmitting(true);
+    try {
+      await onSubmit(
+        state!.mode,
+        {
+          name: name.trim(),
+          description: description.trim(),
+          originalName: state?.mode === "edit" ? state.originalName : undefined,
+        },
+      );
+      onClose();
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const isEdit = state?.mode === "edit";
+
+  return (
+    <Dialog open={!!state} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>
+            {isEdit ? t("skills.category.editTitle") : t("skills.category.createTitle")}
+          </DialogTitle>
+          <DialogDescription>
+            {isEdit ? t("skills.category.editSubtitle") : t("skills.category.createSubtitle")}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid gap-4 py-2">
+          <div className="space-y-2">
+            <Label className="text-sm">
+              {t("skills.category.nameLabel")}
+              <span className="ml-1 text-destructive">*</span>
+            </Label>
+            <Input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={t("skills.category.namePlaceholder")}
+              maxLength={32}
+              autoFocus
+              onKeyDown={(e) => { if (e.key === "Enter" && name.trim()) handleSubmit(); }}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label className="text-sm">
+              {t("skills.category.descLabel")}
+            </Label>
+            <Textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder={t("skills.category.descPlaceholder")}
+              className="min-h-20 resize-none"
+            />
+          </div>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button onClick={handleSubmit} disabled={submitting || !name.trim()}>
+            {submitting && <Loader2 className="animate-spin mr-1" size={14} />}
+            {isEdit ? t("common.save") : t("skills.category.createBtn")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ─── 移动到分类对话框 ───
+
+type MoveCategoryDialogState = {
+  skillId: string;
+  skillName: string;
+  currentCategory: string | null;
+} | null;
+
+type AiOrganizePreview = {
+  categories: { name: string; description?: string | null }[];
+  bindings: Record<string, string>;
+  summary?: {
+    total?: number;
+    included?: number;
+    truncated?: number;
+    category_count?: number;
+    binding_count?: number;
+    unassigned_count?: number;
+    by_category?: Record<string, number>;
+  };
+};
+
+type AiOrganizeApplyPayload = {
+  categories: { name: string; description?: string | null }[];
+  bindings: Record<string, string>;
+  rename_map?: Record<string, string>;
+};
+
+function MoveCategoryDialog({
+  state,
+  categories,
+  onClose,
+  onSubmit,
+  t,
+}: {
+  state: MoveCategoryDialogState;
+  categories: {
+    name: string;
+    description: string | null;
+    system_readonly: boolean;
+    declared?: boolean;
+    is_system_category?: boolean;
+  }[];
+  onClose: () => void;
+  onSubmit: (skillId: string, targetCategory: string | null) => Promise<void>;
+  t: (key: string, opts?: Record<string, unknown>) => string;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const [selected, setSelected] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (state) {
+      setSelected(state.currentCategory || null);
+    }
+  }, [state]);
+
+  const handleConfirm = async () => {
+    if (!state) return;
+    setSubmitting(true);
+    try {
+      await onSubmit(state.skillId, selected);
+      onClose();
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const userCategories = categories.filter(
+    (c) =>
+      !c.system_readonly &&
+      !c.is_system_category &&
+      c.name !== "Uncategorized" &&
+      (c.declared ?? true),
+  );
+
+  return (
+    <Dialog open={!!state} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader>
+          <DialogTitle>{t("skills.category.moveTitle")}</DialogTitle>
+          <DialogDescription>
+            {state ? t("skills.category.moveSubtitle", { name: state.skillName }) : ""}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="relative">
+          <div className="flex flex-col gap-1 py-2 max-h-[40vh] overflow-y-auto">
+            <button
+              type="button"
+              className={`flex items-center gap-2 rounded-md px-3 py-2 text-sm text-left transition-colors ${
+                selected === null
+                  ? "bg-primary/10 border border-primary/40 text-primary font-medium"
+                  : "hover:bg-muted border border-transparent"
+              }`}
+              onClick={() => setSelected(null)}
+            >
+              <span className="flex-1">{t("skills.category.uncategorized")}</span>
+              {selected === null && <IconCheck size={14} />}
+            </button>
+            {userCategories.map((cat) => (
+              <button
+                key={cat.name}
+                type="button"
+                className={`flex items-center gap-2 rounded-md px-3 py-2 text-sm text-left transition-colors ${
+                  selected === cat.name
+                    ? "bg-primary/10 border border-primary/40 text-primary font-medium"
+                    : "hover:bg-muted border border-transparent"
+                }`}
+                onClick={() => setSelected(cat.name)}
+              >
+                <span className="flex-1 min-w-0 truncate">{cat.name}</span>
+                {cat.description && (
+                  <span
+                    title={cat.description}
+                    className="text-xs text-muted-foreground truncate max-w-[140px] shrink-0 cursor-default"
+                  >
+                    {cat.description}
+                  </span>
+                )}
+                {selected === cat.name && <IconCheck size={14} />}
+              </button>
+            ))}
+            {userCategories.length === 0 && (
+              <div className="text-xs text-muted-foreground px-3 py-4 text-center">
+                {t("skills.category.noCategoriesHint")}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button onClick={handleConfirm} disabled={submitting}>
+            {submitting && <Loader2 className="animate-spin mr-1" size={14} />}
+            {t("common.confirm")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ─── AI 整理预览对话框 ───
+
+function AiOrganizePreviewDialog({
+  preview,
+  skills,
+  applying,
+  onClose,
+  onApply,
+  t,
+}: {
+  preview: AiOrganizePreview | null;
+  skills: SkillInfo[];
+  applying: boolean;
+  onClose: () => void;
+  onApply: (payload: AiOrganizeApplyPayload) => Promise<void>;
+  t: (key: string, opts?: Record<string, unknown>) => string;
+}) {
+  const { i18n } = useTranslation();
+  const lang = i18n.language;
+  const [editableCategories, setEditableCategories] = useState<
+    Array<{ id: string; oldName: string; name: string; description: string }>
+  >([]);
+  const [editableBindings, setEditableBindings] = useState<Record<string, string>>({});
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [editingCategoryId, setEditingCategoryId] = useState<string | null>(null);
+  const [validationError, setValidationError] = useState<string | null>(null);
+
+  const prevPreviewRef = useRef<AiOrganizePreview | null>(null);
+  useEffect(() => {
+    if (preview && preview !== prevPreviewRef.current) {
+      const nextCategories = (preview.categories || []).map((c, i) => ({
+        id: `cat_${i}_${(c.name || "").toLowerCase().replace(/\s+/g, "_")}`,
+        oldName: c.name,
+        name: c.name,
+        description: c.description || "",
+      }));
+
+      const idByName = new Map(nextCategories.map((c) => [c.name, c.id]));
+      const missingNames = Array.from(
+        new Set(Object.values(preview.bindings || {}).filter((name) => !idByName.has(name)))
+      );
+      for (const name of missingNames) {
+        const id = `cat_extra_${idByName.size}_${name.toLowerCase().replace(/\s+/g, "_")}`;
+        nextCategories.push({ id, oldName: name, name, description: "" });
+        idByName.set(name, id);
+      }
+
+      const nextBindings: Record<string, string> = {};
+      for (const [sid, catName] of Object.entries(preview.bindings || {})) {
+        const cid = idByName.get(catName);
+        if (cid) nextBindings[sid] = cid;
+      }
+
+      setEditableCategories(nextCategories);
+      setEditableBindings(nextBindings);
+      setExpanded(new Set());
+      setEditingCategoryId(null);
+      setValidationError(null);
+      prevPreviewRef.current = preview;
+    }
+    if (!preview) {
+      prevPreviewRef.current = null;
+    }
+  }, [preview]);
+
+  const skillMap = useMemo(() => {
+    const m = new Map<string, SkillInfo>();
+    for (const s of skills) m.set(s.skillId, s);
+    return m;
+  }, [skills]);
+
+  const liveByCategory = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const cat of editableCategories) counts[cat.id] = 0;
+    for (const cid of Object.values(editableBindings)) {
+      counts[cid] = (counts[cid] || 0) + 1;
+    }
+    return counts;
+  }, [editableBindings, editableCategories]);
+
+  const unassignedSkillIds = useMemo(() => {
+    const boundIds = new Set(Object.keys(editableBindings));
+    return skills
+      .filter((s) => !s.system && !boundIds.has(s.skillId))
+      .map((s) => s.skillId);
+  }, [skills, editableBindings]);
+
+  const bindingCount = Object.keys(editableBindings).length;
+  const unassignedCount = unassignedSkillIds.length;
+
+  const modifiedCount = useMemo(() => {
+    if (!preview) return 0;
+    let count = 0;
+    const origBindings = preview.bindings || {};
+    const catNameById = new Map(editableCategories.map((c) => [c.id, c.name]));
+    for (const [sid, cid] of Object.entries(editableBindings)) {
+      const catName = catNameById.get(cid) || "";
+      if (origBindings[sid] !== catName) count++;
+    }
+    const origByName = new Map((preview.categories || []).map((c) => [c.name, c.description || ""]));
+    for (const cat of editableCategories) {
+      if (cat.name !== cat.oldName) count++;
+      if ((origByName.get(cat.oldName) || "") !== (cat.description || "")) count++;
+    }
+    return count;
+  }, [editableBindings, editableCategories, preview]);
+
+  const toggleExpand = useCallback((name: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
+  }, []);
+
+  const handleBindingChange = useCallback((skillId: string, newCategoryId: string) => {
+    setEditableBindings((prev) => ({ ...prev, [skillId]: newCategoryId }));
+  }, []);
+
+  const handleCategoryChange = useCallback(
+    (id: string, patch: Partial<{ name: string; description: string }>) => {
+      setEditableCategories((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, ...patch } : c))
+      );
+      setValidationError(null);
+    },
+    []
+  );
+
+  const getSkillName = useCallback((skillId: string) => {
+    const info = skillMap.get(skillId);
+    return info ? getSkillDisplayName(info, lang) : skillId;
+  }, [skillMap, lang]);
+
+  const validateBeforeApply = useCallback(() => {
+    const names = editableCategories.map((c) => c.name.trim());
+    if (names.some((n) => !n)) {
+      const msg = t("skills.aiOrganizeCategoryNameRequired");
+      setValidationError(msg);
+      return msg;
+    }
+    if (new Set(names).size !== names.length) {
+      const msg = t("skills.aiOrganizeCategoryNameDuplicate");
+      setValidationError(msg);
+      return msg;
+    }
+    setValidationError(null);
+    return null;
+  }, [editableCategories, t]);
+
+  const handleApplyClick = useCallback(async () => {
+    const err = validateBeforeApply();
+    if (err) {
+      toast.error(err);
+      return;
+    }
+    const categoriesForSubmit = editableCategories.map((c) => ({
+      name: c.name.trim(),
+      description: c.description.trim(),
+    }));
+    const nameById = new Map(editableCategories.map((c) => [c.id, c.name.trim()]));
+    const bindingsForSubmit: Record<string, string> = {};
+    for (const [sid, cid] of Object.entries(editableBindings)) {
+      const name = nameById.get(cid);
+      if (name) bindingsForSubmit[sid] = name;
+    }
+    const renameMap: Record<string, string> = {};
+    for (const c of editableCategories) {
+      const oldName = c.oldName.trim();
+      const newName = c.name.trim();
+      if (oldName && newName && oldName !== newName) renameMap[oldName] = newName;
+    }
+    await onApply({
+      categories: categoriesForSubmit,
+      bindings: bindingsForSubmit,
+      rename_map: Object.keys(renameMap).length ? renameMap : undefined,
+    });
+  }, [editableBindings, editableCategories, onApply, validateBeforeApply]);
+
+  return (
+    <Dialog open={!!preview} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent
+        className="sm:max-w-2xl"
+        onInteractOutside={(e) => e.preventDefault()}
+        onPointerDownOutside={(e) => e.preventDefault()}
+      >
+        <DialogHeader>
+          <DialogTitle>{t("skills.aiOrganizePreviewTitle")}</DialogTitle>
+          <DialogDescription>
+            {t("skills.aiOrganizePreviewSubtitle", {
+              categories: editableCategories.length,
+              bindings: bindingCount,
+            })}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid gap-3 py-1">
+          <div className="grid grid-cols-3 gap-2">
+            <div className="rounded-lg border border-indigo-200 dark:border-indigo-500/20 bg-indigo-50/60 dark:bg-indigo-500/10 px-3 py-1.5">
+              <div className="text-[11px] text-muted-foreground">{t("skills.aiOrganizeCategoryCount")}</div>
+              <div className="text-base font-semibold text-indigo-600 dark:text-indigo-400">{editableCategories.length}</div>
+            </div>
+            <div className="rounded-lg border border-emerald-200 dark:border-emerald-500/20 bg-emerald-50/60 dark:bg-emerald-500/10 px-3 py-1.5">
+              <div className="text-[11px] text-muted-foreground">{t("skills.aiOrganizeBindingCount")}</div>
+              <div className="text-base font-semibold text-emerald-600 dark:text-emerald-400">{bindingCount}</div>
+            </div>
+            <div className="rounded-lg border border-amber-200 dark:border-amber-500/20 bg-amber-50/60 dark:bg-amber-500/10 px-3 py-1.5">
+              <div className="text-[11px] text-muted-foreground">{t("skills.aiOrganizeUnassignedCount")}</div>
+              <div className="text-base font-semibold text-amber-600 dark:text-amber-400">{unassignedCount}</div>
+            </div>
+          </div>
+
+          {modifiedCount > 0 && (
+            <div className="text-xs text-indigo-500 font-medium">
+              {t("skills.aiOrganizeModified", { count: modifiedCount })}
+            </div>
+          )}
+          {!!validationError && (
+            <div className="text-xs text-destructive font-medium">{validationError}</div>
+          )}
+
+          <div className="max-h-[50vh] overflow-y-auto space-y-2">
+            {editableCategories.map((cat) => {
+              const isExpanded = expanded.has(cat.id);
+              const catSkillIds = Object.entries(editableBindings)
+                .filter(([, c]) => c === cat.id)
+                .map(([sid]) => sid);
+              const isEditing = editingCategoryId === cat.id;
+              return (
+                <div key={cat.id} className="rounded-lg border border-transparent bg-card/70 overflow-hidden">
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-accent/50 dark:hover:bg-accent/25 transition-colors"
+                    onClick={() => toggleExpand(cat.id)}
+                  >
+                    {isExpanded
+                      ? <ChevronDown size={14} className="shrink-0 text-muted-foreground" />
+                      : <ChevronRight size={14} className="shrink-0 text-muted-foreground" />}
+                    <div className="min-w-0 flex-1">
+                      {isEditing ? (
+                        <div className="flex flex-col gap-1.5" onClick={(e) => e.stopPropagation()}>
+                          <Input
+                            value={cat.name}
+                            onChange={(e) => handleCategoryChange(cat.id, { name: e.target.value })}
+                            className="h-7 text-xs"
+                            placeholder={t("skills.aiOrganizeCategoryName")}
+                          />
+                          <Textarea
+                            value={cat.description}
+                            onChange={(e) => handleCategoryChange(cat.id, { description: e.target.value })}
+                            className="min-h-[54px] text-xs resize-y"
+                            placeholder={t("skills.aiOrganizeCategoryDescription")}
+                          />
+                        </div>
+                      ) : (
+                        <>
+                          <div className="font-medium text-sm text-foreground">{cat.name}</div>
+                          {cat.description && (
+                            <div title={cat.description} className="text-xs text-muted-foreground line-clamp-1 mt-0.5">{cat.description}</div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                    <Badge variant="secondary" className="shrink-0 tabular-nums text-[11px]">
+                      {liveByCategory[cat.id] || 0}
+                    </Badge>
+                    <div className="flex items-center shrink-0" onClick={(e) => e.stopPropagation()}>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className={isEditing
+                          ? "h-7 w-7 p-0 rounded-md bg-indigo-500/15 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-500/25"
+                          : "h-7 w-7 p-0 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent/60"}
+                        onClick={() => setEditingCategoryId((prev) => (prev === cat.id ? null : cat.id))}
+                        title={isEditing ? t("common.confirm") : t("common.edit")}
+                      >
+                        {isEditing ? <IconCheck size={13} /> : <IconEdit size={13} />}
+                      </Button>
+                    </div>
+                  </button>
+                  {isExpanded && (
+                    <div className="bg-muted/25 dark:bg-muted/10">
+                      {catSkillIds.length === 0 && (
+                        <div className="px-9 py-3 text-xs text-muted-foreground italic">
+                          {t("skills.aiOrganizeNoSkillsInCategory")}
+                        </div>
+                      )}
+                      {catSkillIds.map((sid) => (
+                        <div key={sid} className="flex items-center gap-2.5 pl-6 pr-3 py-2 text-sm hover:bg-accent/60 dark:hover:bg-accent/30 transition-colors">
+                          <span className="size-1.5 shrink-0 rounded-full bg-indigo-400/60 dark:bg-indigo-400/40" />
+                          <div className="min-w-0 flex-1 truncate text-foreground/90 text-[13px]" title={sid}>
+                            {getSkillName(sid)}
+                          </div>
+                          <Select value={cat.id} onValueChange={(v) => handleBindingChange(sid, v)}>
+                            <SelectTrigger size="sm" className="h-7 w-auto max-w-[140px] text-xs border border-border/60 bg-background hover:bg-accent shadow-none">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent position="popper" align="end">
+                              {editableCategories.map((c) => (
+                                <SelectItem key={c.id} value={c.id} className="text-xs">
+                                  {c.name}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {unassignedCount > 0 && (
+              <div className="rounded-lg border border-transparent bg-amber-50/25 dark:bg-amber-500/8 overflow-hidden">
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-accent/50 dark:hover:bg-accent/25 transition-colors"
+                  onClick={() => toggleExpand("__unassigned__")}
+                >
+                  {expanded.has("__unassigned__")
+                    ? <ChevronDown size={14} className="shrink-0 text-amber-500" />
+                    : <ChevronRight size={14} className="shrink-0 text-amber-500" />}
+                  <div className="min-w-0 flex-1">
+                    <div className="font-medium text-sm text-amber-600 dark:text-amber-400">{t("skills.aiOrganizeUnassignedCount")}</div>
+                  </div>
+                  <Badge variant="secondary" className="shrink-0 tabular-nums text-[11px] border-amber-200 dark:border-amber-500/30 text-amber-600 dark:text-amber-400">
+                    {unassignedCount}
+                  </Badge>
+                </button>
+                {expanded.has("__unassigned__") && (
+                  <div className="bg-amber-50/30 dark:bg-amber-500/5">
+                    {unassignedSkillIds.map((sid) => (
+                      <div key={sid} className="flex items-center gap-2.5 pl-6 pr-3 py-2 text-sm hover:bg-accent/60 dark:hover:bg-accent/30 transition-colors">
+                        <span className="size-1.5 shrink-0 rounded-full bg-amber-400/60 dark:bg-amber-400/40" />
+                        <div className="min-w-0 flex-1 truncate text-foreground/90 text-[13px]" title={sid}>
+                          {getSkillName(sid)}
+                        </div>
+                        <Select value="" onValueChange={(v) => handleBindingChange(sid, v)}>
+                          <SelectTrigger size="sm" className="h-7 w-auto max-w-[140px] text-xs border border-amber-300/60 dark:border-amber-500/30 bg-background hover:bg-accent shadow-none text-muted-foreground">
+                            <SelectValue placeholder={t("skills.aiOrganizeSelectCategory")} />
+                          </SelectTrigger>
+                          <SelectContent position="popper" align="end">
+                            {editableCategories.map((c) => (
+                              <SelectItem key={c.id} value={c.id} className="text-xs">
+                                {c.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            {editableCategories.length === 0 && unassignedCount === 0 && (
+              <div className="px-3 py-8 text-center text-sm text-muted-foreground">
+                {t("skills.aiOrganizeNoPreview")}
+              </div>
+            )}
+          </div>
+
+          {!!preview?.summary?.truncated && (
+            <div className="text-[11px] text-muted-foreground">
+              {t("skills.aiOrganizeTruncatedHint", { count: preview.summary.truncated })}
+            </div>
+          )}
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={applying}>
+            {t("common.cancel")}
+          </Button>
+          <Button
+            onClick={handleApplyClick}
+            disabled={applying || editableCategories.length === 0 || bindingCount === 0}
+            className="bg-gradient-to-br from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 text-white border-0 shadow-md shadow-indigo-500/20"
+          >
+            {applying && <Loader2 className="animate-spin mr-1" size={14} />}
+            {t("skills.aiOrganizeApply")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ─── 配置表单自动生成 ───
+
+function SkillConfigForm({
+  fields,
+  envDraft,
+  onEnvChange,
+}: {
+  fields: SkillConfigField[];
+  envDraft: EnvMap;
+  onEnvChange: (fn: (prev: EnvMap) => EnvMap) => void;
+}) {
+  const [secretShown, setSecretShown] = useState<Record<string, boolean>>({});
+  const [localDraft, setLocalDraft] = useState<EnvMap>({});
+  const { t } = useTranslation();
+
+  const getValue = (key: string, fallback: string) =>
+    key in localDraft ? localDraft[key] : envGet(envDraft, key, fallback);
+
+  const handleChange = (key: string, value: string) => {
+    setLocalDraft((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const flushField = (key: string) => {
+    if (key in localDraft) {
+      const v = localDraft[key];
+      onEnvChange((m) => envSet(m, key, v));
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: "8px 0" }}>
+      {fields.map((field) => {
+        const value = getValue(field.key, String(field.default ?? ""));
+        const isSecret = field.type === "secret";
+        const shown = secretShown[field.key] ?? false;
+
+        return (
+          <div key={field.key} className="field">
+            <div className="labelRow">
+              <div className="label">
+                {field.label}
+                {field.required && <span style={{ color: "var(--danger)", marginLeft: 4 }}>*</span>}
+              </div>
+              {field.help && <div className="help">{field.help}</div>}
+            </div>
+
+            {field.type === "select" && field.options ? (
+              <select
+                value={value}
+                onChange={(e) => {
+                  handleChange(field.key, e.target.value);
+                  onEnvChange((m) => envSet(m, field.key, e.target.value));
+                }}
+                style={{ width: "100%", padding: "8px 12px", borderRadius: 10, border: "1px solid var(--line)", background: "var(--panel2)", color: "var(--text)", fontSize: 14 }}
+              >
+                {field.options.map((opt) => (
+                  <option key={opt} value={opt}>{opt}</option>
+                ))}
+              </select>
+            ) : field.type === "bool" ? (
+              <label className="pill" style={{ cursor: "pointer", userSelect: "none", alignSelf: "flex-start" }}>
+                <input
+                  type="checkbox"
+                  checked={value.toLowerCase() === "true"}
+                  onChange={(e) => {
+                    handleChange(field.key, String(e.target.checked));
+                    onEnvChange((m) => envSet(m, field.key, String(e.target.checked)));
+                  }}
+                  style={{ width: 16, height: 16 }}
+                />
+                {field.label}
+              </label>
+            ) : field.type === "number" ? (
+              <input
+                type="number"
+                value={value}
+                min={field.min}
+                max={field.max}
+                onChange={(e) => handleChange(field.key, e.target.value)}
+                onBlur={() => flushField(field.key)}
+                placeholder={String(field.default ?? "")}
+                style={{ width: "100%" }}
+              />
+            ) : (
+              <div style={{ display: "flex", gap: 6 }}>
+                <input
+                  type={isSecret && !shown ? "password" : "text"}
+                  value={value}
+                  onChange={(e) => handleChange(field.key, e.target.value)}
+                  onBlur={() => flushField(field.key)}
+                  placeholder={field.type === "secret" ? t("skills.secretPlaceholder") : String(field.default ?? "")}
+                  style={{ flex: 1 }}
+                />
+                {isSecret && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setSecretShown((s) => ({ ...s, [field.key]: !s[field.key] }))}
+                  >
+                    {shown ? t("skills.hide") : t("skills.show")}
+                  </Button>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── 技能卡片 ───
+
+function SkillCard({
+  skill,
+  onViewSources,
+  expanded,
+  onToggleExpand,
+  onToggleEnabled,
+  onViewDetail,
+  onUninstall,
+  uninstalling,
+  envDraft,
+  onEnvChange,
+  onSaveConfig,
+  saving,
+  onMoveCategory,
+}: {
+  skill: SkillInfo;
+  onViewSources?: () => void;
+  expanded: boolean;
+  onToggleExpand: () => void;
+  onToggleEnabled: () => void;
+  onViewDetail: () => void;
+  onUninstall?: () => void;
+  uninstalling?: boolean;
+  envDraft: EnvMap;
+  onEnvChange: (fn: (prev: EnvMap) => EnvMap) => void;
+  onSaveConfig: () => void;
+  saving: boolean;
+  onMoveCategory?: () => void;
+}) {
+  const hasConfig = skill.config && skill.config.length > 0;
+  const configComplete = skill.configComplete ?? true;
+  const statusColor = skill.enabled === false
+    ? "bg-muted text-muted-foreground border-muted-foreground/30"
+    : configComplete
+      ? "bg-emerald-500/10 text-emerald-600 border-emerald-500/30 dark:text-emerald-400"
+      : "bg-amber-500/10 text-amber-600 border-amber-500/30 dark:text-amber-400";
+  const { t, i18n } = useTranslation();
+  const lang = i18n.language || "zh";
+  const displayName = getSkillDisplayName(skill, lang);
+  const displayDesc = getSkillDisplayDesc(skill, lang);
+  const statusText = skill.enabled === false
+    ? t("skills.disabled")
+    : configComplete
+      ? t("skills.configComplete")
+      : t("skills.configIncomplete");
+
+  return (
+    <Card className="gap-0 overflow-hidden border-border/80 py-0 shadow-sm transition-all hover:shadow-md">
+      <CardContent className="p-4">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+          <div className="flex items-center gap-3 flex-1 min-w-0 cursor-pointer" onClick={onViewDetail}>
+            <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${skill.system ? "bg-blue-500/10 text-blue-600 dark:text-blue-400" : "bg-purple-500/10 text-purple-600 dark:text-purple-400"}`}>
+              {skill.system ? <IconGear size={20} /> : <IconZap size={20} />}
+            </div>
+            <div className="flex flex-col min-w-0 flex-1">
+              <div className="flex items-center gap-2 flex-wrap mb-1">
+                <span className="font-bold text-[15px] text-foreground">{displayName}</span>
+                {displayName !== skill.name && (
+                  <span className="text-[11px] text-muted-foreground font-mono">{skill.name}</span>
+                )}
+                {!skill.system && skill.sourceUrl && (() => {
+                  const src = skill.sourceUrl!;
+                  const ownerRepo = src.startsWith("skillhub:")
+                    ? src.slice("skillhub:".length)
+                    : src.includes("@")
+                      ? src.split("@")[0]
+                      : src.replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, "");
+                  return ownerRepo ? (
+                    <span className="text-[11px] text-muted-foreground font-mono">{ownerRepo}</span>
+                  ) : null;
+                })()}
+                <Badge variant="outline" className={`text-[10px] px-1.5 py-0 h-5 font-medium ${statusColor}`}>
+                  {statusText}
+                </Badge>
+                {onViewSources && <Button size="sm" variant="secondary" className="h-5 px-1.5 text-[10px]" onClick={e => { e.stopPropagation(); onViewSources(); }}>{t("status.skillConflicts.badge")}</Button>}
+                <span className="text-[11px] text-muted-foreground ml-1">{skill.system ? t("skills.system") : t("skills.external")}</span>
+              </div>
+              <div className="text-xs text-muted-foreground truncate">
+                {displayDesc}
+              </div>
+            </div>
+          </div>
+          
+          <div className="flex items-center gap-2 shrink-0 ml-12 sm:ml-0">
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={onViewDetail}
+              title={t("skills.viewDetail")}
+              className="h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted"
+            >
+              <IconEye size={14} />
+            </Button>
+            {!skill.system && onMoveCategory && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={onMoveCategory}
+                title={t("skills.category.moveTitle")}
+                className="h-8 px-2 text-xs text-muted-foreground hover:text-foreground hover:bg-muted"
+              >
+                {t("skills.category.move")}
+              </Button>
+            )}
+            {!skill.system && onUninstall && (
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={onUninstall}
+                disabled={uninstalling}
+                title={t("skills.uninstall")}
+                className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+              >
+                {uninstalling ? <Loader2 className="animate-spin" size={14} /> : <IconTrash size={14} />}
+              </Button>
+            )}
+            {!skill.system && (
+              <Label className="flex items-center gap-1.5 cursor-pointer text-xs font-normal ml-2 mr-2">
+                <Checkbox
+                  checked={skill.enabled !== false}
+                  onCheckedChange={() => onToggleEnabled()}
+                />
+                {t("skills.enabled")}
+              </Label>
+            )}
+            {hasConfig && (
+              <Button
+                variant={expanded ? "secondary" : "outline"}
+                size="sm"
+                onClick={onToggleExpand}
+                className="h-8 text-xs"
+              >
+                {expanded ? t("chat.collapse") : t("skills.configure")}
+              </Button>
+            )}
+          </div>
+        </div>
+
+        {expanded && hasConfig && skill.config && (
+          <div className="mt-4 pt-4 border-t border-border/50 animate-in slide-in-from-top-2 duration-200">
+            <SkillConfigForm fields={skill.config} envDraft={envDraft} onEnvChange={onEnvChange} />
+            <Button
+              onClick={onSaveConfig}
+              disabled={saving}
+              size="sm"
+              className="mt-4"
+            >
+              {saving && <Loader2 className="animate-spin mr-1.5" size={14} />}
+              {t("skills.saveConfig")}
+            </Button>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ─── 技能详情弹窗 ───
+
+function SkillDetailModal({
+  skill,
+  content,
+  contentLoading,
+  contentError,
+  isEditing,
+  editContent,
+  savingContent,
+  isSystem,
+  serviceRunning,
+  onClose,
+  onStartEdit,
+  onCancelEdit,
+  onEditChange,
+  onSave,
+  onUninstall,
+  uninstalling,
+}: {
+  skill: SkillInfo;
+  content: string;
+  contentLoading: boolean;
+  contentError: string | null;
+  isEditing: boolean;
+  editContent: string;
+  savingContent: boolean;
+  isSystem: boolean;
+  serviceRunning: boolean;
+  onClose: () => void;
+  onStartEdit: () => void;
+  onCancelEdit: () => void;
+  onEditChange: (v: string) => void;
+  onSave: () => void;
+  onUninstall?: () => void;
+  uninstalling?: boolean;
+}) {
+  const { t, i18n } = useTranslation();
+  const lang = i18n.language || "zh";
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (isEditing && textareaRef.current) {
+      textareaRef.current.focus();
+    }
+  }, [isEditing]);
+
+  useEffect(() => {
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !savingContent) onClose();
+    };
+    window.addEventListener("keydown", handleEsc);
+    return () => window.removeEventListener("keydown", handleEsc);
+  }, [onClose, savingContent]);
+
+  return (
+    <ModalOverlay onClose={savingContent ? () => {} : onClose}>
+      <div
+        className="modalContent"
+        style={{ maxWidth: 720, width: "90vw", maxHeight: "85vh", display: "flex", flexDirection: "column", padding: 0 }}
+      >
+        {/* Header */}
+        <div style={{ padding: "18px 24px 14px", borderBottom: "1px solid var(--line)", flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ width: 32, height: 32, borderRadius: 8, background: isSystem ? "rgba(37,99,235,0.1)" : "rgba(124,58,237,0.1)", display: "grid", placeItems: "center", flexShrink: 0 }}>
+              {isSystem ? <IconGear size={16} /> : <IconZap size={16} />}
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 800, fontSize: 15 }}>{getSkillDisplayName(skill, lang)}</div>
+              <div style={{ fontSize: 12, opacity: 0.6, marginTop: 2 }}>{getSkillDisplayDesc(skill, lang)}</div>
+            </div>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={onClose}
+              disabled={savingContent}
+            >
+              <IconX size={18} />
+            </Button>
+          </div>
+
+          {/* Meta info */}
+          <div style={{ display: "flex", gap: 16, marginTop: 12, fontSize: 12, opacity: 0.6, flexWrap: "wrap" }}>
+            <span><b>{t("skills.skillType")}:</b> {isSystem ? t("skills.system") : t("skills.external")}</span>
+            {skill.category && <span><b>{t("skills.skillCategory")}:</b> {skill.category}</span>}
+            {!isSystem && skill.sourceUrl && (
+              <span style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.8 }}>
+                <b>{t("skills.source")}:</b> {skill.sourceUrl}
+              </span>
+            )}
+            {skill.path && (
+              <span style={{ fontFamily: "monospace", fontSize: 11, opacity: 0.8, wordBreak: "break-all" }}>
+                <b>{t("skills.filePath")}:</b> {skill.path}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Content area */}
+        <div style={{ flex: 1, overflow: "auto", padding: "16px 24px" }}>
+          {contentLoading ? (
+            <div style={{ textAlign: "center", padding: 40, opacity: 0.5 }}>{t("skills.loadingContent")}</div>
+          ) : contentError ? (
+            <div className="errorBox" style={{ margin: 0 }}>{contentError}</div>
+          ) : isEditing ? (
+            <textarea
+              ref={textareaRef}
+              value={editContent}
+              onChange={(e) => onEditChange(e.target.value)}
+              spellCheck={false}
+              style={{
+                width: "100%",
+                minHeight: 400,
+                fontFamily: "monospace",
+                fontSize: 13,
+                lineHeight: 1.6,
+                padding: 12,
+                border: "1px solid var(--brand)",
+                borderRadius: 8,
+                background: "var(--panel2)",
+                color: "var(--text)",
+                resize: "vertical",
+                outline: "none",
+                tabSize: 2,
+              }}
+            />
+          ) : (
+            <pre style={{
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              fontFamily: "monospace",
+              fontSize: 13,
+              lineHeight: 1.6,
+              margin: 0,
+              padding: 12,
+              background: "var(--panel2)",
+              borderRadius: 8,
+              border: "1px solid var(--line)",
+              minHeight: 200,
+              maxHeight: "none",
+              overflow: "visible",
+            }}>
+              {content}
+            </pre>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div style={{
+          padding: "12px 24px 18px",
+          borderTop: "1px solid var(--line)",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          flexShrink: 0,
+        }}>
+          {isSystem && (
+            <span style={{ fontSize: 12, opacity: 0.5, flex: 1 }}>{t("skills.readOnlyHint")}</span>
+          )}
+          {!isSystem && !serviceRunning && (
+            <span style={{ fontSize: 12, opacity: 0.5, flex: 1 }}>{t("skills.requiresBackend")}</span>
+          )}
+          {!isSystem && serviceRunning && (
+            <>
+              {onUninstall && !isEditing && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={onUninstall}
+                  disabled={uninstalling || savingContent}
+                  className="text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive"
+                >
+                  {uninstalling ? <Loader2 className="animate-spin" size={12} /> : <IconTrash size={12} />} {t("skills.uninstall")}
+                </Button>
+              )}
+              <div style={{ flex: 1 }} />
+              {isEditing ? (
+                <>
+                  <Button variant="outline" size="sm" onClick={onCancelEdit} disabled={savingContent}>
+                    {t("skills.cancelEdit")}
+                  </Button>
+                  <Button size="sm" onClick={onSave} disabled={savingContent || editContent === content}>
+                    {savingContent && <Loader2 className="animate-spin" />}
+                    {t("skills.saveAndReload")}
+                  </Button>
+                </>
+              ) : (
+                <Button variant="outline" size="sm" onClick={onStartEdit} disabled={contentLoading || !!contentError}>
+                  <IconEdit size={12} /> {t("skills.editContent")}
+                </Button>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </ModalOverlay>
+  );
+}
+
+// ─── 市场技能卡片 ───
+
+function MarketplaceSkillCard({
+  skill,
+  onInstall,
+  installing,
+  installStatus,
+}: {
+  skill: MarketplaceSkillView;
+  onInstall: () => void;
+  installing: boolean;
+  installStatus?: string;
+}) {
+  const { t } = useTranslation();
+  return (
+    <Card className="gap-0 overflow-hidden border-border/80 py-0 shadow-sm transition-all hover:shadow-md">
+      <CardContent className="p-4">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+          <div className="flex items-center gap-3 flex-1 min-w-0">
+            <div className="w-10 h-10 rounded-xl bg-purple-500/10 text-purple-600 dark:text-purple-400 flex items-center justify-center shrink-0">
+              <IconPackage size={20} />
+            </div>
+            <div className="flex flex-col min-w-0 flex-1">
+              <div className="flex items-center gap-2 flex-wrap mb-1">
+                <span className="font-bold text-[15px] text-foreground">{skill.display.name}</span>
+                {skill.state.installed && <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-5 font-medium bg-emerald-500/10 text-emerald-600 border-emerald-500/30 dark:text-emerald-400">{t("skills.installed")}</Badge>}
+                {(skill.metrics?.downloads ?? skill.metrics?.installs ?? 0) > 0 && (
+                  <span className="text-[11px] text-muted-foreground flex items-center gap-1">
+                    <IconDownload size={10} />{(skill.metrics?.downloads ?? skill.metrics?.installs ?? 0).toLocaleString()}
+                  </span>
+                )}
+                {(skill.metrics?.stars ?? 0) > 0 && (
+                  <span className="text-[11px] text-muted-foreground flex items-center gap-1">
+                    <IconStar size={11} />{skill.metrics?.stars}
+                  </span>
+                )}
+              </div>
+              <div className="text-xs text-muted-foreground truncate">
+                {skill.display.description || t("skills.marketplaceNoDesc", "暂无描述，安装后可在技能详情中查看")}
+              </div>
+              <div className="text-[11px] text-muted-foreground/60 font-mono mt-1 truncate">
+                {skill.canonicalId}{skill.version ? ` @ ${skill.version}` : ""}
+              </div>
+              {skill.classification?.tags && skill.classification.tags.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 mt-2">
+                  {skill.classification.tags.map((tag) => (
+                    <Badge key={tag} variant="secondary" className="text-[10px] px-1.5 py-0 bg-blue-500/10 text-blue-600 hover:bg-blue-500/20 dark:text-blue-400">
+                      {tag}
+                    </Badge>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          
+          <div className="shrink-0 ml-12 sm:ml-0">
+            <Button
+              variant={skill.state.installed ? "outline" : "default"}
+              size="sm"
+              onClick={onInstall}
+              disabled={skill.state.installed || installing}
+              className={!skill.state.installed && !installing ? "bg-gradient-to-br from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 text-white border-0 shadow-md shadow-indigo-500/20" : ""}
+            >
+              {installing && <Loader2 className="animate-spin mr-1.5" size={14} />}
+              {skill.state.installed ? t("skills.installed") : installing && installStatus ? installStatus : t("skills.install")}
+            </Button>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ─── 主组件 ───
+
+export function SkillManager({
+  venvDir,
+  currentWorkspaceId,
+  envDraft,
+  onEnvChange,
+  onSaveEnvKeys,
+  apiBaseUrl = "http://127.0.0.1:18900",
+  serviceRunning = false,
+  dataMode = "local",
+  desktopVersion = "0.0.0",
+}: {
+  venvDir: string;
+  currentWorkspaceId: string | null;
+  envDraft: EnvMap;
+  onEnvChange: (fn: (prev: EnvMap) => EnvMap) => void;
+  onSaveEnvKeys: (keys: string[]) => Promise<void>;
+  apiBaseUrl?: string;
+  serviceRunning?: boolean;
+  dataMode?: "local" | "remote";
+  desktopVersion?: string;
+}) {
+  const [tab, updateTab] = useState<SkillTab>(skillTabFromHash);
+  const setTab = useCallback((next: SkillTab) => {
+    updateTab(next);
+    window.location.hash = next === "installed" ? "/skills"
+      : `/skills?source=${next === "official" ? "official" : "skillhub"}`;
+  }, []);
+  useEffect(() => {
+    const sync = () => updateTab(skillTabFromHash());
+    window.addEventListener("hashchange", sync);
+    return () => window.removeEventListener("hashchange", sync);
+  }, []);
+  const [sourceFilter, setSourceFilter] = useState(false);
+  const [sourceSkill, setSourceSkill] = useState<SkillInfo | "all" | null>(null);
+  const sourceRecords = useSkillConflicts(apiBaseUrl, serviceRunning, records => {
+    if (records.some(record => record.action === "rejected")) {
+      toast.info(t("status.skillConflicts.newIgnored"), {
+        action: { label: t("status.skillConflicts.manage"), onClick: () => setSourceSkill("all") },
+      });
+    }
+  });
+  const sourceIds = useMemo(() => new Set(sourceRecords.conflicts.map(c => c.skill_id || c.name)), [sourceRecords.conflicts]);
+  const hasSourceRecords = (skill: SkillInfo) => sourceIds.has(skill.skillId) || sourceIds.has(skill.name);
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [expandedSkill, setExpandedSkill] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [marketplace, setMarketplace] = useState<MarketplaceSkillView[]>([]);
+  const [marketLoading, setMarketLoading] = useState(false);
+  const [marketSearch, setMarketSearch] = useState("");
+  const [marketError, setMarketError] = useState<string | null>(null);
+  const [installingSet, setInstallingSet] = useState<Set<string>>(new Set());
+  const [manualUrl, setManualUrl] = useState("");
+  const [manualInstalling, setManualInstalling] = useState(false);
+  const [enabledDraft, setEnabledDraft] = useState<Record<string, boolean>>({});
+  const [enabledDirty, setEnabledDirty] = useState(false);
+  const [savingEnabled, setSavingEnabled] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  
+  const [installedSearch, setInstalledSearch] = useState("");
+  const [aiOrganizing, setAiOrganizing] = useState<string | null>(null);
+  const [aiOrganizeElapsed, setAiOrganizeElapsed] = useState(0);
+  const aiOrganizeTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [aiOrganizeApplying, setAiOrganizeApplying] = useState(false);
+  const [aiOrganizePreview, setAiOrganizePreview] = useState<AiOrganizePreview | null>(null);
+  const [localImporting, setLocalImporting] = useState(false);
+  // ── 技能分类（OpenKitsune 风格：DESCRIPTION.md + 目录） ──
+  type CategoryInfo = {
+    name: string;
+    description: string | null;
+    total: number;
+    enabled: number;
+    system_readonly: boolean;
+    declared?: boolean;
+  };
+  const [categories, setCategories] = useState<CategoryInfo[]>([]);
+  const [groupView, setGroupView] = useState(true);
+  const [categoryBusy, setCategoryBusy] = useState<string | null>(null);
+  const [categoryMassProgress, setCategoryMassProgress] = useState<CategoryMassProgressState | null>(null);
+  const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set());
+  const [categoryDialogState, setCategoryDialogState] = useState<CategoryDialogState>(null);
+  const [categoryDeleteConfirm, setCategoryDeleteConfirm] = useState<string | null>(null);
+  const [moveCategoryState, setMoveCategoryState] = useState<MoveCategoryDialogState>(null);
+  // 「显示系统技能」开关：默认关闭。语义是 *技能级* 过滤——关闭时系统技能在
+  // 平铺视图、分组视图、混合分类内部以及计数中一律隐藏（修复 #598：搜索时系统
+  // 技能/分类仍然出现）。命名从旧的 showSystemCategories 收敛为 showSystemSkills，
+  // 与 i18n key `skills.category.showSystem`（“显示系统技能”）语义对齐。
+  const [showSystemSkills, setShowSystemSkills] = useState(false);
+  // 安装时选择落入的分类（""=不指定，安装到顶层）
+  const [installCategory, setInstallCategory] = useState<string>("");
+  const [detailSkill, setDetailSkill] = useState<SkillInfo | null>(null);
+  const [detailContent, setDetailContent] = useState("");
+  const [detailContentLoading, setDetailContentLoading] = useState(false);
+  const [detailContentError, setDetailContentError] = useState<string | null>(null);
+  const [detailEditing, setDetailEditing] = useState(false);
+  const [detailEditContent, setDetailEditContent] = useState("");
+  const [detailSaving, setDetailSaving] = useState(false);
+  const [uninstallingSet, setUninstallingSet] = useState<Set<string>>(new Set());
+  const [installStatus, setInstallStatus] = useState<string>("");
+  const [uninstallConfirm, setUninstallConfirm] = useState<SkillInfo | null>(null);
+  const marketRequestId = useRef(0);
+  // 已安装技能加载的请求时序守卫：并发的 loadSkills 中只有"最新"那次允许写入
+  // 状态，避免较早发出的请求晚到后用旧/坏数据覆盖较新成功结果（last-write-wins 倒灌）。
+  const skillsRequestId = useRef(0);
+  const refreshingRef = useRef(false);
+  const detailRequestNameRef = useRef<string | null>(null);
+  const { t } = useTranslation();
+
+  // ── 加载已安装技能（返回 true 表示成功，false 表示出错） ──
+  //
+  // 失败语义（修复 #614“导入后列表空白”）：
+  //   - 只有当数据源**明确成功**返回 `{skills: [...]}`（数组）时才覆盖列表；
+  //     合法的空数组（res.ok 且 skills=[]）按真·空渲染。
+  //   - 任何**尝试过但失败**的情况（非 2xx、错误体、响应结构异常、网络/超时）
+  //     都只 setError，**不清空**已有列表——避免一次瞬时故障把整页清成空白
+  //     （此前 `data = await res.json()` 不查 res.ok，500 错误体会被当成空列表）。
+  //   - 完全没有可用数据源时（既无服务也非 Tauri 本地模式）才视为真·空。
+  // 并发语义：用 skillsRequestId 做时序守卫，只有最新一次请求允许写状态。
+  const loadSkills = useCallback(async (): Promise<boolean> => {
+    const seq = ++skillsRequestId.current;
+    const isLatest = () => seq === skillsRequestId.current;
+    setLoading(true);
+    setError(null);
+    try {
+      let data: { skills?: Record<string, unknown>[] } | null = null;
+      let loadError: string | null = null;
+      let attempted = false;
+
+      // 优先从运行中的服务 HTTP API 获取（远程模式或本地服务运行时）
+      if (serviceRunning && apiBaseUrl != null) {
+        attempted = true;
+        try {
+          const res = await safeFetch(`${apiBaseUrl}/api/skills`, { signal: AbortSignal.timeout(15_000), cache: "no-store" });
+          let parsed: { skills?: Record<string, unknown>[]; error?: string; detail?: string } | null = null;
+          try {
+            parsed = await res.json();
+          } catch {
+            parsed = null;
+          }
+          if (!res.ok || parsed?.error) {
+            loadError = String(parsed?.error || parsed?.detail || `HTTP ${res.status}`);
+          } else if (parsed && Array.isArray(parsed.skills)) {
+            data = parsed;
+          } else {
+            // 2xx 但响应结构异常：当作软失败处理，不清空现有列表
+            loadError = "unexpected response shape from /api/skills";
+          }
+        } catch (e) {
+          loadError = String(e);
+        }
+      }
+
+      // Fallback: Tauri 本地命令（仅本地模式，且 HTTP 未成功时）
+      if (!data && IS_TAURI && dataMode !== "remote" && venvDir && currentWorkspaceId) {
+        attempted = true;
+        try {
+          const raw = await invoke<string>("openkitsune_list_skills", { venvDir, workspaceId: currentWorkspaceId });
+          const parsed = JSON.parse(raw);
+          if (parsed && Array.isArray(parsed.skills)) {
+            data = parsed;
+            loadError = null;  // Tauri 兜底成功，清掉 HTTP 阶段的错误
+          } else if (!loadError) {
+            loadError = "unexpected response shape from openkitsune_list_skills";
+          }
+        } catch (e) {
+          if (!loadError) loadError = String(e);
+        }
+      }
+
+      // 时序守卫：较早发出的请求若已被更新的请求取代，则放弃写入。
+      if (!isLatest()) return false;
+
+      if (!data) {
+        if (loadError) {
+          // 尝试过但失败：保留现有列表，仅提示错误，绝不清空。
+          setError(friendlyError(loadError, t, "load"));
+          return false;
+        }
+        // 没有任何可用数据源（既未尝试 HTTP 也未尝试 Tauri）：真·空。
+        if (attempted === false) setSkills([]);
+        return true;
+      }
+
+      const list: SkillInfo[] = (data.skills || []).map((s: Record<string, unknown>) => ({
+        skillId: (s.skill_id as string) || (s.name as string),
+        name: s.name as string,
+        description: s.description as string || "",
+        name_i18n: (s.name_i18n as Record<string, string> | null) || null,
+        description_i18n: (s.description_i18n as Record<string, string> | null) || null,
+        system: s.system as boolean || false,
+        enabled: s.enabled as boolean | undefined,
+        toolName: s.tool_name as string | null,
+        category: s.category as string | null,
+        path: s.path as string | null,
+        sourceUrl: (s.source_url as string | null) || null,
+        marketplaceName: (s.marketplace_name as string | null) || null,
+        config: (s.config as SkillConfigField[] | null) || null,
+        configComplete: true,  // 由 useMemo 动态计算，这里先占位
+      }));
+      setSkills(list);
+      void sourceRecords.refresh();
+      setError(null);
+      // 同步 enabledDraft 到后端最新状态
+      const draft: Record<string, boolean> = {};
+      for (const s of list) draft[s.skillId] = s.enabled !== false;
+      setEnabledDraft(draft);
+      setEnabledDirty(false);
+      return true;
+    } catch (e) {
+      if (isLatest()) setError(friendlyError(e, t, "load"));
+      return false;
+    } finally {
+      if (isLatest()) setLoading(false);
+    }
+  }, [venvDir, currentWorkspaceId, serviceRunning, apiBaseUrl, dataMode, t, sourceRecords.refresh]);
+
+  const reloadRuntimeAfterLocalInstall = useCallback(async () => {
+    if (!serviceRunning || apiBaseUrl == null) return true;
+    try {
+      const res = await safeFetch(`${apiBaseUrl}/api/skills/reload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+        signal: AbortSignal.timeout(180_000),
+      });
+      let data: Record<string, unknown> | null = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+      if (!res.ok || data?.error) {
+        throw new Error(String(data?.error || `HTTP ${res.status}`));
+      }
+      return true;
+    } catch (e) {
+      console.warn("Skill runtime reload after local install failed:", e);
+      toast.warning(t(
+        "skills.runtimeReloadFailed",
+        "技能已安装，但运行时刷新失败，可能需要重启后端服务。",
+      ));
+      return false;
+    }
+  }, [serviceRunning, apiBaseUrl, t]);
+
+  useEffect(() => {
+    loadSkills();
+  }, [loadSkills]);
+
+  // ── 加载技能分类列表 ──
+  const loadCategories = useCallback(async () => {
+    if (!serviceRunning || apiBaseUrl == null) return;
+    try {
+      const res = await safeFetch(`${apiBaseUrl}/api/skill-categories`, {
+        signal: AbortSignal.timeout(8_000),
+      });
+      const data = await res.json();
+      const list: CategoryInfo[] = Array.isArray(data?.categories) ? data.categories : [];
+      setCategories(list);
+    } catch {
+      // 静默失败：分类是增强型功能，不影响主流程
+    }
+  }, [serviceRunning, apiBaseUrl]);
+
+  useEffect(() => {
+    loadCategories();
+  }, [loadCategories]);
+
+  // ── 实时刷新：监听 App.tsx 桥接的 'openkitsune:skills-changed' 事件 ──
+  // enabledDirty=true 时仅 toast 提示用户（避免覆盖未保存草稿），
+  // 否则静默 reload 技能与分类列表
+  const enabledDirtyRef = useRef(enabledDirty);
+  useEffect(() => { enabledDirtyRef.current = enabledDirty; }, [enabledDirty]);
+  useEffect(() => { refreshingRef.current = refreshing; }, [refreshing]);
+  useEffect(() => {
+    const onChange = () => {
+      if (refreshingRef.current) {
+        return;
+      }
+      if (enabledDirtyRef.current) {
+        toast.info(t("skills.realtimeDirtyHint"));
+        return;
+      }
+      loadSkills().catch(() => {});
+      loadCategories().catch(() => {});
+    };
+    window.addEventListener("openkitsune:skills-changed", onChange);
+    return () => window.removeEventListener("openkitsune:skills-changed", onChange);
+  }, [loadSkills, loadCategories, t]);
+
+  // ── 分类操作统一刷新入口 ──
+  // 所有分类写操作成功后必须经过此函数刷新 UI。
+  // 后端 propagate_skill_change 也会通过 WebSocket 广播触发 openkitsune:skills-changed
+  // 事件，但 WS 到达有延迟，这里显式刷新保证操作后立即看到结果。
+  // WS 事件到达时 enabledDirtyRef 仍为 false（因为批量操作不走 draft），
+  // 所以即使 WS 稍后再到一次也只是静默重复，不会冲突。
+  const refreshAfterCategoryMutation = useCallback(async () => {
+    await Promise.all([loadSkills(), loadCategories()]);
+  }, [loadSkills, loadCategories]);
+
+  // 分类名本地化显示：后端 canonical name 是 "Uncategorized"，UI 显示用 i18n
+  const displayCategoryName = useCallback(
+    (name: string) => name === "Uncategorized" ? t("skills.category.uncategorized") : name,
+    [t],
+  );
+
+  // ── 大类启用/禁用 / 创建 / 删除（mass action over allowlist） ──
+  const runCategoryMassAction = useCallback(async (
+    name: string,
+    action: CategoryMassAction,
+  ): Promise<CategoryMassActionResult> => {
+    const actionPath = action === "enable" ? "enable" : "disable";
+    const url = `${apiBaseUrl}/api/skill-categories/${encodeURIComponent(name)}/${actionPath}?stream=1`;
+    const res = await safeFetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+      body: "{}",
+      signal: AbortSignal.timeout(120_000),
+    });
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("text/event-stream") || !res.body) {
+      return await res.json().catch(() => ({}));
+    }
+
+    const reader = res.body.getReader();
+    let finalResult: CategoryMassActionResult | null = null;
+    const applyProgress = (event: CategoryMassProgressEvent) => {
+      if (event.result) finalResult = event.result;
+      const percent = Math.max(0, Math.min(100, Number(event.percent ?? 0)));
+      setCategoryMassProgress({
+        category: name,
+        action,
+        stage: String(event.stage || ""),
+        message: String(event.message || ""),
+        percent,
+        total: Number(event.total || event.result?.total || 0),
+        processed: Number(event.processed || event.result?.processed || 0),
+      });
+      if (event.error) throw new Error(event.error);
+    };
+
+    await consumeSseStream({
+      reader,
+      onFrame: (frame) => {
+        const raw = frame.data.trim();
+        if (!raw) return;
+        const event = JSON.parse(raw) as CategoryMassProgressEvent;
+        applyProgress(event);
+      },
+    });
+    return finalResult || {};
+  }, [apiBaseUrl]);
+
+  const handleCategoryMassAction = useCallback(async (name: string, action: CategoryMassAction) => {
+    if (apiBaseUrl == null || categoryBusy) return;
+    setCategoryBusy(name);
+    setCategoryMassProgress({
+      category: name,
+      action,
+      stage: "starting",
+      message: t("skills.category.massStarting"),
+      percent: 5,
+      total: 0,
+      processed: 0,
+    });
+    try {
+      const data = await runCategoryMassAction(name, action);
+      const count = action === "enable" ? data?.added ?? -1 : data?.removed ?? -1;
+      const sysCount = data?.system_count ?? 0;
+      if (count === 0 && sysCount > 0) {
+        toast.info(t("skills.category.allSystemSkills", { name: displayCategoryName(name), count: sysCount }));
+      } else if (count === 0) {
+        toast.warning(t("skills.category.noSkillsInCategory", { name: displayCategoryName(name) }));
+      } else if (action === "enable") {
+        toast.success(t("skills.category.enabledAll", { name: displayCategoryName(name) }));
+      } else {
+        toast.success(t("skills.category.disabledAll", { name: displayCategoryName(name) }));
+      }
+      setCategoryMassProgress((prev) => prev && prev.category === name
+        ? { ...prev, stage: "syncing", message: t("skills.category.massSyncing"), percent: 95 }
+        : prev);
+      await refreshAfterCategoryMutation();
+    } catch (e) {
+      toast.error(friendlyError(e, t, "save"));
+    } finally {
+      setCategoryBusy(null);
+      setCategoryMassProgress(null);
+    }
+  }, [apiBaseUrl, categoryBusy, runCategoryMassAction, t, displayCategoryName, refreshAfterCategoryMutation]);
+
+  const handleCategoryEnableAll = useCallback(
+    (name: string) => handleCategoryMassAction(name, "enable"),
+    [handleCategoryMassAction],
+  );
+
+  const handleCategoryDisableAll = useCallback(
+    (name: string) => handleCategoryMassAction(name, "disable"),
+    [handleCategoryMassAction],
+  );
+
+  const handleCategoryDialogSubmit = useCallback(async (
+    mode: "create" | "edit",
+    data: { name: string; description: string; originalName?: string },
+  ) => {
+    if (apiBaseUrl == null) return;
+    try {
+      if (mode === "create") {
+        const res = await safeFetch(`${apiBaseUrl}/api/skill-categories`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: data.name, description: data.description }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const resp = await res.json();
+        if (resp?.error || resp?.detail) throw new Error(String(resp.error || resp.detail));
+        toast.success(t("skills.category.created", { name: data.name }));
+      } else {
+        const original = data.originalName!;
+        const payload: Record<string, string> = {};
+        if (data.name !== original) payload.new_name = data.name;
+        payload.description = data.description;
+        const res = await safeFetch(`${apiBaseUrl}/api/skill-categories/${encodeURIComponent(original)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const resp = await res.json();
+        if (resp?.error || resp?.detail) throw new Error(String(resp.error || resp.detail));
+        if (data.name !== original) {
+          toast.success(t("skills.category.renamed", { from: displayCategoryName(original), to: data.name }));
+        } else {
+          toast.success(t("skills.category.descUpdated"));
+        }
+      }
+      await refreshAfterCategoryMutation();
+    } catch (e) {
+      toast.error(friendlyError(e, t, "save"));
+    }
+  }, [apiBaseUrl, t, displayCategoryName, refreshAfterCategoryMutation]);
+
+  const openMoveDialog = useCallback((skill: SkillInfo) => {
+    setMoveCategoryState({
+      skillId: skill.skillId,
+      skillName: skill.name_i18n?.zh || skill.name_i18n?.en || skill.name,
+      currentCategory: skill.category || null,
+    });
+  }, []);
+
+  const handleMoveSkillSubmit = useCallback(async (skillId: string, targetCategory: string | null) => {
+    if (apiBaseUrl == null) return;
+    try {
+      if (targetCategory) {
+        const targetMeta = categories.find((c) => c.name === targetCategory);
+        const isSystemCategory = skills.some(
+          (s) => s.system && (s.category || "Uncategorized") === targetCategory,
+        );
+        if (targetMeta?.system_readonly || isSystemCategory) {
+          toast.error(t("skills.category.moveSystemCategoryDenied"));
+          return;
+        }
+      }
+      const res = await safeFetch(`${apiBaseUrl}/api/skill-categories/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skill_id: skillId, target_category: targetCategory }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      const data = await res.json();
+      if (data?.error || data?.detail) throw new Error(String(data.error || data.detail));
+      toast.success(t("skills.category.moved"));
+      await refreshAfterCategoryMutation();
+    } catch (e) {
+      toast.error(friendlyError(e, t, "save"));
+    }
+  }, [apiBaseUrl, categories, skills, t, refreshAfterCategoryMutation]);
+
+  const requestCategoryDelete = useCallback((name: string) => {
+    setCategoryDeleteConfirm(name);
+  }, []);
+
+  const executeCategoryDelete = useCallback(async (name: string) => {
+    if (apiBaseUrl == null) return;
+    setCategoryBusy(name);
+    try {
+      const res = await safeFetch(`${apiBaseUrl}/api/skill-categories/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+        signal: AbortSignal.timeout(10_000),
+      });
+      const data = await res.json();
+      if (data?.error || data?.detail) throw new Error(String(data.error || data.detail));
+      toast.success(t("skills.category.deleted", { name: displayCategoryName(name) }));
+      await refreshAfterCategoryMutation();
+    } catch (e) {
+      toast.error(friendlyError(e, t, "save"));
+    } finally {
+      setCategoryBusy(null);
+    }
+  }, [apiBaseUrl, t, displayCategoryName, refreshAfterCategoryMutation]);
+
+  // ── 检查配置是否完整（纯函数，不依赖于状态） ──
+  function checkConfigComplete(config: SkillConfigField[] | null | undefined, env: EnvMap): boolean {
+    if (!config || config.length === 0) return true;
+    return config.filter((f) => f.required).every((f) => {
+      const v = env[f.key];
+      return v != null && v.trim() !== "";
+    });
+  }
+
+  // 动态计算每个技能的 configComplete 和 enabled 状态
+  const skillsWithConfig = useMemo(() =>
+    skills.map((s) => ({
+      ...s,
+      enabled: enabledDraft[s.skillId] ?? (s.enabled !== false),
+      configComplete: checkConfigComplete(s.config, envDraft),
+    })),
+    [skills, envDraft, enabledDraft],
+  );
+
+  const systemCategoryNames = useMemo(() => {
+    const names = new Set<string>();
+    for (const s of skillsWithConfig) {
+      if (!s.system) continue;
+      names.add(s.category || "Uncategorized");
+    }
+    return names;
+  }, [skillsWithConfig]);
+
+  const moveDialogCategories = useMemo(
+    () => categories.map((c) => ({ ...c, is_system_category: systemCategoryNames.has(c.name) })),
+    [categories, systemCategoryNames],
+  );
+
+  // 已安装技能搜索过滤（同时匹配原始字段、i18n 字段、目录名和安装来源）
+  const filteredSkills = useMemo(() => {
+    const q = installedSearch.trim().toLowerCase();
+    if (!q) return skillsWithConfig;
+    return skillsWithConfig.filter((s) => {
+      if (s.name.toLowerCase().includes(q)) return true;
+      if (s.marketplaceName?.toLowerCase().includes(q)) return true;
+      if (s.description && s.description.toLowerCase().includes(q)) return true;
+      if (s.category && s.category.toLowerCase().includes(q)) return true;
+      if (s.path) {
+        const parts = s.path.replace(/\\/g, "/").split("/");
+        const dirName = parts.length >= 2 ? parts[parts.length - 2] : "";
+        if (dirName.toLowerCase().includes(q)) return true;
+      }
+      if (s.sourceUrl && s.sourceUrl.toLowerCase().includes(q)) return true;
+      const i18nValues = [
+        ...Object.values(s.name_i18n || {}),
+        ...Object.values(s.description_i18n || {}),
+      ];
+      return i18nValues.some((v) => v.toLowerCase().includes(q));
+    });
+  }, [skillsWithConfig, installedSearch]);
+
+  // 单一可见性来源：在搜索过滤之上再叠加「显示系统技能」开关。
+  // 平铺视图 / 分组聚合 / 计数 / 空状态都消费这一个派生量，避免在多处各自
+  // 重复 `s.system` 判断而产生不一致（#598）。
+  const visibleSkills = useMemo(
+    () => filteredSkills.filter(s => (sourceFilter ? hasSourceRecords(s) : showSystemSkills || !s.system)),
+    [filteredSkills, showSystemSkills, sourceFilter, sourceIds],
+  );
+
+  // ── 保存技能配置 ──
+  const handleSaveConfig = useCallback(async (skill: SkillInfo) => {
+    if (!skill.config) return;
+    setSaving(true);
+    try {
+      // 确保未手动修改但有默认值的字段也写入 envDraft，否则 saveEnvKeys 会跳过它们
+      for (const f of skill.config) {
+        if (f.default != null) {
+          onEnvChange((m) => {
+            if (Object.prototype.hasOwnProperty.call(m, f.key)) return m;  // 用户已修改过，不覆盖
+            return envSet(m, f.key, String(f.default));
+          });
+        }
+      }
+      const keys = skill.config.map((f) => f.key);
+      await onSaveEnvKeys(keys);
+      // 刷新
+      await loadSkills();
+    } catch (e) {
+      setError(friendlyError(e, t, "save"));
+    } finally {
+      setSaving(false);
+    }
+  }, [onSaveEnvKeys, loadSkills, onEnvChange]);
+
+  // ── 切换启用/禁用（仅更新本地 draft，不自动保存） ──
+  const handleToggleEnabled = useCallback((skill: SkillInfo) => {
+    const cur = enabledDraft[skill.skillId] ?? (skill.enabled !== false);
+    setEnabledDraft((prev) => ({ ...prev, [skill.skillId]: !cur }));
+    setEnabledDirty(true);
+  }, [enabledDraft]);
+
+  // ── 保存启用/禁用状态到后端 ──
+  const handleSaveEnabledState = useCallback(async () => {
+    setSavingEnabled(true);
+    setError(null);
+    try {
+      const externalAllowlist = skills
+        .filter((s) => !s.system && (enabledDraft[s.skillId] ?? (s.enabled !== false)))
+        .map((s) => s.skillId);
+
+      const content = {
+        version: 1,
+        external_allowlist: externalAllowlist,
+        updated_at: new Date().toISOString(),
+      };
+
+      if (serviceRunning && apiBaseUrl != null) {
+        // POST /api/config/skills 后端已自动调 propagate_skill_change(ENABLE)，
+        // 无需再额外发 /api/skills/reload（会触发重复全量扫盘）。
+        const res = await safeFetch(`${apiBaseUrl}/api/config/skills`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content }),
+          signal: AbortSignal.timeout(5000),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+      } else if (IS_TAURI && dataMode !== "remote" && currentWorkspaceId) {
+        await invoke("workspace_write_file", {
+          workspaceId: currentWorkspaceId,
+          relativePath: "data/skills.json",
+          content: JSON.stringify(content, null, 2) + "\n",
+        });
+      }
+
+      setEnabledDirty(false);
+      // 刷新技能列表确认后端状态
+      await loadSkills();
+    } catch (e) {
+      setError(friendlyError(e, t, "save"));
+    } finally {
+      setSavingEnabled(false);
+    }
+  }, [skills, enabledDraft, serviceRunning, apiBaseUrl, dataMode, currentWorkspaceId, loadSkills]);
+
+  const handleDiscard = useCallback(() => { loadSkills(); }, [loadSkills]);
+
+  // ── AI 整理技能 ──
+  const handleAiOrganize = useCallback(async () => {
+    if (!serviceRunning || apiBaseUrl == null) return;
+    setAiOrganizing(t("skills.aiOrganizeStepAnalyzing"));
+    setAiOrganizeElapsed(0);
+    setError(null);
+
+    const startTime = Date.now();
+    aiOrganizeTimerRef.current = setInterval(() => {
+      setAiOrganizeElapsed(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
+
+    try {
+      setAiOrganizing(t("skills.aiOrganizeStepGenerating"));
+      const organizeRes = await safeFetch(`${apiBaseUrl}/api/skills/organize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+        signal: AbortSignal.timeout(180_000),
+      });
+      const organizeData = await organizeRes.json();
+      if (!Array.isArray(organizeData?.categories) || !organizeData?.bindings) {
+        throw new Error(t("skills.aiOrganizeBuildFailed"));
+      }
+      setAiOrganizePreview({
+        categories: organizeData.categories,
+        bindings: organizeData.bindings,
+        summary: organizeData.summary,
+      });
+    } catch (e) {
+      const raw = e instanceof Error ? e.message : String(e);
+      if (/422|validation|max_length|at most|too long|请求过长|超长/i.test(raw)) {
+        setError(t("skills.aiOrganizePayloadTooLarge"));
+      } else if (/organize|整理|生成整理请求|技能列表读取失败/i.test(raw)) {
+        setError(t("skills.aiOrganizeBuildFailed"));
+      } else {
+        setError(friendlyError(e, t));
+      }
+    } finally {
+      if (aiOrganizeTimerRef.current) {
+        clearInterval(aiOrganizeTimerRef.current);
+        aiOrganizeTimerRef.current = null;
+      }
+      setAiOrganizing(null);
+    }
+  }, [serviceRunning, apiBaseUrl, t]);
+
+  const handleApplyAiOrganize = useCallback(async (payload: AiOrganizeApplyPayload) => {
+    if (apiBaseUrl == null || !aiOrganizePreview) return;
+    setAiOrganizeApplying(true);
+    setError(null);
+    try {
+      const res = await safeFetch(`${apiBaseUrl}/api/skills/organize/apply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(30_000),
+      });
+      const data = await res.json();
+      toast.success(t("skills.aiOrganizeApplied", {
+        categories: data?.categories ?? payload.categories.length,
+        bindings: data?.bindings ?? Object.keys(payload.bindings).length,
+      }));
+      setAiOrganizePreview(null);
+      await refreshAfterCategoryMutation();
+    } catch (e) {
+      setError(friendlyError(e, t, "save"));
+    } finally {
+      setAiOrganizeApplying(false);
+    }
+  }, [apiBaseUrl, aiOrganizePreview, refreshAfterCategoryMutation, t]);
+
+  // ── 导入本地技能 ──
+  const handleImportLocal = useCallback(async () => {
+    if (dataMode === "remote") return;
+    setLocalImporting(true);
+    setError(null);
+    try {
+      const { openFileDialog } = await import("../platform");
+      const folderPath = await openFileDialog({ directory: true, title: t("skills.importLocalTitle") });
+      if (!folderPath) { setLocalImporting(false); return; }
+
+      let installed = false;
+
+      if (serviceRunning && apiBaseUrl != null) {
+        try {
+          // /api/skills/install 成功后后端会自动 propagate_skill_change(INSTALL)，
+          // 前端不再发追加的 /api/skills/reload。
+          const res = await safeFetch(`${apiBaseUrl}/api/skills/install`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              url: folderPath,
+              ...(installCategory ? { category: installCategory } : {}),
+            }),
+            signal: AbortSignal.timeout(180_000),
+          });
+          const data = await res.json();
+          if (data.error) throw new Error(data.error);
+          installed = true;
+        } catch (apiErr) {
+          const m = String(apiErr).toLowerCase();
+          if (m.includes("request cancel") || m.includes("request_cancel")) {
+            installed = false; // fallback to Tauri invoke below
+          } else {
+            throw apiErr;
+          }
+        }
+      }
+
+      if (!installed && IS_TAURI && currentWorkspaceId) {
+        await invoke<string>("openkitsune_install_skill", {
+          venvDir,
+          workspaceId: currentWorkspaceId,
+          url: folderPath,
+        });
+        await reloadRuntimeAfterLocalInstall();
+      }
+
+      await loadSkills();
+      toast.success(t("skills.importLocalSuccess"));
+    } catch (e) {
+      const msg = String(e);
+      if (msg.includes("该技能已安装") || msg.toLowerCase().includes("already installed")) {
+        await reloadRuntimeAfterLocalInstall();
+        await loadSkills();
+        toast.success(t("skills.alreadyInstalled"));
+      } else {
+        setError(friendlyError(e, t, "install"));
+      }
+    } finally {
+      setLocalImporting(false);
+    }
+  }, [dataMode, serviceRunning, apiBaseUrl, currentWorkspaceId, venvDir, loadSkills, t, installCategory, reloadRuntimeAfterLocalInstall]);
+
+  // ── 打开技能详情弹窗 ──
+  const handleViewDetail = useCallback(async (skill: SkillInfo) => {
+    const requestName = skill.skillId;
+    detailRequestNameRef.current = requestName;
+    setDetailSkill(skill);
+    setDetailEditing(false);
+    setDetailEditContent("");
+    setDetailContentError(null);
+    setDetailContent("");
+    setDetailContentLoading(true);
+    setDetailSaving(false);
+
+    if (!serviceRunning || apiBaseUrl == null) {
+      setDetailContentError(t("skills.requiresBackend"));
+      setDetailContentLoading(false);
+      return;
+    }
+
+    try {
+      const res = await safeFetch(`${apiBaseUrl}/api/skills/content/${encodeURIComponent(skill.skillId)}`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (detailRequestNameRef.current !== requestName) return;
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (detailRequestNameRef.current !== requestName) return;
+      if (data.error) {
+        setDetailContentError(data.error);
+      } else {
+        setDetailContent(data.content || "");
+      }
+    } catch (e) {
+      if (detailRequestNameRef.current !== requestName) return;
+      setDetailContentError(String(e));
+    } finally {
+      if (detailRequestNameRef.current === requestName) {
+        setDetailContentLoading(false);
+      }
+    }
+  }, [serviceRunning, apiBaseUrl, t]);
+
+  const handleCloseDetail = useCallback(() => {
+    setDetailSkill(null);
+    setDetailEditing(false);
+    setDetailEditContent("");
+    setDetailContentError(null);
+  }, []);
+
+  const handleSaveContent = useCallback(async () => {
+    if (!detailSkill || !serviceRunning || apiBaseUrl == null) return;
+    setDetailSaving(true);
+    setDetailContentError(null);
+    try {
+      const res = await safeFetch(`${apiBaseUrl}/api/skills/content/${encodeURIComponent(detailSkill.skillId)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: detailEditContent }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data.error) {
+        setDetailContentError(data.error);
+      } else {
+        setDetailContent(detailEditContent);
+        setDetailEditing(false);
+        toast.success(t("skills.contentSaved"));
+        await loadSkills();
+      }
+    } catch (e) {
+      setDetailContentError(`${t("skills.contentSaveFailed")}: ${e}`);
+    } finally {
+      setDetailSaving(false);
+    }
+  }, [detailSkill, detailEditContent, serviceRunning, apiBaseUrl, loadSkills, t]);
+
+  // ── 卸载技能（第一步：弹出确认） ──
+  const requestUninstall = useCallback((skill: SkillInfo) => {
+    if (skill.system) return;
+    setUninstallConfirm(skill);
+  }, []);
+
+  // ── 卸载技能（第二步：确认后执行） ──
+  const executeUninstall = useCallback(async (skill: SkillInfo) => {
+    const displayName = skill.name_i18n?.zh || skill.name_i18n?.en || skill.name;
+    const key = skill.skillId;
+    setUninstallingSet(prev => new Set(prev).add(key));
+    setError(null);
+    try {
+      if (serviceRunning && apiBaseUrl != null) {
+        const res = await safeFetch(`${apiBaseUrl}/api/skills/uninstall`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ skill_id: key }),
+          signal: AbortSignal.timeout(30_000),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+      } else if (IS_TAURI && currentWorkspaceId) {
+        await invoke<string>("openkitsune_uninstall_skill", {
+          venvDir,
+          workspaceId: currentWorkspaceId,
+          skillName: key,
+        });
+      } else {
+        throw new Error(t("skills.envNotReady") || "环境未就绪");
+      }
+
+      if (detailSkill?.skillId === key) setDetailSkill(null);
+      setMarketplace(prev => prev.map(s => {
+        const sid = s.coordinate.slug;
+        if (sid === key || s.install.locator === skill.sourceUrl) {
+          return { ...s, state: { ...s.state, installed: false } };
+        }
+        return s;
+      }));
+      toast.success(t("skills.uninstallSuccess", { name: displayName }));
+      await loadSkills();
+    } catch (e) {
+      const msg = friendlyError(e, t, "uninstall");
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      setUninstallingSet(prev => { const next = new Set(prev); next.delete(key); return next; });
+    }
+  }, [serviceRunning, apiBaseUrl, venvDir, currentWorkspaceId, detailSkill, loadSkills, t]);
+
+  // ── 搜索统一市场模型（提供方适配只发生在 Python 边界） ──
+  const parseMarketplaceResponse = useCallback((data: MarketplaceResponse) => {
+    if (data.schemaVersion !== 1 || !Array.isArray(data.skills)) {
+      throw new Error("Unsupported marketplace response schema");
+    }
+    return data.skills.map((marketSkill): MarketplaceSkillView => ({
+      ...marketSkill,
+      state: {
+        installed: skills.some((local) => {
+          if (local.sourceUrl) return local.sourceUrl === marketSkill.install.locator;
+          if (local.name === marketSkill.coordinate.slug) return true;
+          const pathParts = local.path ? local.path.replace(/\\/g, "/").split("/") : [];
+          const dirName = pathParts.length >= 2 ? pathParts[pathParts.length - 2] : "";
+          return dirName === marketSkill.coordinate.slug;
+        }),
+      },
+    }));
+  }, [skills]);
+
+  const searchMarketplace = useCallback(async (query: string) => {
+    const reqId = ++marketRequestId.current;
+    setMarketLoading(true);
+    setMarketError(null);
+    try {
+      const q = query.trim() || "agent";  // 默认搜索 "agent" 展示热门技能
+      let data: MarketplaceResponse | null = null;
+
+      if (dataMode === "remote") {
+        // 远程模式只消费 OpenKitsune 后端的统一市场契约。
+        if (serviceRunning && apiBaseUrl != null) {
+          const res = await safeFetch(`${apiBaseUrl}/api/skills/marketplace?q=${encodeURIComponent(q)}`, {
+            signal: AbortSignal.timeout(10000),
+          });
+          data = await res.json();
+        }
+      } else {
+        if (IS_TAURI && venvDir) {
+          try {
+            const raw = await invoke<string>("openkitsune_list_marketplace", { venvDir, query: q });
+            data = JSON.parse(raw);
+          } catch { /* Python bridge 失败，继续尝试运行中的后端 */ }
+        }
+
+        // 本地服务运行时通过同一个后端适配器获取统一模型。
+        if (!data && serviceRunning && apiBaseUrl != null) {
+          const res = await safeFetch(`${apiBaseUrl}/api/skills/marketplace?q=${encodeURIComponent(q)}`, {
+            signal: AbortSignal.timeout(10000),
+          });
+          data = await res.json();
+        }
+      }
+
+      if (!data) throw new Error("OpenKitsune marketplace service is unavailable");
+      if (data.error) throw new Error(data.error);
+
+      // 如果已有更新的请求在飞行中，丢弃此次结果
+      if (reqId !== marketRequestId.current) return;
+      setMarketplace(parseMarketplaceResponse(data));
+    } catch (e) {
+      if (reqId !== marketRequestId.current) return;
+      // 失败时不清空已有数据，只在没有任何数据时显示错误
+      setMarketError(`${t("skills.skillHub")}: ${friendlyError(e, t)}`);
+    } finally {
+      if (reqId === marketRequestId.current) {
+        setMarketLoading(false);
+      }
+    }
+  }, [skills, t, serviceRunning, apiBaseUrl, dataMode, venvDir, parseMarketplaceResponse]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 统一的市场搜索 effect：切换 tab 或搜索词变化时触发
+  useEffect(() => {
+    if (tab !== "marketplace") return;
+    // 切换到市场标签时立即加载，搜索时 debounce 400ms
+    const delay = marketSearch.trim() ? 400 : 50;
+    const timer = setTimeout(() => {
+      searchMarketplace(marketSearch);
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [marketSearch, tab]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── 安装技能 ──
+  const handleInstall = useCallback(async (skill: MarketplaceSkillView) => {
+    if (dataMode !== "remote" && !serviceRunning && (!venvDir || !currentWorkspaceId)) {
+      setError(t("skills.envNotReady"));
+      return;
+    }
+    const uniqueKey = skill.canonicalId;
+    setInstallingSet(prev => new Set(prev).add(uniqueKey));
+    setInstallStatus(t("skills.installDownloading", "正在下载技能..."));
+    setError(null);
+    try {
+      let installed = false;
+
+      // 方式1：服务运行中 → HTTP API 安装
+      // 后端 /api/skills/install 成功后自动 propagate_skill_change(INSTALL)，
+      // 此处不再额外发 /api/skills/reload。
+      if (serviceRunning && apiBaseUrl != null) {
+        setInstallStatus(t("skills.installDownloading", "正在下载技能..."));
+        const res = await safeFetch(`${apiBaseUrl}/api/skills/install`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            install: skill.install,
+            ...(installCategory ? { category: installCategory } : {}),
+          }),
+          signal: AbortSignal.timeout(180_000),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        installed = true;
+        setInstallStatus(t("skills.installParsing", "正在解析技能..."));
+      }
+
+      // 方式2：服务未运行 → Tauri invoke（本地模式）
+      if (!installed && IS_TAURI && dataMode !== "remote" && currentWorkspaceId) {
+        const versionQuery = skill.install.version
+          ? `?version=${encodeURIComponent(skill.install.version)}`
+          : "";
+        await invoke<string>("openkitsune_install_skill", {
+          venvDir,
+          workspaceId: currentWorkspaceId,
+          url: `${skill.install.locator}${versionQuery}`,
+        });
+        await reloadRuntimeAfterLocalInstall();
+      }
+
+      setInstallStatus(t("skills.installDone", "安装完成"));
+      setMarketplace((prev) => prev.map((s) =>
+        s.canonicalId === skill.canonicalId
+          ? { ...s, state: { ...s.state, installed: true, installedVersion: skill.version } }
+          : s
+      ));
+      await loadSkills();
+      setTab("installed");
+      setExpandedSkill(skill.coordinate.slug);
+    } catch (e) {
+      const raw = String(e);
+      if (raw.includes("该技能已安装") || raw.toLowerCase().includes("already installed")) {
+        await reloadRuntimeAfterLocalInstall();
+        const refreshed = await loadSkills();
+        if (refreshed) {
+          setMarketplace((prev) => prev.map((s) =>
+            s.canonicalId === skill.canonicalId
+              ? { ...s, state: { ...s.state, installed: true, installedVersion: skill.version } }
+              : s
+          ));
+          toast.success(t("skills.alreadyInstalled"));
+          setTab("installed");
+        } else {
+          setError(friendlyError(e, t, "install"));
+        }
+      } else {
+        const friendly = friendlyError(e, t, "install");
+        setError(friendly);
+        toast.error(friendly);
+      }
+    } finally {
+      setInstallingSet(prev => { const next = new Set(prev); next.delete(uniqueKey); return next; });
+      setInstallStatus("");
+    }
+  }, [loadSkills, venvDir, currentWorkspaceId, dataMode, serviceRunning, apiBaseUrl, t, installCategory, reloadRuntimeAfterLocalInstall]);
+
+  // ── 手动输入链接安装技能 ──
+  const handleManualInstall = useCallback(async () => {
+    const url = manualUrl.trim();
+    if (!url) return;
+    if (dataMode !== "remote" && !serviceRunning && (!venvDir || !currentWorkspaceId)) {
+      setError(t("skills.envNotReady"));
+      return;
+    }
+    setManualInstalling(true);
+    setError(null);
+    try {
+      let installed = false;
+
+      if (serviceRunning && apiBaseUrl != null) {
+        // /api/skills/install 后端会自动 propagate_skill_change(INSTALL)，
+        // 此处不再发追加的 /api/skills/reload。
+        const res = await safeFetch(`${apiBaseUrl}/api/skills/install`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url,
+            ...(installCategory ? { category: installCategory } : {}),
+          }),
+          signal: AbortSignal.timeout(180_000),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        installed = true;
+      }
+
+      if (!installed && IS_TAURI && dataMode !== "remote" && currentWorkspaceId) {
+        await invoke<string>("openkitsune_install_skill", {
+          venvDir,
+          workspaceId: currentWorkspaceId,
+          url,
+        });
+        await reloadRuntimeAfterLocalInstall();
+      }
+
+      setManualUrl("");
+      await loadSkills();
+      setTab("installed");
+    } catch (e) {
+      const raw = String(e);
+      if (raw.includes("该技能已安装") || raw.toLowerCase().includes("already installed")) {
+        setManualUrl("");
+        await reloadRuntimeAfterLocalInstall();
+        await loadSkills();
+        toast.success(t("skills.alreadyInstalled"));
+        setTab("installed");
+      } else {
+        const friendly = friendlyError(e, t, "install");
+        setError(friendly);
+        toast.error(friendly);
+      }
+    } finally {
+      setManualInstalling(false);
+    }
+  }, [manualUrl, loadSkills, venvDir, currentWorkspaceId, dataMode, serviceRunning, apiBaseUrl, t, installCategory, reloadRuntimeAfterLocalInstall]);
+
+  if (!serviceRunning) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
+        <IconZap size={48} />
+        <div className="mt-3 font-semibold">技能</div>
+        <div className="mt-1 text-xs opacity-50">后端服务未启动，请启动后再进行使用</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-6">
+      <Dialog open={!!sourceSkill} onOpenChange={open => { if (!open) setSourceSkill(null); }}>
+        <DialogContent overlayClassName="z-[1100]" className="z-[1101] sm:max-w-xl max-h-[85dvh] overflow-y-auto" aria-describedby={undefined} showCloseButton={false}>
+          <DialogHeader className="flex-row items-center justify-between gap-3 text-left">
+            <DialogTitle className="min-w-0 text-base leading-snug">{t("status.skillConflicts.title")}</DialogTitle>
+            <div className="flex shrink-0 items-center gap-1">
+              <Button size="icon-sm" variant="ghost" title={t("status.skillConflicts.refresh")} aria-label={t("status.skillConflicts.refresh")} disabled={!serviceRunning} aria-disabled={sourceRecords.busy || !serviceRunning} onClick={() => { if (!sourceRecords.busy) void sourceRecords.refresh(); }}>
+                <RotateCw size={14} aria-hidden="true" className={sourceRecords.busyVisible ? "animate-spin" : undefined} />
+              </Button>
+              {sourceSkill === "all" && <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button size="icon-sm" variant="ghost" title={t("status.skillConflicts.moreActions")} aria-label={t("status.skillConflicts.moreActions")}>
+                    <MoreHorizontal size={14} aria-hidden="true" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="z-[1102]">
+                  <DropdownMenuItem disabled={sourceRecords.busy || !serviceRunning || !sourceRecords.conflicts.length} title={t("status.skillConflicts.clearHint")} onSelect={() => { if (!sourceRecords.busy) { void sourceRecords.clear(); setSourceFilter(false); } }}>
+                    {t("status.skillConflicts.clear")}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>}
+              <DialogClose asChild>
+                <Button size="icon-sm" variant="ghost" title={t("common.close")} aria-label={t("common.close")}>
+                  <X size={14} aria-hidden="true" />
+                </Button>
+              </DialogClose>
+            </div>
+          </DialogHeader>
+          <div className="flex h-64 max-h-[45dvh] flex-col gap-3 overflow-y-auto [scrollbar-gutter:stable] text-sm" aria-busy={sourceRecords.busy}>
+            {!serviceRunning && <p className="text-muted-foreground">{t("adv.needService")}</p>}
+            {serviceRunning && !sourceRecords.loaded && !sourceRecords.error && <p className="text-muted-foreground">{t("status.skillConflicts.loading")}</p>}
+            <SkillConflictsPanel showEmpty={sourceRecords.loaded} conflicts={sourceSkill === "all" ? sourceRecords.conflicts : sourceRecords.conflicts.filter(c => c.skill_id === sourceSkill?.skillId || c.name === sourceSkill?.name)} />
+            {sourceRecords.error && <p role="alert" className="text-destructive">{sourceRecords.error}</p>}
+          </div>
+        </DialogContent>
+      </Dialog>
+      {/* Tab 切换 */}
+      <div className="flex flex-col md:flex-row md:items-center gap-4">
+        <ToggleGroup
+          type="single"
+          value={tab}
+          onValueChange={(v) => { if (v) setTab(v as SkillTab); }}
+          variant="outline"
+          className="w-full justify-start sm:w-fit"
+        >
+          <ToggleGroupItem
+            value="installed"
+            className="px-2 text-xs sm:px-3 sm:text-sm sm:min-w-[5.5rem] data-[state=on]:bg-primary data-[state=on]:text-primary-foreground data-[state=on]:border-primary"
+          >
+            {t("skills.installed")}
+            <Badge
+              variant="secondary"
+              className={
+                tab === "installed"
+                  ? "ml-1.5 px-1.5 py-0 text-[11px] min-w-[1.25rem] justify-center rounded-full bg-white/25 text-primary-foreground"
+                  : "ml-1.5 px-1.5 py-0 text-[11px] min-w-[1.25rem] justify-center rounded-full bg-foreground/10 text-foreground/60"
+              }
+            >
+              {skillsWithConfig.length}
+            </Badge>
+          </ToggleGroupItem>
+          <ToggleGroupItem
+            value="official"
+            className="h-auto min-h-9 min-w-0 flex-1 whitespace-normal px-2 text-xs sm:flex-none sm:px-3 sm:text-sm data-[state=on]:bg-primary data-[state=on]:text-primary-foreground data-[state=on]:border-primary"
+          >
+            {t("skills.officialMarket.title")}
+          </ToggleGroupItem>
+          <ToggleGroupItem
+            value="marketplace"
+            className="px-2 text-xs sm:px-3 sm:text-sm sm:min-w-[5.5rem] data-[state=on]:bg-primary data-[state=on]:text-primary-foreground data-[state=on]:border-primary"
+          >
+            {t("skills.skillHub")}
+          </ToggleGroupItem>
+        </ToggleGroup>
+        <div className="flex-1" />
+        {tab === "installed" && <Button
+          variant="outline"
+          onClick={async () => {
+            if (refreshing || loading) return;
+            setRefreshing(true);
+            setError(null);
+            try {
+              let skippedCount = 0;
+              if (serviceRunning) {
+                const res = await safeFetch(`${apiBaseUrl}/api/skills/reload`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({}),
+                  signal: AbortSignal.timeout(180_000),
+                });
+                const data = await res.json();
+                if (data.error) { setError(friendlyError(data.error, t, "reload")); return; }
+                skippedCount = Number(data.skipped_count || 0);
+              }
+              const ok = await loadSkills();
+              if (ok) {
+                if (skippedCount > 0) {
+                  toast.warning(t("skills.refreshedPartial", { count: skippedCount }));
+                } else {
+                  toast.success(t("skills.refreshed"));
+                }
+              }
+            } catch (e) {
+              setError(friendlyError(e, t, "reload"));
+            } finally {
+              setRefreshing(false);
+            }
+          }}
+          disabled={refreshing || loading}
+          title={t("skills.reloadHint")}
+          className="w-full md:w-auto"
+        >
+          {(refreshing || loading) && <Loader2 className="animate-spin mr-1.5" size={14} />}
+          {t("topbar.refresh")}
+        </Button>}
+      </div>
+
+      {tab !== "official" && error && <div className="p-4 rounded-md bg-destructive/10 border border-destructive/20 text-destructive text-sm">{error}</div>}
+
+      <OfficialSkillMarketplace apiBaseUrl={apiBaseUrl} desktopVersion={desktopVersion}
+        visible={tab === "official"} onSkillHub={query => { setMarketSearch(query); setTab("marketplace"); }} />
+
+      {/* 已安装技能 */}
+      {tab === "installed" && (
+        <div className="flex flex-col gap-4">
+          {/* 搜索 + AI 整理 */}
+          {skillsWithConfig.length > 0 && (
+            <Card className="gap-0 border-border/80 py-0 shadow-sm">
+              <CardContent className="p-4">
+                <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
+                  <div className="relative flex-1">
+                    <IconSearch size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+                    <Input
+                      value={installedSearch}
+                      onChange={(e) => setInstalledSearch(e.target.value)}
+                      placeholder={t("skills.filterPlaceholder")}
+                      className="pl-9 h-9 text-sm"
+                    />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    {/* 安装时归类下拉（""=安装到顶层，与旧行为一致） */}
+                    <select
+                      value={installCategory}
+                      onChange={(e) => setInstallCategory(e.target.value)}
+                      className="h-9 rounded-md border border-input bg-background px-2 text-xs text-foreground"
+                      title={t("skills.category.installToTitle")}
+                    >
+                      <option value="">{t("skills.category.installToTop")}</option>
+                      {categories
+                        .filter(c => !c.system_readonly)
+                        .map(c => (
+                          <option key={c.name} value={c.name}>{c.name}</option>
+                        ))}
+                    </select>
+                    {dataMode !== "remote" && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleImportLocal}
+                        disabled={localImporting}
+                        title={t("skills.importLocalTitle")}
+                        className="h-9"
+                      >
+                        {localImporting ? <Loader2 className="animate-spin mr-1.5" size={14} /> : <IconFolderOpen size={14} className="mr-1.5" />}
+                        {t("skills.importLocal")}
+                      </Button>
+                    )}
+                    {serviceRunning && (<>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleAiOrganize}
+                        disabled={!!aiOrganizing}
+                        title={t("skills.aiOrganizeHint")}
+                        className="h-9 bg-gradient-to-br from-indigo-500 to-purple-500 hover:from-indigo-500 hover:to-purple-500 hover:saturate-90 hover:brightness-105 text-white border-0 shadow-md shadow-indigo-500/20"
+                      >
+                        {aiOrganizing ? <Loader2 className="animate-spin mr-1.5" size={14} /> : <IconZap size={14} className="mr-1.5" />}
+                        {aiOrganizing || t("skills.aiOrganize")}
+                      </Button>
+                      {aiOrganizing && aiOrganizeElapsed > 0 && (
+                        <span className="text-xs text-muted-foreground animate-pulse">
+                          {aiOrganizeElapsed}s
+                        </span>
+                      )}
+                    </>)}
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {loading && skillsWithConfig.length === 0 && (
+            <Card className="border-dashed border-border/80 shadow-sm">
+              <CardContent className="flex flex-col items-center justify-center py-16 text-muted-foreground">
+                <Loader2 className="animate-spin mb-3" size={28} />
+                <p className="text-sm">{t("skills.loading")}</p>
+              </CardContent>
+            </Card>
+          )}
+          
+          {!loading && skillsWithConfig.length === 0 && (
+            <Card className="border-dashed border-border/80 shadow-sm">
+              <CardContent className="flex flex-col items-center justify-center py-16">
+                <IconZap size={40} className="text-muted-foreground/30 mb-3" />
+                <p className="text-sm font-bold text-foreground mb-1">{t("skills.noSkills")}</p>
+                <p className="text-xs text-muted-foreground/60 mb-4">{t("skills.noSkillsHint")}</p>
+                <div className="mb-3 flex flex-wrap justify-center gap-2">
+                  <Button onClick={() => setTab("official")}>{t("skills.officialMarket.browse")}</Button>
+                  <Button variant="outline" onClick={() => setTab("marketplace")}>{t("skills.skillHub")}</Button>
+                </div>
+                {dataMode !== "remote" && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleImportLocal}
+                    disabled={localImporting}
+                  >
+                    {localImporting ? <Loader2 className="animate-spin mr-1.5" size={14} /> : <IconFolderOpen size={14} className="mr-1.5" />}
+                    {t("skills.importLocal")}
+                  </Button>
+                )}
+              </CardContent>
+            </Card>
+          )}
+          
+          {installedSearch && visibleSkills.length === 0 && skillsWithConfig.length > 0 && (
+            <Card className="border-dashed border-border/80 shadow-sm">
+              <CardContent className="flex flex-col items-center justify-center py-14">
+                <IconSearch size={32} className="text-muted-foreground/30 mb-3" />
+                <p className="text-sm text-muted-foreground">{t("skills.noResults")}</p>
+              </CardContent>
+            </Card>
+          )}
+          
+          {/* 列表筛选与来源记录 */}
+            <div className="flex items-center gap-3 flex-wrap">
+              {skillsWithConfig.length > 0 && <>
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground select-none">
+                <input
+                  type="checkbox"
+                  checked={groupView}
+                  onChange={(e) => setGroupView(e.target.checked)}
+                />
+                {t("skills.category.groupView")}
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground select-none">
+                <input
+                  type="checkbox"
+                  checked={showSystemSkills}
+                  onChange={(e) => setShowSystemSkills(e.target.checked)}
+                />
+                {t("skills.category.showSystem")}
+              </label>
+              {(sourceRecords.conflicts.length > 0 || sourceFilter) && <label className="flex items-center gap-1.5 text-xs text-muted-foreground select-none cursor-pointer">
+                <input type="checkbox" checked={sourceFilter} onChange={e => setSourceFilter(e.target.checked)} />
+                {t("status.skillConflicts.filter")}
+              </label>}
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8"
+                onClick={() => setCategoryDialogState({ mode: "create" })}
+                title={t("skills.category.createTitle")}
+              >
+                {t("skills.category.create")}
+              </Button>
+              </>}
+              <Button size="sm" variant="outline" className="h-8 sm:ml-auto" onClick={() => setSourceSkill("all")}>
+                <History size={14} aria-hidden="true" />
+                {t("status.skillConflicts.viewSources")}
+                {sourceIds.size > 0 && <Badge variant="secondary" className="tabular-nums" aria-label={t("status.skillConflicts.skillCount", { count: sourceIds.size })}>{sourceIds.size}</Badge>}
+              </Button>
+            </div>
+          {sourceRecords.error && <p role="alert" className="text-sm text-destructive">{sourceRecords.error}</p>}
+
+          {!groupView && (
+            <div className="flex flex-col gap-3">
+              {visibleSkills.map((skill) => (
+                <SkillCard
+                  key={skill.skillId}
+                  skill={skill}
+                  onViewSources={hasSourceRecords(skill) ? () => setSourceSkill(skill) : undefined}
+                  expanded={expandedSkill === skill.skillId}
+                  onToggleExpand={() => setExpandedSkill(expandedSkill === skill.skillId ? null : skill.skillId)}
+                  onToggleEnabled={() => handleToggleEnabled(skill)}
+                  onViewDetail={() => handleViewDetail(skill)}
+                  onUninstall={!skill.system ? () => requestUninstall(skill) : undefined}
+                  uninstalling={uninstallingSet.has(skill.skillId)}
+                  envDraft={envDraft}
+                  onEnvChange={onEnvChange}
+                  onSaveConfig={() => handleSaveConfig(skill)}
+                  saving={saving}
+                  onMoveCategory={!skill.system ? () => openMoveDialog(skill) : undefined}
+                />
+              ))}
+            </div>
+          )}
+
+          {groupView && (() => {
+            // 用 visibleSkills（已按搜索 + 系统过滤）聚合，使分类成员、计数与
+            // 平铺视图保持同源。系统技能在 showSystemSkills 关闭时此处已被剔除，
+            // 因此混合分类内部不会再渲染系统技能（#598 的第二处缺口）。
+            const grouped: Record<string, typeof visibleSkills> = Object.fromEntries(categories.map(c => [c.name, [] as typeof visibleSkills]));
+            for (const s of visibleSkills) {
+              const k = s.category || "Uncategorized";
+              (grouped[k] ||= [] as typeof visibleSkills).push(s);
+            }
+            const sortedNames = Object.keys(grouped).sort((a, b) => a.localeCompare(b));
+            const metaByName = new Map(categories.map(c => [c.name, c]));
+            const searching = installedSearch.trim().length > 0;
+            // 分类显隐规则：
+            //   - 有可见成员的分类：始终显示。
+            //   - 空分类 + 搜索态：隐藏（无匹配的空壳分类是噪声，#598 的根因之一
+            //     正是空的系统分类在搜索时被当成“空”而无条件显示）。
+            //   - 空分类 + 非搜索 + 显示系统技能：保留（含空的系统分类）。
+            //   - 空分类 + 非搜索 + 隐藏系统技能：仅保留“非系统”的空分类，以便用户
+            //     管理自建的空分类；空的系统分类隐藏。
+            // 系统分类的判定依赖 systemCategoryNames（由 system=true 的技能反推），
+            // 因为内置分类的 system_readonly 实际恒为 false，不可作为依据。
+            const isSystemCategory = (catName: string) =>
+              (metaByName.get(catName)?.system_readonly ?? false) || systemCategoryNames.has(catName);
+            const visibleNames = sortedNames.filter((catName) => {
+              const items = grouped[catName];
+              if (items.length > 0) return true;
+              if (searching) return false;
+              if (showSystemSkills) return true;
+              return !isSystemCategory(catName);
+            });
+            return (
+              <div className="flex flex-col gap-4">
+                {visibleNames.map((catName) => {
+                  const meta = metaByName.get(catName);
+                  const items = grouped[catName];
+                  const readonly = meta?.system_readonly ?? false;
+                  const total = items.length;
+                  const enabled = items.filter(s => s.enabled).length;
+                  const massProgress = categoryMassProgress?.category === catName ? categoryMassProgress : null;
+                  const massProgressLabel = massProgress
+                    ? t(`skills.category.massStage.${massProgress.stage || "working"}`, massProgress.message || t("skills.category.massWorking"))
+                    : "";
+                  const collapsed = !expandedCategories.has(catName);
+                  const toggleCollapse = () => setExpandedCategories(prev => {
+                    const next = new Set(prev);
+                    if (next.has(catName)) next.delete(catName); else next.add(catName);
+                    return next;
+                  });
+                  return (
+                    <div
+                      key={catName}
+                      className="flex flex-col rounded-md border border-border/60 bg-card/40 p-3"
+                      aria-busy={!!massProgress}
+                    >
+                      <div
+                        className="flex flex-wrap items-center gap-2 cursor-pointer select-none"
+                        onClick={toggleCollapse}
+                        role="button"
+                        tabIndex={0}
+                        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleCollapse(); } }}
+                      >
+                        {collapsed
+                          ? <ChevronRight size={16} className="text-muted-foreground shrink-0" />
+                          : <ChevronDown size={16} className="text-muted-foreground shrink-0" />}
+                        <div className="font-semibold text-sm text-foreground">
+                          {displayCategoryName(catName)}
+                        </div>
+                        <Badge variant="secondary" className="text-[11px] px-1.5 py-0">
+                          {enabled}/{total}
+                        </Badge>
+                        {meta?.description && (
+                          <span
+                            title={meta.description}
+                            className="text-xs text-muted-foreground line-clamp-1 flex-1 min-w-[8rem] cursor-default"
+                          >
+                            {meta.description}
+                          </span>
+                        )}
+                        <div className="flex-1" />
+                        {(() => {
+                          const isAllSystem = items.length > 0 && items.every(s => s.system);
+                          const massActionDisabled = readonly || isAllSystem;
+                          const editable = meta ? (meta.declared ?? true) : false;
+                          const editDeleteDisabled = massActionDisabled || !editable;
+                          const enableBusy = massProgress?.action === "enable";
+                          const disableBusy = massProgress?.action === "disable";
+                          const busyDisabled = !!categoryBusy;
+                          return (
+                            <div className="flex flex-wrap items-center gap-1" onClick={(e) => e.stopPropagation()}>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 min-w-[4.75rem] px-2 text-xs"
+                                onClick={() => handleCategoryEnableAll(catName)}
+                                disabled={massActionDisabled || busyDisabled}
+                                title={t("skills.category.enableAllTitle")}
+                              >
+                                {enableBusy && <Loader2 className="animate-spin" size={12} />}
+                                {t("skills.category.enableAll")}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 min-w-[4.75rem] px-2 text-xs"
+                                onClick={() => handleCategoryDisableAll(catName)}
+                                disabled={massActionDisabled || busyDisabled}
+                                title={t("skills.category.disableAllTitle")}
+                              >
+                                {disableBusy && <Loader2 className="animate-spin" size={12} />}
+                                {t("skills.category.disableAll")}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 px-2 text-xs"
+                                onClick={() => setCategoryDialogState({
+                                  mode: "edit",
+                                  originalName: catName,
+                                  currentDescription: meta?.description ?? null,
+                                })}
+                                disabled={editDeleteDisabled || busyDisabled}
+                                title={!editable ? t("skills.category.notDeclaredReadonly") : t("skills.category.edit")}
+                              >
+                                {t("skills.category.edit")}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 px-2 text-xs text-destructive hover:text-destructive"
+                                onClick={() => requestCategoryDelete(catName)}
+                                disabled={editDeleteDisabled || busyDisabled}
+                                title={!editable ? t("skills.category.notDeclaredReadonly") : t("skills.category.deleteTitle")}
+                              >
+                                {t("skills.category.delete")}
+                              </Button>
+                            </div>
+                          );
+                        })()}
+                      </div>
+                      {massProgress && (
+                        <div className="mt-3 grid gap-1.5" aria-live="polite">
+                          <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                            <Loader2 className="h-3 w-3 animate-spin shrink-0" />
+                            <span className="min-w-0 flex-1 truncate">{massProgressLabel}</span>
+                            {massProgress.total > 0 && (
+                              <span className="shrink-0 tabular-nums">
+                                {massProgress.processed}/{massProgress.total}
+                              </span>
+                            )}
+                            <span className="shrink-0 tabular-nums">{Math.round(massProgress.percent)}%</span>
+                          </div>
+                          <div
+                            className="h-1.5 overflow-hidden rounded-full bg-muted"
+                            role="progressbar"
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-valuenow={Math.round(massProgress.percent)}
+                          >
+                            <div
+                              className="h-full rounded-full bg-primary transition-[width] duration-300"
+                              style={{ width: `${Math.max(5, Math.min(100, massProgress.percent))}%` }}
+                            />
+                          </div>
+                        </div>
+                      )}
+                      {!collapsed && (
+                        <div className="flex flex-col gap-2 mt-2">
+                          {items.map((skill) => (
+                            <SkillCard
+                              key={skill.skillId}
+                              skill={skill}
+                              onViewSources={hasSourceRecords(skill) ? () => setSourceSkill(skill) : undefined}
+                              expanded={expandedSkill === skill.skillId}
+                              onToggleExpand={() => setExpandedSkill(expandedSkill === skill.skillId ? null : skill.skillId)}
+                              onToggleEnabled={() => handleToggleEnabled(skill)}
+                              onViewDetail={() => handleViewDetail(skill)}
+                              onUninstall={!skill.system ? () => requestUninstall(skill) : undefined}
+                              uninstalling={uninstallingSet.has(skill.skillId)}
+                              envDraft={envDraft}
+                              onEnvChange={onEnvChange}
+                              onSaveConfig={() => handleSaveConfig(skill)}
+                              saving={saving}
+                              onMoveCategory={!skill.system ? () => openMoveDialog(skill) : undefined}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
+        </div>
+      )}
+
+      {/* 技能市场 */}
+      {tab === "marketplace" && (
+        <div className="flex flex-col gap-4">
+          {marketError && <div role="alert" className="rounded-md bg-destructive/10 p-4 text-sm text-destructive">{marketError}</div>}
+          {/* 安全提示 */}
+          <div className="flex items-start gap-2 px-4 py-3 rounded-md bg-amber-500/10 border border-amber-500/20 text-xs text-amber-600 dark:text-amber-400">
+            <span className="font-bold text-sm shrink-0">&#9888;</span>
+            <div className="flex flex-col gap-0.5">
+              <span className="font-bold">{t("skills.securityTitle")}</span>
+              <span className="opacity-80">{t("skills.securityWarning")}</span>
+            </div>
+          </div>
+
+          <Card className="gap-0 border-border/80 py-0 shadow-sm">
+            <CardContent className="p-4">
+              <div className="flex flex-col md:flex-row gap-6">
+                {/* 手动输入链接安装 */}
+                <div className="flex-1 flex flex-col gap-2">
+                  <div className="text-xs font-bold text-foreground/70">
+                    {t("skills.manualInstallTitle")}
+                  </div>
+                  <div className="flex gap-2">
+                    <Input
+                      value={manualUrl}
+                      onChange={(e) => setManualUrl(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter" && manualUrl.trim()) handleManualInstall(); }}
+                      placeholder={t("skills.manualInstallPlaceholder")}
+                      disabled={manualInstalling}
+                      className="h-9 text-sm"
+                    />
+                    <Button
+                      size="sm"
+                      onClick={handleManualInstall}
+                      disabled={!manualUrl.trim() || manualInstalling}
+                      className="h-9"
+                    >
+                      {manualInstalling && <Loader2 className="animate-spin mr-1.5" size={14} />}
+                      {t("skills.install")}
+                    </Button>
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {t("skills.manualInstallHint")}
+                  </div>
+                </div>
+
+                <div className="hidden md:block w-px bg-border/50" />
+
+                {/* 市场搜索 */}
+                <div className="flex-1 flex flex-col gap-2 justify-center">
+                  <div className="relative">
+                    <IconSearch size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+                    <Input
+                      value={marketSearch}
+                      onChange={(e) => setMarketSearch(e.target.value)}
+                      placeholder={t("skills.skillHubSearch")}
+                      className="pl-9 h-9 text-sm"
+                    />
+                  </div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <div className="flex flex-col gap-3">
+            {marketLoading && (
+              <Card className="border-dashed border-border/80 shadow-sm">
+                <CardContent className="flex flex-col items-center justify-center py-16 text-muted-foreground">
+                  <Loader2 className="animate-spin mb-3" size={28} />
+                  <p className="text-sm">{t("common.loading")}</p>
+                </CardContent>
+              </Card>
+            )}
+            
+            {!marketLoading && marketplace.map((skill) => {
+              const uk = skill.canonicalId;
+              return (
+                <MarketplaceSkillCard
+                  key={uk}
+                  skill={skill}
+                  onInstall={() => handleInstall(skill)}
+                  installing={installingSet.has(uk)}
+                  installStatus={installingSet.has(uk) ? installStatus : undefined}
+                />
+              );
+            })}
+            
+            {!marketLoading && !marketError && marketplace.length === 0 && (
+              <Card className="border-dashed border-border/80 shadow-sm">
+                <CardContent className="flex flex-col items-center justify-center py-14">
+                  <IconSearch size={32} className="text-muted-foreground/30 mb-3" />
+                  <p className="text-sm text-muted-foreground">
+                    {marketSearch ? t("skills.noResults") : t("skills.marketEmpty")}
+                  </p>
+                </CardContent>
+              </Card>
+            )}
+          </div>
+          
+          <div className="text-center text-[11px] text-muted-foreground/60 mt-4">
+            {t("skills.poweredBy")} &middot;{" "}
+            <a href="https://skillhub.cn" target="_blank" rel="noreferrer" className="text-primary hover:underline">
+              SkillHub
+            </a>
+          </div>
+        </div>
+      )}
+
+      {/* 技能详情弹窗 */}
+      {detailSkill && (
+        <SkillDetailModal
+          skill={detailSkill}
+          content={detailContent}
+          contentLoading={detailContentLoading}
+          contentError={detailContentError}
+          isEditing={detailEditing}
+          editContent={detailEditContent}
+          savingContent={detailSaving}
+          isSystem={detailSkill.system}
+          serviceRunning={serviceRunning}
+          onClose={handleCloseDetail}
+          onStartEdit={() => { setDetailEditing(true); setDetailEditContent(detailContent); }}
+          onCancelEdit={() => { setDetailEditing(false); setDetailEditContent(""); }}
+          onEditChange={setDetailEditContent}
+          onSave={handleSaveContent}
+          onUninstall={!detailSkill.system ? () => requestUninstall(detailSkill) : undefined}
+          uninstalling={uninstallingSet.has(detailSkill.skillId)}
+        />
+      )}
+
+      {/* 卸载确认弹窗 */}
+      <AlertDialog open={!!uninstallConfirm} onOpenChange={(open) => { if (!open) setUninstallConfirm(null); }}>
+        <AlertDialogContent size="sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("skills.uninstall")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {uninstallConfirm && t("skills.confirmUninstall", {
+                name: uninstallConfirm.name_i18n?.zh || uninstallConfirm.name_i18n?.en || uninstallConfirm.name,
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                const skill = uninstallConfirm!;
+                setUninstallConfirm(null);
+                executeUninstall(skill);
+              }}
+            >
+              {t("skills.uninstall")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* 删除分类确认弹窗 */}
+      <AlertDialog open={!!categoryDeleteConfirm} onOpenChange={(open) => { if (!open) setCategoryDeleteConfirm(null); }}>
+        <AlertDialogContent size="sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("skills.category.deleteTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {categoryDeleteConfirm != null
+                ? t("skills.category.deleteConfirm", { name: displayCategoryName(categoryDeleteConfirm) })
+                : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                const name = categoryDeleteConfirm!;
+                setCategoryDeleteConfirm(null);
+                void executeCategoryDelete(name);
+              }}
+            >
+              {t("skills.category.delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* 分类新建/编辑对话框 */}
+      <CategoryDialog
+        state={categoryDialogState}
+        onClose={() => setCategoryDialogState(null)}
+        onSubmit={handleCategoryDialogSubmit}
+        t={t}
+      />
+
+      {/* 移动到分类对话框 */}
+      <MoveCategoryDialog
+        state={moveCategoryState}
+        categories={moveDialogCategories}
+        onClose={() => setMoveCategoryState(null)}
+        onSubmit={handleMoveSkillSubmit}
+        t={t}
+      />
+
+      {/* AI整理预览确认对话框 */}
+      <AiOrganizePreviewDialog
+        preview={aiOrganizePreview}
+        skills={skills}
+        applying={aiOrganizeApplying}
+        onClose={() => setAiOrganizePreview(null)}
+        onApply={handleApplyAiOrganize}
+        t={t}
+      />
+
+      {/* 未保存更改提示栏 */}
+      {enabledDirty && (
+        <div className="fixed bottom-6 left-1/2 z-[9999] -translate-x-1/2">
+          <div className="flex items-center gap-3 rounded-xl border border-border bg-background px-5 py-3 shadow-lg"
+            style={{ width: "min(560px, 90vw)" }}
+          >
+            <span className="text-sm text-foreground/70 flex-1 min-w-0">
+              {t("skills.unsavedChanges")}
+            </span>
+            <Button variant="outline" size="sm" onClick={handleDiscard}>
+              {t("skills.discardChanges")}
+            </Button>
+            <Button size="sm" disabled={savingEnabled} onClick={handleSaveEnabledState}>
+              {savingEnabled && <Loader2 className="animate-spin mr-1" size={14} />}
+              {t("skills.saveEnabledState")}
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

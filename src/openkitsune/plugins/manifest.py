@@ -1,0 +1,483 @@
+"""Plugin manifest (plugin.json) parsing and validation.
+
+ROADMAP — Phase 3: ``tool_classes`` schema escalation. Tracked in
+``docs/follow-ups/skipped-items-roadmap.md`` §A.2.
+
+When the plugin ecosystem reaches >=95% ``tool_classes`` coverage
+(audited by ``scripts/audit_tool_classes.py``), promote
+``tool_classes`` from optional to required. Migration path:
+
+    1. WARN at install time when missing    (release N+1)
+    2. ERROR at install time, opt-out flag  (release N+2, 2.0 major)
+    3. Remove opt-out flag                  (release N+3)
+
+The deferred validator stub lives in ``installer.py`` as
+``_validate_tool_classes_completeness`` (mode='off' by default). Do
+NOT flip the default away from 'off' or mark ``tool_classes``
+``required`` here until §A.1 backfill hits the coverage threshold;
+unaware plugins would break on install.
+
+RCA cross-ref: ``_skip_items_rca_v11.md`` §2.5.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
+
+from openkitsune.agent.capabilities import (
+    CapabilityDescriptor,
+    CapabilityKind,
+    CapabilityOrigin,
+    CapabilityVisibility,
+    build_capability_id,
+    build_namespace,
+)
+
+logger = logging.getLogger(__name__)
+
+REQUIRED_FIELDS = {"id", "name", "version", "type"}
+VALID_TYPES = {"python", "mcp", "skill"}
+
+_PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9\-_.]{0,128}$")
+
+BASIC_PERMISSIONS = frozenset(
+    {
+        "tools.register",
+        "hooks.basic",
+        "config.read",
+        "config.write",
+        "data.own",
+        "log",
+        "skill",
+    }
+)
+
+ADVANCED_PERMISSIONS = frozenset(
+    {
+        "memory.read",
+        "memory.write",
+        "channel.register",
+        "channel.send",
+        "hooks.message",
+        "hooks.retrieve",
+        "retrieval.register",
+        "search.register",
+        "routes.register",
+        "brain.access",
+        "vector.access",
+        "settings.read",
+        "llm.register",
+        # Cross-plugin Asset Bus: publish/consume intermediate artifacts
+        # via the host-managed assets_bus.db. See docs/asset-bus.md.
+        "assets.publish",
+        "assets.consume",
+    }
+)
+
+SYSTEM_PERMISSIONS = frozenset(
+    {
+        "hooks.all",
+        "memory.replace",
+        "system.config.write",  # reserved: will gate writes to global settings
+    }
+)
+
+ALL_PERMISSIONS = BASIC_PERMISSIONS | ADVANCED_PERMISSIONS | SYSTEM_PERMISSIONS
+
+
+class PluginUIConfig(BaseModel):
+    """UI configuration for plugins that provide a frontend page (Plugin 2.0).
+
+    When present in a manifest, the plugin manager will serve the UI as a
+    static SPA and expose it in the desktop sidebar under the "Apps" group.
+    """
+
+    model_config = {"extra": "allow"}
+
+    entry: str = "ui/dist/index.html"
+    icon: str = ""
+    title: str = ""
+    title_i18n: dict[str, str] = Field(default_factory=dict)
+    sidebar_group: str = "apps"
+    width: int = 0
+    height: int = 0
+    permissions: list[str] = Field(default_factory=list)
+    sandbox: str = "allow-scripts allow-forms allow-same-origin allow-popups"
+
+
+class PluginManifest(BaseModel):
+    """Parsed plugin.json manifest with strict validation."""
+
+    model_config = {"extra": "allow", "frozen": False, "populate_by_name": True}
+
+    id: str
+    name: str
+    version: str
+    plugin_type: str = Field("python", alias="type")
+    entry: str = "plugin.py"
+    description: str = ""
+    author: str = ""
+    license: str = ""
+    homepage: str = ""
+    permissions: list[str] = Field(default_factory=list)
+    requires: dict[str, Any] = Field(default_factory=dict)
+    provides: dict[str, Any] = Field(default_factory=dict)
+    # C10：插件自报每个工具的 ApprovalClass。键 = 工具名（与
+    # ``register_tools`` 里的 ``definitions[].name`` 完全一致），值 =
+    # ``policy_v2.ApprovalClass.value``（如 ``"mutating_scoped"``）。未声明
+    # 或值非法时，该工具走 handler / 启发式回退（与 v1 行为一致）。
+    tool_classes: dict[str, str] = Field(default_factory=dict)
+    # C10：plugin 在 ``on_before_tool_use`` hook 中修改 ``tool_input`` 的
+    # 工具白名单。声明后 ``tool_executor`` 才允许 hook 改 params；同时把
+    # 修改 diff 强制写到 ``data/audit/plugin_param_modifications.jsonl``。
+    # 未声明时改 params 不生效（diff 还原）。R2-12 强制审计的载体。
+    mutates_params: list[str] = Field(default_factory=list)
+    replaces: list[str] = Field(default_factory=list)  # reserved: plugins this one supersedes
+    conflicts: list[str] = Field(default_factory=list)
+    depends: list[str] = Field(default_factory=list)  # reserved: inter-plugin dependency
+    category: str = ""
+    tags: list[str] = Field(default_factory=list)
+    icon: str = ""
+    display_name_zh: str = ""
+    display_name_en: str = ""
+    description_i18n: dict[str, str] = Field(default_factory=dict)
+    review_status: str = "unreviewed"
+    load_timeout: float = 10.0
+    hook_timeout: float = 5.0
+    retrieve_timeout: float = 3.0
+    ui: PluginUIConfig | None = None
+    raw: dict[str, Any] = Field(default_factory=dict, exclude=True)
+
+    @property
+    def has_ui(self) -> bool:
+        """True when the plugin declares a frontend UI page."""
+        return self.ui is not None
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        if not _PLUGIN_ID_RE.match(v):
+            raise ValueError(f"Plugin ID '{v}' is invalid — must match {_PLUGIN_ID_RE.pattern}")
+        return v
+
+    @field_validator("plugin_type")
+    @classmethod
+    def _validate_type(cls, v: str) -> str:
+        if v not in VALID_TYPES:
+            raise ValueError(f"Invalid plugin type '{v}', must be one of {VALID_TYPES}")
+        return v
+
+    @field_validator("entry")
+    @classmethod
+    def _validate_entry(cls, v: str) -> str:
+        if ".." in v:
+            raise ValueError(f"Plugin entry '{v}' must not contain '..'")
+        return v
+
+    @field_validator("load_timeout", "hook_timeout", "retrieve_timeout", mode="before")
+    @classmethod
+    def _coerce_timeout(cls, v: Any, info: ValidationInfo) -> float:
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            defaults = {"load_timeout": 10.0, "hook_timeout": 5.0, "retrieve_timeout": 3.0}
+            return defaults.get(info.field_name, 10.0)
+
+    @field_validator("permissions", mode="before")
+    @classmethod
+    def _validate_permissions(cls, v: Any) -> list[str]:
+        if not isinstance(v, list):
+            raise ValueError(f"'permissions' must be a list, got {type(v).__name__}")
+        return v
+
+    @field_validator("tool_classes", mode="before")
+    @classmethod
+    def _normalize_tool_classes(cls, v: Any) -> dict[str, str]:
+        """C10：归一 tool_classes 为 ``dict[str, str]``，非法值过滤 + WARN。
+
+        值校验放在 ``PluginManager.get_tool_class`` lookup 阶段（懒校验）：
+        manifest 解析期不引入 policy_v2 enum 依赖，避免循环导入和让
+        plugin 安装阶段崩溃。
+        """
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            raise ValueError(
+                f"'tool_classes' must be a dict[tool_name, approval_class], got {type(v).__name__}"
+            )
+        out: dict[str, str] = {}
+        for tool_name, klass in v.items():
+            if not isinstance(tool_name, str) or not tool_name:
+                continue
+            if klass is None:
+                continue
+            out[tool_name] = str(klass).strip().lower()
+        return out
+
+    @field_validator("mutates_params", mode="before")
+    @classmethod
+    def _normalize_mutates_params(cls, v: Any) -> list[str]:
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v] if v else []
+        if not isinstance(v, list):
+            raise ValueError(
+                f"'mutates_params' must be a list of tool names, got {type(v).__name__}"
+            )
+        return [str(name) for name in v if isinstance(name, str) and name]
+
+    @property
+    def basic_permissions(self) -> list[str]:
+        return [p for p in self.permissions if p in BASIC_PERMISSIONS]
+
+    @property
+    def advanced_permissions(self) -> list[str]:
+        return [p for p in self.permissions if p in ADVANCED_PERMISSIONS]
+
+    @property
+    def system_permissions(self) -> list[str]:
+        return [p for p in self.permissions if p in SYSTEM_PERMISSIONS]
+
+    @property
+    def max_permission_level(self) -> str:
+        if self.system_permissions:
+            return "system"
+        if self.advanced_permissions:
+            return "advanced"
+        return "basic"
+
+    @property
+    def origin(self) -> str:
+        return CapabilityOrigin.PLUGIN.value
+
+    @property
+    def namespace(self) -> str:
+        return build_namespace(CapabilityOrigin.PLUGIN, plugin_id=self.id)
+
+    @property
+    def capability_id(self) -> str:
+        return build_capability_id(
+            CapabilityKind.PLUGIN,
+            self.id,
+            origin=CapabilityOrigin.PLUGIN,
+            plugin_id=self.id,
+        )
+
+    @property
+    def permission_profile(self) -> str:
+        return self.max_permission_level
+
+    def to_capability_descriptor(self) -> CapabilityDescriptor:
+        return CapabilityDescriptor(
+            id=self.capability_id,
+            kind=CapabilityKind.PLUGIN,
+            origin=CapabilityOrigin.PLUGIN,
+            namespace=self.namespace,
+            display_name=self.name,
+            description=self.description,
+            version=self.version,
+            visibility=CapabilityVisibility.PUBLIC,
+            permission_profile=self.permission_profile,
+            i18n={
+                "name": {
+                    "zh": self.display_name_zh or self.name,
+                    "en": self.display_name_en or self.name,
+                },
+                "description": dict(self.description_i18n),
+            },
+            metadata={
+                "plugin_type": self.plugin_type,
+                "permissions": list(self.permissions),
+                "review_status": self.review_status,
+                "category": self.category,
+                "tags": list(self.tags),
+            },
+        )
+
+
+class ManifestError(Exception):
+    """Raised when plugin.json is invalid."""
+
+
+def _check_path_safety(value: str, field_name: str, plugin_id: str = "?") -> None:
+    """Reject paths that contain '..' or absolute path components."""
+    if ".." in value:
+        raise ManifestError(
+            f"Plugin '{plugin_id}' field '{field_name}' contains '..' (path traversal): {value!r}"
+        )
+    if value.startswith("/") or (len(value) >= 2 and value[1] == ":"):
+        raise ManifestError(
+            f"Plugin '{plugin_id}' field '{field_name}' is an absolute path: {value!r}"
+        )
+
+
+def _validate_manifest_paths(raw: dict, plugin_id: str) -> None:
+    """Validate all path-like fields in a manifest dict."""
+    entry = raw.get("entry", "")
+    if entry:
+        _check_path_safety(entry, "entry", plugin_id)
+
+    provides = raw.get("provides", {})
+    if isinstance(provides, dict):
+        for key, val in provides.items():
+            if isinstance(val, str) and val:
+                _check_path_safety(val, f"provides.{key}", plugin_id)
+
+    hooks = raw.get("hooks", {})
+    if isinstance(hooks, dict):
+        for key, val in hooks.items():
+            if isinstance(val, str) and val:
+                _check_path_safety(val, f"hooks.{key}", plugin_id)
+
+    mcp_config = raw.get("mcp_config", {})
+    if isinstance(mcp_config, dict):
+        for key in ("command", "cwd"):
+            val = mcp_config.get(key, "")
+            if isinstance(val, str) and val:
+                _check_path_safety(val, f"mcp_config.{key}", plugin_id)
+        for arg in mcp_config.get("args", []):
+            if isinstance(arg, str) and ".." in arg:
+                _check_path_safety(arg, "mcp_config.args[]", plugin_id)
+
+    ui = raw.get("ui")
+    if isinstance(ui, dict):
+        ui_entry = ui.get("entry", "")
+        if ui_entry:
+            _check_path_safety(ui_entry, "ui.entry", plugin_id)
+        ui_icon = ui.get("icon", "")
+        if ui_icon:
+            _check_path_safety(ui_icon, "ui.icon", plugin_id)
+
+
+def parse_manifest(plugin_dir: Path) -> PluginManifest:
+    """Parse and validate a plugin.json file from a plugin directory."""
+    manifest_path = plugin_dir / "plugin.json"
+    if not manifest_path.exists():
+        raise ManifestError(f"Missing plugin.json in {plugin_dir}")
+
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ManifestError(f"Invalid JSON in {manifest_path}: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ManifestError(f"plugin.json must be a JSON object in {manifest_path}")
+
+    missing = REQUIRED_FIELDS - set(raw.keys())
+    if missing:
+        raise ManifestError(f"Missing required fields in {manifest_path}: {missing}")
+
+    permissions = raw.get("permissions", [])
+    if isinstance(permissions, list):
+        unknown = set(permissions) - ALL_PERMISSIONS
+        if unknown:
+            logger.warning(
+                "Plugin '%s' declares unknown permissions: %s (ignored)",
+                raw.get("id", "?"),
+                unknown,
+            )
+            raw = {**raw, "permissions": [p for p in permissions if p in ALL_PERMISSIONS]}
+
+    entry = raw.get("entry")
+    if entry is None:
+        raw = {**raw, "entry": _default_entry(raw.get("type", "python"))}
+
+    _validate_manifest_paths(raw, raw.get("id", "?"))
+
+    try:
+        manifest = PluginManifest.model_validate(raw)
+    except Exception as e:
+        raise ManifestError(f"Manifest validation failed in {manifest_path}: {e}") from e
+
+    manifest.raw = raw
+    return manifest
+
+
+def _default_entry(plugin_type: str) -> str:
+    if plugin_type == "python":
+        return "plugin.py"
+    if plugin_type == "mcp":
+        return "mcp_config.json"
+    if plugin_type == "skill":
+        return "SKILL.md"
+    return "plugin.py"
+
+
+def validate_plugin(plugin_dir: Path) -> list[str]:
+    """Strict validation of a plugin directory. Returns a list of issues (empty = valid).
+
+    Checks:
+    - Manifest schema (strict mode)
+    - SKILL.md frontmatter (if provides.skill exists)
+    - All path fields for traversal
+    - Entry file existence
+    - Hook file existence
+    """
+    issues: list[str] = []
+
+    manifest_path = plugin_dir / "plugin.json"
+    if not manifest_path.exists():
+        return ["plugin.json not found"]
+
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        return [f"Invalid JSON: {e}"]
+
+    if not isinstance(raw, dict):
+        return ["plugin.json must be a JSON object"]
+
+    missing = REQUIRED_FIELDS - set(raw.keys())
+    if missing:
+        issues.append(f"Missing required fields: {missing}")
+
+    pid = raw.get("id", "?")
+
+    try:
+        _validate_manifest_paths(raw, pid)
+    except ManifestError as e:
+        issues.append(str(e))
+
+    try:
+        PluginManifest.model_validate(raw)
+    except Exception as e:
+        issues.append(f"Schema validation: {e}")
+
+    entry = raw.get("entry", _default_entry(raw.get("type", "python")))
+    entry_path = plugin_dir / entry
+    if not entry_path.exists():
+        issues.append(f"Entry file not found: {entry}")
+
+    provides = raw.get("provides", {})
+    if isinstance(provides, dict):
+        skill_file = provides.get("skill", "")
+        if skill_file:
+            skill_path = plugin_dir / skill_file
+            if not skill_path.exists():
+                issues.append(f"Declared skill file not found: {skill_file}")
+            else:
+                skill_md = (
+                    skill_path if skill_path.name.upper() == "SKILL.MD" else skill_path / "SKILL.md"
+                )
+                if skill_md.exists():
+                    try:
+                        content = skill_md.read_text(encoding="utf-8")
+                        if "---" not in content[:50]:
+                            issues.append("SKILL.md missing YAML frontmatter")
+                    except Exception as e:
+                        issues.append(f"Cannot read SKILL.md: {e}")
+
+    permissions = raw.get("permissions", [])
+    if isinstance(permissions, list):
+        unknown = set(permissions) - ALL_PERMISSIONS
+        if unknown:
+            issues.append(f"Unknown permissions: {unknown}")
+
+    return issues

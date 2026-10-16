@@ -1,0 +1,157 @@
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { toText } from "hast-util-to-text";
+import { IconCheck, IconClipboard } from "../../../icons";
+import { copyToClipboard } from "../../../utils/clipboard";
+import { useSmoothReveal } from "../hooks/useSmoothReveal";
+import type { MdModules } from "../utils/chatTypes";
+import { appendAuthToken } from "../utils/chatHelpers";
+
+const MARKDOWN_PREVIEW_CHAR_LIMIT = 40_000;
+
+function resolveMarkdownImageUrl(src: string, apiBaseUrl?: string): string {
+  if (!src) return "";
+  if (src.startsWith("data:") || src.startsWith("blob:")) return src;
+  if (src.startsWith("http")) return appendAuthToken(src);
+  if (src.startsWith("/")) return appendAuthToken(`${apiBaseUrl || ""}${src}`);
+  return src;
+}
+
+function MarkdownCodeBlock({ node, children, ...props }: any) {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+  const feedbackTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (feedbackTimerRef.current !== null) window.clearTimeout(feedbackTimerRef.current);
+  }, []);
+
+  const handleCopy = async () => {
+    const code = node ? toText(node) : "";
+    if (!await copyToClipboard(code)) return;
+
+    setCopied(true);
+    if (feedbackTimerRef.current !== null) window.clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = window.setTimeout(() => {
+      setCopied(false);
+      feedbackTimerRef.current = null;
+    }, 1500);
+  };
+
+  const label = copied ? t("common.copied", "Copied") : t("common.copy", "Copy");
+
+  return (
+    <div className="markdownCodeBlock">
+      <pre {...props}>{children}</pre>
+      <button
+        type="button"
+        className="markdownCodeCopyBtn"
+        onClick={handleCopy}
+        aria-label={label}
+        title={label}
+      >
+        {copied ? <IconCheck size={15} /> : <IconClipboard size={15} />}
+      </button>
+    </div>
+  );
+}
+
+export function MarkdownContent({
+  content,
+  mdModules,
+  className,
+  streaming = false,
+  apiBaseUrl,
+  onImagePreview,
+}: {
+  content: string;
+  mdModules?: MdModules | null;
+  className?: string;
+  streaming?: boolean;
+  apiBaseUrl?: string;
+  onImagePreview?: (displayUrl: string, downloadUrl: string, name: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  // Track whether THIS mounted instance has ever seen streaming=true.
+  // If yes, the user just watched the content arrive — don't slam it shut the
+  // instant streaming flips to false. They can still collapse via the button.
+  // Fresh mounts of historic messages start with wasStreaming=false, so the
+  // preview gate fires normally for genuinely large old messages.
+  const wasStreamingRef = useRef(streaming);
+  if (streaming) wasStreamingRef.current = true;
+  const wasStreaming = wasStreamingRef.current;
+
+  const shouldPreview = !streaming && !wasStreaming && content.length > MARKDOWN_PREVIEW_CHAR_LIMIT;
+  const displayContent = useMemo(() => {
+    // LaTeX 定界符归一已统一在 useMdModules 包装的 ReactMarkdown 里做（全界面一致），
+    // 这里只负责超长内容折叠。
+    if (!shouldPreview || expanded) return content;
+    return `${content.slice(0, MARKDOWN_PREVIEW_CHAR_LIMIT)}\n\n... 内容过长，已折叠 ${content.length - MARKDOWN_PREVIEW_CHAR_LIMIT} 字符。`;
+  }, [content, expanded, shouldPreview]);
+
+  // 流式时匀速逐字揭示（解耦突发到达与显示节奏）；历史消息整段直出、无动画。
+  const revealed = useSmoothReveal(displayContent, streaming);
+  // 把整条 markdown 渲染降级为可中断的低优先级更新：新 token 到达时 React
+  // 可丢弃正在进行的上一帧渲染重来、并在主线程忙时让位给打字/滚动，
+  // 从根上压平"逐 token 重解析重提交"的卡顿（记忆化只治 KaTeX，这个治整棵树）。
+  const renderContent = useDeferredValue(revealed);
+  const markdownComponents = useMemo(() => {
+    const components: Record<string, any> = {
+      pre: MarkdownCodeBlock,
+    };
+    if (onImagePreview) {
+      components.img = ({ node: _node, src, alt, title, ...props }: any) => {
+        const imageUrl = resolveMarkdownImageUrl(String(src || ""), apiBaseUrl);
+        return (
+          <img
+            {...props}
+            src={imageUrl}
+            alt={alt || ""}
+            title={title}
+            role={imageUrl ? "button" : undefined}
+            tabIndex={imageUrl ? 0 : undefined}
+            style={{ ...(props.style || {}), cursor: imageUrl ? "pointer" : props.style?.cursor }}
+            onClick={(e) => {
+              props.onClick?.(e);
+              if (!imageUrl || e.defaultPrevented) return;
+              onImagePreview(imageUrl, imageUrl, alt || title || "image");
+            }}
+            onKeyDown={(e) => {
+              props.onKeyDown?.(e);
+              if (!imageUrl || e.defaultPrevented || (e.key !== "Enter" && e.key !== " ")) return;
+              e.preventDefault();
+              onImagePreview(imageUrl, imageUrl, alt || title || "image");
+            }}
+          />
+        );
+      };
+    }
+    return components;
+  }, [apiBaseUrl, onImagePreview]);
+
+  return (
+    <div className={className}>
+      {mdModules ? (
+        <mdModules.ReactMarkdown
+          remarkPlugins={mdModules.remarkPlugins}
+          rehypePlugins={mdModules.rehypePlugins}
+          components={markdownComponents}
+        >
+          {renderContent}
+        </mdModules.ReactMarkdown>
+      ) : (
+        <div style={{ whiteSpace: "pre-wrap" }}>{renderContent}</div>
+      )}
+      {shouldPreview && (
+        <button
+          type="button"
+          className="msgActionBtn"
+          onClick={() => setExpanded((v) => !v)}
+          style={{ marginTop: 6 }}
+        >
+          {expanded ? "收起长内容" : "展开全文"}
+        </button>
+      )}
+    </div>
+  );
+}

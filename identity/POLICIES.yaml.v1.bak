@@ -1,0 +1,86 @@
+security:
+  enabled: true
+  zones:
+    enabled: true
+    workspace:
+    - ${CWD}
+    controlled: []
+    protected:
+    - C:/Program Files/**
+    - C:/Program Files (x86)/**
+    - C:/Windows/**
+    - C:/ProgramData/**
+    - /usr/**
+    - /bin/**
+    - /sbin/**
+    - /lib/**
+    - /lib64/**
+    - /boot/**
+    - /etc/**
+    - /dev/**
+    - /proc/**
+    - /sys/**
+    - /System/**
+    - /Library/**
+    forbidden:
+    - ~/.ssh/**
+    - ~/.gnupg/**
+    - C:/Windows/System32/config/**
+    - /etc/shadow
+    - /etc/gshadow
+    default_zone: workspace
+  confirmation:
+    enabled: true
+    mode: trust
+    timeout_seconds: 60
+    default_on_timeout: deny
+    confirm_ttl: 120.0
+  command_patterns:
+    enabled: false
+    custom_critical: []
+    custom_high: []
+    excluded_patterns: []
+    blocked_commands:
+    - reg
+    - regedit
+    - netsh
+    - schtasks
+    - sc
+    - wmic
+    - bcdedit
+    - shutdown
+    - taskkill
+  checkpoint:
+    enabled: true
+    max_snapshots: 50
+    snapshot_dir: data/checkpoints
+  self_protection:
+    enabled: false
+    protected_dirs:
+    - data/
+    - identity/
+    - logs/
+    - src/
+    audit_to_file: true
+    audit_path: data/audit/policy_decisions.jsonl
+    death_switch_threshold: 3
+    death_switch_total_multiplier: 3
+  sandbox:
+    enabled: false
+    backend: auto
+    sandbox_risk_levels:
+    - HIGH
+    exempt_commands: []
+    network:
+      allow_in_sandbox: false
+      allowed_domains: []
+  user_allowlist:
+    commands: []
+    tools: []
+  profile:
+    current: trust
+    base: null
+  shell_risk:
+    enabled: true
+  death_switch:
+    enabled: true

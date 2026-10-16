@@ -1,0 +1,134 @@
+"""Runtime registry for installed/enabled/loaded skill state.
+
+The registry is deliberately disk-first. Background installs or updates can
+record a pending revision without mutating the current in-memory skill catalog;
+the next reload/restart promotes the on-disk state to loaded state.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+from openkitsune.runtime_env import _get_openkitsune_root
+
+
+def _registry_path() -> Path:
+    return _get_openkitsune_root() / "skills" / "installed_skills.json"
+
+
+def _read() -> dict[str, Any]:
+    try:
+        raw = _registry_path().read_text(encoding="utf-8")
+        data = json.loads(raw) if raw.strip() else {}
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write(data: dict[str, Any]) -> None:
+    path = _registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _deps_hash(deps: list[str] | tuple[str, ...] | None) -> str:
+    deps_t = sorted({str(dep).strip() for dep in deps or [] if str(dep).strip()})
+    if not deps_t:
+        return ""
+    return hashlib.sha256("\n".join(deps_t).encode("utf-8")).hexdigest()[:16]
+
+
+def _apply_loaded_record(skills: dict[str, Any], record: dict[str, Any], now: int) -> None:
+    skill_id = str(record.get("skill_id") or "").strip()
+    if not skill_id:
+        return
+
+    current = skills.get(skill_id) if isinstance(skills.get(skill_id), dict) else {}
+    dependencies = record.get("dependencies")
+    if not isinstance(dependencies, (list, tuple)):
+        dependencies = []
+    current.update(
+        {
+            "skill_id": skill_id,
+            "source_path": str(record.get("source_path") or ""),
+            "installed": True,
+            "enabled": bool(record.get("enabled", True)),
+            "loaded": True,
+            "dependencies": list(dependencies or []),
+            "deps_hash": _deps_hash(dependencies),
+            "last_loaded_at": now,
+            "pending_update_revision": "",
+            "pending_update_at": 0,
+            "reload_required": False,
+        }
+    )
+    current.setdefault("installed_at", now)
+    current.setdefault("update_policy", "disk-only")
+    skills[skill_id] = current
+
+
+def mark_skills_loaded(records: list[dict[str, Any]]) -> None:
+    """Mark many skills loaded with a single registry read/write."""
+    if not records:
+        return
+    data = _read()
+    skills = data.setdefault("skills", {})
+    if not isinstance(skills, dict):
+        skills = {}
+        data["skills"] = skills
+    now = int(time.time())
+    for record in records:
+        _apply_loaded_record(skills, record, now)
+    _write(data)
+
+
+def mark_skill_loaded(
+    skill_id: str,
+    *,
+    source_path: str,
+    enabled: bool = True,
+    dependencies: list[str] | tuple[str, ...] | None = None,
+) -> None:
+    mark_skills_loaded(
+        [
+            {
+                "skill_id": skill_id,
+                "source_path": source_path,
+                "enabled": enabled,
+                "dependencies": list(dependencies or []),
+            }
+        ]
+    )
+
+
+def mark_skill_pending_update(
+    skill_id: str,
+    *,
+    revision: str,
+    source_path: str = "",
+) -> None:
+    data = _read()
+    skills = data.setdefault("skills", {})
+    current = skills.get(skill_id) if isinstance(skills.get(skill_id), dict) else {}
+    current.update(
+        {
+            "skill_id": skill_id,
+            "source_path": source_path or current.get("source_path", ""),
+            "installed": True,
+            "loaded": bool(current.get("loaded")),
+            "pending_update_revision": revision,
+            "pending_update_at": int(time.time()),
+            "update_policy": "disk-only",
+            "reload_required": True,
+        }
+    )
+    skills[skill_id] = current
+    _write(data)
+
+
+def read_skill_runtime_registry() -> dict[str, Any]:
+    return _read()

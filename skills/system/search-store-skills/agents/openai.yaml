@@ -1,0 +1,9 @@
+interface:
+  display_name: Search Store Skills
+  short_description: Search for Skills on the OpenKitsune Platform Skill Store
+  default_prompt: Use $search-store-skills
+i18n:
+  zh:
+    name: 搜索技能商店
+    description: 在 OpenKitsune 平台 Skill Store 中搜索技能。
+

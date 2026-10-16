@@ -1,0 +1,41 @@
+{
+  "modules": [
+    {
+      "id": "vector-memory",
+      "name": "向量记忆增强",
+      "description": "让 Kitsune 拥有长期记忆，能根据语义搜索历史对话。体积较大（约 2.5GB，含 PyTorch），安装耗时较长",
+      "packages": [
+        "sentence-transformers>=2.2.0,<3.0",
+        "chromadb>=0.4.0",
+        "regex>=2023.6.3,<2025"
+      ],
+      "estimated_size_mb": 2500,
+      "category": "core",
+      "model": {
+        "kind": "sentence-transformers",
+        "name": "shibing624/text2vec-base-chinese"
+      }
+    },
+    {
+      "id": "whisper",
+      "name": "离线语音识别",
+      "description": "使用 OpenAI Whisper 进行离线语音转文字（约 2.5GB，含 PyTorch）",
+      "packages": [
+        "openai-whisper>=20231117",
+        "static-ffmpeg>=2.7"
+      ],
+      "estimated_size_mb": 2500,
+      "category": "media"
+    },
+    {
+      "id": "orchestration",
+      "name": "多智能体协作",
+      "description": "通过 ZeroMQ 支持多智能体协作（约 10MB）",
+      "packages": [
+        "pyzmq>=25.0.0"
+      ],
+      "estimated_size_mb": 10,
+      "category": "agents"
+    }
+  ]
+}

@@ -1,0 +1,4901 @@
+{
+  "version": "1.0",
+  "total": 240,
+  "herbs": [
+    {
+      "id": 1,
+      "name": "桑枝",
+      "taste": "味苦、淡，微辛；苦降湿热，淡渗湿邪，辛散风邪",
+      "color": "外皮黄褐、内皮青白；黄归脾祛湿，青白入肝疏风",
+      "shape": "藤蔓细长枝条四达，象形四肢经络；光滑无刺，专通经络不排脓",
+      "habitat": "平地田野、坡地向阳，水土平和，不寒不燥",
+      "substance": "木质紧实，轻而不浮，通行四肢；无黏汁，不解毒，只通滞",
+      "growth": "春夏采嫩枝，得升发之气，善走四肢上部",
+      "summary": "藤蔓通肢节+淡苦渗湿+向阳平和，风湿四肢麻木、肩臂酸痛，久服不伤正",
+      "taste_keywords": [
+        "辛",
+        "苦",
+        "淡"
+      ],
+      "color_keywords": [
+        "青",
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "藤蔓",
+        "有刺"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "桂枝",
+      "taste": "味辛、甘，温；辛散风寒，甘温补中",
+      "color": "外皮红棕色，赤色入心通血脉，淡黄入脾温阳",
+      "shape": "细枝藤蔓四向舒展，直达四肢末梢；枝茎圆形，温通柔和",
+      "habitat": "南方温热山林，喜暖恶寒，得天阳温气",
+      "substance": "木枝轻薄，上浮走表，油脂温润通血脉",
+      "growth": "春夏嫩枝药力最胜，生发之气足",
+      "summary": "红赤色活血+藤蔓走四肢+辛温散表，风寒痹痛、四肢冷痛、血寒瘀滞",
+      "taste_keywords": [
+        "辛",
+        "甘"
+      ],
+      "color_keywords": [
+        "赤",
+        "黄"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "络石藤",
+      "taste": "味苦，微寒；苦清血热，入肝通络",
+      "color": "茎叶青褐，青色入肝，清血分风热",
+      "shape": "攀援细藤缠绕石上，善通筋骨深层瘀滞；藤蔓纤细，专走细小络脉",
+      "habitat": "山石阴湿岩壁而生，善除深部湿痹",
+      "substance": "柔韧多汁，润养筋脉",
+      "growth": "夏秋药力最佳，清湿热",
+      "summary": "石生境清湿热+细藤通微络，风湿热痹、筋脉拘挛",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "忍冬藤",
+      "taste": "味甘微苦，寒",
+      "color": "青茎白花；青入肝，白入肺",
+      "shape": "缠绕长藤通经络",
+      "habitat": "田间山野，喜湿润",
+      "substance": "中空多汁，利水清热",
+      "growth": "夏秋采收",
+      "summary": "中空利水+藤通关节+甘寒解毒，风湿痹痛兼皮肤疮毒",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "白"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "鸡血藤",
+      "taste": "味苦甘温",
+      "color": "茎断有红汁，赤色入心活血",
+      "shape": "粗壮长藤贯通周身",
+      "habitat": "南方山林阴坡",
+      "substance": "胶汁黏润，补血通络",
+      "growth": "秋冬采老藤，沉降治腰腿",
+      "summary": "红浆活血+粗藤通周身，血虚兼风湿麻木首选",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "海风藤",
+      "taste": "味辛、苦，温",
+      "color": "茎皮青褐",
+      "shape": "长藤缠绕多节，善走关节",
+      "habitat": "近海山野，得海风水湿之气",
+      "substance": "质韧多节",
+      "growth": "夏秋采收",
+      "summary": "藤蔓通关节+辛温散湿，风湿痹痛、关节屈伸不利",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "藤蔓",
+        "竹节"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "青风藤",
+      "taste": "味苦、辛，平",
+      "color": "茎青绿",
+      "shape": "细长藤蔓缠绕升攀，通经络",
+      "habitat": "山林湿润处",
+      "substance": "质轻而韧",
+      "growth": "夏秋采收",
+      "summary": "青色入肝+藤蔓通络，风湿痹痛、肢体麻木",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 8,
+      "name": "天仙藤",
+      "taste": "味苦，温",
+      "color": "茎青褐",
+      "shape": "藤蔓细长，气香走窜",
+      "habitat": "山坡林缘",
+      "substance": "质轻气香",
+      "growth": "夏季采收",
+      "summary": "藤蔓通络+气香走窜，风湿痹痛、脘腹疼痛",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 9,
+      "name": "首乌藤",
+      "taste": "味甘，平",
+      "color": "茎皮紫褐，断面红棕色",
+      "shape": "藤蔓缠绕，通经络、安心神",
+      "habitat": "山坡灌丛",
+      "substance": "质韧多液",
+      "growth": "秋冬采收",
+      "summary": "藤蔓通络+色赤入血，血虚失眠兼风湿痹痛",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤",
+        "黑"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 10,
+      "name": "钩藤",
+      "taste": "味甘，微寒",
+      "color": "茎节有双钩，赤褐色",
+      "shape": "茎枝有双钩，象形筋脉挛急",
+      "habitat": "山谷溪边湿润处",
+      "substance": "质韧轻柔",
+      "growth": "春夏采带钩枝",
+      "summary": "钩刺通络+甘寒清热，小儿惊风、肝阳头痛、筋脉拘挛",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 11,
+      "name": "丝瓜络",
+      "taste": "味甘，平",
+      "color": "老熟后黄白交络，白入肺",
+      "shape": "老络中空如网络，象形人体脉络",
+      "habitat": "田园栽培",
+      "substance": "质轻中空，通利水道",
+      "growth": "秋老采收",
+      "summary": "中空利水+网络通络，风湿痹痛、乳汁不通、水肿",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "中空"
+      ]
+    },
+    {
+      "id": 12,
+      "name": "竹茹",
+      "taste": "味甘，微寒",
+      "color": "青黄",
+      "shape": "竹茎刮取纤维，中空通气",
+      "habitat": "竹林阴湿",
+      "substance": "质轻柔韧",
+      "growth": "四季可采",
+      "summary": "中空通气+甘寒清热，痰热咳嗽、心烦呕吐",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "青",
+        "黄"
+      ],
+      "shape_keywords": [
+        "中空"
+      ]
+    },
+    {
+      "id": 13,
+      "name": "木通",
+      "taste": "味苦，寒",
+      "color": "茎皮灰褐，内皮淡黄",
+      "shape": "藤蔓细长，茎中有细孔中空通利",
+      "habitat": "山野林间",
+      "substance": "质轻而韧",
+      "growth": "夏秋采收",
+      "summary": "中空利水+苦寒清热，湿热淋证、水肿、心烦尿赤",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "中空",
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 14,
+      "name": "通草",
+      "taste": "味甘、淡，微寒",
+      "color": "茎白，色白入肺",
+      "shape": "茎髓中空轻盈如海绵，象形水道",
+      "habitat": "南方林间",
+      "substance": "极轻中空",
+      "growth": "秋季采收茎髓",
+      "summary": "中空极轻+淡渗利水，湿热淋证、水肿、乳汁不通",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": [
+        "中空"
+      ]
+    },
+    {
+      "id": 15,
+      "name": "丁公藤",
+      "taste": "味辛，温；有毒",
+      "color": "茎皮黄褐",
+      "shape": "粗藤有节，节膨大，善走关节",
+      "habitat": "南方山林湿热地",
+      "substance": "质坚硬",
+      "growth": "夏秋采收",
+      "summary": "粗藤走关节+辛温散寒，风寒湿痹（有毒慎用）",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "藤蔓",
+        "竹节"
+      ]
+    },
+    {
+      "id": 16,
+      "name": "石楠藤",
+      "taste": "味辛、苦，温",
+      "color": "茎叶青绿",
+      "shape": "细藤密叶攀附石上，通络祛风",
+      "habitat": "山石阴湿处",
+      "substance": "质韧气香",
+      "growth": "夏秋采收",
+      "summary": "藤蔓通络+辛温散寒，风寒湿痹、腰膝酸软",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 17,
+      "name": "宽筋藤",
+      "taste": "味微苦，凉",
+      "color": "茎青绿",
+      "shape": "藤蔓粗长，善舒缓筋脉挛急",
+      "habitat": "南方山林",
+      "substance": "质柔韧",
+      "growth": "夏秋采收",
+      "summary": "藤蔓通络+苦凉清热，筋脉挛急、风湿热痹",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 18,
+      "name": "千斤拔",
+      "taste": "味甘、淡，平",
+      "color": "根皮黄褐",
+      "shape": "根粗长深入，形如千斤力拔，通腰膝",
+      "habitat": "山坡草地",
+      "substance": "质重坚实",
+      "growth": "秋冬采根",
+      "summary": "根粗质重沉降+甘淡渗湿，腰膝酸软、风湿痹痛",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 19,
+      "name": "牛膝",
+      "taste": "味苦、酸，平",
+      "color": "茎节膨大如牛膝，紫褐色",
+      "shape": "茎节膨大，善引血下行、壮腰膝",
+      "habitat": "山野路旁",
+      "substance": "质硬而韧",
+      "growth": "秋冬采收",
+      "summary": "茎节象形膝部+酸苦下行，腰膝酸痛、经闭、淋证",
+      "taste_keywords": [
+        "酸",
+        "苦"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "竹节"
+      ]
+    },
+    {
+      "id": 20,
+      "name": "威灵仙",
+      "taste": "味辛、咸，温",
+      "color": "茎暗褐",
+      "shape": "藤蔓多须根，走窜通络，消骨鲠",
+      "habitat": "山坡林缘",
+      "substance": "质韧气烈",
+      "growth": "夏秋采收",
+      "summary": "藤蔓走窜+辛温散湿+咸软坚，风湿痹痛、骨鲠咽喉",
+      "taste_keywords": [
+        "辛",
+        "咸"
+      ],
+      "color_keywords": [],
+      "shape_keywords": [
+        "藤蔓",
+        "根"
+      ]
+    },
+    {
+      "id": 21,
+      "name": "夜交藤",
+      "taste": "味甘、微苦，平",
+      "color": "茎紫褐",
+      "shape": "藤蔓交错，昼开夜合，安神通络",
+      "habitat": "山坡路旁",
+      "substance": "质韧多汁",
+      "growth": "夏秋采收",
+      "summary": "藤蔓通络+甘平安神，血虚失眠、风湿痹痛",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 22,
+      "name": "白毛藤",
+      "taste": "味微苦，平",
+      "color": "茎叶有白毛，白入肺",
+      "shape": "全株密被白毛，祛风解毒",
+      "habitat": "山野林缘",
+      "substance": "质轻有毛",
+      "growth": "夏秋采收",
+      "summary": "有毛祛风+色白入肺，风热感冒、湿热黄疸",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": [
+        "多毛"
+      ]
+    },
+    {
+      "id": 23,
+      "name": "葡萄藤",
+      "taste": "味甘、涩，平",
+      "color": "茎青褐",
+      "shape": "攀援长藤，通经络、利水道",
+      "habitat": "田园栽培",
+      "substance": "质坚韧多汁",
+      "growth": "夏秋采收",
+      "summary": "藤蔓通络+甘涩收敛，风湿痹痛、小便不利",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 24,
+      "name": "南蛇藤",
+      "taste": "味微辛，温",
+      "color": "茎皮黄褐",
+      "shape": "藤蔓粗长缠绕入骨，祛风湿活血脉",
+      "habitat": "山坡林缘",
+      "substance": "质坚气香",
+      "growth": "夏秋采收",
+      "summary": "粗藤走筋骨+辛温散寒，风湿痹痛、跌打损伤",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 25,
+      "name": "穿山龙",
+      "taste": "味苦，平",
+      "color": "根茎黄褐，断面白色",
+      "shape": "根茎横走如龙穿山，通经络化痰浊",
+      "habitat": "山坡林缘",
+      "substance": "质坚韧",
+      "growth": "春秋采根茎",
+      "summary": "根茎横走通络+苦平化痰，风湿痹痛、痰热咳嗽",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 26,
+      "name": "伸筋草",
+      "taste": "味微苦、辛，温",
+      "color": "全草淡绿",
+      "shape": "茎匍匐细长如索，善于伸筋展骨",
+      "habitat": "山坡草地",
+      "substance": "质软如丝",
+      "growth": "夏秋采收",
+      "summary": "细藤通筋+辛温散湿，筋脉挛急、风湿痹痛",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 27,
+      "name": "透骨草",
+      "taste": "味辛，温",
+      "color": "茎青绿",
+      "shape": "全株有细毛，走经入骨",
+      "habitat": "山坡路旁",
+      "substance": "质柔气香",
+      "growth": "夏秋采收",
+      "summary": "有毛祛风+辛温透骨，风寒湿痹、筋骨挛痛",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "多毛"
+      ]
+    },
+    {
+      "id": 28,
+      "name": "松节",
+      "taste": "味苦，温",
+      "color": "黄褐色，松脂明显",
+      "shape": "松树枝节，象形人体骨节",
+      "habitat": "山林松树",
+      "substance": "质重坚硬，富含松脂",
+      "growth": "全年可采",
+      "summary": "木节象形骨节+苦温燥湿，风寒湿痹、关节肿痛",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "竹节"
+      ]
+    },
+    {
+      "id": 29,
+      "name": "柳枝",
+      "taste": "味微苦，寒",
+      "color": "枝青黄",
+      "shape": "柳枝柔韧细长，象形四肢经络",
+      "habitat": "水边湿地",
+      "substance": "质韧中空",
+      "growth": "春夏采收",
+      "summary": "水生+中空利水+枝走四肢，风湿热痹、湿热证",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 30,
+      "name": "槐枝",
+      "taste": "味微苦，平",
+      "color": "枝青褐",
+      "shape": "细枝通达四肢",
+      "habitat": "向阳山坡",
+      "substance": "质轻韧",
+      "growth": "夏秋采收",
+      "summary": "枝走四肢+苦平清热，风湿痹痛、皮肤瘙痒",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 31,
+      "name": "桃枝",
+      "taste": "味微苦，平",
+      "color": "枝赤褐，赤色入心",
+      "shape": "细枝通达四肢、活血通络",
+      "habitat": "田园山林",
+      "substance": "质韧",
+      "growth": "夏秋采收",
+      "summary": "色赤入血+枝走四肢，风湿痹痛、血瘀证",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 32,
+      "name": "皂角藤",
+      "taste": "味辛，温；有小毒",
+      "color": "茎青褐，刺尖锐",
+      "shape": "茎有锐刺，刺能排脓通窍",
+      "habitat": "山坡林缘",
+      "substance": "质坚气烈",
+      "growth": "夏秋采收",
+      "summary": "有刺排脓+辛温通窍，疮痈肿毒、痰浊闭阻",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "有刺"
+      ]
+    },
+    {
+      "id": 33,
+      "name": "菝葜",
+      "taste": "味甘、淡，平",
+      "color": "根茎黄褐",
+      "shape": "根茎块状多刺，通利关节",
+      "habitat": "山坡林缘",
+      "substance": "质坚硬",
+      "growth": "秋冬采根茎",
+      "summary": "有刺通利+甘淡渗湿，风湿痹痛、湿热淋浊",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "有刺",
+        "竹节",
+        "根"
+      ]
+    },
+    {
+      "id": 34,
+      "name": "土茯苓藤",
+      "taste": "味甘、淡，平",
+      "color": "根茎黄白，白入肺",
+      "shape": "藤蔓攀援根茎块状，解毒通利",
+      "habitat": "山坡林缘",
+      "substance": "质坚粉性",
+      "growth": "秋冬采根茎",
+      "summary": "藤蔓通络+甘淡解毒，梅毒疮毒、风湿痹痛",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "藤蔓",
+        "根"
+      ]
+    },
+    {
+      "id": 35,
+      "name": "九节风",
+      "taste": "味微辛，温",
+      "color": "茎青绿多节",
+      "shape": "茎多节如竹，通经络散风",
+      "habitat": "山野阴湿",
+      "substance": "质韧气香",
+      "growth": "夏秋采收",
+      "summary": "多节象形关节+辛温散风，风湿痹痛、跌打损伤",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "竹节"
+      ]
+    },
+    {
+      "id": 36,
+      "name": "过江龙",
+      "taste": "味微苦，凉",
+      "color": "茎青褐",
+      "shape": "藤蔓粗长横走如龙过江，通经络",
+      "habitat": "水边湿地",
+      "substance": "质韧中空",
+      "growth": "夏秋采收",
+      "summary": "水生+藤通经络，风湿痹痛、湿热淋浊",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 37,
+      "name": "四方藤",
+      "taste": "味微辛，平",
+      "color": "方茎青绿，茎方善发散",
+      "shape": "方茎四棱，发散祛风通络",
+      "habitat": "山坡林缘",
+      "substance": "质轻气香",
+      "growth": "夏秋采收",
+      "summary": "方茎发散+藤通经络，风湿痹痛、皮肤风疹",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "方茎"
+      ]
+    },
+    {
+      "id": 38,
+      "name": "鸡屎藤",
+      "taste": "味甘、涩，平",
+      "color": "茎叶青褐",
+      "shape": "藤蔓缠绕，气臭通窍",
+      "habitat": "山坡路旁",
+      "substance": "质韧气臭",
+      "growth": "夏秋采收",
+      "summary": "藤蔓通络+气臭走窜，风湿痹痛、痰浊阻络",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 39,
+      "name": "丝棉木",
+      "taste": "味苦，凉",
+      "color": "茎皮黄白",
+      "shape": "细枝通达",
+      "habitat": "山坡林缘",
+      "substance": "质轻韧",
+      "growth": "夏秋采收",
+      "summary": "枝走肢节+苦凉清热，风湿热痹",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 40,
+      "name": "爬山虎",
+      "taste": "味甘、涩，温",
+      "color": "茎青褐",
+      "shape": "攀援藤蔓有吸盘，吸附石壁活血通络",
+      "habitat": "山壁墙垣",
+      "substance": "质韧多须",
+      "growth": "夏秋采收",
+      "summary": "藤蔓有吸盘通络+甘温活血，风湿痹痛、跌打损伤\n\n---\n\n## 第二部分：根茎补益沉降类（40味）",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 41,
+      "name": "人参",
+      "taste": "味甘微苦，微温",
+      "color": "根皮淡黄白，黄补脾，白润肺",
+      "shape": "主根肥厚，须根四散，象形五脏元气汇聚；无刺无毛，纯补无散",
+      "habitat": "高山阴坡林下，得清阳之气",
+      "substance": "肉质肥厚紧实，重浊沉降，大补下焦元气",
+      "growth": "秋冬采根，收藏之气足，固元固本",
+      "summary": "高山清阳+厚根重质+甘味温补，大补元气，虚劳内伤专用",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "多毛",
+        "有刺",
+        "根"
+      ]
+    },
+    {
+      "id": 42,
+      "name": "熟地黄",
+      "taste": "味甘，微温；纯甘滋阴填精",
+      "color": "纯黑，直入肾，补阴血",
+      "shape": "大块直根下行入下焦，无旁枝，专攻肝肾",
+      "habitat": "平地沃土，水土充足，得阴湿之气",
+      "substance": "黏润厚重，沉降入骨填髓",
+      "growth": "秋后采根，久蒸久晒，敛藏纯阴之气",
+      "summary": "黑色入肾+黏重沉降+沃土阴液，血虚肾亏、骨蒸潮热",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 43,
+      "name": "黄芪",
+      "taste": "味甘温，淡渗",
+      "color": "外皮黄白，黄专补脾，白走肌表",
+      "shape": "长直主根，中空疏松，中空利水走肌表",
+      "habitat": "北方旱地山坡，阳气充足，升阳不滋腻",
+      "substance": "根体轻虚，能升提中气，不沉降",
+      "growth": "春秋采根，升发之气盛，固表升阳",
+      "summary": "中空利水+旱地升阳+黄入脾，气虚自汗、脾虚水肿",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "中空",
+        "根"
+      ]
+    },
+    {
+      "id": 44,
+      "name": "附子",
+      "taste": "味大辛大热",
+      "color": "外皮黑褐，黑入肾温元阳",
+      "shape": "块根厚实，侧根附生，直达下焦命门",
+      "habitat": "低温水田，阴寒之地，制阴寒偏气",
+      "substance": "坚实厚重，沉降下焦，破沉寒痼冷",
+      "growth": "秋后采根，收藏温阳之气",
+      "summary": "黑根入肾+质重沉降+大辛热，命门火衰、四肢厥冷、寒湿痹痛",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "根",
+        "果籽"
+      ]
+    },
+    {
+      "id": 45,
+      "name": "党参",
+      "taste": "味甘，平",
+      "color": "根皮黄白；黄入脾",
+      "shape": "根条长直稍分枝，补中益气",
+      "habitat": "山地林缘向阳",
+      "substance": "质柔韧味甜",
+      "growth": "秋冬采根",
+      "summary": "甘补脾肺+黄入中土，脾虚食少、肺虚咳喘",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 46,
+      "name": "白术",
+      "taste": "味甘、苦，温",
+      "color": "外皮黄褐，断面黄白",
+      "shape": "根茎肥厚团块，气清香，燥湿健脾",
+      "habitat": "山坡林缘凉爽处",
+      "substance": "质坚实，香气浓",
+      "growth": "秋冬采根茎",
+      "summary": "甘补脾+苦燥湿+香醒脾，脾虚湿盛、食少便溏",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 47,
+      "name": "山药",
+      "taste": "味甘，平",
+      "color": "外皮黄褐，肉白，白入肺",
+      "shape": "根条长直，黏液丰厚，补脾肺肾",
+      "habitat": "山坡沙质壤土",
+      "substance": "质黏润多汁",
+      "growth": "秋冬采根",
+      "summary": "甘补+白入肺+黏润滋阴，脾虚泄泻、肺虚咳喘、肾虚遗精",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 48,
+      "name": "甘草",
+      "taste": "味甘，平",
+      "color": "外皮红褐，内黄，黄入脾",
+      "shape": "根长直圆润，象形甘缓和缓",
+      "habitat": "干旱沙地向阳",
+      "substance": "质坚粉性，味甘甜",
+      "growth": "秋冬采根",
+      "summary": "纯甘补中+圆润缓和，调和诸药、补脾益气",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤",
+        "黄"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 49,
+      "name": "当归",
+      "taste": "味甘、辛、苦，温",
+      "color": "外皮黄褐，断面黄白油润",
+      "shape": "根肥厚多分枝，油润养血，辛散活血",
+      "habitat": "高山凉爽湿润处",
+      "substance": "质油润柔韧",
+      "growth": "秋冬采根",
+      "summary": "甘补+辛散+油润，血虚血瘀、月经不调、肠燥便秘",
+      "taste_keywords": [
+        "辛",
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 50,
+      "name": "白芍",
+      "taste": "味苦、酸，微寒",
+      "color": "外皮红褐，断面白",
+      "shape": "根条光滑圆润，象形柔肝缓急",
+      "habitat": "山坡林缘凉爽处",
+      "substance": "质坚实粉性足",
+      "growth": "秋冬采根",
+      "summary": "酸收敛肝+苦降火+白入肺，肝血虚痛、月经不调",
+      "taste_keywords": [
+        "酸",
+        "苦"
+      ],
+      "color_keywords": [
+        "赤",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 51,
+      "name": "川芎",
+      "taste": "味辛，温",
+      "color": "外皮黄褐，断面黄白有油点",
+      "shape": "根茎不规则团块，辛香走窜上行头目",
+      "habitat": "山坡凉爽湿润",
+      "substance": "质坚实香气浓",
+      "growth": "夏季采根茎",
+      "summary": "辛香走窜上行+温通血脉，头痛、血瘀气滞",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 52,
+      "name": "牛膝",
+      "taste": "味苦、酸，平",
+      "color": "外皮黄褐",
+      "shape": "根细长茎节膨大如膝，引血下行",
+      "habitat": "山坡路旁湿润",
+      "substance": "质硬而韧",
+      "growth": "秋冬采根",
+      "summary": "根长下行+酸苦降，腰膝酸痛、经闭、淋证",
+      "taste_keywords": [
+        "酸",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "竹节",
+        "根"
+      ]
+    },
+    {
+      "id": 53,
+      "name": "丹参",
+      "taste": "味苦，微寒",
+      "color": "外皮红棕，断面红，赤入心活血",
+      "shape": "根条长直稍分枝，通心脉",
+      "habitat": "山坡向阳处",
+      "substance": "质坚实致密",
+      "growth": "秋冬采根",
+      "summary": "色赤入心+苦寒清热+根通心脉，血瘀经闭、心痛、热痹",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 54,
+      "name": "玄参",
+      "taste": "味甘、苦、咸，微寒",
+      "color": "外皮灰褐，断面黑，黑入肾",
+      "shape": "根条粗长，润燥滋阴降火",
+      "habitat": "山坡林缘湿润",
+      "substance": "质润多汁",
+      "growth": "秋冬采根",
+      "summary": "色黑入肾+咸软坚+苦降火，阴虚火旺、瘰疬痰核",
+      "taste_keywords": [
+        "甘",
+        "苦",
+        "咸"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 55,
+      "name": "麦冬",
+      "taste": "味甘、微苦，微寒",
+      "color": "外皮淡黄，肉白，白入肺",
+      "shape": "根纺锤形肥厚多汁，养阴润肺",
+      "habitat": "山坡林缘湿润",
+      "substance": "质柔韧多汁",
+      "growth": "夏秋采根",
+      "summary": "甘润+白入肺+多汁滋阴，肺燥干咳、心烦口渴",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 56,
+      "name": "天冬",
+      "taste": "味甘、苦，大寒",
+      "color": "外皮灰黄，肉白半透明",
+      "shape": "根纺锤形肥厚油润，滋阴降火",
+      "habitat": "山坡阴湿",
+      "substance": "质油润多液",
+      "growth": "秋冬采根",
+      "summary": "甘润+白入肺+大寒清热，肺燥干咳、阴虚火旺",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 57,
+      "name": "巴戟天",
+      "taste": "味辛、甘，微温",
+      "color": "外皮灰褐，断面紫黑",
+      "shape": "根扁圆柱形肉质多须，补肾阳",
+      "habitat": "山野凉爽处",
+      "substance": "质韧肉厚",
+      "growth": "秋冬采根",
+      "summary": "辛甘温+根多须入肾，肾阳虚、阳痿、腰膝冷痛",
+      "taste_keywords": [
+        "辛",
+        "甘"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 58,
+      "name": "肉苁蓉",
+      "taste": "味甘、咸，温",
+      "color": "外皮棕褐，断面黑褐",
+      "shape": "根茎肉质肥厚鳞片覆瓦状，补肾阳益精血",
+      "habitat": "沙漠干旱地",
+      "substance": "质柔韧油润",
+      "growth": "春采秋采",
+      "summary": "肉质厚润+甘咸温补肾阳，阳痿不孕、腰膝冷痛、肠燥便秘",
+      "taste_keywords": [
+        "甘",
+        "咸"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 59,
+      "name": "杜仲",
+      "taste": "味甘，温",
+      "color": "外皮灰褐，断面银丝相连象形筋骨",
+      "shape": "树皮，折断银丝连牵，壮筋强骨",
+      "habitat": "山坡温暖湿润",
+      "substance": "质韧，银丝富弹性",
+      "growth": "春夏剥皮",
+      "summary": "银丝连骨象形筋骨+甘温补肝肾，腰膝酸软、胎动不安",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [],
+      "shape_keywords": []
+    },
+    {
+      "id": 60,
+      "name": "续断",
+      "taste": "味苦、辛，微温",
+      "color": "外皮黄褐，断面黑绿",
+      "shape": "根长条，主续筋骨通血脉",
+      "habitat": "山坡凉爽处",
+      "substance": "质韧粉性",
+      "growth": "秋冬采根",
+      "summary": "辛散+根续筋骨，跌打损伤、腰膝酸软、胎漏",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "黄",
+        "黑"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 61,
+      "name": "骨碎补",
+      "taste": "味苦，温",
+      "color": "外皮深褐，密被金色鳞片",
+      "shape": "根茎密被金毛，形如碎骨复生",
+      "habitat": "附生树干石壁",
+      "substance": "质硬脆",
+      "growth": "全年可采",
+      "summary": "金毛入肾+象形碎骨复生，肾虚腰痛、骨折伤损",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [],
+      "shape_keywords": [
+        "多毛",
+        "根"
+      ]
+    },
+    {
+      "id": 62,
+      "name": "独活",
+      "taste": "味辛、苦，微温",
+      "color": "外皮灰褐，断面黄白有油点",
+      "shape": "根粗长香气浓，祛风胜湿散寒",
+      "habitat": "高山阴坡凉爽",
+      "substance": "质坚实油润",
+      "growth": "秋冬采根",
+      "summary": "辛温散寒+香气走窜，风寒湿痹、腰膝酸痛",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 63,
+      "name": "羌活",
+      "taste": "味辛、苦，温",
+      "color": "外皮棕褐，断面黄白",
+      "shape": "根茎粗长香气烈，散上半身风寒湿",
+      "habitat": "高山林缘凉爽",
+      "substance": "质松气香",
+      "growth": "夏秋采根茎",
+      "summary": "辛温气烈上行+香燥湿，风寒感冒、上半身风湿痹痛",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 64,
+      "name": "防风",
+      "taste": "味辛、甘，微温",
+      "color": "外皮灰褐，断面黄白有裂隙",
+      "shape": "根长直体轻虚，象形防御风邪",
+      "habitat": "山坡林缘",
+      "substance": "质松泡",
+      "growth": "春秋采根",
+      "summary": "体轻虚散+辛甘祛风+黄入脾，风寒感冒、风疹瘙痒",
+      "taste_keywords": [
+        "辛",
+        "甘"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 65,
+      "name": "苍术",
+      "taste": "味辛、苦，温",
+      "color": "外皮灰褐，断面朱砂点",
+      "shape": "根茎粗壮肥厚香气特异，燥湿健脾",
+      "habitat": "山坡凉爽",
+      "substance": "质坚实油润",
+      "growth": "春秋采根茎",
+      "summary": "辛温香燥+赤点入血+黄入脾，湿困脾土、风湿痹痛",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 66,
+      "name": "泽泻",
+      "taste": "味甘、淡，寒",
+      "color": "外皮黄白，肉白",
+      "shape": "根茎类圆球状多须根，专利水道",
+      "habitat": "水泽湿地",
+      "substance": "质轻粉性",
+      "growth": "秋冬采根茎",
+      "summary": "水生+白入肺+淡渗利水，湿热淋证、水肿",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 67,
+      "name": "郁金",
+      "taste": "味辛、苦，寒",
+      "color": "外皮灰褐，断面亮黄或暗红",
+      "shape": "根茎类圆辛香走窜，活血行气解郁",
+      "habitat": "山坡林缘",
+      "substance": "质坚实气香",
+      "growth": "秋冬采根茎",
+      "summary": "色黄入脾+辛香行气+苦寒清热，气滞血瘀、胸胁痛",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "赤",
+        "黄"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 68,
+      "name": "香附",
+      "taste": "味辛、微苦、微甘，平",
+      "color": "外皮棕褐，断面黄白",
+      "shape": "根茎纺锤形香气浓，疏肝解郁理气",
+      "habitat": "山坡草地田间",
+      "substance": "质坚实气香",
+      "growth": "春秋采根茎",
+      "summary": "辛香走肝+甘平不燥，肝郁气滞、月经不调",
+      "taste_keywords": [
+        "辛",
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 69,
+      "name": "三棱",
+      "taste": "味苦、辛，平",
+      "color": "外皮灰黄，断面黄白",
+      "shape": "块茎圆锥形坚硬，破血行气消积",
+      "habitat": "池塘沼泽湿地",
+      "substance": "质坚体重",
+      "growth": "秋冬采根茎",
+      "summary": "质坚体重+辛散苦破，癥瘕积聚、血瘀经闭、食积",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 70,
+      "name": "莪术",
+      "taste": "味辛、苦，温",
+      "color": "外皮灰褐，断面黄绿",
+      "shape": "根茎卵圆形坚硬，破血行气消积",
+      "habitat": "山坡林缘",
+      "substance": "质坚气香",
+      "growth": "秋冬采根茎",
+      "summary": "辛温气香走窜+苦破，癥瘕积聚、血瘀经闭",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "黄"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 71,
+      "name": "板蓝根",
+      "taste": "味苦，寒",
+      "color": "外皮灰黄，断面黄白",
+      "shape": "根长直，清热解毒利咽",
+      "habitat": "温暖湿润向阳",
+      "substance": "质坚粉性",
+      "growth": "秋冬采根",
+      "summary": "根长入下+苦寒清热，温病发热、咽喉肿痛",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 72,
+      "name": "桔梗",
+      "taste": "味苦、辛，平",
+      "color": "外皮淡黄，断面白",
+      "shape": "根长直有横纹如桔梗，宣肺祛痰利咽",
+      "habitat": "山坡林缘",
+      "substance": "质坚粉性",
+      "growth": "春秋采根",
+      "summary": "白入肺+根升提上行+辛苦宣肺，咳嗽痰多、咽喉肿痛",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 73,
+      "name": "沙参",
+      "taste": "味甘、微苦，微寒",
+      "color": "外皮黄褐，断面白",
+      "shape": "根条长直多汁，养阴清肺",
+      "habitat": "山坡凉爽处",
+      "substance": "质润多汁",
+      "growth": "秋冬采根",
+      "summary": "白入肺+甘润+多汁滋阴，肺燥干咳、热病伤津",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 74,
+      "name": "玉竹",
+      "taste": "味甘，微寒",
+      "color": "外皮黄白，断面白",
+      "shape": "根茎长条环节明显，养阴润燥",
+      "habitat": "山坡凉爽湿润",
+      "substance": "质柔韧黏润",
+      "growth": "秋冬采根茎",
+      "summary": "白入肺+甘润黏滑，肺燥干咳、胃热口渴",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "竹节",
+        "根"
+      ]
+    },
+    {
+      "id": 75,
+      "name": "黄精",
+      "taste": "味甘，平",
+      "color": "外皮黄褐，断面黄白",
+      "shape": "根茎肥厚横走多节，补脾润肺益肾",
+      "habitat": "山坡阴湿处",
+      "substance": "质润味甜",
+      "growth": "秋冬采根茎",
+      "summary": "甘补+多节走三焦，脾虚食少、肺虚咳嗽、肾虚精亏",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "竹节",
+        "根"
+      ]
+    },
+    {
+      "id": 76,
+      "name": "何首乌",
+      "taste": "味甘、涩，微温",
+      "color": "外皮红褐，断面赤褐云锦纹",
+      "shape": "块根肥大象形固肾涩精",
+      "habitat": "山坡温暖处",
+      "substance": "质坚粉性",
+      "growth": "秋冬采根",
+      "summary": "根块肥大象形固肾+赤入血+涩收，血虚发早白、肾虚遗精",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 77,
+      "name": "远志",
+      "taste": "味苦、辛，温",
+      "color": "外皮灰黄，断面黄白",
+      "shape": "根细长有横纹，安神益智祛痰",
+      "habitat": "山坡凉爽干燥",
+      "substance": "质坚脆",
+      "growth": "春秋采根",
+      "summary": "根细入心+辛苦通窍，失眠多梦、健忘惊悸",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 78,
+      "name": "石菖蒲",
+      "taste": "味辛、苦，温",
+      "color": "外皮棕褐，断面白",
+      "shape": "根茎扁圆柱密环节，芳香开窍",
+      "habitat": "山谷溪边水边石上",
+      "substance": "质硬气香",
+      "growth": "秋冬采根茎",
+      "summary": "水生+芳香开窍+辛苦温，痰蒙心窍、神昏癫痫",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": [
+        "竹节",
+        "根"
+      ]
+    },
+    {
+      "id": 79,
+      "name": "茯苓",
+      "taste": "味甘、淡，平",
+      "color": "外皮黑褐，肉白",
+      "shape": "菌核团块无根无叶，得松之灵气",
+      "habitat": "寄生于松树根",
+      "substance": "质坚粉性",
+      "growth": "全年可采",
+      "summary": "松根灵气+甘淡渗湿，水肿便溏、心悸失眠",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "白",
+        "黑"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 80,
+      "name": "葛根",
+      "taste": "味甘、辛，凉",
+      "color": "外皮黄褐，肉白",
+      "shape": "根长粗大粉质多，升阳解表生津",
+      "habitat": "山坡温暖处",
+      "substance": "质坚粉性",
+      "growth": "秋冬采根",
+      "summary": "白入肺+根长升提+甘辛解表，外感发热、项背强痛\n\n---\n\n## 第三部分：花叶轻清升散类（40味）",
+      "taste_keywords": [
+        "辛",
+        "甘"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 81,
+      "name": "薄荷",
+      "taste": "味辛，凉",
+      "color": "茎叶青绿，青入肝清头目",
+      "shape": "方茎四棱（方茎发散），叶多缺刻（叶缺止痛），全株细毛（有毛祛风）",
+      "habitat": "田间潮湿地，得风木之气",
+      "substance": "轻薄浮散，专走上焦头面",
+      "growth": "盛夏花叶采收，升散力强",
+      "summary": "方茎+多毛+叶缺+质轻，风热头痛、皮肤风疹、咽喉肿痛",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "方茎",
+        "多毛",
+        "叶缺"
+      ]
+    },
+    {
+      "id": 82,
+      "name": "菊花",
+      "taste": "味甘苦微寒",
+      "color": "白、黄、赤三色，分入肺脾心",
+      "shape": "花瓣四散象形头目清散，无刺无藤",
+      "habitat": "向阳坡地，清阳升散不滋腻",
+      "substance": "轻清上浮，专治头面风热",
+      "growth": "秋花采收，秋金收敛散邪不伤阴",
+      "summary": "秋花敛散+质轻上行，风热目赤、头晕",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "赤",
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "藤蔓",
+        "有刺",
+        "花"
+      ]
+    },
+    {
+      "id": 83,
+      "name": "辛夷",
+      "taste": "味辛，温",
+      "color": "花苞青褐，青入肝散风",
+      "shape": "花苞丛生多毛（有毛祛风），象形鼻腔毛孔",
+      "habitat": "山坡向阳，温散风寒",
+      "substance": "轻扬走鼻肺上焦",
+      "growth": "早春未开花苞采收，春升通窍",
+      "summary": "多毛祛风+花苞象形鼻窍，风寒鼻塞、鼻渊",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "多毛",
+        "花"
+      ]
+    },
+    {
+      "id": 84,
+      "name": "金银花",
+      "taste": "味甘，寒",
+      "color": "初开白（入肺）后转黄（入脾）",
+      "shape": "藤蔓缠绕花成对开放",
+      "habitat": "山野田间喜阳光湿润",
+      "substance": "质轻气香",
+      "growth": "春夏采花",
+      "summary": "色白转黄走肺脾+藤通络，风热感冒、温病发热",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "藤蔓",
+        "花"
+      ]
+    },
+    {
+      "id": 85,
+      "name": "槐花",
+      "taste": "味苦，微寒",
+      "color": "花蕾黄白，白入肺清火",
+      "shape": "花蕾粒状未开，清肝泻火",
+      "habitat": "向阳山坡温暖处",
+      "substance": "质轻",
+      "growth": "夏初花蕾未开采收",
+      "summary": "白入肺+苦寒清热+质轻上行，血热出血、目赤头痛",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 86,
+      "name": "侧柏叶",
+      "taste": "味苦、涩，微寒",
+      "color": "枝叶青绿，青入肝",
+      "shape": "枝叶扁平侧生，凉血止血",
+      "habitat": "山林坡地",
+      "substance": "质轻气清香",
+      "growth": "四季可采",
+      "summary": "青入肝+苦涩收敛+质轻升散，血热出血、肺热咳嗽",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 87,
+      "name": "桑叶",
+      "taste": "味甘、苦，寒",
+      "color": "叶青绿，青入肝",
+      "shape": "叶片宽阔脉纹清晰，疏散风热清肝",
+      "habitat": "山坡田野",
+      "substance": "质轻脆",
+      "growth": "霜后采叶（霜桑叶）",
+      "summary": "青入肝+质轻上行+霜后敛降，风热感冒、目赤、肝阳眩晕",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 88,
+      "name": "枇杷叶",
+      "taste": "味苦，微寒",
+      "color": "叶面绿背有毛（有毛祛风）",
+      "shape": "叶片宽大背有绒毛，降肺止咳",
+      "habitat": "山坡温暖处",
+      "substance": "质硬有毛",
+      "growth": "全年可采（刷毛用）",
+      "summary": "有毛祛风+苦降肺气，肺热咳嗽、胃热呕吐",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "多毛"
+      ]
+    },
+    {
+      "id": 89,
+      "name": "淡竹叶",
+      "taste": "味甘、淡，寒",
+      "color": "茎叶青绿",
+      "shape": "茎细弱中空似竹叶，清心利尿",
+      "habitat": "山坡林缘潮湿",
+      "substance": "质轻中空",
+      "growth": "夏末采收",
+      "summary": "中空利水+甘淡寒清心，心烦尿赤、口舌生疮",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "中空"
+      ]
+    },
+    {
+      "id": 90,
+      "name": "月季花",
+      "taste": "味甘，温",
+      "color": "花色红，赤入心活血",
+      "shape": "花瓣多层月月开放，活血调经",
+      "habitat": "田园栽培",
+      "substance": "质轻气香",
+      "growth": "半开花蕾采收",
+      "summary": "色赤入血+月月开花应月经，月经不调、血瘀肿痛",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 91,
+      "name": "玫瑰花",
+      "taste": "味甘、微苦，温",
+      "color": "花色紫红，茎有刺",
+      "shape": "花瓣多层茎有刺（有刺排脓），疏肝解郁",
+      "habitat": "田园栽培",
+      "substance": "质轻气香",
+      "growth": "春末夏初花蕾",
+      "summary": "有刺+色赤入血+香疏肝，肝郁气滞、月经不调",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "赤",
+        "黑"
+      ],
+      "shape_keywords": [
+        "有刺",
+        "花"
+      ]
+    },
+    {
+      "id": 92,
+      "name": "旋覆花",
+      "taste": "味苦、辛、咸，微温",
+      "color": "花金黄",
+      "shape": "头状花序，降气化痰象形下气",
+      "habitat": "山坡路旁湿润",
+      "substance": "质轻绒毛多",
+      "growth": "夏秋采花",
+      "summary": "质轻上行+苦辛咸降，痰多咳喘、噫气呕吐",
+      "taste_keywords": [
+        "辛",
+        "苦",
+        "咸"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 93,
+      "name": "款冬花",
+      "taste": "味辛，温",
+      "color": "花蕾紫红",
+      "shape": "花蕾未开时采收，润肺止咳",
+      "habitat": "山坡林缘湿润",
+      "substance": "质轻气香",
+      "growth": "冬月采花蕾",
+      "summary": "冬花得冬藏之气+辛温润肺，咳嗽痰喘",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "赤",
+        "黑"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 94,
+      "name": "紫菀",
+      "taste": "味辛、甘、苦，温",
+      "color": "根茎紫褐",
+      "shape": "根茎须状多，润肺下气",
+      "habitat": "山坡林缘湿润",
+      "substance": "质柔韧",
+      "growth": "秋冬采根茎",
+      "summary": "甘润+辛苦降气，咳嗽痰喘、肺虚久咳",
+      "taste_keywords": [
+        "辛",
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 95,
+      "name": "荆芥",
+      "taste": "味辛，温",
+      "color": "茎叶青绿花穗淡紫",
+      "shape": "方茎（方茎发散）有毛（有毛祛风），全株香气",
+      "habitat": "山坡向阳",
+      "substance": "质轻气香",
+      "growth": "夏秋采收花穗",
+      "summary": "方茎+有毛+辛温散表，风寒感冒、风疹瘙痒",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青",
+        "黑"
+      ],
+      "shape_keywords": [
+        "方茎",
+        "多毛"
+      ]
+    },
+    {
+      "id": 96,
+      "name": "紫苏叶",
+      "taste": "味辛，温",
+      "color": "叶面紫绿背紫",
+      "shape": "叶片宽阔，散寒解表解鱼蟹毒",
+      "habitat": "田园栽培",
+      "substance": "质薄气香",
+      "growth": "夏秋采叶",
+      "summary": "色紫入血+辛温散寒+叶宽散表，风寒感冒、鱼蟹中毒",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青",
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 97,
+      "name": "藿香",
+      "taste": "味辛，微温",
+      "color": "茎叶青绿",
+      "shape": "方茎叶有毛，芳香化湿",
+      "habitat": "山坡林缘湿润",
+      "substance": "质轻气香",
+      "growth": "夏秋采收",
+      "summary": "方茎+有毛+芳香化湿，暑湿感冒、湿阻中焦",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "方茎",
+        "多毛"
+      ]
+    },
+    {
+      "id": 98,
+      "name": "佩兰",
+      "taste": "味辛，平",
+      "color": "茎叶青绿",
+      "shape": "方茎，芳香化湿醒脾",
+      "habitat": "山坡林缘湿润",
+      "substance": "质轻气香",
+      "growth": "夏秋采收",
+      "summary": "方茎+芳香化湿，暑湿证、口中甜腻",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "方茎"
+      ]
+    },
+    {
+      "id": 99,
+      "name": "牛蒡子",
+      "taste": "味辛、苦，寒",
+      "color": "果实灰褐",
+      "shape": "果实多刺钩（有刺），疏散风热利咽",
+      "habitat": "山坡向阳",
+      "substance": "质坚实",
+      "growth": "秋收果实",
+      "summary": "有刺+辛苦寒散风热，风热感冒、咽喉肿痛",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [],
+      "shape_keywords": [
+        "有刺",
+        "果籽"
+      ]
+    },
+    {
+      "id": 100,
+      "name": "蝉蜕",
+      "taste": "味甘，寒",
+      "color": "淡黄半透明",
+      "shape": "昆虫蝉蜕壳象形皮肤脱屑，疏风透疹",
+      "habitat": "山林树上",
+      "substance": "极轻中空",
+      "growth": "夏秋收集",
+      "summary": "中空质极轻+甘寒疏散，风热感冒、音哑、麻疹不透",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 101,
+      "name": "浮萍",
+      "taste": "味辛，寒",
+      "color": "全草青绿",
+      "shape": "浮水小时根须垂水中空，发汗利水",
+      "habitat": "池塘水面",
+      "substance": "极轻",
+      "growth": "夏季采收",
+      "summary": "水生+质极轻+辛寒发汗+中空利水，风热感冒、水肿",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "中空",
+        "根"
+      ]
+    },
+    {
+      "id": 102,
+      "name": "木贼",
+      "taste": "味甘、苦，平",
+      "color": "茎青绿中空",
+      "shape": "茎中空有节（中空利水+节通窍），疏散风热",
+      "habitat": "山坡湿地",
+      "substance": "质轻中空有节",
+      "growth": "夏秋采收",
+      "summary": "中空有节+青入肝+质轻，风热目赤、翳膜、水肿",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "中空",
+        "竹节"
+      ]
+    },
+    {
+      "id": 103,
+      "name": "密蒙花",
+      "taste": "味甘，微寒",
+      "color": "花蕾黄褐有毛",
+      "shape": "花蕾密被绒毛（有毛祛风），清肝明目",
+      "habitat": "山坡林缘",
+      "substance": "质轻有毛",
+      "growth": "春季花蕾未开采收",
+      "summary": "有毛祛风+甘寒清肝，目赤肿痛、多泪、翳膜",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "多毛",
+        "花"
+      ]
+    },
+    {
+      "id": 104,
+      "name": "谷精草",
+      "taste": "味辛、甘，平",
+      "color": "全草淡绿",
+      "shape": "花茎纤细顶端球状花序，明目退翳",
+      "habitat": "稻田水边湿地",
+      "substance": "质轻",
+      "growth": "夏秋采收",
+      "summary": "水生+质轻+辛散上行，风热目赤、翳膜、头痛",
+      "taste_keywords": [
+        "辛",
+        "甘"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 105,
+      "name": "红花",
+      "taste": "味辛，温",
+      "color": "花红，赤色入心活血",
+      "shape": "管状花，活血通经",
+      "habitat": "田园栽培",
+      "substance": "质轻油润",
+      "growth": "夏季花红时采收",
+      "summary": "色赤入血+辛温通脉，血瘀经闭、心痛、跌打损伤",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 106,
+      "name": "番红花",
+      "taste": "味甘，微寒",
+      "color": "花柱橙红，赤入心",
+      "shape": "柱头三叉如丝，凉血活血解毒",
+      "habitat": "高山栽培",
+      "substance": "质轻油润",
+      "growth": "秋季采花柱",
+      "summary": "色赤入血+甘寒凉血+质轻上行，温病斑疹、血瘀证",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 107,
+      "name": "野菊花",
+      "taste": "味苦、辛，微寒",
+      "color": "花黄",
+      "shape": "头状花序，清热解毒",
+      "habitat": "山野路旁",
+      "substance": "质轻气香",
+      "growth": "秋季采花",
+      "summary": "苦寒清热+辛散+质轻，疮痈肿毒、目赤肿痛",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 108,
+      "name": "荷花",
+      "taste": "味苦、甘，温",
+      "color": "花瓣粉红或白",
+      "shape": "花瓣多层，升清降浊活血止血",
+      "habitat": "池塘水中",
+      "substance": "质轻气香",
+      "growth": "夏季采花",
+      "summary": "水生+质轻上行，暑热烦渴、跌打损伤",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "赤",
+        "白"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 109,
+      "name": "莲须",
+      "taste": "味甘、涩，平",
+      "color": "花蕊黄",
+      "shape": "雄蕊多枚，固肾涩精",
+      "habitat": "池塘水中",
+      "substance": "质轻",
+      "growth": "夏季采收",
+      "summary": "质轻上行+甘涩固肾，遗精滑精、带下",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 110,
+      "name": "丁香",
+      "taste": "味辛，温",
+      "color": "花蕾紫褐香气浓",
+      "shape": "花蕾形如钉，温中降逆",
+      "habitat": "热带栽培",
+      "substance": "质重含油",
+      "growth": "花蕾未开采收",
+      "summary": "辛温+香气浓烈+形钉下行，胃寒呃逆、呕吐",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 111,
+      "name": "桂花",
+      "taste": "味辛，温",
+      "color": "花金黄",
+      "shape": "花小簇生香气馥郁，散寒止痛",
+      "habitat": "园林栽培",
+      "substance": "质轻气香",
+      "growth": "秋季采花",
+      "summary": "辛温+香气散寒，胃寒腹痛、牙痛",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 112,
+      "name": "灯心草",
+      "taste": "味甘、淡，微寒",
+      "color": "茎白",
+      "shape": "茎髓极细中空（中空利水），清心利尿",
+      "habitat": "水边湿地",
+      "substance": "极轻中空",
+      "growth": "夏秋采收茎髓",
+      "summary": "中空极轻+淡渗利水，心烦失眠、小便不利",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": [
+        "中空"
+      ]
+    },
+    {
+      "id": 113,
+      "name": "蔓荆子",
+      "taste": "味辛、苦，微寒",
+      "color": "果实灰褐",
+      "shape": "果实圆球形，疏散风热清头目",
+      "habitat": "山坡向阳",
+      "substance": "质坚实",
+      "growth": "秋季采果实",
+      "summary": "质实下行+辛苦上行散风热，风热头痛、目赤",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 114,
+      "name": "苍耳子",
+      "taste": "味辛、苦，温；有小毒",
+      "color": "果实青褐密被钩刺",
+      "shape": "果实密被钩刺（有刺），散风寒通鼻窍",
+      "habitat": "山坡路旁",
+      "substance": "质坚硬有刺",
+      "growth": "秋季采果实",
+      "summary": "有刺通窍+辛苦温散风寒，鼻渊头痛、风湿痹痛",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "有刺",
+        "果籽"
+      ]
+    },
+    {
+      "id": 115,
+      "name": "鱼腥草",
+      "taste": "味辛，微寒",
+      "color": "茎叶紫绿",
+      "shape": "叶心形茎有节，清热解毒消痈",
+      "habitat": "阴湿水边",
+      "substance": "质脆有腥气",
+      "growth": "夏秋采收",
+      "summary": "水生+辛散+腥气走窍，肺痈吐脓、热毒疮痈",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青",
+        "黑"
+      ],
+      "shape_keywords": [
+        "竹节"
+      ]
+    },
+    {
+      "id": 116,
+      "name": "大青叶",
+      "taste": "味苦，大寒",
+      "color": "叶青绿",
+      "shape": "叶片宽大，清热解毒凉血",
+      "habitat": "山坡林缘",
+      "substance": "质薄脆",
+      "growth": "夏季采叶",
+      "summary": "青入肝+苦大寒清热+叶宽散，温病斑疹、咽喉肿痛",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 117,
+      "name": "木蝴蝶",
+      "taste": "味微苦、甘，微寒",
+      "color": "种子白（入肺），翅薄如蝶翼",
+      "shape": "种子周围有薄翅如蝶，清肺利咽",
+      "habitat": "山坡林缘",
+      "substance": "极轻薄",
+      "growth": "秋季采种子",
+      "summary": "极轻上行+白入肺+苦甘清热，肺热咳嗽、咽喉肿痛",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 118,
+      "name": "腊梅花",
+      "taste": "味辛，温",
+      "color": "花黄",
+      "shape": "花蜡质，散寒解毒",
+      "habitat": "园林栽培",
+      "substance": "质硬气香",
+      "growth": "冬季采花",
+      "summary": "冬花得寒中阳气+辛温散寒，胃痛、目赤",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 119,
+      "name": "合欢花",
+      "taste": "味甘，平",
+      "color": "花粉红",
+      "shape": "花丝细长如绒，解郁安神",
+      "habitat": "山坡林缘",
+      "substance": "质轻气香",
+      "growth": "夏季花未开采收",
+      "summary": "色粉（淡赤）入血+质轻上行+甘平，心神不安、忧郁失眠",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 120,
+      "name": "葛花",
+      "taste": "味甘，平",
+      "color": "花紫褐",
+      "shape": "花穗总状，解酒醒脾",
+      "habitat": "山坡林缘",
+      "substance": "质轻",
+      "growth": "秋季采花",
+      "summary": "质轻上行+甘平解酒，酒醉烦渴、呕恶\n\n---\n\n## 第四部分：果实籽仁敛降类（40味）",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 121,
+      "name": "五味子",
+      "taste": "味酸甘苦辛咸五味俱全，酸为主",
+      "color": "外皮赤红，入心敛阴",
+      "shape": "浆果成团，籽藏果肉，收敛藏精",
+      "habitat": "山林阴坡阴湿敛藏",
+      "substance": "皮肉黏润，沉降固下焦",
+      "growth": "秋熟采收，秋金收敛",
+      "summary": "五味俱全+秋实收敛，久咳虚喘、自汗盗汗、肾虚滑精",
+      "taste_keywords": [
+        "辛",
+        "甘",
+        "酸",
+        "苦",
+        "咸"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 122,
+      "name": "杏仁",
+      "taste": "味苦，温",
+      "color": "种皮白，入肺降逆",
+      "shape": "籽仁圆润对应肺脏，油脂润降",
+      "habitat": "山野果树得木气降肺",
+      "substance": "油脂厚实，润燥滑肠",
+      "growth": "秋果成熟收敛降气",
+      "summary": "白入肺+油脂润降，肺热咳嗽、肠燥便秘",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 123,
+      "name": "山楂",
+      "taste": "味酸、甘，微温",
+      "color": "外皮红（入血），肉黄白",
+      "shape": "果实圆球，消食化积活血化瘀",
+      "habitat": "山坡向阳",
+      "substance": "肉质坚实味酸",
+      "growth": "秋熟采收",
+      "summary": "酸入肝+赤入血+甘补脾，食积不化、血瘀经闭",
+      "taste_keywords": [
+        "甘",
+        "酸"
+      ],
+      "color_keywords": [
+        "赤",
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 124,
+      "name": "麦芽",
+      "taste": "味甘，平",
+      "color": "淡黄",
+      "shape": "颖果，生麦芽升发炒麦芽消食",
+      "habitat": "平地麦田",
+      "substance": "质轻粉性",
+      "growth": "夏收",
+      "summary": "甘平+质轻升发，食积不化、回乳",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 125,
+      "name": "谷芽",
+      "taste": "味甘，平",
+      "color": "淡黄白",
+      "shape": "颖果，消食和中健脾",
+      "habitat": "稻田",
+      "substance": "质轻粉性",
+      "growth": "夏秋",
+      "summary": "甘平+质轻，食积不化、脾虚食少",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 126,
+      "name": "莱菔子",
+      "taste": "味辛、甘，平",
+      "color": "种子黄褐",
+      "shape": "种子圆粒，消食化痰降气",
+      "habitat": "田园萝卜",
+      "substance": "质坚油润",
+      "growth": "夏收",
+      "summary": "辛散+甘平+质坚下行，食积腹胀、咳嗽痰多",
+      "taste_keywords": [
+        "辛",
+        "甘"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 127,
+      "name": "补骨脂",
+      "taste": "味辛、苦，大温",
+      "color": "种子黑褐，黑入肾",
+      "shape": "籽粒扁圆，补肾壮阳固精",
+      "habitat": "山坡向阳",
+      "substance": "质坚硬",
+      "growth": "秋收种子",
+      "summary": "色黑入肾+辛温补阳+质坚沉降，肾阳虚、阳痿、遗精",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 128,
+      "name": "菟丝子",
+      "taste": "味辛、甘，平",
+      "color": "种子黄褐",
+      "shape": "种子细小寄生藤种子，补肾固精",
+      "habitat": "寄生于豆科",
+      "substance": "质坚细小",
+      "growth": "秋收种子",
+      "summary": "质细小沉降+甘平补肾，肾虚腰痛、遗精",
+      "taste_keywords": [
+        "辛",
+        "甘"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "藤蔓"
+      ]
+    },
+    {
+      "id": 129,
+      "name": "枸杞子",
+      "taste": "味甘，平",
+      "color": "果实红（赤入心肾），有光泽",
+      "shape": "浆果长圆，滋阴补肾明目",
+      "habitat": "西北旱地向阳",
+      "substance": "肉质柔润味甜",
+      "growth": "夏秋果实红熟采收",
+      "summary": "色赤入血+甘润滋阴，肝肾阴虚、目昏、消渴",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 130,
+      "name": "女贞子",
+      "taste": "味甘、苦，凉",
+      "color": "果实紫黑，黑入肾",
+      "shape": "浆果肾形，补肾滋阴明目",
+      "habitat": "山坡温暖处",
+      "substance": "肉质柔润",
+      "growth": "冬季果实成熟采收",
+      "summary": "冬实得寒中阴气+色黑入肾，肝肾阴虚、目暗、须发早白",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 131,
+      "name": "覆盆子",
+      "taste": "味甘、酸，微温",
+      "color": "浆果红（赤入血）",
+      "shape": "聚合果似覆盆，固肾涩精缩尿",
+      "habitat": "山坡林缘向阳",
+      "substance": "肉质柔润酸甜",
+      "growth": "夏秋果熟采收",
+      "summary": "赤入血+酸敛固涩+甘温补肾，遗精滑精、遗尿",
+      "taste_keywords": [
+        "甘",
+        "酸"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 132,
+      "name": "金樱子",
+      "taste": "味酸、甘、涩，平",
+      "color": "外皮红黄有刺",
+      "shape": "果实密被刺（有刺），内有多籽固涩下焦",
+      "habitat": "山坡向阳",
+      "substance": "肉质坚实",
+      "growth": "秋熟采收",
+      "summary": "有刺收敛+酸涩固涩，遗精遗尿、久泻",
+      "taste_keywords": [
+        "甘",
+        "酸"
+      ],
+      "color_keywords": [
+        "赤",
+        "黄"
+      ],
+      "shape_keywords": [
+        "有刺",
+        "果籽"
+      ]
+    },
+    {
+      "id": 133,
+      "name": "大枣",
+      "taste": "味甘，温",
+      "color": "外皮红褐，肉黄白",
+      "shape": "果实椭圆，补中益气养血安神",
+      "habitat": "田园栽培",
+      "substance": "肉质厚润味甜",
+      "growth": "秋熟采收",
+      "summary": "甘补中焦+色赤入血，脾虚食少、血虚萎黄",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤",
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 134,
+      "name": "龙眼肉",
+      "taste": "味甘，温",
+      "color": "果肉黄白，核黑",
+      "shape": "假种皮肥厚，养血安神补心脾",
+      "habitat": "南方热带果园",
+      "substance": "肉质柔润味甜",
+      "growth": "夏秋果熟采收",
+      "summary": "甘润+色淡入脾+肉厚补血，心脾两虚、失眠健忘",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄",
+        "白",
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 135,
+      "name": "莲子",
+      "taste": "味甘、涩，平",
+      "color": "外皮青褐，肉白",
+      "shape": "种子椭圆，补脾止泻益肾固精",
+      "habitat": "池塘水中",
+      "substance": "质坚粉性",
+      "growth": "秋收",
+      "summary": "水生+白入肺+甘涩固涩，脾虚泄泻、遗精带下",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "青",
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 136,
+      "name": "芡实",
+      "taste": "味甘、涩，平",
+      "color": "外皮紫褐，肉白",
+      "shape": "种子圆球，补脾固肾涩精",
+      "habitat": "池塘水中",
+      "substance": "质坚粉性",
+      "growth": "秋收",
+      "summary": "水生+白入肺+甘涩固下，脾虚泄泻、遗精滑精",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "白",
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 137,
+      "name": "白果",
+      "taste": "味甘、苦、涩，平；有小毒",
+      "color": "种皮白（入肺），核黄",
+      "shape": "种仁椭圆，敛肺定喘",
+      "habitat": "山坡果园",
+      "substance": "质坚粉性",
+      "growth": "秋收种子（去外壳）",
+      "summary": "白入肺+苦涩收敛，咳嗽痰喘、遗尿带下",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 138,
+      "name": "栀子",
+      "taste": "味苦，寒",
+      "color": "果实红黄，赤入血，黄入脾",
+      "shape": "果实卵形，清热泻火凉血",
+      "habitat": "山坡温暖处",
+      "substance": "质轻有棱",
+      "growth": "秋熟采收",
+      "summary": "色赤入血+苦寒清热+质轻上行，热病心烦、黄疸、出血",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "赤",
+        "黄"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 139,
+      "name": "瓜蒌",
+      "taste": "味甘、微苦，寒",
+      "color": "果实金黄，黄入脾",
+      "shape": "果实圆球，清热化痰宽胸散结",
+      "habitat": "山坡果园",
+      "substance": "肉质多汁",
+      "growth": "秋熟采收",
+      "summary": "甘润+苦降+金黄入脾+肉质宽胸，痰热咳嗽、胸痹",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 140,
+      "name": "枳实",
+      "taste": "味苦、辛、酸，微寒",
+      "color": "外皮青绿，内白",
+      "shape": "幼果圆球，破气消积化痰",
+      "habitat": "山坡果园",
+      "substance": "质坚硬气香",
+      "growth": "夏采幼果",
+      "summary": "质坚破气+辛苦降+青入肝，食积腹胀、胸痹、便秘",
+      "taste_keywords": [
+        "辛",
+        "酸",
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "白"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 141,
+      "name": "枳壳",
+      "taste": "味苦、辛、酸，微寒",
+      "color": "外皮黄绿，内白",
+      "shape": "成熟果实，理气宽中消胀",
+      "habitat": "山坡果园",
+      "substance": "质轻气香",
+      "growth": "秋收熟果",
+      "summary": "质稍轻+辛苦理气，胸胁胀满、气滞",
+      "taste_keywords": [
+        "辛",
+        "酸",
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 142,
+      "name": "青皮",
+      "taste": "味苦、辛，温",
+      "color": "外皮青绿，青入肝",
+      "shape": "幼果皮，疏肝破气散结",
+      "habitat": "果园",
+      "substance": "质硬气烈",
+      "growth": "夏秋采幼果",
+      "summary": "青入肝+辛温破气+质硬，肝郁气滞、胁痛、乳痈",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 143,
+      "name": "陈皮",
+      "taste": "味辛、苦，温",
+      "color": "外皮橘红，内白",
+      "shape": "成熟果皮，理气健脾燥湿",
+      "habitat": "果园",
+      "substance": "质轻气香",
+      "growth": "秋收果皮（陈久者良）",
+      "summary": "辛香理气+苦燥湿+色橙入脾，脘腹胀满、咳嗽痰多",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "赤",
+        "白"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 144,
+      "name": "香橼",
+      "taste": "味辛、苦、酸，温",
+      "color": "外皮黄绿",
+      "shape": "果实椭圆，理气和中化痰",
+      "habitat": "果园",
+      "substance": "质坚气香",
+      "growth": "秋熟采收",
+      "summary": "辛苦酸+气香理气，肝郁胁痛、胃胀",
+      "taste_keywords": [
+        "辛",
+        "酸",
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "黄"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 145,
+      "name": "佛手",
+      "taste": "味辛、苦、酸，温",
+      "color": "外皮黄，形如佛手",
+      "shape": "果实顶端裂开如指，理气化痰",
+      "habitat": "果园",
+      "substance": "质坚气香",
+      "growth": "秋熟采收",
+      "summary": "形如手指（通络）+香气理气，肝郁胁痛、胃胀",
+      "taste_keywords": [
+        "辛",
+        "酸",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 146,
+      "name": "桃仁",
+      "taste": "味苦、甘，平",
+      "color": "种皮红褐，仁白",
+      "shape": "籽仁扁卵形，活血祛瘀润肠",
+      "habitat": "山坡果园",
+      "substance": "质油润",
+      "growth": "秋收种子",
+      "summary": "赤入血+苦泄+油润，血瘀经闭、跌打损伤、肠燥便秘",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "赤",
+        "白"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 147,
+      "name": "郁李仁",
+      "taste": "味辛、苦、甘，平",
+      "color": "种皮黄褐",
+      "shape": "籽仁细小，润肠通便利水",
+      "habitat": "山坡果园",
+      "substance": "质油润细小",
+      "growth": "秋收种子",
+      "summary": "质小油润+辛苦润降，肠燥便秘、水肿",
+      "taste_keywords": [
+        "辛",
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 148,
+      "name": "火麻仁",
+      "taste": "味甘，平",
+      "color": "种皮灰褐",
+      "shape": "籽仁圆润，润肠通便滋养",
+      "habitat": "田园栽培",
+      "substance": "质油润",
+      "growth": "秋收种子",
+      "summary": "甘平+油润，肠燥便秘、血虚便秘",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 149,
+      "name": "益智仁",
+      "taste": "味辛，温",
+      "color": "种子棕褐",
+      "shape": "籽粒结团，温脾暖肾固精",
+      "habitat": "南方林下阴湿",
+      "substance": "质硬气香",
+      "growth": "夏秋采果实",
+      "summary": "辛温气香+质硬沉降，脾寒泄泻、遗精遗尿",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 150,
+      "name": "草果",
+      "taste": "味辛，温",
+      "color": "外皮灰褐",
+      "shape": "果实长椭圆，燥湿温中截疟",
+      "habitat": "南方林下阴湿",
+      "substance": "质硬气烈",
+      "growth": "秋熟采收",
+      "summary": "辛温香燥+质硬沉降，寒湿中阻、疟疾",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 151,
+      "name": "豆蔻",
+      "taste": "味辛，温",
+      "color": "外皮黄白",
+      "shape": "果实圆球，化湿行气温中止呕",
+      "habitat": "南方果园",
+      "substance": "质轻气香",
+      "growth": "夏秋采果实",
+      "summary": "辛温+香气化湿行气，湿阻中焦、呕吐",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 152,
+      "name": "砂仁",
+      "taste": "味辛，温",
+      "color": "外皮灰褐密生刺状突起",
+      "shape": "果实有刺（有刺），芳香化湿行气",
+      "habitat": "南方林下",
+      "substance": "质坚气烈",
+      "growth": "夏秋采果实",
+      "summary": "有刺行气+辛温化湿，湿阻中焦、脾胃气滞",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [],
+      "shape_keywords": [
+        "有刺",
+        "果籽"
+      ]
+    },
+    {
+      "id": 153,
+      "name": "乌梅",
+      "taste": "味酸、涩，平",
+      "color": "外皮乌黑，黑入肾",
+      "shape": "果实熏制，敛肺止咳涩肠生津",
+      "habitat": "山坡果园",
+      "substance": "肉质柔韧",
+      "growth": "夏采半熟果实熏制",
+      "summary": "酸涩收敛+色黑入肾，肺虚久咳、久泻、消渴",
+      "taste_keywords": [
+        "酸"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 154,
+      "name": "木瓜",
+      "taste": "味酸，温",
+      "color": "外皮青黄",
+      "shape": "果实长椭圆，舒筋活络和胃化湿",
+      "habitat": "山坡果园",
+      "substance": "肉质坚实",
+      "growth": "秋熟采收",
+      "summary": "酸入肝+舒筋活络，筋脉拘挛、风湿痹痛",
+      "taste_keywords": [
+        "酸"
+      ],
+      "color_keywords": [
+        "青",
+        "黄"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 155,
+      "name": "槟榔",
+      "taste": "味苦、辛，温",
+      "color": "外皮灰褐",
+      "shape": "种子坚硬，杀虫消积行气利水",
+      "habitat": "南方热带",
+      "substance": "质极硬",
+      "growth": "春采果实",
+      "summary": "质极硬（破积）+辛苦降，虫积、食积、水肿",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [],
+      "shape_keywords": []
+    },
+    {
+      "id": 156,
+      "name": "使君子",
+      "taste": "味甘，温",
+      "color": "种子紫褐",
+      "shape": "籽粒纺锤形，杀虫消积",
+      "habitat": "山坡果园",
+      "substance": "质坚味甜",
+      "growth": "秋收种子",
+      "summary": "甘温+质坚杀虫，蛔虫蛲虫、小儿疳积",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 157,
+      "name": "南瓜子",
+      "taste": "味甘，平",
+      "color": "种皮黄白",
+      "shape": "籽仁扁圆，杀虫",
+      "habitat": "田园栽培",
+      "substance": "质油润",
+      "growth": "秋收种子",
+      "summary": "甘平油润，驱虫（绦虫、蛔虫）",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 158,
+      "name": "槐角",
+      "taste": "味苦，寒",
+      "color": "果实串珠状黄绿",
+      "shape": "荚果串珠，凉血止血清肝",
+      "habitat": "向阳山坡",
+      "substance": "质坚",
+      "growth": "冬采成熟果实",
+      "summary": "苦寒清热+串珠象形血管，痔疮出血、目赤",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "黄"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 159,
+      "name": "楮实子",
+      "taste": "味甘，寒",
+      "color": "果实红（赤入血）",
+      "shape": "浆果类球，补肾清肝利水",
+      "habitat": "山坡林缘",
+      "substance": "肉质多汁",
+      "growth": "秋熟采收",
+      "summary": "赤入血+甘寒补水，肝肾阴虚、水肿、目暗",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 160,
+      "name": "沙苑子",
+      "taste": "味甘，温",
+      "color": "种子黑褐",
+      "shape": "籽粒扁圆，补肾固精缩尿养肝",
+      "habitat": "山坡草地沙地",
+      "substance": "质坚硬",
+      "growth": "秋收种子",
+      "summary": "色黑入肾+甘温固涩，肾虚腰痛、遗精遗尿\n\n---\n\n## 第五部分：金石虫介软坚类（40味）",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 161,
+      "name": "生石膏",
+      "taste": "味辛甘大寒",
+      "color": "白色，专入肺清实热",
+      "shape": "片状结晶层叠通透，清散气分大热",
+      "habitat": "山石矿洞寒凉金石之气",
+      "substance": "重坠沉降，清脏腑实火",
+      "growth": "山石常年凝结，纯阴大寒",
+      "summary": "白色入肺+金石重寒，气分高热、烦渴",
+      "taste_keywords": [
+        "辛",
+        "甘"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 162,
+      "name": "牡蛎",
+      "taste": "味咸微寒",
+      "color": "壳青白，清肺肾阴热",
+      "shape": "贝壳层叠，收敛固藏",
+      "habitat": "海水而生，利水软坚",
+      "substance": "厚重沉降，潜阳敛汗",
+      "growth": "海中常年生长，阴敛潜阳",
+      "summary": "水生咸软+贝壳收敛，阴虚阳亢、痰核瘿瘤、盗汗遗精",
+      "taste_keywords": [
+        "咸"
+      ],
+      "color_keywords": [
+        "青",
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 163,
+      "name": "磁石",
+      "taste": "味辛、咸，微寒",
+      "color": "色黑有光泽，黑入肾",
+      "shape": "矿石块状，潜阳安神纳气",
+      "habitat": "山石矿中",
+      "substance": "重坠坚硬",
+      "growth": "常年开采",
+      "summary": "色黑入肾+咸软+质重沉降，肾虚头晕、耳鸣、惊悸",
+      "taste_keywords": [
+        "辛",
+        "咸"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 164,
+      "name": "代赭石",
+      "taste": "味苦，寒",
+      "color": "色赤褐，赤入心肝",
+      "shape": "片状矿石，重镇降逆凉血",
+      "habitat": "山石矿中",
+      "substance": "质量重坠",
+      "growth": "常年开采",
+      "summary": "色赤入血+质重沉降+苦寒，呃逆呕吐、气喘、出血",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 165,
+      "name": "龙骨",
+      "taste": "味甘、涩，平",
+      "color": "色灰白",
+      "shape": "化石块状，镇惊安神收敛",
+      "habitat": "山石地层中出土",
+      "substance": "质量重",
+      "growth": "出土化石",
+      "summary": "质重镇惊+甘涩收敛，惊悸失眠、自汗盗汗",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 166,
+      "name": "石决明",
+      "taste": "味咸，寒",
+      "color": "壳外绿内珠光",
+      "shape": "贝壳耳状，平肝潜阳明目",
+      "habitat": "海边礁石",
+      "substance": "质坚硬",
+      "growth": "常年采集",
+      "summary": "水生咸软+贝壳潜阳，肝阳上亢、目赤翳障",
+      "taste_keywords": [
+        "咸"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 167,
+      "name": "珍珠母",
+      "taste": "味咸，寒",
+      "color": "内层珠白光泽",
+      "shape": "贝壳内层，平肝潜阳安神",
+      "habitat": "淡水或海水贝类",
+      "substance": "质坚硬",
+      "growth": "常年采集",
+      "summary": "白色入肺+咸寒潜降，心悸失眠、肝阳头痛",
+      "taste_keywords": [
+        "咸"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 168,
+      "name": "龟甲",
+      "taste": "味咸、甘，微寒",
+      "color": "甲板黄褐有角板纹",
+      "shape": "背甲板块，滋阴潜阳益肾",
+      "habitat": "水中",
+      "substance": "质坚硬",
+      "growth": "全年可采",
+      "summary": "水生+咸甘滋阴+质重潜阳，阴虚潮热、骨蒸",
+      "taste_keywords": [
+        "甘",
+        "咸"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 169,
+      "name": "鳖甲",
+      "taste": "味咸，微寒",
+      "color": "背甲青绿",
+      "shape": "甲壳椭圆，软坚散结滋阴",
+      "habitat": "水中",
+      "substance": "质坚硬",
+      "growth": "全年可采",
+      "summary": "水生+咸软坚+质重潜降，阴虚发热、癥瘕积聚",
+      "taste_keywords": [
+        "咸"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 170,
+      "name": "穿山甲",
+      "taste": "味咸，微寒",
+      "color": "鳞片黄褐",
+      "shape": "鳞片覆瓦状，通经下乳消肿",
+      "habitat": "山野穴居",
+      "substance": "质坚硬",
+      "growth": "全年（现禁用）",
+      "summary": "咸软坚+鳞片通窍，经闭、乳痈、瘰疬",
+      "taste_keywords": [
+        "咸"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 171,
+      "name": "全蝎",
+      "taste": "味辛，平；有毒",
+      "color": "青褐",
+      "shape": "蝎体有尾刺（有刺），息风镇痉通络",
+      "habitat": "山石缝穴",
+      "substance": "质硬脆",
+      "growth": "夏秋捕捉",
+      "summary": "有刺通络+辛散息风，惊风抽搐、中风面瘫",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "有刺"
+      ]
+    },
+    {
+      "id": 172,
+      "name": "蜈蚣",
+      "taste": "味辛，温；有毒",
+      "color": "赤褐多足",
+      "shape": "体长多足，息风镇痉通络止痛",
+      "habitat": "潮湿阴暗处",
+      "substance": "质硬脆",
+      "growth": "春夏捕捉",
+      "summary": "赤入血+多足走窜+辛温通络，惊风抽搐、风湿顽痹",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 173,
+      "name": "僵蚕",
+      "taste": "味咸、辛，平",
+      "color": "体白微褐",
+      "shape": "虫体被白僵菌，息风化痰散结",
+      "habitat": "养蚕区",
+      "substance": "质硬脆",
+      "growth": "收取病死蚕",
+      "summary": "色白入肺+咸软坚+辛散，惊风抽搐、咽喉肿痛",
+      "taste_keywords": [
+        "辛",
+        "咸"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 174,
+      "name": "蝉蜕",
+      "taste": "味甘，寒",
+      "color": "淡黄半透明",
+      "shape": "蝉壳中空（中空利水），疏散风热透疹",
+      "habitat": "山林树上",
+      "substance": "极轻中空",
+      "growth": "夏秋收集",
+      "summary": "中空质极轻+甘寒，风热感冒、音哑、麻疹不透",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "中空"
+      ]
+    },
+    {
+      "id": 175,
+      "name": "土鳖虫",
+      "taste": "味咸，寒；有小毒",
+      "color": "紫黑",
+      "shape": "虫体扁椭圆，破血逐瘀",
+      "habitat": "潮湿土中",
+      "substance": "质脆",
+      "growth": "夏秋捕捉",
+      "summary": "色黑入肾+咸软坚+体扁通瘀，跌打损伤、血瘀经闭",
+      "taste_keywords": [
+        "咸"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 176,
+      "name": "水蛭",
+      "taste": "味咸、苦，平；有小毒",
+      "color": "紫褐",
+      "shape": "虫体长扁，破血逐瘀通经",
+      "habitat": "水中",
+      "substance": "质韧滑",
+      "growth": "春夏捕捉",
+      "summary": "水生+咸软坚+体滑行瘀，血瘀经闭、癥瘕",
+      "taste_keywords": [
+        "苦",
+        "咸"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 177,
+      "name": "斑蝥",
+      "taste": "味辛，热；大毒",
+      "color": "色青黑有黄斑",
+      "shape": "甲虫体，破血逐瘀散结",
+      "habitat": "田野草丛",
+      "substance": "质硬脆",
+      "growth": "夏秋捕捉",
+      "summary": "大毒攻毒+辛热走窜，癥瘕、顽癣（外用）",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青",
+        "黄",
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 178,
+      "name": "海螵蛸",
+      "taste": "味咸、涩，微温",
+      "color": "体白（入肺），有细纹",
+      "shape": "乌贼内壳，收敛止血固精",
+      "habitat": "海中",
+      "substance": "质轻脆有细孔",
+      "growth": "捕捞后取内壳",
+      "summary": "白入肺+咸软+涩收敛+质轻多孔，崩漏带下、胃酸过多",
+      "taste_keywords": [
+        "咸"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 179,
+      "name": "瓦楞子",
+      "taste": "味咸，平",
+      "color": "壳白有瓦楞纹",
+      "shape": "蚌壳，消痰化瘀软坚",
+      "habitat": "海中泥沙",
+      "substance": "质坚硬",
+      "growth": "常年采集",
+      "summary": "咸软坚+白入肺+壳质坚，痰核瘰疬、癥瘕",
+      "taste_keywords": [
+        "咸"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 180,
+      "name": "寒水石",
+      "taste": "味咸、辛，大寒",
+      "color": "色白（入肺）或青",
+      "shape": "层状矿石，清热泻火",
+      "habitat": "山石矿洞",
+      "substance": "质量",
+      "growth": "常年开采",
+      "summary": "白色入肺+大寒清热+质量沉降，热病烦渴、丹毒",
+      "taste_keywords": [
+        "辛",
+        "咸"
+      ],
+      "color_keywords": [
+        "青",
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 181,
+      "name": "滑石",
+      "taste": "味甘、淡，寒",
+      "color": "色白（入肺），有滑腻感",
+      "shape": "片状或块状，清热利水通淋",
+      "habitat": "山石矿中",
+      "substance": "质软滑腻",
+      "growth": "常年开采",
+      "summary": "白色入肺+滑利水道+淡渗，湿热淋证、暑热烦渴",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 182,
+      "name": "芒硝",
+      "taste": "味咸、苦，寒",
+      "color": "色白透明棱柱",
+      "shape": "结晶状，泻下软坚清热",
+      "habitat": "盐矿或制取",
+      "substance": "质脆易溶",
+      "growth": "常年制取",
+      "summary": "白色入肺+咸苦软坚泻下，实热便秘、积滞",
+      "taste_keywords": [
+        "苦",
+        "咸"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 183,
+      "name": "玄明粉",
+      "taste": "味咸、苦，寒",
+      "color": "白色粉末",
+      "shape": "芒硝精制粉末，泻下软坚",
+      "habitat": "制取",
+      "substance": "质细粉",
+      "growth": "常年制取",
+      "summary": "白入肺+咸苦软坚，实热便秘、疮疡",
+      "taste_keywords": [
+        "苦",
+        "咸"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 184,
+      "name": "炉甘石",
+      "taste": "味甘，平",
+      "color": "色白淡红",
+      "shape": "矿石块状，解毒明目收湿",
+      "habitat": "山石矿中",
+      "substance": "质松脆",
+      "growth": "常年开采",
+      "summary": "色白入肺+质轻收湿，目赤翳障、湿疹",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤",
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 185,
+      "name": "雄黄",
+      "taste": "味辛，温；有毒",
+      "color": "色红黄，赤入血",
+      "shape": "块状矿石，解毒杀虫",
+      "habitat": "山石矿中",
+      "substance": "质脆",
+      "growth": "常年开采",
+      "summary": "色赤入血+辛温解毒，痈肿疔疮、蛇虫咬伤（外用）",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "赤",
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 186,
+      "name": "硫磺",
+      "taste": "味酸，温；有毒",
+      "color": "色黄（入脾）",
+      "shape": "块状，外用杀虫止痒内服壮阳",
+      "habitat": "火山矿中",
+      "substance": "质脆易燃",
+      "growth": "常年开采",
+      "summary": "色黄入脾+酸温燥湿，疥癣湿疹、肾阳虚",
+      "taste_keywords": [
+        "酸"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 187,
+      "name": "赤石脂",
+      "taste": "味甘、涩，温",
+      "color": "色赤（入血）",
+      "shape": "黏土块状，涩肠止泻止血",
+      "habitat": "山石土中",
+      "substance": "质细腻",
+      "growth": "常年开采",
+      "summary": "色赤入血+涩收敛+质细，久泻久痢、崩漏带下",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 188,
+      "name": "禹余粮",
+      "taste": "味甘、涩，微寒",
+      "color": "色黄褐",
+      "shape": "矿石块状，涩肠止泻止血",
+      "habitat": "山石土中",
+      "substance": "质重",
+      "growth": "常年开采",
+      "summary": "质重沉降+甘涩收敛，久泻久痢、崩漏",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 189,
+      "name": "青礞石",
+      "taste": "味咸、甘，平",
+      "color": "色青黑有光泽",
+      "shape": "片状，坠痰下气平肝",
+      "habitat": "山石矿中",
+      "substance": "质重",
+      "growth": "常年开采",
+      "summary": "色青入肝+质重沉降+咸软，顽痰咳喘、癫痫",
+      "taste_keywords": [
+        "甘",
+        "咸"
+      ],
+      "color_keywords": [
+        "青",
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 190,
+      "name": "金礞石",
+      "taste": "味咸、甘，平",
+      "color": "色金黄有光泽",
+      "shape": "片状，坠痰下气",
+      "habitat": "山石矿中",
+      "substance": "质重",
+      "growth": "常年开采",
+      "summary": "色金黄（兼入脾肺）+质重沉降，顽痰咳喘",
+      "taste_keywords": [
+        "甘",
+        "咸"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 191,
+      "name": "琥珀",
+      "taste": "味甘，平",
+      "color": "色黄褐透明",
+      "shape": "树脂化石，镇惊安神活血",
+      "habitat": "山石地层",
+      "substance": "质轻脆",
+      "growth": "常年开采",
+      "summary": "甘平+质轻镇惊，惊悸失眠、血瘀经闭",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 192,
+      "name": "朱砂",
+      "taste": "味甘，寒；有毒",
+      "color": "色赤红（真朱色），入心",
+      "shape": "结晶粒状，镇心安神解毒",
+      "habitat": "山石矿中",
+      "substance": "质量脆",
+      "growth": "常年开采",
+      "summary": "色赤入心+质重镇惊+甘寒清热，心悸失眠、惊风（慎）",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 193,
+      "name": "紫石英",
+      "taste": "味甘，温",
+      "color": "色紫（赤入心）",
+      "shape": "矿石块状，镇心定惊温肺",
+      "habitat": "山石矿中",
+      "substance": "质重",
+      "growth": "常年开采",
+      "summary": "色紫入心+甘温+质重，心悸怔忡、惊痫",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "赤",
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 194,
+      "name": "白石英",
+      "taste": "味甘，微温",
+      "color": "色白（入肺）",
+      "shape": "矿石块状，温肺肾安心",
+      "habitat": "山石矿中",
+      "substance": "质重",
+      "growth": "常年开采",
+      "summary": "色白入肺+甘温+质重，肺寒咳喘",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 195,
+      "name": "海浮石",
+      "taste": "味咸，寒",
+      "color": "色灰白多孔",
+      "shape": "多孔如海绵（中空利水），清肺化痰软坚",
+      "habitat": "海中火山浮石",
+      "substance": "极轻多孔",
+      "growth": "常年采集",
+      "summary": "质轻多孔中空+咸软坚+白入肺，痰热咳嗽、瘰疬",
+      "taste_keywords": [
+        "咸"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": [
+        "中空"
+      ]
+    },
+    {
+      "id": 196,
+      "name": "石燕",
+      "taste": "味咸，凉",
+      "color": "色青灰",
+      "shape": "化石贝壳，清湿热利小便",
+      "habitat": "山石地层",
+      "substance": "质坚硬",
+      "growth": "常年采集",
+      "summary": "化石沉降+咸凉清热，湿热淋证",
+      "taste_keywords": [
+        "咸"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 197,
+      "name": "人中白",
+      "taste": "味咸，平",
+      "color": "色灰白",
+      "shape": "人尿自然沉淀物，清热降火化瘀",
+      "habitat": "制取",
+      "substance": "质轻脆",
+      "growth": "常年制取",
+      "summary": "咸软+降火，咽喉肿痛、口舌生疮",
+      "taste_keywords": [
+        "咸"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 198,
+      "name": "五灵脂",
+      "taste": "味咸、甘，温",
+      "color": "色黑褐",
+      "shape": "鼯鼠粪便，活血止痛化瘀止血",
+      "habitat": "山崖洞穴",
+      "substance": "质黏腻",
+      "growth": "春秋采收",
+      "summary": "色黑入肾+咸甘温通，血瘀经闭、心腹刺痛",
+      "taste_keywords": [
+        "甘",
+        "咸"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 199,
+      "name": "蜂房",
+      "taste": "味甘，平；有小毒",
+      "color": "色灰白至灰褐",
+      "shape": "蜂巢多孔（中空），攻毒杀虫祛风",
+      "habitat": "树丛屋檐",
+      "substance": "质轻多孔",
+      "growth": "秋冬采收",
+      "summary": "中空多孔通窍+甘平解毒，疮痈、风湿痹痛",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": [
+        "中空"
+      ]
+    },
+    {
+      "id": 200,
+      "name": "桑螵蛸",
+      "taste": "味甘、咸，平",
+      "color": "色黄褐",
+      "shape": "螳螂卵鞘，固精缩尿补肾",
+      "habitat": "树枝上",
+      "substance": "质轻泡",
+      "growth": "春秋采收",
+      "summary": "甘咸补肾+多孔卵鞘象形固涩，遗精遗尿\n\n---\n\n## 第六部分：草本利水解毒类（40味）",
+      "taste_keywords": [
+        "甘",
+        "咸"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 201,
+      "name": "车前草",
+      "taste": "味甘淡寒",
+      "color": "青绿叶白根，分入肝肺",
+      "shape": "叶片宽阔主通水道，根须细密渗湿",
+      "habitat": "田间水沟湿地水生气",
+      "substance": "多汁轻清，上浮兼利下焦",
+      "growth": "盛夏采收利湿力强",
+      "summary": "水生境+淡味渗湿，湿热淋证、小便不利、水肿",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "青",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 202,
+      "name": "蒲公英",
+      "taste": "味甘苦寒",
+      "color": "黄花黄根，黄入脾清湿热",
+      "shape": "折断有白黏浆（黏泥拔毒），叶缺刺止痛，植株细毛祛风",
+      "habitat": "路边阴湿野地湿毒多发",
+      "substance": "黏汁润，外敷拔疮毒",
+      "growth": "春夏开花采收散风热疮毒",
+      "summary": "黏浆拔毒+多毛祛风，乳痈疮毒、湿热黄疸",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "多毛",
+        "有刺",
+        "叶缺"
+      ]
+    },
+    {
+      "id": 203,
+      "name": "泽泻",
+      "taste": "味甘淡寒",
+      "color": "外皮黄白肉白",
+      "shape": "根茎类圆多须根，利水渗湿泄热",
+      "habitat": "水泽湿地",
+      "substance": "质轻粉性",
+      "growth": "秋冬采根茎",
+      "summary": "水生+白入肺+淡渗，湿热淋证、水肿",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 204,
+      "name": "猪苓",
+      "taste": "味甘淡平",
+      "color": "外皮黑褐肉白",
+      "shape": "菌核不规则块状，利水渗湿",
+      "habitat": "山林树根下",
+      "substance": "质坚粉性",
+      "growth": "全年可采",
+      "summary": "甘淡渗湿+色黑入肾，水肿、小便不利",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "白",
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 205,
+      "name": "茯苓皮",
+      "taste": "味甘淡平",
+      "color": "外皮黑褐（利皮水）",
+      "shape": "茯苓外皮，利水消肿",
+      "habitat": "同茯苓",
+      "substance": "质轻",
+      "growth": "同茯苓",
+      "summary": "色黑入肾走表+淡渗，皮肤水肿",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 206,
+      "name": "冬瓜皮",
+      "taste": "味甘凉",
+      "color": "皮青绿肉白",
+      "shape": "外皮薄，利水消肿",
+      "habitat": "田园栽培",
+      "substance": "质轻脆",
+      "growth": "夏末采皮",
+      "summary": "色青入肝+甘凉清热+质轻走表，水肿胀满",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [
+        "青",
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 207,
+      "name": "赤小豆",
+      "taste": "味甘酸平",
+      "color": "色赤红（入心小肠），形如肾",
+      "shape": "籽粒椭圆，利水消肿解毒",
+      "habitat": "田园栽培",
+      "substance": "质坚粉性",
+      "growth": "秋收种子",
+      "summary": "色赤入心+形如肾+酸甘，水肿脚气、疮痈",
+      "taste_keywords": [
+        "甘",
+        "酸"
+      ],
+      "color_keywords": [
+        "赤"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 208,
+      "name": "薏苡仁",
+      "taste": "味甘淡微寒",
+      "color": "色白（入肺），有沟纹",
+      "shape": "籽粒饱满，利水渗湿健脾",
+      "habitat": "山坡湿地栽培",
+      "substance": "质坚粉性",
+      "growth": "秋收种子",
+      "summary": "色白入肺+甘淡渗湿+质坚降，水肿、湿痹、脾虚泄泻",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 209,
+      "name": "地肤子",
+      "taste": "味辛苦寒",
+      "color": "果实灰褐",
+      "shape": "果实扁圆，清热利湿祛风",
+      "habitat": "山坡路旁",
+      "substance": "质轻",
+      "growth": "秋收果实",
+      "summary": "辛苦散风+寒清热+质轻，湿热淋证、皮肤风疹",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [],
+      "shape_keywords": [
+        "果籽"
+      ]
+    },
+    {
+      "id": 210,
+      "name": "白鲜皮",
+      "taste": "味苦寒",
+      "color": "根皮黄白有羊膻气",
+      "shape": "根皮卷筒状，清热燥湿祛风解毒",
+      "habitat": "山坡林缘",
+      "substance": "质脆有香气",
+      "growth": "春秋采根皮",
+      "summary": "色白入肺+苦寒燥湿+香气祛风，湿热疮毒",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 211,
+      "name": "苦参",
+      "taste": "味苦寒",
+      "color": "根皮黄褐断面黄白",
+      "shape": "根长条，清热燥湿杀虫",
+      "habitat": "山坡林缘向阳",
+      "substance": "质坚实",
+      "growth": "春秋采根",
+      "summary": "苦寒燥湿+根长下行，湿热痢疾、带下、皮肤瘙痒",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 212,
+      "name": "黄芩",
+      "taste": "味苦寒",
+      "color": "外皮黄褐断面黄（入脾肺）",
+      "shape": "根条长直中空老根清上焦实根清下焦",
+      "habitat": "山坡林缘向阳",
+      "substance": "质坚中空",
+      "growth": "春秋采根",
+      "summary": "色黄入脾肺+苦寒清热+中空利上焦，肺热咳嗽、湿热泻痢",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "中空",
+        "根",
+        "果籽"
+      ]
+    },
+    {
+      "id": 213,
+      "name": "黄连",
+      "taste": "味苦寒",
+      "color": "根茎黄断面红黄，黄入脾",
+      "shape": "根茎多节簇生如鸡爪（象形心），清热燥湿泻火",
+      "habitat": "高山林下阴湿",
+      "substance": "质坚硬",
+      "growth": "秋冬采根茎",
+      "summary": "色黄入脾+苦寒清心火+象形心，心烦失眠、湿热泻痢",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "赤",
+        "黄"
+      ],
+      "shape_keywords": [
+        "竹节",
+        "根"
+      ]
+    },
+    {
+      "id": 214,
+      "name": "黄柏",
+      "taste": "味苦寒",
+      "color": "树皮黄（入肾膀胱）",
+      "shape": "皮厚多层，清热燥湿泻火退虚热",
+      "habitat": "山坡林缘",
+      "substance": "质韧",
+      "growth": "春夏剥皮",
+      "summary": "色黄入肾+苦寒清下焦，湿热下注、骨蒸潮热",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 215,
+      "name": "紫花地丁",
+      "taste": "味苦辛寒",
+      "color": "花紫叶青",
+      "shape": "全株矮小，清热解毒散结",
+      "habitat": "田野路旁",
+      "substance": "质柔软",
+      "growth": "春夏采收",
+      "summary": "色紫入血+辛苦寒散毒，疔疮痈肿、毒蛇咬伤",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 216,
+      "name": "野菊花",
+      "taste": "味苦辛微寒",
+      "color": "花黄",
+      "shape": "头状花序，清热解毒",
+      "habitat": "山野路旁",
+      "substance": "质轻气香",
+      "growth": "秋季采花",
+      "summary": "苦寒清热+辛散+质轻，疮痈肿毒、目赤肿痛",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "黄"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 217,
+      "name": "鱼腥草",
+      "taste": "味辛微寒",
+      "color": "茎叶紫绿",
+      "shape": "叶心形茎有节有腥气，清热解毒消痈",
+      "habitat": "阴湿水边",
+      "substance": "质脆有腥气",
+      "growth": "夏秋采收",
+      "summary": "水生+辛散+腥气走窍，肺痈、热毒疮痈",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "青",
+        "黑"
+      ],
+      "shape_keywords": [
+        "竹节"
+      ]
+    },
+    {
+      "id": 218,
+      "name": "败酱草",
+      "taste": "味辛苦微寒",
+      "color": "叶青绿花黄",
+      "shape": "全株有臭酱气，清热解毒消痈",
+      "habitat": "山坡草地",
+      "substance": "质柔有臭气",
+      "growth": "夏秋采收",
+      "summary": "辛苦散+臭气走窍，肠痈、肺痈",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 219,
+      "name": "马齿苋",
+      "taste": "味酸寒",
+      "color": "茎紫红叶青绿籽黑",
+      "shape": "茎叶肉质多汁，清热解毒凉血",
+      "habitat": "田园田间",
+      "substance": "肉质多汁",
+      "growth": "夏秋采收",
+      "summary": "酸收敛+色紫入血+肉质多汁，热毒痢疾、疮痈",
+      "taste_keywords": [
+        "酸"
+      ],
+      "color_keywords": [
+        "青",
+        "赤",
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 220,
+      "name": "白花蛇舌草",
+      "taste": "味甘淡微寒",
+      "color": "花白（入肺），茎青",
+      "shape": "茎细弱，清热解毒利湿",
+      "habitat": "水田湿地",
+      "substance": "质柔软",
+      "growth": "夏秋采收",
+      "summary": "色白入肺+甘淡利湿+质轻，疮痈肿毒、湿热淋证",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "青",
+        "白"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 221,
+      "name": "半枝莲",
+      "taste": "味辛苦寒",
+      "color": "花紫茎青绿",
+      "shape": "茎方，清热解毒化瘀利尿",
+      "habitat": "山坡湿地",
+      "substance": "质柔软",
+      "growth": "夏秋采收",
+      "summary": "方茎发散+辛苦散毒+色紫入血，疮痈肿毒、水肿",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "黑"
+      ],
+      "shape_keywords": [
+        "方茎"
+      ]
+    },
+    {
+      "id": 222,
+      "name": "半边莲",
+      "taste": "味甘淡寒",
+      "color": "花白或淡紫",
+      "shape": "茎细，清热解毒利水消肿",
+      "habitat": "水边湿地",
+      "substance": "质柔软",
+      "growth": "夏秋采收",
+      "summary": "水生+甘淡利水+辛散，蛇虫咬伤、水肿",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "白",
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 223,
+      "name": "萹蓄",
+      "taste": "味苦平微寒",
+      "color": "茎青绿",
+      "shape": "茎匍匐，利尿通淋杀虫",
+      "habitat": "田野路旁",
+      "substance": "质柔软",
+      "growth": "夏季采收",
+      "summary": "苦平清热+茎匍匐下行，湿热淋证、湿疹",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 224,
+      "name": "瞿麦",
+      "taste": "味苦寒",
+      "color": "茎青绿花紫红",
+      "shape": "茎细中空（中空利水），破血通淋",
+      "habitat": "山坡田野",
+      "substance": "质柔软中空",
+      "growth": "夏秋采收",
+      "summary": "中空利水+苦寒清热+色赤入血，热淋、血淋",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "赤",
+        "黑"
+      ],
+      "shape_keywords": [
+        "中空"
+      ]
+    },
+    {
+      "id": 225,
+      "name": "灯心草",
+      "taste": "味甘淡微寒",
+      "color": "茎白",
+      "shape": "茎髓极细中空（中空利水），清心利尿",
+      "habitat": "水边湿地",
+      "substance": "极轻中空",
+      "growth": "夏秋采收茎髓",
+      "summary": "中空极轻+淡渗利水，心烦失眠、淋证",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "白"
+      ],
+      "shape_keywords": [
+        "中空"
+      ]
+    },
+    {
+      "id": 226,
+      "name": "石韦",
+      "taste": "味甘苦微寒",
+      "color": "叶背密被星状毛（有毛）",
+      "shape": "叶背有毛（有毛祛风），利水通淋清肺",
+      "habitat": "山石阴湿处",
+      "substance": "质硬有毛",
+      "growth": "全年可采",
+      "summary": "有毛祛风+苦平清热，热淋、血淋、肺热咳嗽",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [],
+      "shape_keywords": [
+        "多毛"
+      ]
+    },
+    {
+      "id": 227,
+      "name": "海金沙",
+      "taste": "味甘寒",
+      "color": "孢子粉褐如沙",
+      "shape": "孢子细微如沙，清利湿热通淋",
+      "habitat": "山坡林缘",
+      "substance": "质细微沙",
+      "growth": "秋季采孢子",
+      "summary": "细小如沙通窍+甘寒清热，各种淋证",
+      "taste_keywords": [
+        "甘"
+      ],
+      "color_keywords": [],
+      "shape_keywords": []
+    },
+    {
+      "id": 228,
+      "name": "金钱草",
+      "taste": "味甘咸微寒",
+      "color": "叶圆如钱青绿",
+      "shape": "叶片圆如铜钱，利水通淋解毒",
+      "habitat": "山坡湿地",
+      "substance": "质柔软",
+      "growth": "夏秋采收",
+      "summary": "叶圆象形钱（通淋）+甘咸软坚，湿热淋证、石淋",
+      "taste_keywords": [
+        "甘",
+        "咸"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 229,
+      "name": "茵陈",
+      "taste": "味辛苦微寒",
+      "color": "茎灰绿密被白毛（有毛祛风）",
+      "shape": "全株有白毛（有毛祛风），清热利湿退黄",
+      "habitat": "山坡田野",
+      "substance": "质柔软气清香",
+      "growth": "春季幼苗采收",
+      "summary": "有毛祛风+辛苦清热+香走肝胆，湿热黄疸、湿疮",
+      "taste_keywords": [
+        "辛",
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "白"
+      ],
+      "shape_keywords": [
+        "多毛"
+      ]
+    },
+    {
+      "id": 230,
+      "name": "虎杖",
+      "taste": "味苦微寒",
+      "color": "根茎黄褐断面红黄",
+      "shape": "根茎粗壮，清热利湿解毒活血",
+      "habitat": "山坡林缘",
+      "substance": "质坚硬",
+      "growth": "春秋采根茎",
+      "summary": "色黄入脾+色赤入血+苦寒清热，湿热黄疸、经闭",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "赤",
+        "黄"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 231,
+      "name": "漏芦",
+      "taste": "味苦寒",
+      "color": "根茎黑褐",
+      "shape": "根茎粗长，清热解毒消痈下乳",
+      "habitat": "山坡林缘",
+      "substance": "质硬",
+      "growth": "春秋采根",
+      "summary": "苦寒清热+根长下行+通乳，乳痈、乳汁不下",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黑"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 232,
+      "name": "大蓟",
+      "taste": "味甘苦凉",
+      "color": "叶青绿有刺（有刺排脓），花紫红",
+      "shape": "叶缘有刺（有刺），凉血止血散瘀",
+      "habitat": "山坡路旁",
+      "substance": "质脆有刺",
+      "growth": "夏秋采收",
+      "summary": "有刺排脓+色赤入血+苦凉止血，血热出血、疮痈",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "赤",
+        "黑"
+      ],
+      "shape_keywords": [
+        "有刺"
+      ]
+    },
+    {
+      "id": 233,
+      "name": "小蓟",
+      "taste": "味甘苦凉",
+      "color": "叶青绿有刺（有刺）",
+      "shape": "叶缘有刺（有刺），凉血止血散瘀",
+      "habitat": "田野路旁",
+      "substance": "质柔软",
+      "growth": "夏秋采收",
+      "summary": "有刺排脓+甘凉止血，血热出血、尿血",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "有刺"
+      ]
+    },
+    {
+      "id": 234,
+      "name": "地榆",
+      "taste": "味苦酸微寒",
+      "color": "根皮黑褐断面红",
+      "shape": "根条长，凉血止血解毒敛疮",
+      "habitat": "山坡林缘",
+      "substance": "质硬",
+      "growth": "春秋采根",
+      "summary": "色赤入血+酸敛+苦寒清热+根厚沉降，血热出血、烫伤",
+      "taste_keywords": [
+        "酸",
+        "苦"
+      ],
+      "color_keywords": [
+        "赤",
+        "黑"
+      ],
+      "shape_keywords": [
+        "根"
+      ]
+    },
+    {
+      "id": 235,
+      "name": "槐花",
+      "taste": "味苦微寒",
+      "color": "花蕾黄白，白入肺",
+      "shape": "花蕾粒状未开，凉血止血清肝",
+      "habitat": "山坡果园",
+      "substance": "质轻",
+      "growth": "夏初花蕾",
+      "summary": "色白入肺+苦寒清热+质轻上行，血热出血、目赤头痛",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "黄",
+        "白"
+      ],
+      "shape_keywords": [
+        "花"
+      ]
+    },
+    {
+      "id": 236,
+      "name": "千里光",
+      "taste": "味苦寒",
+      "color": "花黄叶青绿",
+      "shape": "全株清热解毒明目",
+      "habitat": "山坡林缘",
+      "substance": "质柔软",
+      "growth": "夏秋采收",
+      "summary": "苦寒清热+明目，疮痈肿毒、目赤肿痛",
+      "taste_keywords": [
+        "苦"
+      ],
+      "color_keywords": [
+        "青",
+        "黄"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 237,
+      "name": "木贼",
+      "taste": "味甘苦平",
+      "color": "茎青绿中空",
+      "shape": "茎中空有节（中空利水），疏散风热",
+      "habitat": "山坡湿地",
+      "substance": "质轻中空有节",
+      "growth": "夏秋采收",
+      "summary": "中空有节+青入肝+质轻，风热目赤、翳膜",
+      "taste_keywords": [
+        "甘",
+        "苦"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": [
+        "中空",
+        "竹节"
+      ]
+    },
+    {
+      "id": 238,
+      "name": "鸭跖草",
+      "taste": "味甘淡寒",
+      "color": "花蓝茎绿叶青",
+      "shape": "茎叶多汁，清热解毒利水",
+      "habitat": "水边湿地",
+      "substance": "质柔多汁",
+      "growth": "夏秋采收",
+      "summary": "水生+甘淡利水+质柔，风热感冒、湿热淋证",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 239,
+      "name": "地锦草",
+      "taste": "味辛平",
+      "color": "茎叶紫红，赤入血",
+      "shape": "茎匍匐有白色乳汁（黏泥拔毒），清热解毒活血",
+      "habitat": "田野路旁",
+      "substance": "质柔有白浆",
+      "growth": "夏秋采收",
+      "summary": "色赤入血+白浆拔毒+辛苦，湿热痢疾、疮痈",
+      "taste_keywords": [
+        "辛"
+      ],
+      "color_keywords": [
+        "赤",
+        "黑"
+      ],
+      "shape_keywords": []
+    },
+    {
+      "id": 240,
+      "name": "垂盆草",
+      "taste": "味甘淡凉",
+      "color": "茎叶绿，肉质",
+      "shape": "茎匍匐肉质多汁，清热解毒利湿",
+      "habitat": "山坡阴湿",
+      "substance": "肉质多汁",
+      "growth": "夏秋采收",
+      "summary": "肉质多汁+甘淡利湿，湿热黄疸、疮痈\n\n---\n\n## 版本记录\n\n| 版本 | 日期 | 说明 |\n|:---:|:---:|:---|\n| v1.0 | 2026-06-16 | 初始创建，总纲+双案例 |\n| v2.0 | 2026-06-16 | 240味中药六维解析完整版 |\n\n---\n*以河图数理为体，以象形六维为用* 🪷",
+      "taste_keywords": [
+        "甘",
+        "淡"
+      ],
+      "color_keywords": [
+        "青"
+      ],
+      "shape_keywords": []
+    }
+  ]
+}

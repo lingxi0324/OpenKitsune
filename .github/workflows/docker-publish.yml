@@ -1,0 +1,92 @@
+name: Docker Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建并打到镜像上的 tag（例如 v1.2.7）。留空则使用当前 ref。"
+        required: false
+        default: ""
+      ref:
+        description: "要构建的 commit SHA 或分支（留空则用 tag 指向的 commit）"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "*"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RELEASE_TAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.tag != '' && inputs.tag) || github.ref_name }}
+  CHECKOUT_REF: ${{ (github.event_name == 'workflow_dispatch' && inputs.ref != '' && inputs.ref) || (github.event_name == 'workflow_dispatch' && inputs.tag != '' && inputs.tag) || github.ref_name }}
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docker_publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Validate Docker Hub configuration
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_IMAGE }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ]; then
+            echo "DOCKERHUB_USERNAME secret is required"
+            exit 1
+          fi
+          if [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "DOCKERHUB_TOKEN secret is required"
+            exit 1
+          fi
+          if [ -z "$DOCKERHUB_IMAGE" ]; then
+            echo "DOCKERHUB_IMAGE secret is required, for example: openkitsune/openkitsune"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_IMAGE }}
+          # value=${{ env.RELEASE_TAG }} 让 semver/raw 都以 RELEASE_TAG 为准，
+          # 这样 push tag 与 workflow_dispatch 手动指定 tag 两种入口行为一致，
+          # 而不再隐式依赖 tag push 事件（否则手动触发时 type=ref/semver 不生成）。
+          tags: |
+            type=raw,value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest,enable=${{ startsWith(env.RELEASE_TAG, 'v') && !contains(env.RELEASE_TAG, '-') }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            OPENKITSUNE_BUILD_GIT_HASH=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

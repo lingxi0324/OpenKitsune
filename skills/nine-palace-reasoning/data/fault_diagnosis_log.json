@@ -1,0 +1,75 @@
+{
+  "palace_stats": {
+    "震魂": {
+      "total_calls": 1,
+      "no_responses": 0,
+      "consecutive_no_response": 0,
+      "avg_conflict": 0.0,
+      "conflict_history": [],
+      "last_health": "normal"
+    },
+    "离神": {
+      "total_calls": 1,
+      "no_responses": 0,
+      "consecutive_no_response": 0,
+      "avg_conflict": 0.0,
+      "conflict_history": [],
+      "last_health": "normal"
+    },
+    "坤情": {
+      "total_calls": 1,
+      "no_responses": 0,
+      "consecutive_no_response": 0,
+      "avg_conflict": 0.0,
+      "conflict_history": [],
+      "last_health": "normal"
+    },
+    "坎精": {
+      "total_calls": 1,
+      "no_responses": 1,
+      "consecutive_no_response": 1,
+      "avg_conflict": 0.0,
+      "conflict_history": [],
+      "last_health": "normal"
+    },
+    "艮志": {
+      "total_calls": 1,
+      "no_responses": 0,
+      "consecutive_no_response": 0,
+      "avg_conflict": 0.0,
+      "conflict_history": [],
+      "last_health": "normal"
+    },
+    "巽性": {
+      "total_calls": 1,
+      "no_responses": 0,
+      "consecutive_no_response": 0,
+      "avg_conflict": 0.0,
+      "conflict_history": [],
+      "last_health": "normal"
+    },
+    "乾气": {
+      "total_calls": 1,
+      "no_responses": 0,
+      "consecutive_no_response": 0,
+      "avg_conflict": 0.0,
+      "conflict_history": [],
+      "last_health": "normal"
+    },
+    "兑魄": {
+      "total_calls": 1,
+      "no_responses": 0,
+      "consecutive_no_response": 0,
+      "avg_conflict": 0.0,
+      "conflict_history": [],
+      "last_health": "normal"
+    }
+  },
+  "diagnosis_history": [
+    {
+      "time": "2026-06-14T20:03:16.538362",
+      "overall_health": "critical",
+      "diagnoses_count": 10
+    }
+  ]
+}
