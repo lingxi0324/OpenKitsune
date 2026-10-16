@@ -201,7 +201,8 @@ def test_catalog_builder_passes_context_window_to_stable_skill_metadata_catalog(
     assert "compact" in output
     assert captured["context_window"] == 65_536
     assert captured["max_tokens"] == 600
-    assert captured["priority_categories"] == ("file-tools", "filesystem", "file")
+    # "File System" hint → 真实技能分类（中英混合，Fix-4 映射）
+    assert captured["priority_categories"] == ("file system", "文档与数据", "知识与效率")
 
 
 def test_catalog_builder_uses_progressive_tool_catalog_with_intent_hints():

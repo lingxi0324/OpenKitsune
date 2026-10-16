@@ -26,7 +26,8 @@
         "douyin-tool",
         "image-understanding",
         "seedance-video",
-        "video-downloader"
+        "video-downloader",
+        "youtube-summarizer"
       ]
     },
     {
@@ -35,6 +36,7 @@
       "skills": [
         "baidu-paddleocr-doc",
         "baidu-paddleocr-text",
+        "baidu-ppt-gen",
         "doc-coauthoring",
         "docx",
         "pdf",
@@ -104,6 +106,7 @@
       "description": "地图查询、路线规划、打车与旅行服务。",
       "skills": [
         "amap-maps",
+        "baidu-maps",
         "didi-ride",
         "fliggy-travel"
       ]

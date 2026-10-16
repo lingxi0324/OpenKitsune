@@ -97,6 +97,10 @@ _INTERRUPT_BEHAVIOR_MAP: dict[str, InterruptBehavior] = {
     "opencli_run": "block",
     "run_powershell": "block",
     "run_shell": "block",
+    # ── Code execution ──────────────────────────────────────────
+    # Arbitrary code runs with real side effects (fs/network/process);
+    # interrupt mid-run risks inconsistent state.
+    "execute_code": "block",
     # ── Code quality / search ─────────────────────────────────────
     "read_lints": "cancel",
     "semantic_search": "cancel",
@@ -197,6 +201,16 @@ _INTERRUPT_BEHAVIOR_MAP: dict[str, InterruptBehavior] = {
     "exit_plan_mode": "block",
     "get_todo_status": "cancel",
     "update_todo_step": "block",
+    # ── Kanban ──────────────────────────────────────────────────
+    # Mutations persist board/column/card state — block; pure reads cancel.
+    "kanban_comment": "block",
+    "kanban_complete": "block",
+    "kanban_create": "block",
+    "kanban_delete": "block",
+    "kanban_get": "cancel",
+    "kanban_list": "cancel",
+    "kanban_move": "block",
+    "kanban_update": "block",
     # ── Plugins ────────────────────────────────────────────────
     "get_plugin_info": "cancel",
     "list_plugins": "cancel",
@@ -225,6 +239,13 @@ _INTERRUPT_BEHAVIOR_MAP: dict[str, InterruptBehavior] = {
     "submit_skill_repo": "block",
     # ── Stickers ─────────────────────────────────────────────
     # (send_sticker already listed under IM channel.)
+    # ── Voice / audio ─────────────────────────────────────────
+    # Recording captures audio to disk; transcription/synthesis hit
+    # external APIs and write artifacts — all block. No pure-read voice tool.
+    "text_to_speech": "block",
+    "transcribe_audio": "block",
+    "voice_listen": "block",
+    "voice_record": "block",
     # ── Web ─────────────────────────────────────────────────
     "news_search": "cancel",
     "web_fetch": "cancel",

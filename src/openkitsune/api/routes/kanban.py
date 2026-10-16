@@ -23,7 +23,7 @@ import asyncio
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from openkitsune.kanban.store import get_kanban_store

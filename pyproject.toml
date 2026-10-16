@@ -83,6 +83,9 @@ dependencies = [
     # Image processing
     "Pillow>=10.0.0",
 
+    # Voice VAD 核心计算（src/openkitsune/voice/vad.py 生产代码真实依赖）
+    "numpy>=1.26.0",
+
     # Read-only extraction for cloud knowledge-base PDF content
     "pypdf>=5.0,<7.0",
 

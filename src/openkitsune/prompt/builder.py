@@ -542,6 +542,8 @@ def build_system_prompt(
         )
 
         if prompt_mode == PromptMode.FULL and not is_sub_agent and mode == "agent":
+            # 委派前言是 FULL-only 动态区内容：注入 runtime 区（System 缓存前缀之后），
+            # 保证 FULL/MINIMAL 共享相同的静态前缀（prompt cache 契约）。
             runtime_parts.append(_build_delegation_rules())
 
         if identity_section:

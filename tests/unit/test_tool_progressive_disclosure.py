@@ -115,6 +115,9 @@ async def test_discovered_list_skills_schema_reaches_next_stream_request(
         hard_limit=12000,
         max_tokens=16000,
     )
+    # 与真实 ContextManager 默认一致：不触发任务恢复卡注入/角色规范化
+    context.context_preparation_pending = False
+    context.normalize_turn_roles = lambda messages, **_: messages
     brain = SimpleNamespace(model="test", get_current_endpoint_info=lambda: {})
     engine = ReasoningEngine(
         brain=brain,

@@ -1,6 +1,8 @@
 import inspect
 from types import SimpleNamespace
 
+import pytest
+
 from openkitsune.agent.core import Agent
 from openkitsune.core._agent_runtime import (
     _apply_previous_answer_replay_hint,
@@ -34,10 +36,30 @@ from openkitsune.prompt.builder import PromptMode, PromptProfile, build_system_p
 from openkitsune.runtime.llm import CompilerCircuitBreaker
 
 
+@pytest.fixture(autouse=True)
+def _pin_intent_analyzer_llm_mode():
+    """本模块专门验证 IntentAnalyzer 的 LLM 路径契约（brain.compiler_think
+    必须被调用）。settings 默认 intent_analyzer_mode="hermes"（规则短路、
+    零 LLM 调用），因此必须显式钉回 "llm"，否则这些测试的 mock brain
+    永远不会被调用。
+    """
+    from openkitsune.config import settings
+
+    old = settings.intent_analyzer_mode
+    settings.intent_analyzer_mode = "llm"
+    try:
+        yield
+    finally:
+        settings.intent_analyzer_mode = old
+
+
 class _StaticCompilerBrain:
     def __init__(self, content: str):
         self.content = content
         self.calls = 0
+
+    def _compiler_available(self):
+        return True
 
     async def compiler_think(self, *args, **kwargs):
         self.calls += 1
@@ -55,6 +77,9 @@ async def test_intent_analyzer_uses_bounded_output_budget():
     class _CapturingBrain:
         def __init__(self):
             self.kwargs = {}
+
+        def _compiler_available(self):
+            return True
 
         async def compiler_think(self, **kwargs):
             self.kwargs = kwargs
@@ -140,6 +165,9 @@ def test_session_preparation_has_no_sub_agent_intent_shortcut():
 
 async def test_intent_analyzer_preserves_compiler_fallback_diagnostics():
     class _FallbackBrain:
+        def _compiler_available(self):
+            return True
+
         async def compiler_think(self, *args, **kwargs):
             return SimpleNamespace(
                 content=(
@@ -317,7 +345,8 @@ suggest_plan: false"""
     assert brain.calls == 1
     assert result.intent == IntentType.TASK
     assert result.task_type == "compound"
-    assert result.tool_hints == ["Web Search", "File System"]
+    # evidence_required=true 时规则启发会按消息内容补充提示（"写成query.py"→Code）
+    assert result.tool_hints == ["Web Search", "File System", "Code"]
     assert result.capability_scope == [CapabilityScope.WEB, CapabilityScope.FILES]
     assert result.requires_project_context is True
 

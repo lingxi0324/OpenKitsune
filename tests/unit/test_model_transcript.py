@@ -371,6 +371,9 @@ async def test_real_reasoning_loop_replays_normal_turns_and_completed_retries(
             hard_limit=12000,
             max_tokens=16000,
         )
+        # 与真实 ContextManager 默认一致：不触发任务恢复卡注入路径
+        context.context_preparation_pending = False
+        context.normalize_turn_roles = lambda messages, **_: messages
         instance = ReasoningEngine(
             brain=SimpleNamespace(
                 model="test", max_tokens=4096, get_current_endpoint_info=lambda: {}

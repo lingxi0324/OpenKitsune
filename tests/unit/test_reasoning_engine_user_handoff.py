@@ -531,7 +531,17 @@ async def test_response_wording_does_not_trigger_execution_inference(reply: str)
         tool_evidence_required=False,
     )
 
-    assert result == reply
+    if isinstance(result, tuple):
+        # 零工具调用 + 完成声明：注入 [系统] 纠偏警告并进入有界重试
+        # （2026-10-10 整改：杜绝"报文本即停"）——绝不伪造执行证据。
+        wm = result[0]
+        assert wm[-1]["role"] == "user"
+        assert wm[-1]["content"].startswith("[系统]")
+        # 原文以 assistant 消息原样保留
+        assert wm[-2]["role"] == "assistant"
+    else:
+        # 带 [来源:…] 标签等可追溯声明直接接受
+        assert result == reply
 
 
 @pytest.mark.asyncio

@@ -36,15 +36,18 @@ class TestDelegationPreambleInjection:
         prompt = self._build_prompt(is_sub_agent=True)
         assert "协作优先原则" not in prompt
 
-    def test_preamble_before_identity(self):
-        """Delegation preamble should appear BEFORE identity content."""
+    def test_preamble_lives_in_dynamic_region_not_cached_static_prefix(self):
+        """委派前言是 FULL-only 内容：必须位于 System 静态前缀（缓存区）之外。
+
+        FULL/MINIMAL 共享同一缓存前缀（test_prompt_cache_stability 的架构不变量），
+        因此前言只能注入 Runtime 动态区——不能放在身份内容之前。
+        """
+        from openkitsune.prompt import builder as prompt_builder
+
         prompt = self._build_prompt(is_sub_agent=False)
-        preamble_pos = prompt.find("协作优先原则")
-        identity_markers = ["Kitsune", "核心执行原则", "三条铁律"]
-        for marker in identity_markers:
-            marker_pos = prompt.find(marker)
-            if marker_pos >= 0:
-                assert preamble_pos < marker_pos, f"Preamble should come before '{marker}'"
+        static, _ = prompt_builder.split_static_dynamic(prompt)
+        assert "协作优先原则" in prompt
+        assert "协作优先原则" not in static
 
     def test_preamble_contains_priority_override(self):
         """Preamble must explicitly override solo-agent philosophy."""

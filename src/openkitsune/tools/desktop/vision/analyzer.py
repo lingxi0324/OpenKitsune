@@ -671,10 +671,10 @@ class VisionAnalyzer:
         Returns:
             提取结果
         """
+        import os
         import shutil
         import subprocess
         import tempfile
-        import os
 
         tess = shutil.which("tesseract")
         if not tess:

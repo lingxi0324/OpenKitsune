@@ -22,7 +22,9 @@ def test_intent_to_priority_categories_empty_input():
 
 def test_intent_to_priority_categories_known_hints():
     cats = intent_to_priority_categories(["File System", "Web Search"])
-    assert "file-tools" in cats
+    # 映射到真实技能分类（中英混合，见 _TOOL_HINT_TO_SKILL_CATEGORY）
+    assert "file system" in cats
+    assert "文档与数据" in cats
     assert "web" in cats
 
 

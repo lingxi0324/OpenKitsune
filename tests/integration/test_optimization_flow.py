@@ -25,6 +25,22 @@ from openkitsune.prompt.budget import BudgetConfig
 from openkitsune.prompt.compiler import check_compiled_outdated, compile_all
 from openkitsune.tools.catalog import ToolCatalog
 
+
+@pytest.fixture(autouse=True)
+def _pin_intent_analyzer_llm_mode():
+    """TestIntentAnalyzerLLMCall 专门验证 IntentAnalyzer 的 LLM 路径；
+    settings 默认 intent_analyzer_mode="hermes"（零 LLM 调用），必须
+    钉回 "llm" 才能断言 compiler_think 被调用。
+    """
+    from openkitsune.config import settings
+
+    old = settings.intent_analyzer_mode
+    settings.intent_analyzer_mode = "llm"
+    try:
+        yield
+    finally:
+        settings.intent_analyzer_mode = old
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -507,10 +523,13 @@ class TestContextManagerOptimizations:
         messages = [
             {"role": "user", "content": f"Message {i}" + " padding" * 100} for i in range(20)
         ]
-        # Leave room for the two recent messages and the truncation notice.
-        max_tokens = cm.estimate_messages_tokens(messages[-2:]) + 100
+        # Leave room for the protected head and the truncation notice.
+        max_tokens = cm.estimate_messages_tokens(messages[:3]) + 100
+        head_end = cm._head_protect_end(messages)
         result = cm._hard_truncate_if_needed(messages, max_tokens)
-        assert result[-2:] == messages[-2:]
+        # P0-3 head 保护契约：受保护的核心前缀永不因硬截断被删
+        # （截断说明消息恒定前置在 index 0）
+        assert result[1 : 1 + head_end] == messages[:head_end]
         assert cm.estimate_messages_tokens(result) <= max_tokens
 
     def test_hard_truncate_rejects_impossible_budget_without_mutating_history(self):

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from openkitsune.agent.core import Agent
 from openkitsune.core.intent_analyzer import (
     INTENT_ANALYZER_SYSTEM,
@@ -13,6 +15,22 @@ from openkitsune.integrations.knowledge.routing import (
     knowledge_priority_prompt_section,
     should_prefer_knowledge,
 )
+
+
+@pytest.fixture(autouse=True)
+def _pin_intent_analyzer_llm_mode():
+    """IntentAnalyzer 的 LLM 路径契约测试：settings 默认
+    intent_analyzer_mode="hermes"（零 LLM 调用），必须钉回 "llm"
+    才能验证编译器重试/失败回退逻辑。
+    """
+    from openkitsune.config import settings
+
+    old = settings.intent_analyzer_mode
+    settings.intent_analyzer_mode = "llm"
+    try:
+        yield
+    finally:
+        settings.intent_analyzer_mode = old
 
 
 def _config(*, preferred: bool = True) -> dict:
@@ -91,6 +109,9 @@ class _SequenceCompilerBrain:
     def __init__(self, *outputs: str):
         self.outputs = list(outputs)
         self.calls = 0
+
+    def _compiler_available(self):
+        return True
 
     async def compiler_think(self, **_kwargs):
         output = self.outputs[min(self.calls, len(self.outputs) - 1)]

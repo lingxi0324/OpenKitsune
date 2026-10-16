@@ -4,7 +4,10 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
+# `build/*`（而非 `build/`）匹配子项但保留目录本身，使下面的
+# `!build/*.py/.sh/.ps1` 白名单能够重新包含脚本；CI 的 bootstrap /
+# tauri 打包与 unit/bundle/release 合约测试依赖这些脚本，必须入库。
+build/*
 !build/*.py
 !build/*.sh
 !build/*.ps1
@@ -108,6 +111,10 @@ apps/setup-center/src-tauri/resources/modules/
 apps/setup-center/src-tauri/resources/bootstrap/bin/
 apps/setup-center/src-tauri/resources/bootstrap/wheels/
 apps/setup-center/src-tauri/resources/bootstrap/wheelhouse/
+# Setup Center 前端 lib 源码（shadcn cn 工具、插件桥、原生命令桥）——
+# 被 tracked 的 src/views 直接 import，必须入库；`lib/` 全局规则仅针对 Python 构建产物。
+!apps/setup-center/src/lib/
+!apps/setup-center/src/lib/**
 apps/setup-center/src-tauri/resources/bootstrap/python/
 
 # Data (keep structure)

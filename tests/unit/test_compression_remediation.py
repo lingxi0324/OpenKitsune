@@ -139,7 +139,6 @@ async def test_state_rehydration_checked_before_adopting_baseline(tmp_path):
     [
         {"messages": [{"role": "user", "content": "x" * 5000}], "max_tokens": 100},
         {"messages": [], "tools": [{"schema": "x" * 5000}], "max_tokens": 100},
-        {"messages": [], "max_tokens": 2000},
     ],
 )
 def test_final_provider_budget_includes_output_and_tools(body):
@@ -147,6 +146,18 @@ def test_final_provider_budget_includes_output_and_tools(body):
         validate_request_body(
             body, SimpleNamespace(name="small", context_window=1000, max_tokens=100)
         )
+
+
+def test_oversized_output_reserve_is_clamped_on_small_windows():
+    """整改 2026-10-10：chat 请求 max_tokens=2000 打到小窗口端点不再误报。
+
+    输出预留被钳制到 ``window // 4``，校验只拦截真实的输入超限；
+    仅 max_tokens 大于窗口不构成溢出。
+    """
+    validate_request_body(
+        {"messages": [], "max_tokens": 2000},
+        SimpleNamespace(name="small", context_window=1000, max_tokens=100),
+    )
 
 
 async def test_cold_output_read_is_scoped_and_paged(tmp_path):

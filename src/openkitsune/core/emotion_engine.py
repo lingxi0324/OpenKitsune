@@ -979,10 +979,14 @@ class EmotionEngine:
     def get_matching_level(self) -> tuple[str, str]:
         """默契度等级 (名称, 描述)"""
         m = self._mo_qi
-        if m >= 80: return ("道侣", "阴阳相契，你我本是一体")
-        if m >= 60: return ("知己", "高山流水，知音难觅已得")
-        if m >= 40: return ("亲近", "心有灵犀，一个眼神便能会意")
-        if m >= 20: return ("初识", "渐渐熟悉，已能说些体己话")
+        if m >= 80:
+            return ("道侣", "阴阳相契，你我本是一体")
+        if m >= 60:
+            return ("知己", "高山流水，知音难觅已得")
+        if m >= 40:
+            return ("亲近", "心有灵犀，一个眼神便能会意")
+        if m >= 20:
+            return ("初识", "渐渐熟悉，已能说些体己话")
         return ("陌路", "尚在初识")
 
     def set_matching_degree(self, value: float) -> None:
@@ -1047,7 +1051,7 @@ class EmotionEngine:
     # ── 混沌境·情根 生命体征 ─────────────────────────────────────
     def get_vital_signs(self) -> dict[str, Any]:
         """🔧 混沌境·情根 — 自观测接口
-        
+
         供镜厅汇聚七境生命体征，反映情感引擎实时健康状态：
         - 灵树花色 = 主情感（七色光华）
         - 枝叶摇曳幅度 = 情感强度

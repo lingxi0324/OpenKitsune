@@ -164,8 +164,14 @@ class TestReranking:
             access_frequency_score=1.0,
         )
         engine._rerank([c], "test")
-        expected = 1.0 * 0.4 + 1.0 * 0.25 + 1.0 * 0.2 + 1.0 * 0.15
-        assert c.score == pytest.approx(expected)
+        expected = (
+            c.relevance * engine.W_RELEVANCE
+            + c.recency_score * engine.W_RECENCY
+            + c.importance_score * engine.W_IMPORTANCE
+            + c.access_frequency_score * engine.W_ACCESS
+        )
+        # 完整查询短语命中内容 → 额外 ×1.5 加成（检索加权有意行为）
+        assert c.score == pytest.approx(expected * 1.5)
 
 
 class TestEnhancedQuery:

@@ -55,9 +55,9 @@ from .code_quality import CODE_QUALITY_TOOLS
 from .config import CONFIG_TOOLS
 from .filesystem import FILESYSTEM_TOOLS
 from .im_channel import IM_CHANNEL_TOOLS
+from .kanban import KANBAN_TOOLS
 from .knowledge import KNOWLEDGE_TOOLS
 from .lsp import LSP_TOOLS
-from .kanban import KANBAN_TOOLS
 from .mcp import MCP_TOOLS
 from .memory import MEMORY_TOOLS
 from .mode import MODE_TOOLS

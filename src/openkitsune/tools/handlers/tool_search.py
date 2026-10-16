@@ -64,10 +64,12 @@ class ToolSearchHandler:
     # 会话级查询缓存：同一关键词重复搜索时直接返回上次结果并提示，
     # 避免模型"失忆重搜"同一查询（对标 Hermes：重复搜索无新信息即视为浪费）。
     # key = (会话作用域, 规范化后的 query)；value = (首次命中结果 JSON 列表, 命中工具名列表)
-    _query_cache: dict[tuple[str, str], tuple[list[dict], list[str]]] = {}
+    # 注意：必须是实例级（__init__ 中初始化）——类属性会在多个会话/Agent 之间
+    # 共享，导致别的会话命中原会话缓存后跳过 discovery 注册，破坏渐进式工具披露。
 
     def __init__(self, agent: "Agent"):
         self.agent = agent
+        self._query_cache: dict[tuple[str, str], tuple[list[dict], list[str]]] = {}
 
     @staticmethod
     def _session_scope(agent: "Agent") -> str:
