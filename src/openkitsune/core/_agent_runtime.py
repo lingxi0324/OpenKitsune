@@ -62,15 +62,6 @@ from ..config import settings
 from ..memory import MemoryManager
 from ..memory.json_utils import coerce_text
 
-# [TaskContinuation] 继续类指令检测与跨轮任务上下文恢复（R4/R1/R2）
-from .task_continuation import (
-    TASK_ANCHOR_META_KEY,
-    build_continuation_guidance,
-    is_continuation_directive,
-    restore_task_definition,
-    task_definition_is_hollow,
-)
-
 # Prompt 编译管线 (v2)
 # 技能系统 (SKILL.md 规范)
 # NOTE: SkillCatalog / SkillLoader / SkillRegistry are imported lazily inside
@@ -96,8 +87,8 @@ from ..tools.handlers.agent_package import create_handler as create_agent_packag
 # would re-enter ``core.capabilities`` mid-init if pulled here.
 from ..tools.handlers.cli_anything import create_handler as create_cli_anything_handler
 from ..tools.handlers.cli_anything import is_available as cli_anything_available
-from ..tools.handlers.code_quality import create_handler as create_code_quality_handler
 from ..tools.handlers.code_execution import create_handler as create_code_execution_handler
+from ..tools.handlers.code_quality import create_handler as create_code_quality_handler
 from ..tools.handlers.config import create_handler as create_config_handler
 from ..tools.handlers.desktop import create_handler as create_desktop_handler
 from ..tools.handlers.filesystem import create_handler as create_filesystem_handler
@@ -161,6 +152,15 @@ from .response_handler import (
     INTERNAL_TRACE_SECTION_TERMINATORS,
     ResponseHandler,
     strip_thinking_tags,
+)
+
+# [TaskContinuation] 继续类指令检测与跨轮任务上下文恢复（R4/R1/R2）
+from .task_continuation import (
+    TASK_ANCHOR_META_KEY,
+    build_continuation_guidance,
+    is_continuation_directive,
+    restore_task_definition,
+    task_definition_is_hollow,
 )
 from .task_monitor import RETROSPECT_PROMPT, TaskMonitor
 from .token_tracking import (
@@ -4714,7 +4714,10 @@ class Agent:
         self.memory_manager.record_turn("user", message)
         if session and hasattr(session, "context"):
             try:
-                from openkitsune.agent.working_facts import extract_working_facts, merge_working_facts
+                from openkitsune.agent.working_facts import (
+                    extract_working_facts,
+                    merge_working_facts,
+                )
 
                 turn_no = len(getattr(session.context, "messages", []) or [])
                 updates = extract_working_facts(message, source_turn=turn_no)
@@ -6380,7 +6383,7 @@ class Agent:
                 return
             _started_at = time.perf_counter()
             real_intent = await asyncio.wait_for(task, timeout=30)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "[Session:%s] Background intent analysis timed out (30s), keeping rule-based",
                 session_id,
@@ -8019,7 +8022,7 @@ class Agent:
                 self._current_task_query = task_def
                 logger.info(
                     "[Session:%s] TaskContinuation restored from %s (len=%d)",
-                    getattr(self, "_current_session_id", None) or session_id,
+                    getattr(self, "_current_session_id", None),
                     _continuation_restored[0],
                     len(task_def),
                 )

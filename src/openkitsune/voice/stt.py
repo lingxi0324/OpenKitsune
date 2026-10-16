@@ -20,7 +20,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .config import DEFAULT_LOCAL_STT_MODEL, config_bool, config_number, get_stt_config
 
@@ -235,7 +235,7 @@ class OnlineSTT:
             self._client = STTClient(self._endpoints)
 
     @classmethod
-    def from_config(cls) -> "OnlineSTT":
+    def from_config(cls) -> OnlineSTT:
         """从 llm_endpoints.json 的 stt_endpoints 构建。"""
         try:
             from ..llm.config import load_endpoints_config

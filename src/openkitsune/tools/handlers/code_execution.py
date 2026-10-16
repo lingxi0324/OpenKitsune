@@ -21,7 +21,7 @@ import json
 import logging
 import sys
 import threading
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from ...config import settings
 from ...core.policy_v2 import ApprovalClass
@@ -72,7 +72,7 @@ _BLOCKED_CLASSES = frozenset(
 )
 
 
-def _compute_sandbox_tools(agent: "Agent", extra: list[str] | None) -> frozenset[str]:
+def _compute_sandbox_tools(agent: Agent, extra: list[str] | None) -> frozenset[str]:
     """推导脚本内工具白名单：基础安全集合 + registry 显式 READONLY 类工具。
 
     任何被 registry 显式标为执行/破坏/修改类的工具一律排除；未显式分类的
@@ -86,9 +86,7 @@ def _compute_sandbox_tools(agent: "Agent", extra: list[str] | None) -> frozenset
     if registry is not None and hasattr(registry, "get_tool_class"):
         for name in candidates:
             klass = registry.get_tool_class(name)
-            if klass is None:
-                allowed.add(name)
-            elif isinstance(klass, tuple) and klass[0] in _SAFE_CLASSES:
+            if klass is None or isinstance(klass, tuple) and klass[0] in _SAFE_CLASSES:
                 allowed.add(name)
         # registry 里显式 READONLY 的工具自动加入（无论是否在基础集合）
         if hasattr(registry, "list_tools"):
@@ -150,7 +148,7 @@ class CodeExecutionHandler:
     TOOLS = ["execute_code"]
     TOOL_CLASSES = {"execute_code": ApprovalClass.EXEC_CAPABLE}
 
-    def __init__(self, agent: "Agent"):
+    def __init__(self, agent: Agent):
         self.agent = agent
 
     async def handle(self, tool_name: str, params: dict[str, Any]) -> str:
@@ -232,7 +230,7 @@ class CodeExecutionHandler:
                     self._async_execute(registry, tool_name, tool_args), loop
                 )
                 result = future.result(timeout=300)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return tool_error(f"Tool '{tool_name}' timed out inside execute_code")
             except Exception as exc:
                 return tool_error(str(exc))
@@ -250,6 +248,6 @@ class CodeExecutionHandler:
         return result if isinstance(result, str) else str(result)
 
 
-def create_handler(agent: "Agent"):
+def create_handler(agent: Agent):
     handler = CodeExecutionHandler(agent)
     return handler.handle

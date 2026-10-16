@@ -40,8 +40,9 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -478,7 +479,7 @@ class CellAuthority:
     running under a stale identity.
     """
 
-    def __init__(self, dispatch: Optional[Callable[[str, dict], str]]):
+    def __init__(self, dispatch: Callable[[str, dict], str] | None):
         self.dispatch_fn = dispatch
         self.active = True
 
@@ -531,12 +532,12 @@ class SessionKernel:
 
     def __init__(self, key: tuple):
         self.key, self.owner, self.lock = key, key[0], threading.Lock()
-        self.proc: Optional[subprocess.Popen] = None
+        self.proc: subprocess.Popen | None = None
         self.tmpdir = self.rpc_token = self.sentinel = ""
-        self.sock_path: Optional[str] = None
-        self.server_sock: Optional[socket.socket] = None
+        self.sock_path: str | None = None
+        self.server_sock: socket.socket | None = None
         self.stop_event = threading.Event()
-        self.death_pipe_w: Optional[int] = None
+        self.death_pipe_w: int | None = None
         self.tool_call_log: list = []
         self.cell_log_start = 0
         self.tool_call_counter: list[int] = [0]
@@ -544,7 +545,7 @@ class SessionKernel:
         self.response_q: queue.Queue[dict] = queue.Queue()
         self.raw, self.stderr = _BoundedBuffer(), _BoundedBuffer()
         self.execution_count, self.last_used = 0, time.monotonic()
-        self.cell_authority: Optional[CellAuthority] = None
+        self.cell_authority: CellAuthority | None = None
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -582,11 +583,11 @@ class KernelRegistry:
         self.kernels: dict = {}
         self._teardown = teardown
 
-    def shutdown(self, owner: Optional[str] = None,
-                 *, owner_matches: Optional[Callable[[str], bool]] = None) -> None:
+    def shutdown(self, owner: str | None = None,
+                 *, owner_matches: Callable[[str], bool] | None = None) -> None:
         doomed = []
         with self.lock:
-            for key, kernel in list(self.kernels.items()):
+            for key, _kernel in list(self.kernels.items()):
                 if owner is not None and key[0] != owner:
                     continue
                 if owner_matches is not None and not owner_matches(key[0]):
@@ -759,7 +760,7 @@ def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
     parent_handle, close_handle, startupinfo = (
         _parent_process_handle(child_env) if _IS_WINDOWS else (None, None, None)
     )
-    death_r: Optional[int] = None
+    death_r: int | None = None
     pass_fds: tuple = ()
     if not _IS_WINDOWS:
         death_r, kernel.death_pipe_w = os.pipe()
@@ -891,7 +892,7 @@ def _acquire_kernel(key: tuple, reset: bool) -> tuple[SessionKernel, bool]:
             kernel = _KERNELS[key] = SessionKernel(key)
         kernel.last_used = time.monotonic()
         kernel.attached += 1
-        unpinned = [k for k in _KERNELS]
+        unpinned = list(_KERNELS)
         by_age = sorted((k for k in unpinned if k != key and _KERNELS[k].attached == 0),
                         key=lambda k: _KERNELS[k].last_used)
         expired.extend(_KERNELS.pop(k) for k in by_age[: max(0, len(unpinned) - _KERNEL_CAP)])
@@ -900,7 +901,7 @@ def _acquire_kernel(key: tuple, reset: bool) -> tuple[SessionKernel, bool]:
     return kernel, state_reset
 
 
-def _sweep_stale_staging_dirs(now: Optional[float] = None) -> int:
+def _sweep_stale_staging_dirs(now: float | None = None) -> int:
     now = time.time() if now is None else now
     removed = 0
     for path in glob.glob(os.path.join(tempfile.gettempdir(), _STAGING_PREFIX + "*")):
@@ -994,7 +995,7 @@ def _truncate_stdout_text(stdout_text: str) -> tuple[str, dict[str, Any]]:
     return text, metadata
 
 
-def _spill_full_stdout(stdout_text: str) -> Optional[str]:
+def _spill_full_stdout(stdout_text: str) -> str | None:
     """Best-effort: write full stdout next to the kernel staging area and return
     its path (None on failure — the truncated inline output is still returned)."""
     try:
@@ -1048,7 +1049,7 @@ def _error_result(error: str, *, tool_calls_made: int = 0, duration: float = 0) 
     return json.dumps(body, ensure_ascii=False)
 
 
-def _sandbox_failure_hint(stderr_text: str, enabled_tools) -> Optional[str]:
+def _sandbox_failure_hint(stderr_text: str, enabled_tools) -> str | None:
     """Map well-known sandbox script failures to one actionable recovery hint."""
     if not stderr_text:
         return None
@@ -1140,7 +1141,7 @@ def _cell_result(kernel: SessionKernel, key: tuple, status: str, payload: dict[s
 def execute_in_session_kernel(
     code: str, *, owner: str, child_python: str, child_cwd: str,
     sandbox_tools: frozenset, timeout: int, max_tool_calls: int, reset: bool,
-    is_interrupted, dispatch: Optional[Callable[[str, dict], str]] = None,
+    is_interrupted, dispatch: Callable[[str, dict], str] | None = None,
 ) -> str:
     """Run one cell in the (owner, python, cwd, tools) session kernel.
 
@@ -1170,7 +1171,7 @@ def _run_cell(kernel: SessionKernel, key: tuple, code: str, *, owner: str,
               child_python: str, child_cwd: str, sandbox_tools: frozenset,
               timeout: int, max_tool_calls: int, is_interrupted,
               exec_start: float, state_reset: bool,
-              dispatch: Optional[Callable[[str, dict], str]]) -> str:
+              dispatch: Callable[[str, dict], str] | None) -> str:
     reused = kernel.proc is not None
     authority = CellAuthority(dispatch)
     with kernel.lock:

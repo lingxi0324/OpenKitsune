@@ -11,16 +11,12 @@ import base64
 import contextlib
 import json
 import logging
-import os
 import re
 import uuid
-from pathlib import Path
-from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from typing import Any
 
 from . import audio
 from .config import (
-    BUILTIN_TTS_PROVIDERS,
     DEFAULT_DEEPINFRA_TTS_VOICE,
     DEFAULT_EDGE_VOICE,
     DEFAULT_ELEVENLABS_MODEL_ID,
@@ -38,7 +34,6 @@ from .config import (
     DEFAULT_OPENAI_MODEL,
     DEFAULT_OPENAI_VOICE,
     DEFAULT_XAI_VOICE_ID,
-    PROVIDER_MAX_TEXT_LENGTH,
     config_bool,
     get_env_value,
     resolve_provider_key,
@@ -79,7 +74,7 @@ def _close_response(response: Any) -> None:
             close()
 
 
-def _read_tts_response_bytes(response: Any, *, label: str, limit: Optional[int] = None) -> bytes:
+def _read_tts_response_bytes(response: Any, *, label: str, limit: int | None = None) -> bytes:
     """有界读取上游 TTS 响应（硬字节上限）。"""
     limit = TTS_RESPONSE_BODY_LIMIT_BYTES if limit is None else limit
     chunks: list[bytes] = []
@@ -106,7 +101,7 @@ def _read_tts_response_bytes(response: Any, *, label: str, limit: Optional[int] 
         _close_response(response)
 
 
-def _parse_json_body(response: Any, raw: bytes) -> Dict[str, Any]:
+def _parse_json_body(response: Any, raw: bytes) -> dict[str, Any]:
     if raw:
         return json.loads(raw.decode("utf-8"))
     if not _response_has_explicit_stream(response):
@@ -117,7 +112,7 @@ def _parse_json_body(response: Any, raw: bytes) -> Dict[str, Any]:
     return {}
 
 
-def _read_tts_response_json(response: Any, *, label: str, limit: Optional[int] = None) -> Dict[str, Any]:
+def _read_tts_response_json(response: Any, *, label: str, limit: int | None = None) -> dict[str, Any]:
     return _parse_json_body(response, _read_tts_response_bytes(response, label=label, limit=limit))
 
 
@@ -127,7 +122,7 @@ def _write_bytes(output_path: str, audio_bytes: bytes) -> str:
     return output_path
 
 
-def _post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str], **extra: Any):
+def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], **extra: Any):
     import requests
     return requests.post(url, headers=headers, json=payload, timeout=60, stream=True, **extra)
 
@@ -138,7 +133,7 @@ def _import_edge_tts():
     return edge_tts
 
 
-async def generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+async def generate_edge_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     """Edge TTS（微软神经语音，免费默认引擎）。
 
     语音未显式配置时按文本语言自动适配（中文 -> zh-CN-XiaoxiaoNeural，
@@ -152,7 +147,7 @@ async def generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, A
     if not edge_config.get("voice"):
         voice = _auto_edge_voice(text, voice)
     speed = float(edge_config.get("speed", (tts_config or {}).get("speed", 1.0)))
-    kwargs: Dict[str, Any] = {"voice": voice}
+    kwargs: dict[str, Any] = {"voice": voice}
     if speed != 1.0:
         kwargs["rate"] = f"{round((speed - 1.0) * 100):+d}%"
     await edge_tts.Communicate(text, **kwargs).save(output_path)
@@ -171,7 +166,6 @@ _EDGE_LANG_VOICES = {
 def _auto_edge_voice(text: str, fallback: str = DEFAULT_EDGE_VOICE) -> str:
     """按文本字符分布选 edge 语音：含中文 -> 中文，日文假名 -> 日文，韩文 -> 韩文，
     否则 fallback（英文默认）。"""
-    import unicodedata
 
     han = kana = hangul = 0
     for ch in text[:2000]:
@@ -192,7 +186,7 @@ def _auto_edge_voice(text: str, fallback: str = DEFAULT_EDGE_VOICE) -> str:
 
 
 # ---- ElevenLabs ----
-def _elevenlabs_environment_kwargs(el_config: Dict[str, Any]) -> Dict[str, Any]:
+def _elevenlabs_environment_kwargs(el_config: dict[str, Any]) -> dict[str, Any]:
     """SDK 环境 kwargs（base_url/wss_url）；无 base_url 时 SDK 默认。"""
     base_url = (el_config.get("base_url") or "").rstrip("/")
     if not base_url:
@@ -207,7 +201,7 @@ def _import_elevenlabs():
     return ElevenLabs
 
 
-def generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def generate_elevenlabs(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     """ElevenLabs TTS。"""
     api_key = _require_key("ELEVENLABS_API_KEY", "elevenlabs", "Get one at https://elevenlabs.io/")
     el_config = tts_config.get("elevenlabs") if isinstance(tts_config, dict) else {}
@@ -256,7 +250,7 @@ def _clamped_number(raw: Any, cast, lo, hi):
     return max(lo, min(hi, raw))
 
 
-def generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def generate_xai_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     """xAI TTS（API 计费；优先 XAI_API_KEY）。"""
     api_key = resolve_provider_key("XAI_API_KEY", "xai") or ""
     if not api_key:
@@ -279,9 +273,9 @@ def generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     base_url = str(xai_config.get("base_url") or get_env_value("XAI_BASE_URL")
                    or DEFAULT_XAI_BASE_URL).strip().rstrip("/")
     codec = "wav" if output_path.endswith(".wav") else "mp3"
-    payload: Dict[str, Any] = {"text": text, "voice_id": voice_id, "language": language}
+    payload: dict[str, Any] = {"text": text, "voice_id": voice_id, "language": language}
     if codec != "mp3" or sample_rate != DEFAULT_XAI_SAMPLE_RATE or bit_rate != DEFAULT_XAI_BIT_RATE:
-        output_format: Dict[str, Any] = {"codec": codec}
+        output_format: dict[str, Any] = {"codec": codec}
         if sample_rate:
             output_format["sample_rate"] = sample_rate
         if codec == "mp3" and bit_rate:
@@ -313,7 +307,7 @@ def _apply_xai_auto_speech_tags(text: str) -> str:
 
 
 # ---- MiniMax TTS ----
-def _resolve_minimax_tts_runtime(tts_config: Dict[str, Any]) -> tuple[str, str, str]:
+def _resolve_minimax_tts_runtime(tts_config: dict[str, Any]) -> tuple[str, str, str]:
     """MiniMax 区域/端点/凭证原子选择：显式 region 优先；否则仅配置 CN 密钥时选 cn。"""
     mm_config = tts_config.get("minimax") if isinstance(tts_config, dict) else {}
     credentials = {
@@ -332,7 +326,7 @@ def _resolve_minimax_tts_runtime(tts_config: Dict[str, Any]) -> tuple[str, str, 
     return region, endpoint, api_key
 
 
-def _raise_minimax_api_error(result: Dict[str, Any]) -> None:
+def _raise_minimax_api_error(result: dict[str, Any]) -> None:
     base_resp = result.get("base_resp", {})
     status_code = base_resp.get("status_code", -1)
     if status_code != 0:
@@ -340,7 +334,7 @@ def _raise_minimax_api_error(result: Dict[str, Any]) -> None:
             f"MiniMax TTS API error (code {status_code}): {base_resp.get('status_msg', 'unknown error')}")
 
 
-def generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def generate_minimax_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     """MiniMax ``t2a_v2``（嵌套 payload，hex 音频）或 legacy ``text_to_speech``（raw body）。"""
     _, base_url, api_key = _resolve_minimax_tts_runtime(tts_config)
     mm_config = tts_config.get("minimax") if isinstance(tts_config, dict) else {}
@@ -395,10 +389,10 @@ def _import_mistral_client():
     return Mistral
 
 
-def generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def generate_mistral_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     api_key = _require_key("MISTRAL_API_KEY", "mistral", "Get one at https://console.mistral.ai/")
     mi_config = tts_config.get("mistral") if isinstance(tts_config, dict) else {}
-    client_kwargs: Dict[str, Any] = {"api_key": api_key}
+    client_kwargs: dict[str, Any] = {"api_key": api_key}
     if mi_config.get("base_url"):
         client_kwargs["server_url"] = mi_config["base_url"]
     Mistral = _import_mistral_client()
@@ -418,7 +412,7 @@ def generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any]
 
 
 # ---- Google Gemini TTS ----
-def generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def generate_gemini_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     """Gemini ``generateContent`` + ``responseModalities=["AUDIO"]``。回复为 base64 24kHz
     mono 16-bit PCM，包装为 WAV 后 ffmpeg 转目标容器。"""
     api_key = resolve_provider_key("GEMINI_API_KEY", "gemini") or resolve_provider_key("GOOGLE_API_KEY", "gemini")
@@ -429,7 +423,7 @@ def generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any])
     voice = str(gemini_config.get("voice", DEFAULT_GEMINI_TTS_VOICE)).strip() or DEFAULT_GEMINI_TTS_VOICE
     base_url = str(gemini_config.get("base_url") or get_env_value("GEMINI_BASE_URL")
                    or DEFAULT_GEMINI_TTS_BASE_URL).strip().rstrip("/")
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "contents": [{"parts": [{"text": text}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
@@ -472,9 +466,9 @@ def _import_openai_client():
 
 
 def generate_openai_tts(
-    text: str, output_path: str, tts_config: Dict[str, Any], *, api_key: Optional[str] = None,
-    base_url: Optional[str] = None, model: Optional[str] = None, voice: Optional[str] = None,
-    speed: Optional[float] = None, instructions: Optional[str] = None,
+    text: str, output_path: str, tts_config: dict[str, Any], *, api_key: str | None = None,
+    base_url: str | None = None, model: str | None = None, voice: str | None = None,
+    speed: float | None = None, instructions: str | None = None,
 ) -> str:
     """OpenAI ``audio.speech.create`` 形状。显式 kwargs 供 DeepInfra 等 OpenAI 兼容后端
     注入凭证/模型/音色；否则走 ``tts.openai`` 配置 + 环境密钥链。"""
@@ -493,7 +487,7 @@ def generate_openai_tts(
     if speed is None:
         speed_default = tts_config.get("speed", 1.0) if isinstance(tts_config, dict) else 1.0
         speed = float(oai_config.get("speed", speed_default))
-    create_kwargs: Dict[str, Any] = {
+    create_kwargs: dict[str, Any] = {
         "model": model, "voice": voice, "input": text,
         "response_format": _tts_response_format_from_path(output_path),
         "extra_headers": {"x-idempotency-key": str(uuid.uuid4())}}
@@ -513,7 +507,7 @@ def generate_openai_tts(
             close()
 
 
-def generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def generate_deepinfra_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     """DeepInfra TTS（OpenAI 兼容）。"""
     api_key = resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra")
     if not api_key:

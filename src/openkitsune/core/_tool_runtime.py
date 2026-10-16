@@ -1244,7 +1244,7 @@ class ToolExecutor:
             tool_input = tc.get("input", tc.get("arguments", {})) or {}
             tool_use_id = tc.get("id", "")
 
-            if isinstance(tool_input, dict) or isinstance(tool_input, list):
+            if isinstance(tool_input, (dict, list)):
                 tool_input = normalize_tool_input(tool_name, tool_input)
 
             # 检查取消

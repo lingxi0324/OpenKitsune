@@ -14,13 +14,12 @@ ContextManager + CompactionGuard 架构。
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any
 
 from openkitsune.runtime.context.continuity import content_digest
 
@@ -46,10 +45,10 @@ class CompressionLineage:
     tokens_before: int = 0
     tokens_after: int = 0
     quality: str = "validated"      # validated / failed / cancelled
-    _branched_from: Optional[str] = None  # 并发压缩时的分支标记
-    _delegate_from: Optional[str] = None  # 委派压缩标记
-    watermark: Optional[int] = None   # 压缩开始时的消息水位线
-    watermark_ceiling: Optional[int] = None  # 水位线上限
+    _branched_from: str | None = None  # 并发压缩时的分支标记
+    _delegate_from: str | None = None  # 委派压缩标记
+    watermark: int | None = None   # 压缩开始时的消息水位线
+    watermark_ceiling: int | None = None  # 水位线上限
 
     def to_dict(self) -> dict:
         return {
@@ -213,12 +212,12 @@ class CompressionManager:
             )
 
         # Lineage 记录（进程内缓存；对接 DB 后由 load() 填充）
-        self._lineage: Dict[str, CompressionLineage] = {}       # child_id → record
-        self._parent_children: Dict[str, List[str]] = {}        # parent_id → [child_ids]
-        self._parent_chain: Dict[str, str] = {}                 # child_id → parent_id
+        self._lineage: dict[str, CompressionLineage] = {}       # child_id → record
+        self._parent_children: dict[str, list[str]] = {}        # parent_id → [child_ids]
+        self._parent_chain: dict[str, str] = {}                 # child_id → parent_id
 
         # 压缩锁
-        self._locks: Dict[str, CompressionLock] = {}            # session_id → lock
+        self._locks: dict[str, CompressionLock] = {}            # session_id → lock
 
         # 冷却期
         self._cooldown = CompressionCooldown()
@@ -305,7 +304,7 @@ class CompressionManager:
                 self._store.set_meta(self._state_key, json.dumps({
                     "cooldown": self._cooldown.to_dict(),
                     "lineage": [r.to_dict() for r in list(self._lineage.values())[-100:]],
-                    "locks": [l.to_dict() for l in self._locks.values() if not l.is_expired],
+                    "locks": [lock.to_dict() for lock in self._locks.values() if not lock.is_expired],
                 }, ensure_ascii=False))
             else:
                 self._store.set_compression_state(
@@ -313,7 +312,7 @@ class CompressionManager:
                     {
                         "cooldown": self._cooldown.to_dict(),
                         "lineage": [r.to_dict() for r in list(self._lineage.values())[-100:]],
-                        "locks": [l.to_dict() for l in self._locks.values() if not l.is_expired],
+                        "locks": [lock.to_dict() for lock in self._locks.values() if not lock.is_expired],
                     },
                 )
         except Exception as exc:
@@ -327,12 +326,12 @@ class CompressionManager:
         self,
         parent_session_id: str,
         child_session_id: str,
-        parent_messages: List[dict],
-        child_messages: List[dict],
+        parent_messages: list[dict],
+        child_messages: list[dict],
         tokens_before: int,
         tokens_after: int,
-        watermark: Optional[int] = None,
-        watermark_ceiling: Optional[int] = None,
+        watermark: int | None = None,
+        watermark_ceiling: int | None = None,
     ) -> CompressionLineage:
         """记录一次成功的压缩。生成 lineage 记录并持久化。对标 Hermes publish_compression_child。"""
         parent_digest = content_digest(parent_messages)
@@ -369,7 +368,7 @@ class CompressionManager:
         )
         return record
 
-    def find_live_compression_child(self, parent_session_id: str) -> Optional[CompressionLineage]:
+    def find_live_compression_child(self, parent_session_id: str) -> CompressionLineage | None:
         """查找压缩父会话的活跃子会话。对标 Hermes find_live_compression_child。
         仅当恰好有一个子会话时返回；多个时返回 None（并发分裂，无法确定）。"""
         children = self._parent_children.get(parent_session_id, [])
@@ -383,9 +382,9 @@ class CompressionManager:
             )
         return None
 
-    def get_compression_chain(self, session_id: str) -> List[CompressionLineage]:
+    def get_compression_chain(self, session_id: str) -> list[CompressionLineage]:
         """获取从根会话到当前会话的完整压缩链。对标 Hermes walk lineage。"""
-        chain: List[CompressionLineage] = []
+        chain: list[CompressionLineage] = []
         current = session_id
         seen = {current}
         while current in self._parent_chain:
@@ -514,25 +513,25 @@ class CompressionManager:
         tail_count: int,
         soft_limit: int = 0,
         estimate_tokens_fn=None,
-    ) -> tuple[Optional[int], Optional[int]]:
+    ) -> tuple[int | None, int | None]:
         """计算压缩水位线。对标 Hermes watermark 处理。
 
         压缩范围 = messages[:watermark]
         新消息（归属于子会话）= messages[watermark:]
-        
+
         改进了基于 token 预算的水位线计算：
         1. 尾部保护：最近 tail_count 条消息不参与压缩
         2. Token 预算感知：基于 soft_limit 计算可压缩区的实际 token 数，
            确保压缩后剩余 token 不超过 soft_limit
         3. watermark 为压缩起始索引（messages[:watermark] 将被压缩），
            watermark_ceiling 为尾部保护起始索引（messages[watermark_ceiling:] 不参与压缩）
-        
+
         Args:
             messages: 完整消息列表（压缩前）
             tail_count: 尾部保护消息数（最近 N 条不纳入压缩）
             soft_limit: 软限制 token 数（压缩后剩余预算）
             estimate_tokens_fn: token 估算函数 (messages) -> int
-        
+
         Returns:
             (watermark, watermark_ceiling)
             - watermark: 压缩起始索引（含），None 表示不压缩
@@ -545,7 +544,7 @@ class CompressionManager:
         # 尾部保护起点
         ceiling = n - tail_count if tail_count > 0 else n
         ceiling = max(0, min(ceiling, n))
-        
+
         # 如果没有足够的消息进行压缩
         if ceiling <= 0:
             return None, ceiling
@@ -569,7 +568,7 @@ class CompressionManager:
         while low <= high:
             mid = (low + high) // 2
             mid_tokens = estimate_tokens_fn(messages[:mid]) if mid > 0 else 0
-            
+
             if mid_tokens >= available_for_compression and mid > 0:
                 result_watermark = mid
                 high = mid - 1  # 尝试更小的 watermark
@@ -598,12 +597,12 @@ class CompressionManager:
         watermark_ceiling: int | None,
     ) -> tuple[list[dict], list[dict]]:
         """按 Watermark 拆分消息：压缩前消息 vs 压缩期间新消息。
-        
+
         Args:
             messages: 完整消息列表
             watermark: 压缩起始索引（含）
             watermark_ceiling: 尾部保护起始索引（含）
-        
+
         Returns:
             (parent_messages, child_messages)
             - parent_messages: messages[:watermark]（参与压缩的部分）
@@ -611,7 +610,7 @@ class CompressionManager:
         """
         if watermark is None:
             return [], list(messages)
-        
+
         # 压缩范围 = [0, watermark)
         # 新消息（归属于子会话）= [watermark:, 包括尾部保护消息）
         parent_msgs = list(messages[:watermark])
@@ -626,14 +625,14 @@ class CompressionManager:
         self, session_id: str, holder: str, ttl_seconds: float = 60.0
     ) -> bool:
         """尝试获取压缩 Turn Lease。对标 Hermes try_acquire_session_turn_lease。
-        
+
         Turn Lease 防止多进程/多线程并发压缩同一会话。
         与压缩锁配合使用：Turn Lease 控制"谁可以发起压缩"，
         压缩锁控制"压缩期间的原子性"。
         """
         lease_key = f"turn_lease:{session_id}"
         now = time.time()
-        
+
         existing = self._locks.get(lease_key)
         if existing:
             if existing.holder == holder and not existing.is_expired:
@@ -642,7 +641,7 @@ class CompressionManager:
                 logger.debug("[TurnLease] reclaimed expired lease: session=%s", session_id)
             elif existing.holder != holder:
                 return False  # 他方持有活跃 lease
-        
+
         lease = CompressionLock(
             session_id=lease_key,
             holder=holder,
@@ -757,7 +756,7 @@ class CompressionManager:
         if self._cooldown.cooldown_until > 0:
             is_active = True
             remaining = self._cooldown.cooldown_until - now
-        
+
         return {
             "cooldown_until": self._cooldown.cooldown_until,
             "remaining_seconds": max(0.0, remaining),
@@ -812,16 +811,16 @@ class CompressionManager:
         compress_func,
         validate_func,
         **kwargs,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """事务性压缩：锁 → 压缩 → 验证 → 提交 lineage → 释放锁。
         对标 Hermes publish_compression_child 的事务性保证。
-        
+
         Args:
             session_id: 会话 ID
             holder: 压缩器标识
             compress_func: 压缩函数 (messages, **kwargs) -> (compressed_messages, tokens_before, tokens_after)
             validate_func: 验证函数 (compressed_messages, **kwargs) -> None (抛 CompressionError 表示验证失败)
-        
+
         Returns:
             (success: bool, error_message: str)
         """
@@ -833,19 +832,19 @@ class CompressionManager:
             # 2. 执行压缩
             old_messages = kwargs.get("messages", [])
             compressed_messages, tokens_before, tokens_after = compress_func(old_messages, **kwargs)
-            
+
             # 3. 验证压缩结果
             try:
                 validate_func(compressed_messages, **kwargs)
             except Exception as e:
                 return False, f"Compression validation failed: {e}"
-            
+
             # 4. 生成 lineage 记录
             child_session_id = str(uuid.uuid4())[:12]
             watermark = kwargs.get("watermark")
             watermark_ceiling = kwargs.get("watermark_ceiling")
-            
-            record = self.record_compression_success(
+
+            self.record_compression_success(
                 parent_session_id=session_id,
                 child_session_id=child_session_id,
                 parent_messages=old_messages,
@@ -855,7 +854,7 @@ class CompressionManager:
                 watermark=watermark,
                 watermark_ceiling=watermark_ceiling,
             )
-            
+
             # 5. 压缩成功：清除冷却期
             self._cooldown.cooldown_until = 0.0
             self._cooldown.last_failure_error = ""
@@ -863,7 +862,7 @@ class CompressionManager:
             if self._cooldown.streak_ineffective:
                 self._cooldown.streak_ineffective = 0
             self._persist()
-            
+
             logger.info(
                 "[CompressionTransaction] successful: parent=%s → child=%s "
                 "(msgs %d→%d, tokens %d→%d)",
@@ -872,13 +871,13 @@ class CompressionManager:
                 tokens_before, tokens_after,
             )
             return True, ""
-            
+
         except Exception as e:
             # 6. 压缩失败：记录失败，不提交 lineage
             logger.warning("[CompressionTransaction] failed: %s", e)
             self.record_compression_failure(str(e), use_fallback=False)
             return False, str(e)
-            
+
         finally:
             # 7. 释放压缩锁
             self.release_lock(session_id, holder)

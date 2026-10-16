@@ -51,6 +51,16 @@ export function deriveMessageParts(msg: ChatMessage): MessagePart[] {
 
   const parts: MessagePart[] = [];
 
+  // Todo/plan 进度卡片放在轮次最上方：让用户和后续 LLM 读取会话时，第一眼就能
+  // 看到该轮的任务计划与逐步完成状态（计划创建 → 步骤执行 → 完成/失败）。
+  if (msg.todo && msg.todo.steps && msg.todo.steps.length > 0) {
+    parts.push({
+      kind: "plan",
+      id: pid(msg.id, "plan", msg.todo.id || ""),
+      todo: msg.todo,
+      progressEvents: msg.progressEvents || undefined,
+    });
+  }
   if (msg.thinkingChain && msg.thinkingChain.length > 0) {
     parts.push({ kind: "reasoning", id: pid(msg.id, "reasoning") });
   }
@@ -66,14 +76,6 @@ export function deriveMessageParts(msg: ChatMessage): MessagePart[] {
   }
   if (msg.mcpCalls && msg.mcpCalls.length > 0) {
     parts.push({ kind: "mcp", id: pid(msg.id, "mcp") });
-  }
-  if (msg.todo && msg.todo.steps && msg.todo.steps.length > 0) {
-    parts.push({
-      kind: "plan",
-      id: pid(msg.id, "plan", msg.todo.id || ""),
-      todo: msg.todo,
-      progressEvents: msg.progressEvents || undefined,
-    });
   }
   if (msg.optionalFeatureInstall) {
     parts.push({

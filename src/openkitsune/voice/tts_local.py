@@ -12,8 +12,9 @@ import shutil
 import subprocess
 import sys
 import wave
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +25,11 @@ DEFAULT_NEUTTS_MODEL = "neuphonic/neutts-air-q4-gguf"
 
 _TTS_MODEL_CACHE_MAX = 3
 
-_piper_voice_cache: Dict[str, Any] = {}
-_kittentts_model_cache: Dict[str, Any] = {}
+_piper_voice_cache: dict[str, Any] = {}
+_kittentts_model_cache: dict[str, Any] = {}
 
 
-def _tts_cache_get_or_load(cache: Dict[str, Any], key: str, load: Callable[[], Any]) -> Any:
+def _tts_cache_get_or_load(cache: dict[str, Any], key: str, load: Callable[[], Any]) -> Any:
     """从缓存取或加载 *key*，LRU 上限 ``_TTS_MODEL_CACHE_MAX``（命中刷新新鲜度）。"""
     if key in cache:
         cache[key] = cache.pop(key)
@@ -45,7 +46,7 @@ def _run_helper(cmd: list, timeout: int) -> subprocess.CompletedProcess:
                           errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
 
 
-def _section(tts_config: Any, key: str) -> Dict[str, Any]:
+def _section(tts_config: Any, key: str) -> dict[str, Any]:
     section = tts_config.get(key) if isinstance(tts_config, dict) else None
     return section if isinstance(section, dict) else {}
 
@@ -79,7 +80,7 @@ def _import_neutts_synth_script() -> str:
     return str(script)
 
 
-def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_neutts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     neutts_config = _section(tts_config, "neutts")
     wav_path = _wav_sidecar_path(output_path)
     script = _import_neutts_synth_script()
@@ -93,7 +94,7 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
         "--device", str(neutts_config.get("device") or "cpu")]
     result = _run_helper(cmd, 120)
     if result.returncode != 0:
-        error_lines = [l for l in result.stderr.strip().splitlines() if not l.startswith("OK:")]
+        error_lines = [line for line in result.stderr.strip().splitlines() if not line.startswith("OK:")]
         raise RuntimeError(f"NeuTTS synthesis failed: {chr(10).join(error_lines) or 'unknown error'}")
     return _finalize_wav_output(wav_path, output_path)
 
@@ -140,7 +141,7 @@ def _import_piper():
     return PiperVoice
 
 
-def _load_piper_voice_for_config(tts_config: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+def _load_piper_voice_for_config(tts_config: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     PiperVoice = _import_piper()
     piper_config = _section(tts_config, "piper")
     voice_name = piper_config.get("voice") or DEFAULT_PIPER_VOICE
@@ -163,7 +164,7 @@ _PIPER_ADVANCED_KNOBS = ("length_scale", "noise_scale", "noise_w_scale", "volume
                          "normalize_audio", "speaker_id")
 
 
-def _generate_piper_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_piper_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     voice, piper_config = _load_piper_voice_for_config(tts_config)
     _raw_speaker = piper_config.get("speaker_id", 0)
     speaker_id = _raw_speaker if type(_raw_speaker) is int else 0
@@ -195,7 +196,7 @@ def _import_kittentts():
     return KittenTTS
 
 
-def _load_kittentts_model_for_config(tts_config: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+def _load_kittentts_model_for_config(tts_config: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     KittenTTS = _import_kittentts()
     kt_config = _section(tts_config, "kittentts")
     model_name = kt_config.get("model", DEFAULT_KITTENTTS_MODEL)
@@ -209,7 +210,7 @@ def _load_kittentts_model_for_config(tts_config: Dict[str, Any]) -> Tuple[Any, D
     return _tts_cache_get_or_load(_kittentts_model_cache, model_name, _load_kittentts_model), kt_config
 
 
-def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+def _generate_kittentts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
     model, kt_config = _load_kittentts_model_for_config(tts_config)
     audio_arr = model.generate(  # numpy 24kHz
         text, voice=kt_config.get("voice", DEFAULT_KITTENTTS_VOICE),
@@ -226,7 +227,7 @@ class _LocalTTSDispatch:
 
     SUPPORTED = frozenset({"piper", "kittentts", "neutts"})
 
-    def __call__(self, text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    def __call__(self, text: str, output_path: str, tts_config: dict[str, Any]) -> str:
         provider = str(tts_config.get("_provider") or "piper").lower().strip()
         if provider == "piper":
             return _generate_piper_tts(text, output_path, tts_config)

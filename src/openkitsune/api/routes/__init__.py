@@ -11,8 +11,8 @@ from . import (
     chat_models,
     config,
     diagnostics,
-    feishu_onboard,
     feedback_store,
+    feishu_onboard,
     files,
     health,
     hub,
@@ -39,13 +39,14 @@ from . import (
     skills,
     token_stats,
     upload,
+    web_search,
+    websocket,
     wechat_onboard,
     wecom_onboard,
-    websocket,
-    web_search,
     workspace_io,
     workspaces,
 )
+
 try:
     from . import plugins
 except ImportError:  # pragma: no cover

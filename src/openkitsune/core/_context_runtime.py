@@ -33,14 +33,6 @@ from openkitsune.runtime.context.continuity import (
 from openkitsune.utils.url_safety import safe_urlparse
 
 from ..tracing.tracer import get_tracer
-from ._tool_runtime import OVERFLOW_MARKER
-from .compression_contract import (
-    CompressionError,
-    compression_attempt,
-    gather_summaries,
-    transactional_compression,
-    validated_summary,
-)
 from ._compaction_guard import CompactionGuard
 from ._priority_compaction import (
     CompressionGrade,
@@ -50,6 +42,14 @@ from ._priority_compaction import (
     purge_p6_noise,
     restructure_by_priority,
     verify_priority_integrity,
+)
+from ._tool_runtime import OVERFLOW_MARKER
+from .compression_contract import (
+    CompressionError,
+    compression_attempt,
+    gather_summaries,
+    transactional_compression,
+    validated_summary,
 )
 from .context_utils import DEFAULT_MAX_CONTEXT_TOKENS
 from .context_utils import estimate_tokens as _shared_estimate_tokens
@@ -367,6 +367,8 @@ class ContextManager:
                 return None
             from ._context_preparation import (
                 TaskContextSnapshot,
+            )
+            from ._context_preparation import (
                 restore_task_context as _restore,
             )
 
@@ -1974,6 +1976,44 @@ class ContextManager:
             except Exception as exc:
                 logger.warning("[Compress] Started checkpoint persistence failed: %s", exc)
 
+        # [TurnSkeleton-Primary 2026-10-16] 骨架压缩作为主路径：
+        # 先尝试确定性轮次骨架压缩（零 LLM），成功且能降到阈值以下直接返回；
+        # 失败或短对话时降级到下面的 LLM 摘要路径兜底。
+        try:
+            if bool(getattr(_settings, "context_turn_skeleton_primary_enabled", True)):
+                from ._turn_skeleton_compressor import (
+                    compress_with_turn_skeleton as _sk_compress,
+                )
+                _sk_result, _sk_stats = _sk_compress(
+                    source_messages,
+                    keep_last_n=int(
+                        getattr(_settings, "context_turn_skeleton_keep_last_n", 3) or 3
+                    ),
+                    estimate_tokens=self.estimate_messages_tokens,
+                )
+                if _sk_stats.get("compressed"):
+                    _sk_tokens = self.estimate_messages_tokens(_sk_result)
+                    logger.info(
+                        "[TurnSkeleton-Primary] used skeleton compression: "
+                        "%dtok -> %dtok, turns=%d skeletonized=%d kept=%d",
+                        current_tokens,
+                        _sk_tokens,
+                        _sk_stats.get("turns_total", 0),
+                        _sk_stats.get("turns_skeletonized", 0),
+                        _sk_stats.get("turns_kept_full", 0),
+                    )
+                    # 骨架压缩后仍需硬保底（极长尾部）
+                    _sk_final = self._hard_truncate_if_needed(
+                        _sk_result,
+                        hard_limit,
+                        memory_manager,
+                        overhead_bytes=_overhead_bytes,
+                    )
+                    return _end_ctx_span(_sk_final)
+        except Exception as _sk_e:
+            logger.warning("[TurnSkeleton-Primary] skeleton compress failed, "
+                           "falling back to LLM summary: %s", _sk_e)
+
         # P0-4 修复：pre-LLM 可行性跳过（对标 Hermes _feasibility_skip）——
         # 已有无效压缩记录且中间区过小时，跳过 LLM 摘要直接走确定性 fallback，
         # 避免零收益 LLM 调用与"未减少"异常。
@@ -2045,6 +2085,37 @@ class ContextManager:
         compressed = self._inject_summary_into_recent(summary, recent_messages)
 
         compressed_tokens = self.estimate_messages_tokens(compressed)
+
+        # [TurnSkeleton-Shadow 2026-10-16] 观察模式：并行跑一次轮次骨架压缩，
+        # 结果只写日志不替换消息。用于线上观察：骨架压缩比 vs LLM 压缩比、
+        # user 输入保留度。确认不失忆后再切换为正式 fallback。
+        try:
+            if bool(getattr(_settings, "context_turn_skeleton_shadow_enabled", False)):
+                from ._turn_skeleton_compressor import (
+                    compress_with_turn_skeleton as _sk_compress,
+                )
+                _sk_result, _sk_stats = _sk_compress(
+                    source_messages,
+                    keep_last_n=int(
+                        getattr(_settings, "context_turn_skeleton_keep_last_n", 3) or 3
+                    ),
+                    estimate_tokens=self.estimate_messages_tokens,
+                )
+                logger.info(
+                    "[TurnSkeleton-Shadow] original=%dtok LLM_compressed=%dtok "
+                    "skeleton=%dtok msgs=%d->%d turns_total=%d skeletonized=%d kept_full=%d",
+                    current_tokens,
+                    compressed_tokens,
+                    _sk_stats.get("compressed_tokens", 0),
+                    len(source_messages),
+                    len(_sk_result),
+                    _sk_stats.get("turns_total", 0),
+                    _sk_stats.get("turns_skeletonized", 0),
+                    _sk_stats.get("turns_kept_full", 0),
+                )
+        except Exception as _sk_e:
+            logger.debug("[TurnSkeleton-Shadow] shadow compute failed: %s", _sk_e)
+
         if compressed_tokens <= soft_limit:
             logger.info(f"Compressed context from {current_tokens} to {compressed_tokens} tokens")
             return _end_ctx_span(compressed)
@@ -2467,7 +2538,7 @@ class ContextManager:
                         return validated_summary(response, structured=True)
                     except (_CancelledError, asyncio.CancelledError):
                         raise
-                    except CompressionError as exc:
+                    except CompressionError:
                         # 校验/预算/退避类失败：重试大概率同样失败，直接上抛。
                         raise
                     except Exception as exc:  # 瞬时 LLM 调用失败：重试一次

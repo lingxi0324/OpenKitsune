@@ -210,9 +210,9 @@ def build_continuation_guidance(restored: tuple[str, str] | None) -> str | None:
         source, definition = restored
         return (
             "\n\n## Developer: TaskContinuation\n"
-            "用户要求继续之前的工作。已从 %s 恢复任务上下文：\n%s\n"
+            f"用户要求继续之前的工作。已从 {source} 恢复任务上下文：\n{definition}\n"
             "请基于该任务定义继续推进；不要重复已完成步骤，不要泛化收尾。"
-        ) % (source, definition)
+        )
     return (
         "\n\n## Developer: TaskContinuation\n"
         "用户要求继续之前的工作，但当前会话未能自动恢复任务定义。"

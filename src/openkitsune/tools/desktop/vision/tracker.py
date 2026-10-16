@@ -7,11 +7,7 @@ Tab-Agent 风格时序追踪工具
 使用本地 LLM 多模端点进行跨帧对象一致性验证。
 """
 
-import json
-import re
-import os
 from typing import Any
-from PIL import Image
 
 from .analyzer import VisionAnalyzer, get_vision_analyzer
 from .segmenter import LlmSegmenter
@@ -20,12 +16,12 @@ from .segmenter import LlmSegmenter
 class TemporalTracker:
     """
     时序追踪器
-    
+
     模仿 TAB-Agent 的 VlmFrameExpansion 流程：
     - 从参考帧（reference frame）开始
     - 向左右扩展，逐帧验证目标一致性
     - 使用 VLM 验证每帧是否包含目标对象
-    
+
     使用方式：
         tracker = TemporalTracker(vision_analyzer)
         results = await tracker.track_frames(
@@ -54,14 +50,14 @@ class TemporalTracker:
     ) -> list[dict[str, Any]]:
         """
         在连续图像序列中追踪目标对象。
-        
+
         Args:
             image_files: 按时间顺序排列的图像文件列表
             description: 目标对象描述
             reference_image: 参考图像（包含目标的帧），None 则自动检测
             max_expand_frames: 最大扩展帧数（每方向）
             verify_method: 验证方法 ("llm"=LLM 视觉, "segment"=分割对比)
-            
+
         Returns:
             追踪结果列表，按时间顺序排列，每个元素:
             - frame_index: int (图像文件索引)
@@ -112,7 +108,7 @@ class TemporalTracker:
             try:
                 with open(img_path, 'rb') as f:
                     img_bytes = f.read()
-                
+
                 analyzer = self._get_analyzer()
                 result = await self._verify_frame_has_target(
                     analyzer,
@@ -144,7 +140,7 @@ class TemporalTracker:
         # 构造参考上下文
         ref_context = ""
         if reference_context:
-            ref_context = f"\nReference context image provided.\n"
+            ref_context = "\nReference context image provided.\n"
 
         prompt = f"""You are a target object verification assistant. Your job is to determine if the target object exists in the current frame.
 
@@ -188,9 +184,9 @@ Return only the JSON, nothing else."""
     ) -> list[dict[str, Any]]:
         """向一个方向扩展追踪"""
         results = []
-        
+
         start_index = ref_index + 1 if direction == "right" else ref_index - 1
-        
+
         if direction == "right":
             indices = list(range(start_index, min(ref_index + max_frames, len(image_files))))
         else:
@@ -199,12 +195,12 @@ Return only the JSON, nothing else."""
         for idx in indices:
             if idx < 0 or idx >= len(image_files):
                 break
-                
+
             img_path = image_files[idx]
             try:
                 with open(img_path, 'rb') as f:
                     img_bytes = f.read()
-                    
+
                 result = await self._verify_frame_has_target(
                     analyzer, img_bytes, description
                 )
@@ -218,7 +214,7 @@ Return only the JSON, nothing else."""
                 })
                 if not result.get("has_target", False):
                     break  # 目标消失，停止扩展
-            except Exception as e:
+            except Exception:
                 break
 
         return results
@@ -233,24 +229,24 @@ Return only the JSON, nothing else."""
         """
         寻找与已有追踪结果在空间/时间上最远的新视角
         （模仿 TAB-Agent ExpandFromSecondaryView）
-        
+
         Returns:
             新视角的追踪结果
         """
         existing_indices = [r.get("frame_index") for r in existing_results if r.get("has_target")]
-        
+
         if not existing_indices:
             return []
 
         # 找与现有帧最远的候选帧
         distances = []
-        for i, (img_path, _idx) in enumerate([(f, idx) for idx, f in enumerate(image_files) if idx not in existing_indices]):
-            min_dist = min(abs(idx - _idx) for _idx in existing_indices)
+        for i, (_img_path, _idx) in enumerate([(f, idx) for idx, f in enumerate(image_files) if idx not in existing_indices]):
+            min_dist = min(abs(_idx - existing) for existing in existing_indices)
             distances.append((i, min_dist))
 
         # 取距离最大的候选帧
         distances.sort(key=lambda x: x[1], reverse=True)
-        
+
         candidates = []
         for idx, _dist in distances[:max_candidate_frames]:
             img_path = image_files[idx]
@@ -278,7 +274,7 @@ Return only the JSON, nothing else."""
 class MultiViewTracker:
     """
     多视角追踪器
-    
+
     整合多个视角的追踪结果，生成完整的对象覆盖轨迹。
     """
 
@@ -292,7 +288,7 @@ class MultiViewTracker:
     ) -> list[dict[str, Any]]:
         """
         合并多个视角的追踪结果，去重并按时间排序
-        
+
         Args:
             views: 多个视角的追踪结果列表
         """

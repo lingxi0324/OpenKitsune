@@ -861,10 +861,12 @@ class DesktopToolHandler:
 
     async def _handle_segment_object(self, params: dict) -> dict:
         """Tab-Agent 风格对象分割"""
-        from .vision.segmenter import LlmSegmenter
-        from PIL import Image as PILImage
-        from io import BytesIO
         import base64
+        from io import BytesIO
+
+        from PIL import Image as PILImage
+
+        from .vision.segmenter import LlmSegmenter
 
         description = params.get("description", "")
         image_data = params.get("image", "")
@@ -884,10 +886,12 @@ class DesktopToolHandler:
 
     async def _handle_segment_all_objects(self, params: dict) -> dict:
         """Tab-Agent 风格全目标分割"""
-        from .vision.segmenter import LlmSegmenter
-        from PIL import Image as PILImage
-        from io import BytesIO
         import base64
+        from io import BytesIO
+
+        from PIL import Image as PILImage
+
+        from .vision.segmenter import LlmSegmenter
 
         image_data = params.get("image", "")
         max_objects = params.get("max_objects", 50)
@@ -910,14 +914,16 @@ class DesktopToolHandler:
 
     async def _handle_spatial_query(self, params: dict) -> dict:
         """Tab-Agent 风格空间推理"""
-        from .vision.spatial import SpatialReasoner
-        from PIL import Image as PILImage
-        from io import BytesIO
         import base64
+        from io import BytesIO
+
+        from PIL import Image as PILImage
+
+        from .vision.spatial import SpatialReasoner
 
         question = params.get("question", "")
         image_data = params.get("image", "")
-        answer_options = params.get("answer_options", None)
+        answer_options = params.get("answer_options")
 
         if image_data:
             if image_data.startswith("data:"):
@@ -937,13 +943,13 @@ class DesktopToolHandler:
 
     async def _handle_track_frames(self, params: dict) -> dict:
         """Tab-Agent 风格时序追踪"""
-        from .vision.tracker import TemporalTracker
-        from PIL import Image as PILImage
         import os
+
+        from .vision.tracker import TemporalTracker
 
         image_files = params.get("image_files", [])
         description = params.get("description", "")
-        reference_image = params.get("reference_image", None)
+        reference_image = params.get("reference_image")
         max_expand = params.get("max_expand_frames", 16)
 
         if image_files:

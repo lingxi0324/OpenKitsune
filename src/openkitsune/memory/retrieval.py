@@ -273,10 +273,7 @@ class RetrievalEngine:
         enhanced_query = self._build_enhanced_query(query, recent_messages, search_keywords)
         # 语义主检索使用拆解出的核心关键词（去噪），避免整句中的
         # "帮我看看/组成/主治" 等低信息词稀释 BM25 权重；无关键词时回退整句。
-        if search_keywords:
-            semantic_query = " ".join(dict.fromkeys(search_keywords))
-        else:
-            semantic_query = query
+        semantic_query = " ".join(dict.fromkeys(search_keywords)) if search_keywords else query
 
         semantic_results = self._search_semantic(semantic_query)
         episode_results = self._search_episodes(enhanced_query)
@@ -323,10 +320,7 @@ class RetrievalEngine:
         # 语义查询用拆解出的核心关键词（去噪），避免整句中的
         # "帮我看看/组成/主治" 等低信息词稀释 BM25 权重；
         # 无关键词时回退整句。
-        if search_keywords:
-            semantic_query = " ".join(dict.fromkeys(search_keywords))
-        else:
-            semantic_query = query
+        semantic_query = " ".join(dict.fromkeys(search_keywords)) if search_keywords else query
 
         semantic = self._search_semantic(semantic_query)
         episodes = self._search_episodes(enhanced)

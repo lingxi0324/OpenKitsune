@@ -19,7 +19,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from openkitsune.runtime_manager import build_user_subprocess_environment, get_agent_python_executable
+from openkitsune.runtime_manager import (
+    build_user_subprocess_environment,
+    get_agent_python_executable,
+)
 
 logger = logging.getLogger(__name__)
 

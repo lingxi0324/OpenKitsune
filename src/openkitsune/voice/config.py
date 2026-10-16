@@ -18,7 +18,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ DEFAULT_NEUTTS_MODEL = "neuphonic/neutts-air-q4-gguf"
 DEFAULT_DEEPINFRA_TTS_VOICE = "default"
 
 # provider -> 单请求输入字符上限（官方文档 / 实践值）
-PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
+PROVIDER_MAX_TEXT_LENGTH: dict[str, int] = {
     "edge": 5000,
     "openai": 4096,
     "deepinfra": 4096,
@@ -96,7 +96,7 @@ _TRUE_WORDS = {"1", "true", "yes", "on", "enabled"}
 _FALSE_WORDS = {"0", "false", "no", "off", "disabled"}
 
 # 环境变量 -> (provider 名, 配置键)。TTS/在线 STT key 统一从这里解析。
-PROVIDER_KEY_ENV: Dict[str, str] = {
+PROVIDER_KEY_ENV: dict[str, str] = {
     "ELEVENLABS_API_KEY": "elevenlabs",
     "OPENAI_API_KEY": "openai",
     "VOICE_TOOLS_OPENAI_KEY": "openai",
@@ -110,8 +110,8 @@ PROVIDER_KEY_ENV: Dict[str, str] = {
     "GROQ_API_KEY": "groq",
 }
 
-_voice_config_path: Optional[Path] = None
-_voice_config: Dict[str, Any] = {}
+_voice_config_path: Path | None = None
+_voice_config: dict[str, Any] = {}
 
 
 def set_voice_config_path(path: str | Path | None) -> None:
@@ -132,7 +132,7 @@ def get_voice_config_path() -> Path:
         return Path.cwd() / "data" / "voice_config.json"
 
 
-def load_voice_config() -> Dict[str, Any]:
+def load_voice_config() -> dict[str, Any]:
     """加载 voice 配置段（{} 缺失/损坏时）。"""
     global _voice_config
     if _voice_config:
@@ -149,14 +149,14 @@ def load_voice_config() -> Dict[str, Any]:
     return _voice_config
 
 
-def reload_voice_config() -> Dict[str, Any]:
+def reload_voice_config() -> dict[str, Any]:
     """强制重读 voice 配置（配置变更后调用）。"""
     global _voice_config
     _voice_config = {}
     return load_voice_config()
 
 
-def section(config: Dict[str, Any] | None, key: str) -> Dict[str, Any]:
+def section(config: dict[str, Any] | None, key: str) -> dict[str, Any]:
     """``cfg.<key>`` 作为 dict（null/非 dict 读作空）。"""
     cfg = config if isinstance(config, dict) else {}
     sec = cfg.get(key)
@@ -175,7 +175,7 @@ def config_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-def config_number(cfg: Dict[str, Any], key: str, default: float, cast=float) -> Any:
+def config_number(cfg: dict[str, Any], key: str, default: float, cast=float) -> Any:
     """读取 ``cfg[key]`` 经 *cast* 转换，坏值回退默认。"""
     try:
         return cast(cfg.get(key, default))
@@ -222,10 +222,10 @@ def ensure_output_dir() -> Path:
     return path
 
 
-def get_vad_config() -> Dict[str, Any]:
+def get_vad_config() -> dict[str, Any]:
     """VAD 配置段（含默认值合并）。"""
     cfg = section(load_voice_config(), "vad")
-    defaults: Dict[str, Any] = {
+    defaults: dict[str, Any] = {
         "sample_rate": SAMPLE_RATE,
         "channels": CHANNELS,
         "silence_threshold": SILENCE_RMS_THRESHOLD,
@@ -240,17 +240,17 @@ def get_vad_config() -> Dict[str, Any]:
     return merged
 
 
-def get_stt_config() -> Dict[str, Any]:
+def get_stt_config() -> dict[str, Any]:
     """STT 配置段（{} 缺失时）。"""
     return section(load_voice_config(), "stt")
 
 
-def get_tts_config() -> Dict[str, Any]:
+def get_tts_config() -> dict[str, Any]:
     """TTS 配置段（{} 缺失时）。"""
     return section(load_voice_config(), "tts")
 
 
-def get_tts_provider(tts_config: Dict[str, Any] | None = None) -> str:
+def get_tts_provider(tts_config: dict[str, Any] | None = None) -> str:
     """配置的 TTS provider 或免费默认（edge）。"""
     cfg = tts_config if tts_config is not None else get_tts_config()
     provider = (cfg.get("provider") or DEFAULT_TTS_PROVIDER).lower().strip()

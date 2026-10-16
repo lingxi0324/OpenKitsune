@@ -73,6 +73,7 @@ if TYPE_CHECKING:
         set_hook_executor,
     )
     from .identity import Identity
+    from .kitsune import KitsuneLoop, StopHook, Task, TaskResult, TaskStatus
     from .loop_budget import (
         READONLY_EXPLORATION_TOOLS,
         LoopBudgetDecision,
@@ -126,7 +127,6 @@ if TYPE_CHECKING:
         PersonaTrait,
         persist_trait_to_memory,
     )
-    from .kitsune import KitsuneLoop, StopHook, Task, TaskResult, TaskStatus
     from .reasoning import Checkpoint, DecisionType, ReasoningEngine
     from .reasoning import Decision as ReasoningDecision
     from .resource_budget import (

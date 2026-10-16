@@ -340,7 +340,7 @@ def get_active_todo_prompt(session_id: str) -> str:
 def hydrate_todo_from_messages(
     session_id: str,
     messages: list[dict],
-    handler_factory: Optional[callable] = None,
+    handler_factory: callable | None = None,
 ) -> bool:
     """对标 Hermes ``_hydrate_todo_store``：从消息历史水合 Todo。
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 view_switch_review.py —— 视角切换审查点 · 生产接入适配器
 
@@ -30,8 +29,8 @@ from __future__ import annotations
 import logging
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +81,11 @@ def config_from_settings() -> ViewSwitchConfig:
     )
 
 
-def extract_evidence(trace: Optional[List[dict]], max_chars: int = 6000) -> str:
+def extract_evidence(trace: list[dict] | None, max_chars: int = 6000) -> str:
     """从 _last_react_trace 复用 pass1 已读的工具结果（文件原文），去重 + 限长。"""
     if not trace:
         return ""
-    blocks: List[str] = []
+    blocks: list[str] = []
     seen: set = set()
     for entry in trace:
         if not isinstance(entry, dict):
@@ -108,7 +107,7 @@ def extract_evidence(trace: Optional[List[dict]], max_chars: int = 6000) -> str:
     return joined
 
 
-def count_tool_calls(trace: Optional[List[dict]]) -> int:
+def count_tool_calls(trace: list[dict] | None) -> int:
     if not trace:
         return 0
     n = 0
@@ -132,7 +131,7 @@ def count_hedges(final_text: str) -> int:
     return sum(1 for w in HEDGE_WORDS if w in final_text)
 
 
-def should_review(exit_reason: str, trace: Optional[List[dict]], final_text: str) -> Tuple[bool, str]:
+def should_review(exit_reason: str, trace: list[dict] | None, final_text: str) -> tuple[bool, str]:
     """触发判定（未触发 = 零成本，不调模型）。"""
     reason = (exit_reason or "normal").strip().lower()
     if reason in TRIGGER_EXIT_REASONS:
@@ -180,7 +179,7 @@ def build_review_prompt(task_description: str, final_text: str, evidence: str) -
 （若"通过"，只输出：三态：通过）"""
 
 
-def parse_verdict(text: str) -> Tuple[str, str, List[str]]:
+def parse_verdict(text: str) -> tuple[str, str, list[str]]:
     """解析审查输出 → (三态, 异议, 引号片段列表)。异议取整段（到原文证据/三态行为止）。"""
     t = (text or "").strip()
     state = "通过"
@@ -227,10 +226,10 @@ def _claim_indices(text: str) -> set:
 def machine_verify(
     state: str,
     objection: str,
-    quotes: List[str],
+    quotes: list[str],
     evidence: str,
     final_text: str,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """
     机器裁决（保守默认）。异议必须同时满足：
       1) 引号片段逐字出现在证据池（防编造证据）；
@@ -313,10 +312,10 @@ async def view_switch_review(
     *,
     final_text: str,
     exit_reason: str,
-    trace: Optional[List[dict]],
+    trace: list[dict] | None,
     task_description: str = "",
-    config: Optional[ViewSwitchConfig] = None,
-) -> Tuple[str, Dict[str, Any]]:
+    config: ViewSwitchConfig | None = None,
+) -> tuple[str, dict[str, Any]]:
     """
     视角切换审查点主入口（生产接入调用）。
 
@@ -326,7 +325,7 @@ async def view_switch_review(
     任何异常 → 返回 (final_text, {"triggered": False, "error": ...}) —— 原响应不变。
     """
     cfg = config or ViewSwitchConfig()
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "triggered": False,
         "trigger_reason": "",
         "verdict": "通过",

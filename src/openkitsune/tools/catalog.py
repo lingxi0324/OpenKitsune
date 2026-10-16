@@ -33,7 +33,7 @@ import logging
 import re
 from collections import OrderedDict
 
-from .defer_config import STABLE_MAIN_CHAT_CORE_TOOLS, STABLE_MAIN_CHAT_CORE_TOOL_SET
+from .defer_config import STABLE_MAIN_CHAT_CORE_TOOL_SET, STABLE_MAIN_CHAT_CORE_TOOLS
 from .definitions.base import infer_category
 
 logger = logging.getLogger(__name__)

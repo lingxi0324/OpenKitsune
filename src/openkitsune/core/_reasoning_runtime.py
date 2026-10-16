@@ -671,6 +671,14 @@ class Checkpoint:
 
 
 # Compatibility aliases for guards whose implementations live in the state graph runtime.
+# [整改 2026-10-10 对标 OpenAkita P-RC-5] 无工具完成声明防护（unbacked-action claim）：
+# OpenAkita 在 _handle_final_answer 用 action_claim_re + done 短语 + 文本化工具执行
+# 轨迹三路检测"已保存/已删除/调用X完成"类声明，零工具调用时强制有界重试，耗尽后
+# 返回非欺骗性失败文本，杜绝"报文本即停"。OpenKitsune 此前仅认 [ACTION] 标签，
+# 导致多轮后模型以完成态措辞收尾时任务静默失败，现恢复该防护。
+from openkitsune.runtime.state_graph.guards._text_patterns import (  # noqa: E402
+    action_done_re as _get_action_done_re,
+)
 from openkitsune.runtime.state_graph.guards.conversation_state import (
     has_recoverable_tool_issue as _has_recoverable_tool_issue,
 )
@@ -680,16 +688,10 @@ from openkitsune.runtime.state_graph.guards.conversation_state import (
 from openkitsune.runtime.state_graph.guards.tool_failure_ack import (  # noqa: E402
     check_tool_failure_acknowledgement as _check_tool_failure_acknowledgement,
 )
-# [整改 2026-10-10 对标 OpenAkita P-RC-5] 无工具完成声明防护（unbacked-action claim）：
-# OpenAkita 在 _handle_final_answer 用 action_claim_re + done 短语 + 文本化工具执行
-# 轨迹三路检测"已保存/已删除/调用X完成"类声明，零工具调用时强制有界重试，耗尽后
-# 返回非欺骗性失败文本，杜绝"报文本即停"。OpenKitsune 此前仅认 [ACTION] 标签，
-# 导致多轮后模型以完成态措辞收尾时任务静默失败，现恢复该防护。
-from openkitsune.runtime.state_graph.guards._text_patterns import (  # noqa: E402
-    action_done_re as _get_action_done_re,
-)
 from openkitsune.runtime.state_graph.guards.unbacked_action import (  # noqa: E402
     action_claim_re as _get_action_claim_re,
+)
+from openkitsune.runtime.state_graph.guards.unbacked_action import (
     looks_like_no_tool_completion_claim as _looks_like_no_tool_completion_claim,
 )
 
@@ -4932,7 +4934,7 @@ class ReasoningEngine:
                                         )
                                         or "data/handoff"
                                     ),
-                                    session_id=str(session_id or conversation_id or ""),
+                                    session_id=str(conversation_id or ""),
                                     task_goal=str(task_description or ""),
                                     trigger_ratio=float(
                                         _pressure.trigger_tokens

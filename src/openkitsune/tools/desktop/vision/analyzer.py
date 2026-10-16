@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import sys
+from typing import Any
 
 from PIL import Image
 
@@ -97,35 +98,116 @@ class VisionAnalyzer:
 
         return ""
 
-    def _parse_json_response(self, text: str) -> dict | None:
+    def _parse_json_response(self, text: str) -> Any:
         """
-        解析模型返回的 JSON
+        解析模型返回的 JSON，支持 dict 和 list，带容错恢复。
 
         Args:
             text: 模型响应文本
 
         Returns:
-            解析后的 JSON 对象
+            解析后的 JSON 对象（dict 或 list）
         """
-        # 尝试提取 JSON 块
+        # Try 1: extract markdown JSON block
         json_match = re.search(r"```json\s*([\s\S]*?)\s*```", text)
         if json_match:
             json_str = json_match.group(1)
         else:
-            # 尝试直接解析
-            json_str = text.strip()
-            # 尝试找到 JSON 对象
-            start = json_str.find("{")
-            end = json_str.rfind("}") + 1
-            if start >= 0 and end > start:
-                json_str = json_str[start:end]
+            # Try 2: extract markdown code/text block
+            json_match = re.search(r"```\s*\n([\s\S]*?)\s*```", text)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                # Try 3: find JSON array in text
+                start = text.find("[")
+                end = text.rfind("]") + 1
+                if start >= 0 and end > start:
+                    json_str = text[start:end]
+                else:
+                    # Try 4: find JSON object
+                    start = text.find("{")
+                    end = text.rfind("}") + 1
+                    json_str = text[start:end] if start >= 0 and end > start else text.strip()
 
+        # Try to parse, with lenient recovery
         try:
             return json.loads(json_str)
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse JSON response: {e}")
-            logger.debug(f"Raw response: {text}")
+            logger.debug(f"Raw response: {text[:500]}...")
+            recovered = self._recover_json(json_str)
+            if recovered is not None:
+                return recovered
+            # Try normalizing escaped curly braces (f-string template format {{ -> {)
+            try:
+                fixed = json_str.replace("{{", "{").replace("}}", "}")
+                return json.loads(fixed)
+            except json.JSONDecodeError:
+                pass
             return None
+
+    def _recover_json(self, json_str: str) -> Any | None:
+        """尝试宽松恢复 JSON，处理常见格式问题（尾随逗号、多余字符、缺少逗号、中文引号等）。"""
+        # 1. Remove trailing commas before } or ]
+        try:
+            return json.loads(re.sub(r",\s*([}\]])", r"\1", json_str))
+        except json.JSONDecodeError:
+            pass
+        # 2. Handle missing commas between strings in arrays: ,"text"  →  ,"text"
+        #    Common issue: model outputs ["a" "b"] instead of ["a", "b"]
+        try:
+            fixed = re.sub(r'"(\s*)"', r'",\1"', json_str)
+            fixed = re.sub(r'(\s*)"(\s*)"', r'\1",\2"', fixed)
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+        # 3. Handle unicode/smart quotes
+        try:
+            fixed = json_str.replace(chr(0x201C), chr(0x2018)).replace(chr(0x201C), chr(0x22)).replace(chr(0x201D), chr(0x22))
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+        # 4. Truncate at first complete array/object structure
+        try:
+            depth = 0
+            in_string = False
+            for i, ch in enumerate(json_str):
+                if ch == '"' and (i == 0 or json_str[i - 1] != "\\"):
+                    in_string = not in_string
+                if not in_string:
+                    if ch in "{[":
+                        depth += 1
+                    elif ch in "}]":
+                        depth -= 1
+                        if depth == 0:
+                            return json.loads(json_str[:i + 1])
+        except json.JSONDecodeError:
+            pass
+        # 5. Strip non-JSON trailing content
+        try:
+            return json.loads(json_str[:json_str.rfind("}") + 1])
+        except json.JSONDecodeError:
+            pass
+        # 6. Try to find complete array by tracking bracket depth with string awareness
+        try:
+            depth = 0
+            in_string = False
+            brace_count = 0
+            for i, ch in enumerate(json_str):
+                if ch == '"' and (i == 0 or json_str[i - 1] != "\\"):
+                    in_string = not in_string
+                if not in_string:
+                    if ch == "[":
+                        depth += 1
+                        brace_count += 1
+                    elif ch == "]":
+                        depth -= 1
+                        brace_count -= 1
+                        if depth == 0:
+                            return json.loads(json_str[:i + 1])
+        except json.JSONDecodeError:
+            pass
+        return None
 
     async def find_element(
         self,
@@ -133,14 +215,7 @@ class VisionAnalyzer:
         image: Image.Image | None = None,
     ) -> ElementLocation | None:
         """
-        根据描述查找 UI 元素
-
-        Args:
-            description: 元素描述（如"保存按钮"、"红色图标"）
-            image: 截图，None 则自动截取当前屏幕
-
-        Returns:
-            找到的元素位置，未找到返回 None
+        Find a UI element in the screenshot by description.
         """
         if image is None:
             image = self._capture.capture(use_cache=False)
@@ -442,22 +517,59 @@ class VisionAnalyzer:
                     raw_response=response,
                 )
 
-            # 提取文本元素
+            # Handle list results (LLM may return array instead of dict)
             elements = []
-            for text_data in result.get("texts", []):
-                bbox_data = text_data.get("bbox")
-                if bbox_data and len(bbox_data) == 4:
-                    elements.append(
-                        ElementLocation(
-                            description=text_data.get("content", ""),
-                            bbox=BoundingBox(
-                                left=int(bbox_data[0]),
-                                top=int(bbox_data[1]),
-                                right=int(bbox_data[2]),
-                                bottom=int(bbox_data[3]),
-                            ),
+            if isinstance(result, list):
+                for text_data in result:
+                    if isinstance(text_data, dict):
+                        bbox_data = text_data.get("bbox") or text_data.get("bbox_2d")
+                        if bbox_data and len(bbox_data) == 4:
+                            elements.append(
+                                ElementLocation(
+                                    description=text_data.get("text", "") or text_data.get("content", ""),
+                                    bbox=BoundingBox(
+                                        left=int(bbox_data[0]),
+                                        top=int(bbox_data[1]),
+                                        right=int(bbox_data[2]),
+                                        bottom=int(bbox_data[3]),
+                                    ),
+                                )
+                            )
+                    elif isinstance(text_data, str):
+                        # Flat string list (e.g., ["text1", "text2", ...])
+                        elements.append(
+                            ElementLocation(
+                                description=text_data,
+                                bbox=BoundingBox(
+                                    left=0, top=0, right=100, bottom=20,
+                                ),
+                            )
                         )
+                if elements:
+                    return VisionResult(
+                        success=True,
+                        query="extract_text",
+                        answer="\n".join(e.description for e in elements),
+                        elements=elements,
+                        raw_response=response,
                     )
+
+            # Extract text elements from dict format
+            if not elements:
+                for text_data in result.get("texts", []):
+                    bbox_data = text_data.get("bbox")
+                    if bbox_data and len(bbox_data) == 4:
+                        elements.append(
+                            ElementLocation(
+                                description=text_data.get("content", ""),
+                                bbox=BoundingBox(
+                                    left=int(bbox_data[0]),
+                                    top=int(bbox_data[1]),
+                                    right=int(bbox_data[2]),
+                                    bottom=int(bbox_data[3]),
+                                ),
+                            )
+                        )
 
             return VisionResult(
                 success=True,

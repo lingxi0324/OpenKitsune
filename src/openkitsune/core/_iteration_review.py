@@ -25,8 +25,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 __all__ = ["build_review_message"]
 
 # 只读探索类工具（与 loop_budget.READONLY_EXPLORATION_TOOLS 保持一致）
@@ -146,7 +144,7 @@ def build_review_message(
         review_lines.append(f"已连续 {explore_rounds} 轮只读探索，未取得实质推进（停滞）")
 
     if review_lines:
-        review_body = "\n".join(f"- {l}" for l in review_lines)
+        review_body = "\n".join(f"- {line}" for line in review_lines)
     else:
         review_body = "- 未发现问题，继续推进。"
 

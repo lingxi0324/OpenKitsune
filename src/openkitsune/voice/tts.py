@@ -15,15 +15,14 @@ import asyncio
 import logging
 import os
 import shutil
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 from . import audio
 from .config import (
     BUILTIN_TTS_PROVIDERS,
     FALLBACK_MAX_TEXT_LENGTH,
-    NATIVE_OPUS_PROVIDERS,
-    OPUS_VOICE_PLATFORMS,
     PROVIDER_MAX_TEXT_LENGTH,
     get_tts_config,
     get_tts_provider,
@@ -52,15 +51,15 @@ _NEEDS_FFMPEG_CONCAT = _FFMPEG_OPUS
 DEFAULT_RESPONSE_BYTE_LIMIT = 16 * 1024 * 1024
 
 
-def _section(tts_config: Any, key: str) -> Dict[str, Any]:
+def _section(tts_config: Any, key: str) -> dict[str, Any]:
     return audio._section(tts_config, key)
 
 
-def _positive_int(value: Any) -> Optional[int]:
+def _positive_int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def resolve_max_text_length(provider: Optional[str], tts_config: Optional[Dict[str, Any]] = None) -> int:
+def resolve_max_text_length(provider: str | None, tts_config: dict[str, Any] | None = None) -> int:
     """provider 输入字符上限：``tts.<provider>.max_text_length`` > 内置表 > 兜底。"""
     if not provider:
         return FALLBACK_MAX_TEXT_LENGTH
@@ -78,7 +77,7 @@ def resolve_max_text_length(provider: Optional[str], tts_config: Optional[Dict[s
     return PROVIDER_MAX_TEXT_LENGTH.get(key, FALLBACK_MAX_TEXT_LENGTH)
 
 
-def audio_elevenlabs_model_cap(model_id: str) -> Optional[int]:
+def audio_elevenlabs_model_cap(model_id: str) -> int | None:
     """ElevenLabs 模型感知字符上限（官方模型表）。"""
     caps = {
         "eleven_v3": 5000, "eleven_ttv_v3": 5000,
@@ -88,14 +87,14 @@ def audio_elevenlabs_model_cap(model_id: str) -> Optional[int]:
     return caps.get(model_id)
 
 
-def _is_command_provider(provider: str, tts_config: Dict[str, Any]) -> bool:
+def _is_command_provider(provider: str, tts_config: dict[str, Any]) -> bool:
     """命令 provider（本地可执行文件合成）暂不迁移；返回 False。"""
     return False
 
 
-def _resolve_engine(provider: str) -> Optional[Callable]:
+def _resolve_engine(provider: str) -> Callable | None:
     """返回 provider 对应的同步/异步生成函数；未知返回 None。"""
-    engines: Dict[str, Callable] = {
+    engines: dict[str, Callable] = {
         "edge": generate_edge_tts,          # async
         "openai": generate_openai_tts,
         "deepinfra": generate_deepinfra_tts,
@@ -111,7 +110,7 @@ def _resolve_engine(provider: str) -> Optional[Callable]:
     return engines.get(provider.lower().strip())
 
 
-def _resolve_local_engine(provider: str) -> Optional[Callable]:
+def _resolve_local_engine(provider: str) -> Callable | None:
     """本地引擎（piper/kittentts/neutts）延迟导入；未安装返回 None。
 
     返回绑定 provider 的局部函数，供 ``_run_engine`` 直接调用。
@@ -120,7 +119,7 @@ def _resolve_local_engine(provider: str) -> Optional[Callable]:
     try:
         from .tts_local import generate_local_tts
         if key in generate_local_tts.SUPPORTED:
-            def _bound(text: str, output_path: str, cfg: Dict[str, Any]) -> str:
+            def _bound(text: str, output_path: str, cfg: dict[str, Any]) -> str:
                 local_cfg = dict(cfg)
                 local_cfg["_provider"] = key
                 return generate_local_tts(text, output_path, local_cfg)
@@ -134,7 +133,7 @@ def _is_async_engine(provider: str) -> bool:
     return provider.lower().strip() == "edge"
 
 
-def _run_engine(engine: Callable, text: str, output_path: str, tts_config: Dict[str, Any],
+def _run_engine(engine: Callable, text: str, output_path: str, tts_config: dict[str, Any],
                 provider: str) -> str:
     """执行引擎（async 用事件循环；sync 直调）。
 
@@ -163,7 +162,7 @@ def _default_output_path(provider: str, fmt: str, output_dir: str) -> str:
     return str(Path(output_dir) / f"tts_{os.path.getpid()}_{int(__import__('time').time() * 1000)}.{fmt}")
 
 
-def _resolve_output_format(tts_config: Dict[str, Any], output_path: Optional[str],
+def _resolve_output_format(tts_config: dict[str, Any], output_path: str | None,
                            provider: str, voice_compatible: bool) -> str:
     """输出格式：显式路径扩展名 > ``tts.output_format`` > provider/平台推断。"""
     if output_path and Path(output_path).suffix.lower() in (".mp3", ".wav", ".ogg", ".opus", ".flac"):
@@ -208,7 +207,7 @@ def _finalize_output(engine_path: str, output_path: str, provider: str, fmt: str
     return output_path
 
 
-def _remove_quietly(path: Optional[str]) -> None:
+def _remove_quietly(path: str | None) -> None:
     if path:
         try:
             os.remove(path)
@@ -219,14 +218,14 @@ def _remove_quietly(path: Optional[str]) -> None:
 def synthesize_text(
     text: str,
     *,
-    provider: Optional[str] = None,
-    output_path: Optional[str] = None,
-    tts_config: Optional[Dict[str, Any]] = None,
+    provider: str | None = None,
+    output_path: str | None = None,
+    tts_config: dict[str, Any] | None = None,
     voice_compatible: bool = False,
-    platform: Optional[str] = None,
-    max_text_length: Optional[int] = None,
-    format: Optional[str] = None,
-) -> Dict[str, Any]:
+    platform: str | None = None,
+    max_text_length: int | None = None,
+    format: str | None = None,
+) -> dict[str, Any]:
     """合成语音并返回交付信息。
 
     Args:
@@ -261,7 +260,7 @@ def synthesize_text(
     output_dir = str(Path(output_path).parent) if output_path else get_output_dir_path(cfg)
 
     # 每个分块生成独立文件
-    chunk_paths: List[str] = []
+    chunk_paths: list[str] = []
     try:
         for index, chunk in enumerate(chunks, start=1):
             if output_path and len(chunks) == 1:
@@ -278,7 +277,7 @@ def synthesize_text(
             if Path(chunk_out).suffix.lower() == ".ogg":
                 result = audio.repair_ogg_container(result)
             chunk_paths.append(result)
-    except Exception as e:
+    except Exception:
         for path in chunk_paths:
             _remove_quietly(path)
         raise
@@ -294,8 +293,8 @@ def synthesize_text(
     return {"paths": chunk_paths, "provider": provider, "format": fmt, "combined": False}
 
 
-def _combine_chunks(chunk_paths: List[str], output_path: str, fmt: str,
-                    voice_compatible: bool, cfg: Dict[str, Any]) -> Tuple[List[str], bool]:
+def _combine_chunks(chunk_paths: list[str], output_path: str, fmt: str,
+                    voice_compatible: bool, cfg: dict[str, Any]) -> tuple[list[str], bool]:
     """按目标路径合并分块（ffmpeg concat）；超限时按平台 profile 打包。"""
     profile = audio.resolve_audio_delivery_profile(None, cfg)
     # 先尝试直接合并
@@ -310,7 +309,7 @@ def _combine_chunks(chunk_paths: List[str], output_path: str, fmt: str,
     return final_paths, combined_any
 
 
-def get_output_dir_path(tts_config: Dict[str, Any]) -> str:
+def get_output_dir_path(tts_config: dict[str, Any]) -> str:
     """输出目录：``tts.output_dir`` > voice 配置 output_dir > data/voice_cache。"""
     from .config import get_output_dir
     configured = tts_config.get("output_dir")
@@ -319,7 +318,7 @@ def get_output_dir_path(tts_config: Dict[str, Any]) -> str:
     return get_output_dir()
 
 
-def list_available_providers() -> List[str]:
+def list_available_providers() -> list[str]:
     """列出可用引擎（本地引擎按依赖可用性过滤）。"""
     available = []
     for provider in sorted(BUILTIN_TTS_PROVIDERS):

@@ -12,6 +12,7 @@ Tab-Agent 风格空间推理工具
 import json
 import re
 from typing import Any
+
 from PIL import Image
 
 from .analyzer import VisionAnalyzer, get_vision_analyzer
@@ -20,14 +21,14 @@ from .analyzer import VisionAnalyzer, get_vision_analyzer
 class SpatialReasoner:
     """
     空间推理器
-    
+
     使用 LLM 视觉端点进行空间关系推理：
     - 相对位置判断（左/右/上/下/前/后/内/外）
     - 距离估计（近/远/中等）
     - 遮挡关系判断
     - 空间关系链推理（A 在 B 左边，B 在 C 前 → A 在 C 的左前）
     - 3D 空间推断（从 2D 图像推断深度/层次）
-    
+
     使用方式：
         reasoner = SpatialReasoner(vision_analyzer)
         answer = await reasoner.query("Is the cat to the left of the dog?")
@@ -49,12 +50,12 @@ class SpatialReasoner:
     ) -> dict[str, Any]:
         """
         回答关于图像空间关系的问题。
-        
+
         Args:
             question: 空间关系问题（如 "Where is the red car relative to the building?"）
             image: 输入图像，None 则自动截图
             answer_options: 预定义选项列表，如 ["left", "right", "above", "below", "in_front", "behind", "left_front", "left_behind", "right_front", "right_behind"]
-            
+
         Returns:
             推理结果，包含:
             - question: str
@@ -64,7 +65,7 @@ class SpatialReasoner:
             - spatial_relationships: list[dict] (对象间关系)
         """
         analyzer = self._get_analyzer()
-        
+
         options_text = ""
         if answer_options:
             options_text = f"""
@@ -123,7 +124,7 @@ Notes:
     ) -> dict[str, Any]:
         """
         比较两个对象的空间关系。
-        
+
         Args:
             object1_description: 第一个对象描述（如 "the red car"）
             object2_description: 第二个对象描述（如 "the building"）
@@ -131,7 +132,7 @@ Notes:
             image: 输入图像
         """
         analyzer = self._get_analyzer()
-        
+
         relationship_prompts = {
             "relative_position": (
                 f"What is the relative position of '{object1_description}' compared to '{object2_description}'?\n"
@@ -156,7 +157,7 @@ Notes:
         }
 
         prompt = relationship_prompts.get(relationship, relationship_prompts["relative_position"])
-        
+
         result_text = await analyzer._call_vision_model(prompt, image or (await self._get_analyzer()._capture.capture(use_cache=False)))
         return analyzer._parse_json_response(result_text) or {
             "question": f"{relationship}: {object1_description} vs {object2_description}",
@@ -173,14 +174,14 @@ Notes:
     ) -> dict[str, Any]:
         """
         回答任意视觉问题（通用问答，不限于空间关系）。
-        
+
         Args:
             question: 问题（如 "How many cars are parked?"）
             image: 输入图像
             max_retries: 重试次数
         """
         analyzer = self._get_analyzer()
-        
+
         prompt = f"""You are a visual question answering expert. Analyze this image and answer the question.
 
 Question: "{question}"
@@ -214,7 +215,7 @@ Only return the JSON, nothing else."""
 class SpatialChainReasoner:
     """
     空间关系链推理器
-    
+
     模仿 TAB-Agent 的推理链：先识别对象 → 建立空间关系 → 推导间接关系。
     例如：A 在 B 左边，B 在 C 上面 → A 在 C 的左上方。
     """
@@ -231,7 +232,7 @@ class SpatialChainReasoner:
     ) -> dict[str, Any]:
         """
         执行空间关系链推理。
-        
+
         Args:
             scene_description: 场景描述（如 "a living room with a couch, coffee table, and TV"）
             chain: 推理链，如 ["Where is the coffee table?", "Is the TV above the couch?"]
@@ -239,7 +240,7 @@ class SpatialChainReasoner:
         """
         analyzer = self._get_analyzer()
         results = []
-        
+
         # 第一步：建立对象索引
         objects_prompt = f"""Analyze this image and create an index of all major objects and their spatial relationships.
 

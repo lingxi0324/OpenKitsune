@@ -21,7 +21,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +33,18 @@ def _windows_hide_flags():
     return 0
 
 
-def _section(tts_config: Any, key: str) -> Dict[str, Any]:
+def _section(tts_config: Any, key: str) -> dict[str, Any]:
     """``tts.<key>`` 作为 dict（null/非 dict 读作空）。"""
     section = tts_config.get(key) if isinstance(tts_config, dict) else None
     return section if isinstance(section, dict) else {}
 
 
-def _positive_int(value: Any) -> Optional[int]:
+def _positive_int(value: Any) -> int | None:
     """*value* 为正非布尔 int 时返回，否则 None。"""
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def _remove_quietly(path: Optional[str]) -> None:
+def _remove_quietly(path: str | None) -> None:
     """尽力删除（缺失/占用忽略）。"""
     if path:
         try:
@@ -74,7 +74,7 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def _ffmpeg_run(ffmpeg: str, args: List[str], *, timeout: int = 30, check: bool = False,
+def _ffmpeg_run(ffmpeg: str, args: list[str], *, timeout: int = 30, check: bool = False,
                 capture: bool = True) -> subprocess.CompletedProcess:
     """运行 ``ffmpeg <args>``（无 stdin，Windows 隐藏窗口）。"""
     return subprocess.run([ffmpeg, *args], capture_output=capture, check=check, timeout=timeout,
@@ -115,7 +115,7 @@ def write_wav_bytes_as(wav_bytes: bytes, output_path: str) -> str:
 
 
 def transcode_to_ogg_opus(input_path: str, *, bitrate: str = "48k", timeout: int = 30,
-                          output_path: Optional[str] = None) -> Optional[str]:
+                          output_path: str | None = None) -> str | None:
     """将任意 ffmpeg 可读音频转码为 Ogg/Opus；失败返回 None。"""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -141,7 +141,7 @@ _MP4_AUDIO_BRANDS = (b"m4a ", b"m4b ")
 _PREFIX_CONTAINERS = ((b"OggS", "ogg"), (b"fLaC", "flac"), (b"ID3", "mp3"))
 
 
-def sniff_container(data: bytes) -> Optional[str]:
+def sniff_container(data: bytes) -> str | None:
     """从魔数返回容器 id（CONTAINER_TO_EXT 键）或 None。"""
     if len(data) >= 8 and data[4:8] == b"ftyp":
         if len(data) >= 12 and data[8:12].lower() in _MP4_AUDIO_BRANDS:
@@ -197,10 +197,10 @@ def repair_ogg_container(file_str: str) -> str:
 
 
 # ---- 长文本分块 ----
-def pack_under_cap(pieces: List[str], max_chars: int, *, slice_oversized: bool = False) -> List[str]:
+def pack_under_cap(pieces: list[str], max_chars: int, *, slice_oversized: bool = False) -> list[str]:
     """贪心以单空格连接 *pieces*，超过 *max_chars* 另起块；``slice_oversized`` 时
     超长 piece 硬切为独立块。"""
-    chunks: List[str] = []
+    chunks: list[str] = []
     current = ""
     for piece in pieces:
         if slice_oversized and len(piece) > max_chars:
@@ -220,7 +220,7 @@ def pack_under_cap(pieces: List[str], max_chars: int, *, slice_oversized: bool =
     return chunks
 
 
-def split_text_for_tts(text: str, max_chars: int) -> List[str]:
+def split_text_for_tts(text: str, max_chars: int) -> list[str]:
     """在 provider 上限下拆分长文本（不丢规范化内容）。"""
     if max_chars <= 0:
         max_chars = 4000
@@ -229,7 +229,7 @@ def split_text_for_tts(text: str, max_chars: int) -> List[str]:
         return []
     if len(normalized) <= max_chars:
         return [normalized]
-    expanded: List[str] = []
+    expanded: list[str] = []
     for sentence in filter(None, (s.strip() for s in re.split(r"(?<=[.!?;:,])\s+", normalized))):
         if len(sentence) <= max_chars:
             expanded.append(sentence)
@@ -252,15 +252,15 @@ class AudioDeliveryProfile:
         return max(1, int(self.max_file_bytes * self.safety_ratio))
 
 
-_PLATFORM_AUDIO_DEFAULTS: Dict[str, Dict[str, Any]] = {
+_PLATFORM_AUDIO_DEFAULTS: dict[str, dict[str, Any]] = {
     "discord": {"max_file_bytes": 10 * 1024 * 1024, "safety_ratio": 0.85},
     "telegram": {"max_file_bytes": 50 * 1024 * 1024, "safety_ratio": 0.85},
     "feishu": {"max_file_bytes": 100 * 1024 * 1024, "safety_ratio": 0.85},
     "default": {"max_file_bytes": 10 * 1024 * 1024, "safety_ratio": 0.85}}
 
 
-def resolve_audio_delivery_profile(platform: Optional[str],
-                                   tts_config: Optional[Dict[str, Any]] = None) -> AudioDeliveryProfile:
+def resolve_audio_delivery_profile(platform: str | None,
+                                   tts_config: dict[str, Any] | None = None) -> AudioDeliveryProfile:
     """按平台解析上传约束（含 ``tts.delivery_profiles`` 覆盖）。"""
     key = (platform or "default").lower().strip() or "default"
     defaults = dict(_PLATFORM_AUDIO_DEFAULTS.get(key) or _PLATFORM_AUDIO_DEFAULTS["default"])
@@ -275,7 +275,7 @@ def resolve_audio_delivery_profile(platform: Optional[str],
     return AudioDeliveryProfile(platform=key, max_file_bytes=max_file_bytes, safety_ratio=float(safety_ratio))
 
 
-def concat_audio_files(audio_paths: List[str], output_path: str, *, voice_compatible: bool = False) -> Optional[str]:
+def concat_audio_files(audio_paths: list[str], output_path: str, *, voice_compatible: bool = False) -> str | None:
     """ffmpeg 合并独立编码的分块（绝不字节拼接）。Ogg/Opus 总是重编码；同后缀 MP3 保留帧
     （``-c:a copy``）。ffmpeg 缺失/失败返回 None，调用方保留有效分块。"""
     if not audio_paths:
@@ -315,8 +315,8 @@ def concat_audio_files(audio_paths: List[str], output_path: str, *, voice_compat
 
 
 def build_audio_delivery_files(
-    audio_paths: List[str], output_path: str, profile: AudioDeliveryProfile, *, voice_compatible: bool = False,
-) -> Tuple[List[str], bool]:
+    audio_paths: list[str], output_path: str, profile: AudioDeliveryProfile, *, voice_compatible: bool = False,
+) -> tuple[list[str], bool]:
     """按上传硬上限打包最终编码块 -> ``(final_paths, combined_any)``。
 
     分组按保守目标体积；合并产物按真实大小复查，超限组对半拆分重试；合并失败返回
@@ -331,10 +331,10 @@ def build_audio_delivery_files(
                 f"Final-encoded TTS chunk exceeds {profile.platform} delivery "
                 f"limit ({size} > {profile.max_file_bytes} bytes): {path}")
     base = Path(output_path)
-    scratch_outputs: List[str] = []
+    scratch_outputs: list[str] = []
     combined_any, combine_index = False, 0
 
-    def emit(group: List[str]) -> List[str]:
+    def emit(group: list[str]) -> list[str]:
         nonlocal combined_any, combine_index
         if len(group) == 1:
             return list(group)
@@ -351,8 +351,8 @@ def build_audio_delivery_files(
         midpoint = max(1, len(group) // 2)
         return emit(group[:midpoint]) + emit(group[midpoint:])
 
-    groups: List[List[str]] = []
-    current: List[str] = []
+    groups: list[list[str]] = []
+    current: list[str] = []
     current_size, current_suffix = 0, ""
     for path in audio_paths:
         size, suffix = Path(path).stat().st_size, Path(path).suffix.lower()
@@ -363,7 +363,7 @@ def build_audio_delivery_files(
         current_size, current_suffix = current_size + size, suffix
     groups += [current] if current else []
     packed = [path for group in groups for path in emit(group)]
-    final_paths: List[str] = []
+    final_paths: list[str] = []
     for index, source in enumerate(packed, start=1):
         destination = base
         if len(packed) > 1:

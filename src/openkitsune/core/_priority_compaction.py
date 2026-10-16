@@ -22,8 +22,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Callable, Iterable
 from enum import IntEnum
-from typing import Any, Callable, Iterable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -434,7 +435,7 @@ class Turn:
         # 由调用方注入估算函数，避免本模块与 ContextManager 循环依赖
         return getattr(self, "_tokens", 0)
 
-    def with_tokens(self, tokens: int) -> "Turn":
+    def with_tokens(self, tokens: int) -> Turn:
         self._tokens = tokens
         return self
 
@@ -451,7 +452,7 @@ def segment_turns(messages: list[dict]) -> list[Turn]:
     current: list[dict] = []
     current_start_role: str | None = None
     idx = 0
-    for i, msg in enumerate(messages):
+    for _i, msg in enumerate(messages):
         role = msg.get("role", "")
         if current_start_role is None:
             current = [msg]

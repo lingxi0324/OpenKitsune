@@ -389,10 +389,12 @@ ignore = [
     "SIM103", # needless-bool (style-only)
     "SIM105", # prefer contextlib.suppress (style-only)
     "SIM116", # dict-lookup instead of if-chain (less readable in some contexts)
+    "SIM108", # ternary operator suggestion (if-else with comments is clearer)
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "src/openkitsune/integrations/**" = ["F401", "F821", "SIM117", "E722", "UP035"]
+"**/__init__.py" = ["F401"]
 
 [tool.mypy]
 python_version = "3.11"

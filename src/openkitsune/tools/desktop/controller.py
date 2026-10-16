@@ -687,12 +687,11 @@ class DesktopController:
 
         # Try to serve via the local API server
         try:
-            import asyncio
-
-            import httpx
 
             # Resolve absolute path
             from pathlib import Path as _Path
+
+            import httpx
 
             abs_path = str(_Path(filepath).resolve())
             # Use relative path under workspace
@@ -702,10 +701,10 @@ class DesktopController:
                 )
 
                 ws = session_working_directory(session=None, require_available=False)
-                rel = str(_Path(abs_path).relative_to(_Path(ws).resolve()))
+                str(_Path(abs_path).relative_to(_Path(ws).resolve()))
             except Exception:
                 # If we can't resolve relative to workspace, use absolute
-                rel = abs_path
+                pass
 
             url = f"{base_url}/api/files?path={abs_path.replace(chr(92), chr(92) + chr(92))}"
             async with httpx.AsyncClient(timeout=5.0) as client:

@@ -27,10 +27,10 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +190,7 @@ class HandoffSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "HandoffSnapshot":
+    def from_dict(cls, data: dict) -> HandoffSnapshot:
         return cls(
             task_goal=str(data.get("task_goal", "")),
             completed_summary=str(data.get("completed_summary", "")),

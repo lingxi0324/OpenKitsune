@@ -160,7 +160,7 @@ class VoiceHandler:
     # ── voice_record ──
     async def _voice_record(self, params: dict) -> str:
         """麦克风录音 + VAD（静音自动停止）。"""
-        from ...voice import AudioRecorder, create_audio_recorder
+        from ...voice import create_audio_recorder
 
         output_path = params.get("output_path")
 

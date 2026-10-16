@@ -8,11 +8,14 @@ Tab-Agent 风格视觉工具包
 - segmenter.py: 对象分割（模仿 SAM 流程，用 LLM 视觉替代）
 - tracker.py: 时序追踪 + 多视角追踪（模仿 VlmFrameExpansion）
 - spatial.py: 空间关系推理（模仿 TAB-Agent spatial reasoning）
+- analyzer.py: 视觉分析（OCR、页面分析、问答、验证）
 """
 
+from .analyzer import VisionAnalyzer, get_vision_analyzer
+from .prompts import PromptTemplates
 from .segmenter import LlmSegmenter
-from .tracker import TemporalTracker, MultiViewTracker
-from .spatial import SpatialReasoner, SpatialChainReasoner
+from .spatial import SpatialChainReasoner, SpatialReasoner
+from .tracker import MultiViewTracker, TemporalTracker
 
 __all__ = [
     "LlmSegmenter",
@@ -20,4 +23,6 @@ __all__ = [
     "MultiViewTracker",
     "SpatialReasoner",
     "SpatialChainReasoner",
+    "VisionAnalyzer",
+    "get_vision_analyzer",
 ]

@@ -54,7 +54,7 @@ describe("message parts projection", () => {
       parts: [{ kind: "plan", id: "plan:plan-1", todo }],
     };
 
-    expect(resolveMessageParts(msg).map((part) => part.kind)).toEqual(["reasoning", "plan"]);
+    expect(resolveMessageParts(msg).map((part) => part.kind)).toEqual(["plan", "reasoning"]);
   });
 
   it("does not treat plan cards as assistant message body", () => {

@@ -21,17 +21,15 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import math
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import wave
 from collections import deque
-from typing import Any, Callable, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 from .config import (
     CHANNELS,
@@ -79,7 +77,7 @@ def _write_wav_frames(dest: str, frames: bytes, sample_rate: int) -> None:
         wav.writeframes(frames)
 
 
-def _unlink_quietly(path: Optional[str]) -> None:
+def _unlink_quietly(path: str | None) -> None:
     """尽力删除（缺失/占用忽略）。"""
     if path:
         try:
@@ -128,7 +126,7 @@ class AudioRecorder(_RecorderBase):
         super().__init__()
         vad_cfg = get_vad_config()
         self._stream: Any = None
-        self._frames: List[Any] = []
+        self._frames: list[Any] = []
         self._sample_rate: int = int(vad_cfg.get("sample_rate", SAMPLE_RATE))
         self._on_silence_stop = None
         self._silence_threshold: int = int(vad_cfg.get("silence_threshold", SILENCE_RMS_THRESHOLD))
@@ -300,7 +298,7 @@ class AudioRecorder(_RecorderBase):
         if t.is_alive():
             logger.warning("Audio stream close timed out after %.1fs — forcing ahead", timeout)
 
-    def stop(self) -> Optional[str]:
+    def stop(self) -> str | None:
         """停止录音（流保持存活），返回 WAV 路径；不可用时返回 None。"""
         with self._lock:
             if not self._recording:
@@ -433,7 +431,7 @@ def _play_int16_via_sounddevice(data, sample_rate: int) -> bool:
         return False
 
 
-def _system_player_candidates(file_path: str) -> List[List[str]]:
+def _system_player_candidates(file_path: str) -> list[list[str]]:
     """平台系统播放器候选命令。"""
     if sys.platform == "win32":
         return [["powershell", "-NoProfile", "-Command",
@@ -461,11 +459,11 @@ def _play_via_system_player(file_path: str) -> bool:
 # ── 持续监听（抢话监视器）──
 def listen_for_speech(
     should_stop: Callable[[], bool],
-    threshold: Optional[int] = None,
+    threshold: int | None = None,
     sustained_ms: int = 300,
     calibration_ms: int = 400,
     capture: bool = False,
-    on_trigger: Optional[Callable[[], None]] = None,
+    on_trigger: Callable[[], None] | None = None,
     pre_roll_ms: int = 1200,
     endpoint_silence_ms: int = 1250,
     max_utterance_ms: int = 30_000,
@@ -550,7 +548,7 @@ def listen_for_speech(
                     return True
 
                 # 滚动到用户安静。播放已停止，普通静音端点即可。
-                frames: List[Any] = list(pre_roll)
+                frames: list[Any] = list(pre_roll)
                 quiet = 0
                 for _ in range(max_blocks):
                     data, _ = stream.read(block)
@@ -581,7 +579,7 @@ def _vad_log(msg: str) -> None:
 
 def _capture_until_quiet(stream, np, block: int, pre_roll, *, endpoint_blocks: int, max_blocks: int) -> str:
     """触发后读取至 *endpoint_blocks* 静音（或 *max_blocks*），写预卷+录音为 WAV。"""
-    frames: List[Any] = list(pre_roll)
+    frames: list[Any] = list(pre_roll)
     quiet = 0
     for _ in range(max_blocks):
         data, _ = stream.read(block)
@@ -632,7 +630,7 @@ class _BargeDetector:
         self.playing_prev = playing
         self.blocks_since_playback = 0 if playing else self.blocks_since_playback + 1
 
-    def feed(self, rms: float, playing: bool) -> Optional[str]:
+    def feed(self, rms: float, playing: bool) -> str | None:
         """消费一个 30ms 块；语音触发时返回阶段名，否则 None。"""
         self.block_idx += 1
         if not self.floor_locked and not self._calibrate(rms, playing):
@@ -666,11 +664,11 @@ class _BargeDetector:
 
 
 def full_duplex_listen(
-    should_stop: Callable[[], bool], is_playing: Optional[Callable[[], bool]] = None,
-    on_trigger: Optional[Callable[[str], None]] = None, multiplier: Optional[float] = None,
+    should_stop: Callable[[], bool], is_playing: Callable[[], bool] | None = None,
+    on_trigger: Callable[[str], None] | None = None, multiplier: float | None = None,
     sustained_ms: int = 300, calibration_ms: int = 450, grace_ms: int = 500, pre_roll_ms: int = 1200,
     endpoint_silence_ms: int = 1250, max_utterance_ms: int = 30_000,
-) -> Optional[str]:
+) -> str | None:
     """跨整轮 agent turn 监听；返回捕获的打断 WAV 路径。
 
     阶段（依据 *is_playing*，通常为 ``is_audio_output_active``）：

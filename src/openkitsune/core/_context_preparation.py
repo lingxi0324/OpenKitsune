@@ -18,9 +18,9 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +108,7 @@ class TaskContextSnapshot:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "TaskContextSnapshot":
+    def from_dict(cls, data: dict) -> TaskContextSnapshot:
         return cls(
             task_goal=str(data.get("task_goal", "")),
             progress_summary=str(data.get("progress_summary", "")),

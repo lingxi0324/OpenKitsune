@@ -48,8 +48,8 @@ from .base import (
 )
 from .browser import BROWSER_TOOLS
 from .cli_anything import CLI_ANYTHING_TOOLS
-from .code_quality import CODE_QUALITY_TOOLS
 from .code_execution import CODE_EXECUTION_TOOLS
+from .code_quality import CODE_QUALITY_TOOLS
 
 # 工具定义
 from .config import CONFIG_TOOLS
@@ -77,10 +77,10 @@ from .sticker import STICKER_TOOLS
 from .structured_output import STRUCTURED_OUTPUT_TOOLS
 from .system import SYSTEM_TOOLS
 from .tool_search import TOOL_SEARCH_TOOLS
+from .voice import VOICE_TOOLS
 from .web_fetch import WEB_FETCH_TOOLS
 from .web_search import WEB_SEARCH_TOOLS
 from .worktree import WORKTREE_TOOLS
-from .voice import VOICE_TOOLS
 
 # 合并所有工具定义（不含平台连接类工具，后者由 agent 根据 hub_enabled 动态加载）
 BASE_TOOLS = (

@@ -379,9 +379,9 @@ Do not infer filesystem paths from the workspace map; `get_skill_info` is author
             # 里同样需要剔除（"When to use this skill" 这类标题无主题词）
             "to", "of", "in", "on", "at", "by", "is", "be", "it", "as", "so",
             "but", "if", "then", "than", "am", "are", "was", "were", "been",
-            "has", "have", "had", "did", "does", "its", "our", "their", "them",
+            "has", "have", "had", "did", "its", "our", "their", "them",
             "him", "her", "his", "she", "he", "they", "we", "who", "whom",
-            "which", "what", "where", "when", "why", "how", "than", "too",
+            "which", "what", "where", "why", "how", "too",
         }
     )
 

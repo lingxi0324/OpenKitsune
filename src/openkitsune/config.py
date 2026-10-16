@@ -1336,6 +1336,28 @@ class Settings(BaseSettings):
         le=720.0,
         description="交接快照 TTL（小时），超时自动清理；默认 168h=7 天",
     )
+    context_turn_skeleton_shadow_enabled: bool = Field(
+        default=False,
+        description=(
+            "轮次骨架压缩影子模式：开启后 compress_if_needed 跑完 LLM 压缩的同时，"
+            "并行跑一次轮次骨架压缩，结果只写日志不替换消息（观察线上压缩比与"
+            "信息保留度，确认不失忆后再切换为正式 fallback/替换）"
+        ),
+    )
+    context_turn_skeleton_keep_last_n: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="轮次骨架压缩影子模式下，最近 N 轮保留完整原文",
+    )
+    context_turn_skeleton_primary_enabled: bool = Field(
+        default=True,
+        description=(
+            "轮次骨架压缩作为主路径：开启后 compress_if_needed 先走确定性骨架压缩"
+            "（零 LLM），成功且能降到阈值以下直接返回；短对话或骨架失败时降级到"
+            "LLM 摘要兜底。关闭则完全走原 LLM 摘要路径。"
+        ),
+    )
     context_cached_summary_chars: int = Field(
         default=2400,
         description="缓存/聚合工具结果摘要的默认字符预算",
