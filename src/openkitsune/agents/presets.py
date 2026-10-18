@@ -18,7 +18,7 @@ SYSTEM_PRESETS: list[AgentProfile] = [
     # ── 通用基础 ──────────────────────────────────────────────────────
     AgentProfile(
         id="default",
-        name="小秋",
+        name="涂山汐",
         description="通用全能助手，拥有所有技能",
         type=AgentType.SYSTEM,
         skills=[],
@@ -29,7 +29,7 @@ SYSTEM_PRESETS: list[AgentProfile] = [
         category="general",
         fallback_profile_id=None,
         created_by="system",
-        name_i18n={"zh": "小秋", "en": "Kitsune"},
+        name_i18n={"zh": "涂山汐", "en": "Kitsune"},
         description_i18n={
             "zh": "通用全能助手，拥有所有技能",
             "en": "General-purpose assistant with all skills",

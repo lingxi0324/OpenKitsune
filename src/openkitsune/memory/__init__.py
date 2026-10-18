@@ -16,6 +16,18 @@ OpenKitsune 记忆系统 (v2)
 from .consolidator import MemoryConsolidator
 from .extractor import MemoryExtractor
 from .manager import MemoryManager
+from .public_api import (
+    MEMORY_TOOL_NAMES,
+    MEMORY_TOOL_SCHEMAS,
+    BuiltinMemoryProvider,
+    MemoryProvider,
+    MemoryProviderRegistry,
+    MemoryRecord,
+    MemorySystemAPI,
+    RegisteredProvider,
+    create_memory_api,
+    dispatch_memory_tool,
+)
 from .retrieval import RetrievalEngine
 from .search_backends import (
     APIEmbeddingBackend,
@@ -63,4 +75,15 @@ __all__ = [
     "Scratchpad",
     "Attachment",
     "AttachmentDirection",
+    # Public API
+    "MemorySystemAPI",
+    "MemoryProvider",
+    "MemoryProviderRegistry",
+    "BuiltinMemoryProvider",
+    "MemoryRecord",
+    "RegisteredProvider",
+    "create_memory_api",
+    "dispatch_memory_tool",
+    "MEMORY_TOOL_SCHEMAS",
+    "MEMORY_TOOL_NAMES",
 ]

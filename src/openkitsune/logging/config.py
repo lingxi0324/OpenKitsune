@@ -18,7 +18,12 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from ..utils.redaction import RedactionFilter
-from .handlers import ColoredConsoleHandler, ErrorOnlyHandler, SessionLogHandler
+from .handlers import (
+    ColoredConsoleHandler,
+    ColoredFormatter,
+    ErrorOnlyHandler,
+    SessionLogHandler,
+)
 
 
 def _compute_frontend_fingerprint() -> str:
@@ -104,11 +109,14 @@ def setup_logging(
     formatter = logging.Formatter(log_format)
     redaction_filter = RedactionFilter()
 
-    # 控制台处理器
+    # 控制台处理器：使用段级彩色格式化器（时间/级别/模块名/消息分别着色）
+    # 颜色能力由 ColoredConsoleHandler 检测（NO_COLOR / OPENKITSUNE_LOG_COLOR / tty）
     if log_to_console:
         console_handler = ColoredConsoleHandler(sys.stdout)
         console_handler.setLevel(logging.DEBUG)
-        console_handler.setFormatter(formatter)
+        console_handler.setFormatter(
+            ColoredFormatter(log_format, use_colors=console_handler.supports_color)
+        )
         console_handler.addFilter(redaction_filter)
         root_logger.addHandler(console_handler)
 

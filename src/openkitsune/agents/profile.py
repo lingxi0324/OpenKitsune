@@ -164,7 +164,7 @@ class AgentProfile:
     created_by: str = "system"
     created_at: str = ""
 
-    # 国际化：{"zh": "小秋", "en": "Kitsune"}
+    # 国际化：{"zh": "涂山汐", "en": "Kitsune"}
     name_i18n: dict[str, str] = field(default_factory=dict)
     description_i18n: dict[str, str] = field(default_factory=dict)
 
@@ -649,7 +649,7 @@ class ProfileStore:
 
             # 当调用方仅改了 name/description 而未显式提供对应的 i18n 字段时，
             # 镜像新值到 `name_i18n['zh']` / `description_i18n['zh']`，避免出现
-            # `name="中秋"` 而 `name_i18n.zh="小秋"` 的内部不自洽状态。该状态会
+            # `name="中秋"` 而 `name_i18n.zh="涂山汐"` 的内部不自洽状态。该状态会
             # 让 system prompt（用 name）和 IM 显示 / 像素办公室 / 日志（用 name_i18n
             # 经 get_display_name 解析）出现"双名"漂移。
             # 调用方若需精确控制多语言版本，可同时显式传 name_i18n/description_i18n

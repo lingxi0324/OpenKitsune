@@ -1,0 +1,36 @@
+LANG = "hi"
+
+EXTRA = {
+ "agentStore": {
+  "subtitle": "OpenKitsune समुदाय से Agent खोजें और इंस्टॉल करें (नेटवर्क आवश्यक; स्थानीय आयात/निर्यात प्रभावित नहीं)",
+  "searchPlaceholder": "Agent खोजें...",
+  "allCategories": "सभी श्रेणियाँ",
+  "catCustomerService": "ग्राहक सेवा",
+  "catDevelopment": "विकास",
+  "catBusiness": "व्यवसाय",
+  "catCreative": "रचनात्मक",
+  "catEducation": "शिक्षा",
+  "catProductivity": "उत्पादकता",
+  "catGeneral": "सामान्य",
+  "sortDownloads": "डाउनलोड द्वारा",
+  "sortRating": "रेटिंग द्वारा",
+  "sortNewest": "नवीनतम",
+  "searching": "खोज हो रही है...",
+  "downloads": "{{count}} डाउनलोड",
+  "install": "इंस्टॉल करें",
+  "installing": "इंस्टॉल हो रहा है...",
+  "installSuccess": "{{name}} सफलतापूर्वक इंस्टॉल हुआ",
+  "installFail": "इंस्टॉल विफल: {{msg}}",
+  "connectFail": "रिमोट Agent स्टोर से कनेक्ट नहीं हो सका",
+  "offlineHint": "रिमोट स्टोर फिलहाल अनुपलब्ध है। स्थानीय सुविधाएँ प्रभावित नहीं होतीं।\nआप साइडबार «Agent प्रबंधन» में स्थानीय Agent आयात/निर्यात का उपयोग कर सकते हैं,\nया .kitsune-agent फ़ाइलों के माध्यम से सीधे Agent साझा और आयात कर सकते हैं।",
+  "retry": "कनेक्शन पुनः प्रयास",
+  "empty": "कोई Agent उपलब्ध नहीं",
+  "featured": "विशेष चयनित",
+  "noDesc": "कोई विवरण नहीं",
+  "confirmTitle": "Agent इंस्टॉल की पुष्टि करें",
+  "confirmDesc": "आप OpenKitsune Agent हब से \"{{name}}\" इंस्टॉल करने वाले हैं। इस Agent में तृतीय-पक्ष बाहरी निर्भरताएँ हो सकती हैं जो इंस्टॉल के समय उनके मूल रिपॉज़िटरी से लाई जाएँगी।",
+  "confirmInstall": "इंस्टॉल की पुष्टि करें",
+  "license": "ओपन-सोर्स लाइसेंस",
+  "licenseNotice": "इंस्टॉल करने का अर्थ है आप इस Agent और उसकी निर्भरताओं के ओपन-सोर्स लाइसेंस की शर्तों का पालन करने को सहमत हैं। बाहरी निर्भरता Skills उनके मूल GitHub रिपॉज़िटरी से लाई जाती हैं, प्लेटफ़ॉर्म द्वारा पुनर्वितरित नहीं। उल्लंघन मिलने पर संपर्क करें: zacon365@gmail.com।",
+ }
+}

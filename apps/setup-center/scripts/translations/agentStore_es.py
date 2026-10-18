@@ -1,0 +1,36 @@
+LANG = "es"
+
+EXTRA = {
+ "agentStore": {
+  "subtitle": "Descubre e instala Agents de la comunidad OpenKitsune (requiere red; la importación/exportación local no se ve afectada)",
+  "searchPlaceholder": "Buscar Agents...",
+  "allCategories": "Todas las categorías",
+  "catCustomerService": "Atención al cliente",
+  "catDevelopment": "Desarrollo",
+  "catBusiness": "Negocio",
+  "catCreative": "Creatividad",
+  "catEducation": "Educación",
+  "catProductivity": "Productividad",
+  "catGeneral": "General",
+  "sortDownloads": "Por descargas",
+  "sortRating": "Por valoración",
+  "sortNewest": "Más recientes",
+  "searching": "Buscando...",
+  "downloads": "{{count}} descargas",
+  "install": "Instalar",
+  "installing": "Instalando...",
+  "installSuccess": "{{name}} instalado correctamente",
+  "installFail": "Error al instalar: {{msg}}",
+  "connectFail": "No se puede conectar con la tienda remota de Agents",
+  "offlineHint": "La tienda remota no está disponible temporalmente. Las funciones locales no se ven afectadas.\nPuedes seguir usando la importación/exportación de Agents en «Gestión de Agents» de la barra lateral,\no compartir e importar Agents directamente mediante archivos .kitsune-agent.",
+  "retry": "Reintentar conexión",
+  "empty": "No hay Agents disponibles",
+  "featured": "Destacados",
+  "noDesc": "Sin descripción",
+  "confirmTitle": "Confirmar instalación del Agent",
+  "confirmDesc": "Estás a punto de instalar \"{{name}}\" desde el Hub de Agents de OpenKitsune. Este Agent puede incluir dependencias externas de terceros que se descargarán de sus repositorios originales durante la instalación.",
+  "confirmInstall": "Confirmar instalación",
+  "license": "Licencia de código abierto",
+  "licenseNotice": "Al instalar, aceptas cumplir los términos de la licencia de código abierto de este Agent y sus dependencias. Las Skills externas se obtienen de sus repositorios originales de GitHub; esta plataforma no las redistribuye. Infracciones: zacon365@gmail.com.",
+ }
+}

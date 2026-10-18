@@ -6,8 +6,9 @@
     "error",
     "finalize",
     "init",
+    "reflect",
     "run_loop",
     "validate_input"
   ],
-  "description": "lifecycle graph has exactly the documented 6 nodes"
+  "description": "lifecycle graph has exactly the documented 7 nodes (incl. reflect closure node)"
 }

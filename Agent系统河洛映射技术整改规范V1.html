@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent系统河洛映射技术整改规范V1</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230F4C5C'/%3E%3Cpath d='M16 7 L25 16 L16 25 L7 16 Z' fill='%23F8F9FA'/%3E%3Ccircle cx='16' cy='16' r='4' fill='%23C2410C'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#F8F9FA; --ink:#1F2937; --muted:#5B6470; --accent:#0F4C5C;
+    --line:#D8DEE4; --code-bg:#EEF1F4; --warn:#9A3412; --ok:#14532D;
+    --g:#2E7D32; --c:#C2410C; --s:#8D6E63; --r:#A16207; --l:#1D4ED8;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;line-height:1.65;}
+  .wrap{max-width:1000px;margin:0 auto;padding:28px 18px 60px;}
+  .hd{border-bottom:2px solid var(--accent);padding-bottom:14px;margin-bottom:8px;}
+  .hd .ver{display:inline-block;background:var(--accent);color:#fff;font-size:12px;padding:2px 10px;border-radius:10px;margin-bottom:8px;letter-spacing:.5px;}
+  h1{font-size:26px;margin:6px 0 6px;color:var(--ink);}
+  .sub{color:var(--muted);font-size:14px;margin:0;}
+  h2{font-size:20px;color:var(--accent);margin:34px 0 10px;padding-left:10px;border-left:4px solid var(--accent);}
+  h3{font-size:16px;margin:20px 0 8px;color:#334155;}
+  p{font-size:14.5px;margin:8px 0;}
+  .muted{color:var(--muted);font-size:13px;}
+  table{width:100%;border-collapse:collapse;margin:10px 0 14px;font-size:13.5px;table-layout:fixed;}
+  th{background:#E7ECEF;color:#334155;text-align:left;font-weight:600;padding:7px 9px;border:1px solid var(--line);}
+  td{padding:7px 9px;border:1px solid var(--line);vertical-align:top;word-break:break-word;}
+  tr:nth-child(even) td{background:#FBFCFD;}
+  .tag{display:inline-block;font-family:Consolas,"Courier New",monospace;font-size:12px;padding:0 6px;border-radius:4px;background:var(--code-bg);border:1px solid var(--line);}
+  code,pre{font-family:Consolas,"Courier New",monospace;}
+  pre{background:#0F172A;color:#E2E8F0;border-radius:8px;padding:12px 14px;font-size:12.5px;overflow-x:auto;line-height:1.55;}
+  pre .k{color:#7DD3FC;} pre .c{color:#94A3B8;}
+  .ok{color:var(--ok);font-weight:600;} .warn{color:var(--warn);font-weight:600;}
+  .pill{display:inline-block;font-size:11.5px;padding:1px 8px;border-radius:9px;color:#fff;margin-right:4px;}
+  .flow{display:flex;flex-wrap:wrap;gap:4px 0;align-items:center;font-size:12.5px;margin:8px 0;}
+  .node{background:#fff;border:1px solid var(--line);border-top:3px solid var(--accent);border-radius:6px;padding:5px 8px;font-family:Consolas,monospace;font-size:11.5px;}
+  .arr{color:var(--muted);padding:0 3px;}
+  .note{background:#FFF8E7;border:1px solid #EAD9A8;border-radius:8px;padding:10px 14px;font-size:13.5px;margin:12px 0;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+  @media (max-width:640px){ .grid2{grid-template-columns:1fr;} .tbl{overflow-x:auto;} table{min-width:560px;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hd">
+    <span class="ver">整改规范 · V1.0</span>
+    <h1>Agent 系统河洛映射技术整改规范</h1>
+    <p class="sub">2026-10-17 · 将河图洛书·干支·九宫约束体系转译为可实现的工程规范；实现层不含任何玄学术语，干支词仅出现在第 10 章溯源核对表中。</p>
+  </div>
+
+  <h2>1. 目的与边界</h2>
+  <p>本规范把「天干主时、地支主节、洛书主位」的约束骨架，转译为三层工程结构：<span class="tag">L1 生命周期状态机</span>（何时做什么）、<span class="tag">L2 校验门</span>（每步查什么）、<span class="tag">L3 运行角色</span>（各处守什么），并以「复合状态编码 + 五类横切策略」贯穿。整改目标是<b>逻辑闭环、状态唯一、节奏同步</b>——既不残缺（无未校验环节）也不重复（无冗余状态）。</p>
+  <p class="muted">边界：本规范描述系统应具备的约束能力与接口契约，不绑定具体语言与实现；实现层标识符即本章及后文给出的英文标识，禁止把干支/九宫名词写入配置或代码。</p>
+
+  <h2>2. 术语与标识符约定</h2>
+  <div class="tbl"><table>
+    <colgroup><col style="width:26%"><col style="width:74%"></colgroup>
+    <tr><th>术语</th><th>含义</th></tr>
+    <tr><td>Stage / 阶段</td><td>任务生命周期的推进位置，共 10 态，编号 <span class="tag">S0–S9</span></td></tr>
+    <tr><td>Gate / 校验门</td><td>任务周期内的强制校验点，共 12 门，编号 <span class="tag">G0–G11</span></td></tr>
+    <tr><td>Role / 角色</td><td>运行时职责单元，共 9 个，见第 6 章</td></tr>
+    <tr><td>TaskState</td><td>复合状态码 = (stage_idx, gate_idx)，合法组合恰 60 个</td></tr>
+    <tr><td>策略标签</td><td>五类横切语义：GROWTH / CLARITY / STABILITY / RIGOR / LEARNING</td></tr>
+  </table></div>
+
+  <h2>3. 架构总览</h2>
+  <div class="flow">
+    <span class="node">S0 意图获取</span><span class="arr">→</span><span class="node">S1 规格解析</span><span class="arr">→</span><span class="node">S2 方案设计</span><span class="arr">→</span><span class="node">S3 草稿生成</span><span class="arr">→</span><span class="node">S4 执行</span><span class="arr">→</span><span class="node">S5 过程审计</span><span class="arr">→</span><span class="node">S6 结果验证</span><span class="arr">→</span><span class="node">S7 优化</span><span class="arr">→</span><span class="node">S8 交付</span><span class="arr">→</span><span class="node">S9 复盘沉淀</span><span class="arr">↺</span>
+  </div>
+  <p class="muted">12 道校验门分布于入口、各阶段转换、收尾与闭环回程上（见第 5 章）；9 个角色按星型拓扑围绕编排器运转（见第 6 章）。三层叠加构成完整约束空间。</p>
+
+  <h2>4. L1 生命周期状态机</h2>
+  <div class="tbl"><table>
+    <colgroup><col style="width:9%"><col style="width:24%"><col style="width:33%"><col style="width:34%"></colgroup>
+    <tr><th>编号</th><th>状态</th><th>职责</th><th>进入 / 退出条件</th></tr>
+    <tr><td>S0</td><td>INTENT_ACQUISITION</td><td>输入解析、意图识别、上下文装载</td><td>入：任务创建；出：意图无歧义且输入就绪（G0/G1）</td></tr>
+    <tr><td>S1</td><td>SPEC_RESOLUTION</td><td>需求拆解、边界界定、约束提取、歧义标记</td><td>出：规格书完备（G2）</td></tr>
+    <tr><td>S2</td><td>PLAN_DESIGN</td><td>路径规划、工具选择、步骤排序、风险预判</td><td>出：方案可执行且风险可接受（G3）</td></tr>
+    <tr><td>S3</td><td>DRAFT_GENERATION</td><td>推理链、假设生成、草案输出</td><td>出：草稿齐备且素材已汇拢（G4）</td></tr>
+    <tr><td>S4</td><td>EXECUTION</td><td>工具调用、代码运行、动作执行</td><td>出：执行产物已提炼为可验证结论（G5）</td></tr>
+    <tr><td>S5</td><td>PROCESS_AUDIT</td><td>口径核对、资源核对、防走样</td><td>出：审计记录完整（G6 前置）</td></tr>
+    <tr><td>S6</td><td>RESULT_VERIFICATION</td><td>测试回读、正反对照、交叉核验</td><td>出：证据确凿、缺口补全（G7）</td></tr>
+    <tr><td>S7</td><td>OPTIMIZATION</td><td>迭代收敛、冗余取舍、格式体验</td><td>出：定稿合规（G9）</td></tr>
+    <tr><td>S8</td><td>DELIVERY</td><td>产物呈现、可访问性、交付回执</td><td>出：交付确认、已归档（G10）</td></tr>
+    <tr><td>S9</td><td>RETROSPECTION</td><td>复盘三条、偏好写入、经验归档</td><td>出：复盘入库（G11），转 S0 新任务</td></tr>
+  </table></div>
+  <h3>4.1 转移规则</h3>
+  <ul style="font-size:14px;">
+    <li><b>主链</b>：S0→S1→…→S9→S0，顺序推进，每步须通过绑定门。</li>
+    <li><b>回退（制衡触发）</b>：S6→S3（生成-验证分离：验证发现草稿缺陷，回退重生成）；S6→S1（越界：产物超出意图边界，回退重解析）；S4→S2（执行不可行：连续失败且方案失效，回退重规划）；S9 仅消费 S5 审计日志（复盘数据可追溯）。</li>
+    <li><b>心跳</b>：S4 执行期间须有心跳检测，超时挂起而非空转。</li>
+  </ul>
+
+  <h2>5. L2 校验门系统</h2>
+  <h3>5.1 接口契约</h3>
+  <pre><span class="k">interface</span> Gate {
+  id: G0..G11;
+  bound_stage: Stage;          <span class="c">// 绑定的状态或转换</span>
+  condition: () =&gt; boolean;     <span class="c">// 可判定的通过条件</span>
+  on_pass: () =&gt; void;          <span class="c">// 推进</span>
+  on_fail: () =&gt; Rollback;      <span class="c">// 回退到指定状态 / 挂起等待 / 请求确认</span>
+  audit_log: AuditRecord;       <span class="c">// 判定依据可追溯</span>
+}</pre>
+  <h3>5.2 十二门分布</h3>
+  <div class="tbl"><table>
+    <colgroup><col style="width:9%"><col style="width:20%"><col style="width:15%"><col style="width:30%"><col style="width:26%"></colgroup>
+    <tr><th>编号</th><th>门</th><th>绑定</th><th>判定条件</th><th>失败动作</th></tr>
+    <tr><td>G0</td><td>GOAL_CONFIRMATION</td><td>任务入口</td><td>目标明确、成功标准已定义</td><td>挂起，请求意图确认</td></tr>
+    <tr><td>G1</td><td>INPUT_READINESS</td><td>S0→S1</td><td>输入/上下文/工具就绪</td><td>补齐资源后重试</td></tr>
+    <tr><td>G2</td><td>START_COMMITMENT</td><td>S1→S2</td><td>规格确认，正式开工</td><td>回退 S1 补规格</td></tr>
+    <tr><td>G3</td><td>PROGRESS_MONITOR</td><td>S2→S3</td><td>方案落实、推进启动</td><td>回退 S2 修方案</td></tr>
+    <tr><td>G4</td><td>DATA_CONSOLIDATION</td><td>S3→S4</td><td>散料汇拢为可执行数据集</td><td>回退 S3 补素材</td></tr>
+    <tr><td>G5</td><td>SYNTHESIS</td><td>S4→S5</td><td>执行产物提炼为可验证结论</td><td>回退 S4 补提炼</td></tr>
+    <tr><td>G6</td><td>EVIDENCE_AUDIT</td><td>S5→S6</td><td>证据多源交叉验证、口径标注</td><td>回退 S5 补审计</td></tr>
+    <tr><td>G7</td><td>GAP_FILLING</td><td>S6→S7</td><td>覆盖缺口、边界细节补全</td><td>回退 S6 补验证</td></tr>
+    <tr><td>G8</td><td>RIGOR_TRIAGE</td><td>S7 内部</td><td>冗余删除、弱证据剔除、取舍留痕</td><td>挂起，人工取舍确认</td></tr>
+    <tr><td>G9</td><td>CONFORMANCE</td><td>S7→S8</td><td>规格符合、格式定型、可交付</td><td>回退 S7 修正</td></tr>
+    <tr><td>G10</td><td>FINALIZATION</td><td>S8→S9</td><td>收束归档、无遗落项</td><td>补归档后重试</td></tr>
+    <tr><td>G11</td><td>RETROSPECT_LOCK</td><td>S9→S0</td><td>复盘入库、经验已沉淀</td><td>挂起，补复盘</td></tr>
+  </table></div>
+  <div class="note"><b>完整性四门</b>：G1（输入就绪）、G4（数据汇聚）、G7（缺口补全）、G10（收束归档）共用同一套完整性判定策略，仅作用对象不同——这是「四库尽归土·信」的技术化：四处完整性承诺必须逐项兑现。</div>
+
+  <h2>6. L3 运行角色</h2>
+  <div class="tbl"><table>
+    <colgroup><col style="width:18%"><col style="width:20%"><col style="width:34%"><col style="width:28%"></colgroup>
+    <tr><th>角色</th><th>标识</th><th>职责</th><th>关键约束</th></tr>
+    <tr><td>守卫</td><td>GUARD</td><td>安全策略、风险闸门、内容与权限判定</td><td>横切所有门；命中高危立即终止</td></tr>
+    <tr><td>上下文池</td><td>CONTEXT_POOL</td><td>上下文装载、资源缓存、状态持久化</td><td>与记忆库读写分离（短期/长期）</td></tr>
+    <tr><td>执行器</td><td>EXECUTOR</td><td>动作执行、工具落地、副作用管理</td><td>执行须对齐意图，偏离即回退</td></tr>
+    <tr><td>采集器</td><td>COLLECTOR</td><td>输入感知、信息检索、来源登记</td><td>每条来源登记出处</td></tr>
+    <tr><td>编排器</td><td>ORCHESTRATOR</td><td>状态机推进、门触发、任务分合、优先级</td><td>唯一状态源（single source of truth）</td></tr>
+    <tr><td>工具注册表</td><td>TOOL_REGISTRY</td><td>工具注册、能力发现、调用契约、降级</td><td>工具须有调用契约与失败降级</td></tr>
+    <tr><td>呈现器</td><td>PRESENTER</td><td>产物格式化、呈现、可访问性、交付回执</td><td>执行结果不得自我宣称交付成功</td></tr>
+    <tr><td>记忆库</td><td>MEMORY_STORE</td><td>长期记忆、偏好画像、经验索引</td><td>只写结论性经验（复盘产出）</td></tr>
+    <tr><td>推理器</td><td>REASONER</td><td>推理生成、假设、批判性审查</td><td>生成与验证分离；生成前须检索先验</td></tr>
+  </table></div>
+  <h3>6.1 拓扑与架构级制衡</h3>
+  <p>所有角色经 <span class="tag">ORCHESTRATOR</span> 调度（星型/中介模式），不直接互相调用；读路径可加缓存降级（见第 12 章）。四组对角对位制衡：</p>
+  <div class="tbl"><table>
+    <colgroup><col style="width:34%"><col style="width:66%"></colgroup>
+    <tr><th>对位</th><th>技术语义</th></tr>
+    <tr><td>REASONER ↔ GUARD</td><td>推理产出的每条内容须经守卫判定（生成即审核，自由与底线互为张力）</td></tr>
+    <tr><td>EXECUTOR ↔ PRESENTER</td><td>执行与交付分离，执行结果不得自我宣称交付成功</td></tr>
+    <tr><td>COLLECTOR ↔ TOOL_REGISTRY</td><td>采集须登记来源，工具须有调用契约</td></tr>
+    <tr><td>CONTEXT_POOL ↔ MEMORY_STORE</td><td>短期上下文与长期记忆物理隔离、语义分流</td></tr>
+  </table></div>
+
+  <h2>7. 复合状态编码</h2>
+  <p>任务状态由两个维度构成：<b>推进序号</b> i（stage_idx，0–9）与 <b>校验序号</b> j（gate_idx，0–11）。合法组合要求两序号<b>同奇偶</b>，恰生成 60 个合法态；30 个异奇偶组合是「推进与校验节奏脱节」的失衡态，状态机在进入前拦截。</p>
+  <pre><span class="c">// 合法性：推进节奏与校验节奏同频（奇阳偶阴相配的技术化）</span>
+<span class="k">bool</span> is_valid(<span class="k">int</span> i, <span class="k">int</span> j) { <span class="k">return</span> (i % 2) == (j % 2); }
+
+<span class="c">// 转移：阶段与门同步推进，保持同频</span>
+State advance(State s)  { <span class="k">return</span> (s.i+1, s.j+1); }   <span class="c">// 先过当前门再推进</span>
+State rollback(State s) { <span class="k">return</span> (s.i-1, s.j-1); }
+State audit(State s)    { <span class="k">return</span> s; }               <span class="c">// 门内复核不改变状态码</span></pre>
+  <ul style="font-size:14px;">
+    <li><b>完整</b>：任何合法时刻存在唯一状态码；<b>唯一</b>：(i,j) 组合互异、可追溯；<b>可推演</b>：依 advance/rollback 可预测下一态。</li>
+    <li>示例：<span class="tag">(0,0)</span>＝任务入口·目标校验中；<span class="tag">(4,4)</span>＝执行中·数据已汇聚；<span class="tag">(8,10)</span>＝交付中·收束在即；<span class="tag">(9,11)</span>＝复盘归藏·经验入册。</li>
+  </ul>
+
+  <h2>8. 横切策略：依赖与制衡</h2>
+  <h3>8.1 五类策略标签</h3>
+  <div class="tbl"><table>
+    <colgroup><col style="width:14%"><col style="width:20%"><col style="width:30%"><col style="width:36%"></colgroup>
+    <tr><th>策略</th><th>标识</th><th>语义</th><th>注入点</th></tr>
+    <tr><td>生长</td><td>GROWTH</td><td>意图导向、主动推进、以用户利益为行动立场</td><td>S0–S4；EXECUTOR/COLLECTOR</td></tr>
+    <tr><td>明辨</td><td>CLARITY</td><td>明证、可解释、证据秩序</td><td>S5–S6；REASONER、EVIDENCE 门</td></tr>
+    <tr><td>稳定</td><td>STABILITY</td><td>完整性、确定性、落盘</td><td>S0/S1/S3/S8；CONTEXT、四完整性门</td></tr>
+    <tr><td>严断</td><td>RIGOR</td><td>验证、取舍、去伪</td><td>S6–S7；EVIDENCE/TRIAGE 门</td></tr>
+    <tr><td>归藏</td><td>LEARNING</td><td>反思、沉淀、抑制重复错误</td><td>S9；RETROSPECT/LEARN 门</td></tr>
+  </table></div>
+  <h3>8.2 依赖方向（相生 → 前置条件）</h3>
+  <p>规格完备(CLARITY 产物)是方案设计前置；草案就绪是执行前置；审计记录完整是验证前置；定稿合规是交付前置；复盘经验是下任务意图获取的前置——五段依赖构成主链推进力，任一前置缺失则后继状态不可进入。</p>
+  <h3>8.3 制衡触发（相克 → 回退/分离规则）</h3>
+  <div class="tbl"><table>
+    <colgroup><col style="width:22%"><col style="width:44%"><col style="width:34%"></colgroup>
+    <tr><th>制衡</th><th>技术语义</th><th>触发条件</th></tr>
+    <tr><td>生成-验证分离</td><td>草稿生成与结果验证必须由不同执行上下文/视角完成</td><td>验证发现草稿缺陷 → 回退 S3 重生成</td></tr>
+    <tr><td>验证-意图边界</td><td>验证须约束越界行动</td><td>产物超出意图边界 → 回退 S1 重解析</td></tr>
+    <tr><td>执行-规划纠偏</td><td>执行不得僵化盲从</td><td>连续失败且方案不可行 → 回退 S2 重规划</td></tr>
+    <tr><td>复盘-数据溯源</td><td>复盘必须基于完整审计记录</td><td>RETROSPECTION 仅消费 S5 审计日志，不得凭记忆</td></tr>
+    <tr><td>生成-先验约束</td><td>生成必须检索历史先验</td><td>DRAFT 生成前查询 MEMORY_STORE 同类经验，命中先对照</td></tr>
+  </table></div>
+
+  <h2>9. 逻辑闭环验证</h2>
+  <div class="tbl"><table>
+    <colgroup><col style="width:22%"><col style="width:78%"></colgroup>
+    <tr><th>验证项</th><th>结论与依据</th></tr>
+    <tr><td>V1 状态可达性</td><td><span class="ok">通过</span>：主链成环（S9→S0）+ 回退边，任意状态经有限步沿链前进或回退可达任意状态（强连通）。</td></tr>
+    <tr><td>V2 门覆盖</td><td><span class="ok">通过</span>：G0–G11 覆盖任务入口、9 段阶段转换、S7 内部取舍、闭环回程共 11 个转换点+1 入口，全周期无未校验转换。</td></tr>
+    <tr><td>V3 制衡覆盖</td><td><span class="ok">通过</span>：5 条流程制衡（8.3）+ 4 组架构对位制衡（6.1），覆盖生成/验证/执行/交付/记忆/复盘全部主要模块对，无单点无约束模块。</td></tr>
+    <tr><td>V4 状态唯一性</td><td><span class="ok">通过</span>：同奇偶约束下合法态恰 60 个、互异可追溯；30 个失衡态被 is_valid 拦截，无歧义状态。</td></tr>
+    <tr><td>V5 学习闭环</td><td><span class="ok">通过</span>：RETROSPECT 产物 → MEMORY_STORE → DRAFT 生成前检索先验 → EVIDENCE 交叉验证 → 再次沉淀，全链路闭合。</td></tr>
+  </table></div>
+
+  <h2>10. 映射溯源与覆盖核对</h2>
+  <p class="muted">本表仅用于对照验收；实现层禁止出现左列名词。核对结论：<b>全部映射已替换</b>，共 31 项核心映射 + 3 项机制映射，覆盖率 100%。</p>
+  <h3>10.1 天干十阶段 → 生命周期状态机</h3>
+  <div class="tbl"><table>
+    <colgroup><col style="width:16%"><col style="width:28%"><col style="width:40%"><col style="width:16%"></colgroup>
+    <tr><th>溯源（干）</th><th>技术实现</th><th>替换说明</th><th>覆盖</th></tr>
+    <tr><td>甲·探</td><td>S0 INTENT_ACQUISITION</td><td>感知辨机 → 意图获取</td><td class="ok">✓</td></tr>
+    <tr><td>乙·析</td><td>S1 SPEC_RESOLUTION</td><td>细察拆解 → 规格解析</td><td class="ok">✓</td></tr>
+    <tr><td>丙·谋</td><td>S2 PLAN_DESIGN</td><td>定策定向 → 方案设计</td><td class="ok">✓</td></tr>
+    <tr><td>丁·思</td><td>S3 DRAFT_GENERATION</td><td>推理论证 → 草稿生成</td><td class="ok">✓</td></tr>
+    <tr><td>戊·行</td><td>S4 EXECUTION</td><td>落地执行 → 执行</td><td class="ok">✓</td></tr>
+    <tr><td>己·校</td><td>S5 PROCESS_AUDIT</td><td>细查补漏 → 过程审计</td><td class="ok">✓</td></tr>
+    <tr><td>庚·审</td><td>S6 RESULT_VERIFICATION</td><td>去伪存真 → 结果验证</td><td class="ok">✓</td></tr>
+    <tr><td>辛·琢</td><td>S7 OPTIMIZATION</td><td>打磨优化 → 优化</td><td class="ok">✓</td></tr>
+    <tr><td>壬·达</td><td>S8 DELIVERY</td><td>交付通达 → 交付</td><td class="ok">✓</td></tr>
+    <tr><td>癸·藏</td><td>S9 RETROSPECTION</td><td>复盘沉淀 → 复盘沉淀</td><td class="ok">✓</td></tr>
+  </table></div>
+  <h3>10.2 地支十二关 → 校验门</h3>
+  <div class="tbl"><table>
+    <colgroup><col style="width:14%"><col style="width:30%"><col style="width:40%"><col style="width:16%"></colgroup>
+    <tr><th>溯源（支）</th><th>技术实现</th><th>替换说明</th><th>覆盖</th></tr>
+    <tr><td>子·问根</td><td>G0 GOAL_CONFIRMATION</td><td>目标与动机校验 → 目标确认门</td><td class="ok">✓</td></tr>
+    <tr><td>丑·备料</td><td>G1 INPUT_READINESS</td><td>素材齐备 → 输入就绪门（完整性）</td><td class="ok">✓</td></tr>
+    <tr><td>寅·启行</td><td>G2 START_COMMITMENT</td><td>正式启动 → 开工承诺门</td><td class="ok">✓</td></tr>
+    <tr><td>卯·推进</td><td>G3 PROGRESS_MONITOR</td><td>主流程推进 → 推进监控门</td><td class="ok">✓</td></tr>
+    <tr><td>辰·汇聚</td><td>G4 DATA_CONSOLIDATION</td><td>散料汇拢 → 数据汇聚门（完整性）</td><td class="ok">✓</td></tr>
+    <tr><td>巳·炼化</td><td>G5 SYNTHESIS</td><td>提炼成论 → 结论提炼门</td><td class="ok">✓</td></tr>
+    <tr><td>午·昭明</td><td>G6 EVIDENCE_AUDIT</td><td>证据明察 → 证据审计门</td><td class="ok">✓</td></tr>
+    <tr><td>未·滋养</td><td>G7 GAP_FILLING</td><td>缺口补足 → 缺口补全门（完整性）</td><td class="ok">✓</td></tr>
+    <tr><td>申·肃正</td><td>G8 RIGOR_TRIAGE</td><td>从严取舍 → 取舍门</td><td class="ok">✓</td></tr>
+    <tr><td>酉·定形</td><td>G9 CONFORMANCE</td><td>定型合规 → 合规定形门</td><td class="ok">✓</td></tr>
+    <tr><td>戌·收束</td><td>G10 FINALIZATION</td><td>收束归档 → 收束门（完整性）</td><td class="ok">✓</td></tr>
+    <tr><td>亥·归藏</td><td>G11 RETROSPECT_LOCK</td><td>复盘入册 → 复盘入库门</td><td class="ok">✓</td></tr>
+  </table></div>
+  <h3>10.3 洛书九宫 → 运行角色</h3>
+  <div class="tbl"><table>
+    <colgroup><col style="width:16%"><col style="width:30%"><col style="width:38%"><col style="width:16%"></colgroup>
+    <tr><th>溯源（宫）</th><th>技术实现</th><th>替换说明</th><th>覆盖</th></tr>
+    <tr><td>坎一·底线</td><td>GUARD</td><td>安全合规守卫 → 守卫角色</td><td class="ok">✓</td></tr>
+    <tr><td>坤二·承载</td><td>CONTEXT_POOL</td><td>资源承载 → 上下文池</td><td class="ok">✓</td></tr>
+    <tr><td>震三·行动</td><td>EXECUTOR</td><td>行动发动 → 执行器</td><td class="ok">✓</td></tr>
+    <tr><td>巽四·采信</td><td>COLLECTOR</td><td>信息采信 → 采集器</td><td class="ok">✓</td></tr>
+    <tr><td>中五·中枢</td><td>ORCHESTRATOR</td><td>居中决策 → 编排器（唯一状态源）</td><td class="ok">✓</td></tr>
+    <tr><td>乾六·利器</td><td>TOOL_REGISTRY</td><td>工具利器 → 工具注册表</td><td class="ok">✓</td></tr>
+    <tr><td>兑七·言达</td><td>PRESENTER</td><td>表达交付 → 呈现器</td><td class="ok">✓</td></tr>
+    <tr><td>艮八·记忆</td><td>MEMORY_STORE</td><td>记忆归藏 → 记忆库</td><td class="ok">✓</td></tr>
+    <tr><td>离九·明思</td><td>REASONER</td><td>明思烛照 → 推理器</td><td class="ok">✓</td></tr>
+  </table></div>
+  <h3>10.4 机制映射</h3>
+  <div class="tbl"><table>
+    <colgroup><col style="width:22%"><col style="width:42%"><col style="width:20%"><col style="width:16%"></colgroup>
+    <tr><th>溯源</th><th>技术实现</th><th>替换说明</th><th>覆盖</th></tr>
+    <tr><td>六十甲子</td><td>TaskState (i,j) 同奇偶约束</td><td>60 合法态唯一 → 状态编码</td><td class="ok">✓</td></tr>
+    <tr><td>五行相生</td><td>8.2 五段依赖前置</td><td>生 → 前置条件</td><td class="ok">✓</td></tr>
+    <tr><td>五行相克</td><td>8.3 五条制衡触发</td><td>克 → 回退/分离规则</td><td class="ok">✓</td></tr>
+    <tr><td>四库·信</td><td>G1/G4/G7/G10 完整性四门</td><td>四处完整性承诺</td><td class="ok">✓</td></tr>
+    <tr><td>仁义礼智信</td><td>GROWTH/CLARITY/STABILITY/RIGOR/LEARNING</td><td>五常 → 五类策略标签</td><td class="ok">✓</td></tr>
+  </table></div>
+  <div class="note"><b>核对结论</b>：上轮全部映射均已替换为技术实现，无遗漏项；3 处需在实施中校准，见第 12 章。</div>
+
+  <h2>11. 整改实施清单</h2>
+  <div class="tbl"><table>
+    <colgroup><col style="width:12%"><col style="width:38%"><col style="width:24%"><col style="width:26%"></colgroup>
+    <tr><th>阶段</th><th>内容</th><th>验收标准</th><th>对应章节</th></tr>
+    <tr><td>A</td><td>状态机骨架：十态枚举、转移函数、Gate 接口、TaskState 合法性</td><td>单测覆盖 60 态合法性、12 门触发、回退路径</td><td>4/5/7</td></tr>
+    <tr><td>B</td><td>角色装配：星型拓扑、四组对角制衡、依赖方向</td><td>依赖方向单测；生成-验证分离测试</td><td>6/8.1</td></tr>
+    <tr><td>C</td><td>策略注入：五类标签、五条相克触发条件</td><td>5 条触发条件场景测试（含越界/失效/溯源）</td><td>8.2/8.3</td></tr>
+  </table></div>
+
+  <h2>12. 遗留缺口与 V2 候选</h2>
+  <ol style="font-size:14px;">
+    <li><b>触发阈值待校准</b>：复盘-数据溯源（土克水）与生成-先验约束（水克火）的触发条件依赖审计日志完整度与先验命中率，需实测调参。</li>
+    <li><b>制衡分层防混淆</b>：流程级制衡（8.3）与架构级制衡（6.1）是两层，实施中须在配置中显式分层，避免互相覆盖。</li>
+    <li><b>单点瓶颈</b>：星型拓扑的 ORCHESTRATOR 为潜在单点，读路径建议加缓存直连降级（V2 候选）。</li>
+  </ol>
+
+</div>
+</body>
+</html>

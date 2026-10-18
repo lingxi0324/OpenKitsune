@@ -1,7 +1,7 @@
 import { chatIsReady } from "./utils/backendReadiness";
 import { createContext, useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense, startTransition } from "react";
 import { useTranslation } from "react-i18next";
-import { invoke, listen, IS_TAURI, IS_WEB, IS_CAPACITOR, IS_LOCAL_WEB, getAppVersion, onWsEvent, reconnectWsNow, setWsApiBaseUrl, logger } from "./platform";
+import { invoke, listen, IS_TAURI, IS_WEB, IS_CAPACITOR, getAppVersion, onWsEvent, reconnectWsNow, setWsApiBaseUrl, logger } from "./platform";
 import { getActiveServer, getActiveServerId } from "./platform/servers";
 import { checkAuth, installFetchInterceptor, AUTH_EXPIRED_EVENT, clearAccessToken, setTauriRemoteMode, isTauriRemoteMode } from "./platform/auth";
 import { LoginView } from "./views/LoginView";
@@ -278,10 +278,13 @@ function MainApp() {
   const { t } = useTranslation();
 
   // ── Web / Capacitor auth gate ──
-  // IS_LOCAL_WEB: hostname is 127.0.0.1/localhost/::1 — backend authenticates
-  // by client IP, no tokens or round-trips needed.  This eliminates the entire
-  // class of "checkAuth timeout → login page flash" bugs.
-  const needsRemoteAuth = (IS_WEB || IS_CAPACITOR) && !IS_LOCAL_WEB;
+  // Always ask the backend whether this connection is authenticated. Hostname
+  // heuristics are unsafe: a loopback URL can still reach a backend that sees a
+  // non-loopback peer (e.g. WSL2 + Windows portproxy), in which case the backend
+  // requires a token and skipping checkAuth would leave every /api/* call at 401.
+  // Genuine local connections are still recognised — /api/auth/check reports
+  // method="local" and the login screen is skipped.
+  const needsRemoteAuth = IS_WEB || IS_CAPACITOR;
   const [webAuthed, setWebAuthed] = useState(!needsRemoteAuth);
   const [authChecking, setAuthChecking] = useState(needsRemoteAuth);
   const [showPwBanner, setShowPwBanner] = useState(false);

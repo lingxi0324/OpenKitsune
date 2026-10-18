@@ -132,6 +132,52 @@ def test_mark_done_failure() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle gate-order sync (整改接入：transition 自动同步生命周期)
+# ---------------------------------------------------------------------------
+
+
+def test_transition_syncs_lifecycle_on_progressing_phases() -> None:
+    """推进阶段迁移自动同步任务级生命周期（门序同门归属）。"""
+    state = TaskState(task_id="t")
+    state.transition(ReasoningPhase.COMPILING)  # IDLE→COMPILING
+    assert state.lifecycle == TaskLifecycleState.PLANNING
+    state.transition(ReasoningPhase.THINK)
+    assert state.lifecycle == TaskLifecycleState.WAITING_DEPS
+    state.transition(ReasoningPhase.ACT)
+    assert state.lifecycle == TaskLifecycleState.EXECUTING
+    state.transition(ReasoningPhase.OBSERVE)
+    assert state.lifecycle == TaskLifecycleState.STALLED
+    state.transition(ReasoningPhase.VERIFY)
+    assert state.lifecycle == TaskLifecycleState.VERIFYING
+    state.transition(ReasoningPhase.DONE)
+    assert state.lifecycle == TaskLifecycleState.DONE
+
+
+def test_transition_keeps_lifecycle_on_interrupt() -> None:
+    """中断阶段迁移保持生命周期现值（不误打回初始态）。"""
+    state = TaskState(task_id="t")
+    state.transition(ReasoningPhase.COMPILING)  # → PLANNING
+    state.transition(ReasoningPhase.THINK)
+    state.transition(ReasoningPhase.ACT)        # → EXECUTING
+    assert state.lifecycle == TaskLifecycleState.EXECUTING
+    state.transition(ReasoningPhase.AWAITING_USER)  # 中断：保持 EXECUTING
+    assert state.lifecycle == TaskLifecycleState.EXECUTING
+    state.transition(ReasoningPhase.THINK)      # 恢复推进：门序同步回 WAITING_DEPS
+    assert state.lifecycle == TaskLifecycleState.WAITING_DEPS
+
+
+def test_derive_lifecycle_for_phase_none_for_non_progressing() -> None:
+    """入口/中断阶段无推进门映射：返回 None。"""
+    from openkitsune.agent.state import derive_lifecycle_for_phase
+
+    assert derive_lifecycle_for_phase(ReasoningPhase.IDLE) is None
+    assert derive_lifecycle_for_phase(ReasoningPhase.AWAITING_USER) is None
+    assert derive_lifecycle_for_phase(ReasoningPhase.COMPILING) is (
+        TaskLifecycleState.PLANNING
+    )
+
+
+# ---------------------------------------------------------------------------
 # AgentState registry
 # ---------------------------------------------------------------------------
 

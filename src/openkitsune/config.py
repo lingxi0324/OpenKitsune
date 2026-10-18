@@ -919,6 +919,11 @@ class Settings(BaseSettings):
         default=10,
         description="每隔多少轮对话触发一次记忆回顾（0 表示禁用）",
     )
+    memory_nudge_timeout: int = Field(
+        default=180,
+        description="记忆回顾单次执行超时（秒）。35B 推理模型先思考后回答，生成慢，"
+        "默认 180s；超时按软失败处理，下次周期自动重试。",
+    )
 
     # === Plugin reseed drift detection ===
     # When True (default), PluginManager logs WARN at startup if any
@@ -971,7 +976,7 @@ class Settings(BaseSettings):
     )
     ui_language: str = Field(
         default="zh",
-        description="桌面客户端语言: zh(中文) | en(英文)",
+        description="桌面客户端语言: zh(中文) | en(英文) | hi(印地语) | es(西班牙语) | ar(阿拉伯语) | fr(法语) | bn(孟加拉语) | pt(葡萄牙语) | ru(俄语)",
     )
 
     # === 桌面通知配置 ===
@@ -2006,6 +2011,7 @@ _PERSISTABLE_KEYS: list[str] = [
     "persona_name",
     "memory_nudge_enabled",
     "memory_nudge_interval",
+    "memory_nudge_timeout",
     "proactive_enabled",
     "proactive_max_daily_messages",
     "proactive_min_interval_minutes",

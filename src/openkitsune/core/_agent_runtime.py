@@ -834,6 +834,16 @@ class Agent:
         except Exception as e:
             logger.debug(f"[LingxiBridge] mount failed: {e}")
 
+        # 九尾内核桥接器（九尾并行推演 + 中宫狐心裁决 + 复盘闭环）
+        self.kitsune_heart = None
+        try:
+            from .kitsune_tails import KitsuneHeartBridge
+
+            self.kitsune_heart = KitsuneHeartBridge(self)
+            logger.info("🦊 九尾内核桥接器挂载成功（九尾+狐心+复盘闭环）")
+        except Exception as e:
+            logger.debug(f"[KitsuneHeart] mount failed: {e}")
+
         # 表情包引擎
         self.sticker_engine = (
             StickerEngine(
@@ -3175,6 +3185,16 @@ class Agent:
                         _lx_ctx = self.lingxi_bridge.get_session_context()
                         if _lx_ctx:
                             session_context["lingxi_presence"] = _lx_ctx
+                except Exception:
+                    pass
+                # 九尾内核·对话前注入：狐心裁决（模式/情绪/潜台词/风险/伦理/记忆/目标） → prompt
+                try:
+                    if getattr(self, "kitsune_heart", None) is not None:
+                        _kh_ctx = self.kitsune_heart.get_session_context(
+                            getattr(self, "_current_user_message", "") or ""
+                        )
+                        if _kh_ctx:
+                            session_context["kitsune_heart"] = _kh_ctx
                 except Exception:
                     pass
                 # PR-A2：把活跃的授权意图传给 prompt builder，让它注入到 system prompt
@@ -5919,6 +5939,17 @@ class Agent:
                 )
             except Exception as e:
                 logger.debug(f"[LingxiBridge] after_turn failed: {e}")
+
+        # 九尾内核·收尾钩子：复盘六问落盘（retrospects）+ 改进项回写 MEMORY.md（闭环）
+        if getattr(self, "kitsune_heart", None) is not None:
+            try:
+                self.kitsune_heart.after_turn(
+                    message=getattr(self, "_current_user_message", "") or "",
+                    reply=response_text,
+                    session_id=session_id,
+                )
+            except Exception as e:
+                logger.debug(f"[KitsuneHeart] after_turn failed: {e}")
 
         # Trait learning is post-turn enrichment. Schedule it only after the
         # active run has completed so it cannot delay intent routing or the

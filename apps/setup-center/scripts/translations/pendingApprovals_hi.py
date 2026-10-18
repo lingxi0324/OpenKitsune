@@ -1,0 +1,38 @@
+LANG = "hi"
+
+EXTRA = {
+ "pendingApprovals": {
+  "title": "लंबित अनुमोदन",
+  "subtitle": "अनअटेंडेड कार्यों से आने वाले टूल कॉल जिन्हें owner की स्वीकृति चाहिए",
+  "serviceNotRunning": "सेवा चालू नहीं, लंबित अनुमोदन नहीं देखे जा सकते",
+  "noEntries": "कोई लंबित अनुमोदन नहीं",
+  "filterActive": "लंबित",
+  "filterAll": "सभी",
+  "approve": "स्वीकृत करें",
+  "deny": "अस्वीकार करें",
+  "approved": "स्वीकृत — कार्य स्वतः फिर शुरू होगा",
+  "denied": "अस्वीकृत",
+  "taskResumed": "संबंधित कार्य पुनः निर्धारित हुआ, कुछ सेकंड में निष्पादित होगा",
+  "resolveFailed": "अनुमोदन कार्रवाई विफल",
+  "statusPending": "लंबित",
+  "statusApproved": "स्वीकृत",
+  "statusDenied": "अस्वीकृत",
+  "statusExpired": "समाप्त",
+  "stat_pending": "लंबित",
+  "stat_approved": "स्वीकृत",
+  "stat_denied": "अस्वीकृत",
+  "stat_expired": "समाप्त",
+  "createdAt": "निर्माण समय",
+  "expiresAt": "समाप्ति समय: {{time}}",
+  "strategy": "रणनीति",
+  "taskId": "कार्य ID",
+  "sessionId": "सत्र ID",
+  "approvalClass": "अनुमोदन श्रेणी",
+  "resolvedAt": "निपटान समय",
+  "resolvedBy": "निपटानकर्ता",
+  "note": "टिप्पणी",
+  "viewParams": "टूल पैरामीटर देखें",
+  "notePlaceholder": "वैकल्पिक: अनुमोदन टिप्पणी जोड़ें...",
+  "expired": "समाप्त",
+ }
+}

@@ -1,0 +1,36 @@
+LANG = "fr"
+
+EXTRA = {
+ "agentStore": {
+  "subtitle": "Découvrez et installez des Agents de la communauté OpenKitsune (nécessite le réseau ; l'import/export local n'est pas affecté)",
+  "searchPlaceholder": "Rechercher des Agents...",
+  "allCategories": "Toutes les catégories",
+  "catCustomerService": "Service client",
+  "catDevelopment": "Développement",
+  "catBusiness": "Affaires",
+  "catCreative": "Créatif",
+  "catEducation": "Éducation",
+  "catProductivity": "Productivité",
+  "catGeneral": "Général",
+  "sortDownloads": "Par téléchargements",
+  "sortRating": "Par note",
+  "sortNewest": "Plus récents",
+  "searching": "Recherche...",
+  "downloads": "{{count}} téléchargements",
+  "install": "Installer",
+  "installing": "Installation...",
+  "installSuccess": "{{name}} installé avec succès",
+  "installFail": "Échec de l'installation : {{msg}}",
+  "connectFail": "Impossible de se connecter à la boutique d'Agents distante",
+  "offlineHint": "La boutique distante est temporairement indisponible. Les fonctions locales ne sont pas affectées.\nVous pouvez continuer à utiliser l'import/export d'Agents dans « Gestion des Agents » de la barre latérale,\nou partager et importer des Agents directement via des fichiers .kitsune-agent.",
+  "retry": "Réessayer la connexion",
+  "empty": "Aucun Agent disponible",
+  "featured": "En vedette",
+  "noDesc": "Aucune description",
+  "confirmTitle": "Confirmer l'installation de l'Agent",
+  "confirmDesc": "Vous allez installer \"{{name}}\" depuis le Hub d'Agents OpenKitsune. Cet Agent peut inclure des dépendances externes tierces qui seront récupérées depuis leurs dépôts d'origine lors de l'installation.",
+  "confirmInstall": "Confirmer l'installation",
+  "license": "Licence open source",
+  "licenseNotice": "En installant, vous acceptez de respecter les termes de la licence open source de cet Agent et de ses dépendances. Les Skills externes sont récupérées depuis leurs dépôts GitHub d'origine ; cette plateforme ne les redistribue pas. Signalement d'infraction : zacon365@gmail.com.",
+ }
+}

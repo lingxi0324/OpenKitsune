@@ -1761,19 +1761,48 @@ class OpenAIProvider(LLMProvider):
                     f"({len(text_content)} chars extracted from {len(reasoning_content)} chars reasoning)"
                 )
             else:
-                # 1. 把 reasoning 全文作为 visible text fallback (优于直接放弃)
-                text_content = reasoning_content
-                reasoning_content = ""
-                content_blocks.insert(0, TextBlock(text=text_content))
-                logger.warning(
-                    f"[PARSE] content is empty; using reasoning_content "
-                    f"({len(text_content)} chars) as visible text fallback from {self.name}"
+                # [fix 2026-10-17] 截断的思考碎片（finish=length 且 reasoning 很短）
+                # 只是模型思考到一半被 max_tokens 切断，不是可用回复：
+                # 不提升为可见文本（避免把 "Here's a thinking process:" 当答案），
+                # 保留 reasoning_content 供调用方（如健康检查）作为"已响应"信号。
+                _finish_reason = (
+                    choice.get("finish_reason") if isinstance(choice, dict) else ""
                 )
+                # [fix 2026-10-18] 短思考碎片（<200 字符）无论 finish_reason 均不提升：
+                # 例如 31 字符的思考过程不可能是可用回复，
+                # 避免每次健康/探测请求触发 WARN 刷屏。
+                _short_reasoning = len(reasoning_content) < 200
+                _truncated_fragment = _finish_reason == "length" and _short_reasoning
+                if _truncated_fragment or _short_reasoning:
+                    logger.info(
+                        f"[PARSE] reasoning-only fragment from {self.name} "
+                        f"({len(reasoning_content)} chars, finish={_finish_reason or '?'}): "
+                        f"content empty, reasoning kept as reasoning_content, "
+                        f"not promoted as visible text"
+                    )
+                    # 不修改 text_content / reasoning_content / content_blocks
+                else:
+                    # 1. 把 reasoning 全文作为 visible text fallback (优于直接放弃)
+                    text_content = reasoning_content
+                    reasoning_content = ""
+                    content_blocks.insert(0, TextBlock(text=text_content))
+                    logger.warning(
+                        f"[PARSE] content is empty; using reasoning_content "
+                        f"({len(text_content)} chars) as visible text fallback from {self.name}"
+                    )
 
         # 非标准 OpenAI-compatible 代理容错：有 token 但 message.content 为空时，
         # 不要求一定存在 reasoning_content，尽量从其他常见字段恢复可见文本。
+        # [fix 2026-10-17] 截断思考碎片场景已明确保留 reasoning_content 且不提升，
+        # 此处跳过，避免 _recover_empty_content_text 又把 reasoning 重新提升为可见文本。
         recovered_from: str = ""
-        if not text_content and not has_tool_calls and not content_blocks and _out_tokens > 0:
+        if (
+            not text_content
+            and not has_tool_calls
+            and not content_blocks
+            and not reasoning_content
+            and _out_tokens > 0
+        ):
             recovered_source, recovered_text = self._recover_empty_content_text(
                 message, choice, data
             )
@@ -1828,7 +1857,9 @@ class OpenAIProvider(LLMProvider):
             content_blocks.insert(0, TextBlock(text=text_content))
 
         # 仍然为空 → 记录详细诊断信息（帮助定位代理格式变化）
-        if not content_blocks and _out_tokens > 0:
+        # [fix 2026-10-17] reasoning-only 响应（content 空但 reasoning 有值）是
+        # 推理模型的正常形态，不是 CONTENT LOST；跳过诊断，避免告警刷屏。
+        if not content_blocks and _out_tokens > 0 and not reasoning_content:
             msg_keys = sorted(k for k in message if k != "role")
             msg_preview = {
                 k: (

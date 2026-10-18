@@ -121,7 +121,7 @@ describe("Sidebar account distribution mode", () => {
     await waitFor(() => {
       expect(screen.getByRole("menu")).toHaveAccessibleName(/应用菜单|App menu/i);
     });
-    expect(screen.getByText(/配置|Config/i)).toBeInTheDocument();
+    expect(screen.getByText(/^配置$|^Config$/i)).toBeInTheDocument();
     expect(screen.queryByText(/退出登录|Sign out/i)).not.toBeInTheDocument();
   });
 

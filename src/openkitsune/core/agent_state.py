@@ -238,6 +238,56 @@ class TaskState:
     # 原始用户消息（用于模型切换时重置上下文）
     original_user_messages: list[dict] = field(default_factory=list)
 
+    # ──────────────────────────────────────────────────────────────────
+    # 复合状态编码（任务级 × 回合级 × 校验门）—— 规范第 7 章
+    # TaskState 新增 stage_idx + gate_idx 双维度，合法性由奇偶校验保证。
+    # 与 lifecycle_constraints.Gate.parity_consistent 同义：
+    #   is_valid() = (stage_idx % 2) == (gate_idx % 2)
+    # 合法态共 60 个（10×12=120，同奇偶），30 个失衡态被 is_valid 拦截。
+    # 注意：此处是 v1 core/agent_state.py 的 TaskState（对应 ReasoningEngine），
+    #       v2 runtime/models.py 的 TaskLifecycleState 已有独立实现。
+    # ──────────────────────────────────────────────────────────────────
+    stage_idx: int = 0
+    gate_idx: int = 0
+
+    def is_valid(self) -> bool:
+        """复合状态合法性校验（规范第 7 章）。
+
+        推进序号与校验序号同奇偶 → 合法态；异奇偶 → 失衡态，
+        状态机在进入前拦截（见 begin_task / ensure_ready_for_reasoning）。
+        """
+        return (self.stage_idx % 2) == (self.gate_idx % 2)
+
+    def advance(self) -> tuple[int, int]:
+        """规范 advance()：先过当前门再推进，保持同频。
+
+        Returns:
+            (new_stage_idx, new_gate_idx)
+
+        Raises:
+            ValueError: 推进后同奇偶校验失败（失衡态拦截）。
+        """
+        new_stage = self.stage_idx + 1
+        new_gate = self.gate_idx + 1
+        if (new_stage % 2) != (new_gate % 2):
+            raise ValueError(
+                f"推进后失衡：stage={new_stage} (奇), gate={new_gate} (偶) – "
+                f"同频推进必须同奇偶。这是失衡态之一。"
+            )
+        self.stage_idx = new_stage
+        self.gate_idx = new_gate
+        return (new_stage, new_gate)
+
+    def rollback(self) -> tuple[int, int]:
+        """规范 rollback()：同步回退 stage 和 gate。"""
+        if self.stage_idx == 0 and self.gate_idx == 0:
+            raise ValueError("rollback to initial state")
+        new_stage = max(0, self.stage_idx - 1)
+        new_gate = max(0, self.gate_idx - 1)
+        self.stage_idx = new_stage
+        self.gate_idx = new_gate
+        return (new_stage, new_gate)
+
     def transition(self, new_status: TaskStatus) -> None:
         """执行状态转换，带合法性验证。
 

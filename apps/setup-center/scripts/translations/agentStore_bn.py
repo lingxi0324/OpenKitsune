@@ -1,0 +1,36 @@
+LANG = "bn"
+
+EXTRA = {
+ "agentStore": {
+  "subtitle": "OpenKitsune কমিউনিটি থেকে Agent আবিষ্কার ও ইনস্টল করুন (নেটওয়ার্ক প্রয়োজন; স্থানীয় ইমপোর্ট/এক্সপোর্ট অপ্রভাবিত)",
+  "searchPlaceholder": "Agent খুঁজুন...",
+  "allCategories": "সব বিভাগ",
+  "catCustomerService": "গ্রাহক সেবা",
+  "catDevelopment": "ডেভেলপমেন্ট",
+  "catBusiness": "ব্যবসা",
+  "catCreative": "সৃজনশীল",
+  "catEducation": "শিক্ষা",
+  "catProductivity": "উৎপাদনশীলতা",
+  "catGeneral": "সাধারণ",
+  "sortDownloads": "ডাউনলোড অনুযায়ী",
+  "sortRating": "রেটিং অনুযায়ী",
+  "sortNewest": "সর্বশেষ",
+  "searching": "খোঁজা হচ্ছে...",
+  "downloads": "{{count}}টি ডাউনলোড",
+  "install": "ইনস্টল করুন",
+  "installing": "ইনস্টল হচ্ছে...",
+  "installSuccess": "{{name}} সফলভাবে ইনস্টল হয়েছে",
+  "installFail": "ইনস্টল ব্যর্থ: {{msg}}",
+  "connectFail": "রিমোট Agent স্টোরে সংযোগ করা যাচ্ছে না",
+  "offlineHint": "রিমোট স্টোর সাময়িকভাবে অনুপলব্ধ। স্থানীয় সুবিধা অপ্রভাবিত।\nসাইডবারের «Agent পরিচালনা»-তে স্থানীয় Agent ইমপোর্ট/এক্সপোর্ট ব্যবহার চালিয়ে যেতে পারেন,\nবা .kitsune-agent ফাইল দিয়ে সরাসরি Agent শেয়ার ও ইমপোর্ট করতে পারেন।",
+  "retry": "সংযোগ আবার চেষ্টা",
+  "empty": "কোনো Agent উপলব্ধ নেই",
+  "featured": "বিশেষ নির্বাচিত",
+  "noDesc": "কোনো বিবরণ নেই",
+  "confirmTitle": "Agent ইনস্টল নিশ্চিত করুন",
+  "confirmDesc": "আপনি OpenKitsune Agent হাব থেকে \"{{name}}\" ইনস্টল করতে চলেছেন। এই Agent-এ তৃতীয়-পক্ষের বাহ্যিক নির্ভরতা থাকতে পারে যা ইনস্টলের সময় তাদের মূল রিপোজিটরি থেকে আনা হবে।",
+  "confirmInstall": "ইনস্টল নিশ্চিত করুন",
+  "license": "ওপেন-সোর্স লাইসেন্স",
+  "licenseNotice": "ইনস্টল করার অর্থ আপনি এই Agent ও তার নির্ভরতার ওপেন-সোর্স লাইসেন্সের শর্ত মানতে সম্মত। বাহ্যিক নির্ভরতা Skills তাদের মূল GitHub রিপোজিটরি থেকে আনা হয়, এই প্ল্যাটফর্ম পুনর্বিতরণ করে না। লঙ্ঘন রিপোর্ট করুন: zacon365@gmail.com।",
+ }
+}

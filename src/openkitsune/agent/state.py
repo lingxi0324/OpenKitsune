@@ -22,7 +22,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import StrEnum
+from enum import Enum, StrEnum
 from typing import Any
 from uuid import uuid4
 
@@ -33,6 +33,7 @@ __all__ = [
     "ReasoningPhase",
     "TaskState",
     "AgentState",
+    "derive_lifecycle_for_phase",
 ]
 
 
@@ -56,33 +57,113 @@ class ReasoningPhase(StrEnum):
     DONE = "done"
 
 
-_VALID_PHASE_TRANSITIONS: dict[ReasoningPhase, frozenset[ReasoningPhase]] = {
-    ReasoningPhase.IDLE: frozenset(
-        {ReasoningPhase.COMPILING, ReasoningPhase.THINK, ReasoningPhase.DONE}
-    ),
-    ReasoningPhase.COMPILING: frozenset({ReasoningPhase.THINK, ReasoningPhase.DONE}),
-    ReasoningPhase.THINK: frozenset(
-        {
-            ReasoningPhase.ACT,
-            ReasoningPhase.VERIFY,
-            ReasoningPhase.AWAITING_USER,
-            ReasoningPhase.DONE,
-        }
-    ),
-    ReasoningPhase.ACT: frozenset(
-        {
-            ReasoningPhase.OBSERVE,
-            ReasoningPhase.AWAITING_USER,
-            ReasoningPhase.DONE,
-        }
-    ),
-    ReasoningPhase.OBSERVE: frozenset(
-        {ReasoningPhase.THINK, ReasoningPhase.VERIFY, ReasoningPhase.DONE}
-    ),
-    ReasoningPhase.VERIFY: frozenset({ReasoningPhase.DONE, ReasoningPhase.THINK}),
-    ReasoningPhase.AWAITING_USER: frozenset({ReasoningPhase.THINK, ReasoningPhase.DONE}),
-    ReasoningPhase.DONE: frozenset({ReasoningPhase.IDLE}),
+class _PhaseRole(Enum):
+    """推理阶段的内在职能签名（技术语义，非领域名词）。
+
+    迁移合法性不再逐条手写，而是由『职能签名 + 递生链 + 收敛规则』推导：
+    - ENTRY 启动位、COMPILE 汇编产物、DECIDE 消费并产出决策、
+      ACT 消费决策产出动作、OBSERVE 消费动作产出观察、
+      VERIFY 消费观察产出判定、INTERRUPT 中断等待、TERMINAL 终态复位。
+    """
+
+    ENTRY = "entry"
+    COMPILE = "compile"
+    DECIDE = "decide"
+    ACT = "act"
+    OBSERVE = "observe"
+    VERIFY = "verify"
+    INTERRUPT = "interrupt"
+    TERMINAL = "terminal"
+
+
+# 阶段 → 职能签名（唯一事实来源；迁移关系全部由规则推导）
+_PHASE_ROLE: dict[ReasoningPhase, _PhaseRole] = {
+    ReasoningPhase.IDLE: _PhaseRole.ENTRY,
+    ReasoningPhase.COMPILING: _PhaseRole.COMPILE,
+    ReasoningPhase.THINK: _PhaseRole.DECIDE,
+    ReasoningPhase.ACT: _PhaseRole.ACT,
+    ReasoningPhase.OBSERVE: _PhaseRole.OBSERVE,
+    ReasoningPhase.VERIFY: _PhaseRole.VERIFY,
+    ReasoningPhase.AWAITING_USER: _PhaseRole.INTERRUPT,
+    ReasoningPhase.DONE: _PhaseRole.TERMINAL,
 }
+
+# 递生链：沿『汇编→决策→行动→观察→判定』的产物契约单向推进，
+# 每个环节的产物恰好被下一环节消费（前序产物满足后序输入）。
+_PRODUCE_CHAIN: tuple[_PhaseRole, ...] = (
+    _PhaseRole.COMPILE,
+    _PhaseRole.DECIDE,
+    _PhaseRole.ACT,
+    _PhaseRole.OBSERVE,
+    _PhaseRole.VERIFY,
+)
+
+
+def _derive_phase_transitions() -> dict[ReasoningPhase, frozenset[ReasoningPhase]]:
+    """由内在规则推导推理阶段迁移表（不逐条硬编码）。
+
+    推导规则：
+    1. 递生链：COMPILE 产物供 DECIDE 消费；DECIDE 可产出 ACT / VERIFY /
+       中断 / 终态；ACT 产出 OBSERVE / 中断 / 终态；OBSERVE 回 DECIDE
+       （再决策）或进 VERIFY / 终态；
+    2. 判定收敛：VERIFY 通过进终态，未过回 DECIDE（唯一回退路径）；
+    3. 中断归位：INTERRUPT 仅在收到用户输入后回 DECIDE 或进终态；
+    4. 终态复位：TERMINAL 唯一出边回 ENTRY，完成一轮闭环。
+    """
+    table: dict[ReasoningPhase, set[ReasoningPhase]] = {}
+    for phase, role in _PHASE_ROLE.items():
+        targets: set[ReasoningPhase] = set()
+        if role is _PhaseRole.ENTRY:
+            targets |= {ReasoningPhase.COMPILING, ReasoningPhase.THINK, ReasoningPhase.DONE}
+        elif role is _PhaseRole.COMPILE:
+            targets |= {ReasoningPhase.THINK, ReasoningPhase.DONE}
+        elif role is _PhaseRole.DECIDE:
+            targets |= {ReasoningPhase.ACT, ReasoningPhase.VERIFY, ReasoningPhase.AWAITING_USER, ReasoningPhase.DONE}
+        elif role is _PhaseRole.ACT:
+            targets |= {ReasoningPhase.OBSERVE, ReasoningPhase.AWAITING_USER, ReasoningPhase.DONE}
+        elif role is _PhaseRole.OBSERVE:
+            targets |= {ReasoningPhase.THINK, ReasoningPhase.VERIFY, ReasoningPhase.DONE}
+        elif role is _PhaseRole.VERIFY:
+            targets |= {ReasoningPhase.DONE, ReasoningPhase.THINK}
+        elif role is _PhaseRole.INTERRUPT:
+            targets |= {ReasoningPhase.THINK, ReasoningPhase.DONE}
+        elif role is _PhaseRole.TERMINAL:
+            targets |= {ReasoningPhase.IDLE}
+        table[phase] = frozenset(targets)
+    return table
+
+
+_VALID_PHASE_TRANSITIONS: dict[ReasoningPhase, frozenset[ReasoningPhase]] = (
+    _derive_phase_transitions()
+)
+
+
+# ---------------------------------------------------------------------------
+# 生命周期随门序同步（单一事实来源）
+# ---------------------------------------------------------------------------
+
+# 推进阶段 → 任务级生命周期应处阶段（门序同门归属）。
+# 与约束层 lifecycle_constraints.PHASE_TO_GATE × LIFECYCLE_TO_GATE 语义同源：
+#   COMPILING→READY→PLANNING   THINK→START→WAITING_DEPS
+#   ACT→FLOW→EXECUTING         OBSERVE→AGGREGATE→STALLED
+#   VERIFY→EVIDENCE→VERIFYING  DONE→FINALIZE→DONE
+# 入口（IDLE）与中断（AWAITING_USER）阶段无推进门映射 → None：
+# 调用方须保持生命周期现值，不得误打回初始态。
+_LIFECYCLE_FOR_PHASE: dict[ReasoningPhase, TaskLifecycleState | None] = {
+    ReasoningPhase.COMPILING: TaskLifecycleState.PLANNING,
+    ReasoningPhase.THINK: TaskLifecycleState.WAITING_DEPS,
+    ReasoningPhase.ACT: TaskLifecycleState.EXECUTING,
+    ReasoningPhase.OBSERVE: TaskLifecycleState.STALLED,
+    ReasoningPhase.VERIFY: TaskLifecycleState.VERIFYING,
+    ReasoningPhase.DONE: TaskLifecycleState.DONE,
+    ReasoningPhase.IDLE: None,
+    ReasoningPhase.AWAITING_USER: None,
+}
+
+
+def derive_lifecycle_for_phase(phase: ReasoningPhase) -> TaskLifecycleState | None:
+    """推进阶段 → 生命周期应处阶段（None = 无推进门，保持现值）。"""
+    return _LIFECYCLE_FOR_PHASE.get(phase)
 
 
 @dataclass
@@ -123,6 +204,12 @@ class TaskState:
         Raises ``ValueError`` on illegal transitions. The previous code
         logged a warning and forced the move; v2 raises so bugs surface
         in tests rather than corrupting state silently.
+
+        After a legal move, the task-level lifecycle follows the gate
+        order automatically: progressing phases sync their lifecycle
+        stage (COMPILING→PLANNING, … VERIFY→VERIFYING, DONE→DONE).
+        Entry (IDLE) and interrupt (AWAITING_USER) phases keep the
+        current lifecycle value (they are not gate-bound).
         """
         allowed = _VALID_PHASE_TRANSITIONS.get(self.phase, frozenset())
         if target not in allowed:
@@ -132,6 +219,9 @@ class TaskState:
                 f"(allowed: {sorted(s.value for s in allowed)})"
             )
         self.phase = target
+        derived = derive_lifecycle_for_phase(target)
+        if derived is not None:
+            self.lifecycle = derived
 
     # ------------------------------------------------------------------
     # Cooperative cancel adapter
@@ -177,6 +267,69 @@ class TaskState:
         return (self.finished_at - self.started_at).total_seconds()
 
     # ------------------------------------------------------------------
+    # 双维度状态编码（任务级 × 回合级）
+    # ------------------------------------------------------------------
+
+    @property
+    def state_code(self) -> str:
+        """双维度状态编码 ``lifecycle.phase``。
+
+        供奇偶一致性校验（openkitsune.agent.lifecycle_constraints）与
+        诊断使用；只读派生字段，不改变任何既有运行路径。
+        """
+        return f"{self.lifecycle.value}.{self.phase.value}"
+
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # 复合状态编码（任务级 × 回合级 × 校验门）—— 规范第 7 章
+    # TaskState 新增 stage_idx + gate_idx 双维度，合法性由奇偶校验保证。
+    # 与 lifecycle_constraints.Gate.parity_consistent 同义：
+    #   is_valid() = (stage_idx % 2) == (gate_idx % 2)
+    # 合法态共 60 个（10×12=120，同奇偶恰 60），30 个失衡态被 is_valid 拦截。
+    # ------------------------------------------------------------------
+
+    stage_idx: int = 0
+    gate_idx: int = 0
+
+    def is_valid(self) -> bool:
+        """复合状态合法性校验（规范第 7 章）。
+
+        推进序号与校验序号同奇偶 → 合法态；异奇偶 → 30 个失衡态，
+        状态机在进入前拦截（见 begin_task / ensure_ready_for_reasoning）。
+        """
+        return (self.stage_idx % 2) == (self.gate_idx % 2)
+
+    def advance(self) -> tuple[int, int]:
+        """规范 advance()：先过当前门再推进，保持同频。
+
+        Returns:
+            (new_stage_idx, new_gate_idx)
+
+        Raises:
+            ValueError: 推进后同奇偶校验失败（失衡态拦截）。
+        """
+        new_stage = self.stage_idx + 1
+        new_gate = self.gate_idx + 1
+        if (new_stage % 2) != (new_gate % 2):
+            raise ValueError(
+                f"推进后失衡：stage={new_stage} (奇), gate={new_gate} (偶) – "
+                f"同频推进必须同奇偶。这是 30 个失衡态之一。"
+            )
+        self.stage_idx = new_stage
+        self.gate_idx = new_gate
+        return (new_stage, new_gate)
+
+    def rollback(self) -> tuple[int, int]:
+        """规范 rollback()：同步回退 stage 和 gate。"""
+        if self.stage_idx == 0 and self.gate_idx == 0:
+            raise ValueError("rollback to initial state")
+        new_stage = max(0, self.stage_idx - 1)
+        new_gate = max(0, self.gate_idx - 1)
+        self.stage_idx = new_stage
+        self.gate_idx = new_gate
+        return (new_stage, new_gate)
+
     # Serialisation
     # ------------------------------------------------------------------
 

@@ -1,0 +1,38 @@
+LANG = "ru"
+
+EXTRA = {
+ "pendingApprovals": {
+  "title": "Ожидающие одобрения",
+  "subtitle": "Вызовы инструментов из фоновых задач, ожидающие одобрения владельца",
+  "serviceNotRunning": "Сервис не запущен, невозможно просмотреть ожидающие одобрения",
+  "noEntries": "Нет ожидающих одобрений",
+  "filterActive": "Активные",
+  "filterAll": "Все",
+  "approve": "Одобрить",
+  "deny": "Отклонить",
+  "approved": "Одобрено — задача возобновится автоматически",
+  "denied": "Отклонено",
+  "taskResumed": "Связанная задача перепланирована, выполнится через несколько секунд",
+  "resolveFailed": "Не удалось обработать одобрение",
+  "statusPending": "Ожидает",
+  "statusApproved": "Одобрено",
+  "statusDenied": "Отклонено",
+  "statusExpired": "Истекло",
+  "stat_pending": "Ожидает",
+  "stat_approved": "Одобрено",
+  "stat_denied": "Отклонено",
+  "stat_expired": "Истекло",
+  "createdAt": "Время создания",
+  "expiresAt": "Истекает: {{time}}",
+  "strategy": "Стратегия",
+  "taskId": "ID задачи",
+  "sessionId": "ID сеанса",
+  "approvalClass": "Класс одобрения",
+  "resolvedAt": "Время обработки",
+  "resolvedBy": "Обработано",
+  "note": "Примечание",
+  "viewParams": "Просмотреть параметры инструмента",
+  "notePlaceholder": "Необязательно: добавьте примечание...",
+  "expired": "Истекло",
+ }
+}

@@ -1,0 +1,35 @@
+LANG = "bn"
+
+EXTRA = {
+ "common": {
+  "loading": "প্রসেস হচ্ছে...",
+  "error": "আগে ওয়ার্কস্পেস সেট করুন",
+  "back": "ফিরুন",
+  "add": "যোগ করুন",
+  "retry": "আবার চেষ্টা",
+  "cancel": "বাতিল",
+  "save": "সংরক্ষণ",
+  "close": "বন্ধ",
+  "confirm": "নিশ্চিত",
+  "delete": "মুছুন",
+  "search": "খুঁজুন",
+  "noData": "কোনো ডেটা নেই",
+  "noResults": "কোনো ফলাফল নেই",
+  "optional": "ঐচ্ছিক",
+  "missingFields": "অনুপস্থিত",
+  "confirmDeleteMsg": "আপনি কি নিশ্চিত মুছে ফেলতে চান",
+  "custom": "কাস্টম...",
+  "prevPage": "পূর্ববর্তী",
+  "nextPage": "পরবর্তী",
+  "pageInfo": "পৃষ্ঠা {{page}} / মোট {{total}}",
+  "refresh": "রিফ্রেশ",
+  "copy": "কপি",
+  "copied": "কপি হয়েছে",
+  "confirmTitle": "কার্যক্রম নিশ্চিত করুন",
+  "enabled": "{{label}} সক্রিয় হয়েছে",
+  "disabled": "{{label}} নিষ্ক্রিয় হয়েছে",
+  "loadingSkills": "স্কিল তালিকা পড়া হচ্ছে...",
+  "skillsNotLoaded": "স্কিল তালিকা পড়া হয়নি, আগে স্কিল রিফ্রেশ করুন।",
+  "savingSkillState": "স্কিল সক্রিয় অবস্থা সংরক্ষণ হচ্ছে...",
+ }
+}

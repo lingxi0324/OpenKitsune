@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState, useCallback, type ReactNode } fro
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { Virtuoso } from "react-virtuoso";
-import { setLanguage } from "../i18n";
+import { setLanguage, type AppLanguage } from "../i18n";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ProviderIcon } from "../components/ProviderIcon";
 import { AgentIcon, agentIconText } from "../components/AgentIcon";
@@ -5320,7 +5320,7 @@ export function ChatView({
               }
               case "ui_preference":
                 if (event.theme) setThemePref(event.theme as Theme);
-                if (event.language) setLanguage(event.language as "auto" | "zh" | "en");
+                if (event.language) setLanguage(event.language as AppLanguage);
                 break;
               case "artifact":
                 logger.debug("Chat", "Artifact SSE received", { name: event.name, file_url: event.file_url, artifact_type: event.artifact_type });

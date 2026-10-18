@@ -11,9 +11,16 @@ import {
   ExternalLink,
   Eye,
   EyeOff,
+  FileText,
+  Folder,
+  FolderOpen,
+  Home,
   KeyRound,
   Loader2,
+  RefreshCw,
+  ScanLine,
   Search,
+  Settings2,
   ShieldCheck,
   Sparkles,
   Trash2,
@@ -21,6 +28,7 @@ import {
 import { toast } from "sonner";
 
 import { safeFetch } from "../providers";
+import { CATEGORY_COLORS, KnowledgeGraph } from "../components/KnowledgeGraph";
 import { Badge } from "@/components/ui/badge";
 import {
   AlertDialog,
@@ -86,6 +94,85 @@ type SearchResponse = {
   results?: SearchResult[];
 };
 
+/* ── 本地知识库契约类型（与 kb_integration_contract.md 对应） ── */
+type LocalStats = {
+  files?: number;
+  dirs?: number;
+  meta_files?: number;
+  indexed?: number;
+  last_scan_at?: string | null;
+  index_age_ms?: number | null;
+};
+
+type LocalConfig = {
+  ok?: boolean;
+  root?: string;
+  root_exists?: boolean;
+  stats?: LocalStats;
+};
+
+type BrowseEntry = {
+  name: string;
+  rel_path: string;
+  is_dir: boolean;
+  is_doc: boolean;
+  size?: number;
+  mtime?: string | null;
+  title?: string;
+  category?: string | null;
+  domain?: string | null;
+};
+
+type BrowseResponse = {
+  ok?: boolean;
+  path?: string;
+  entries?: BrowseEntry[];
+};
+
+type RelatedNode = {
+  id: string;
+  label: string;
+  category: string;
+  domain: string | null;
+  path: string;
+};
+
+type DocResponse = {
+  ok?: boolean;
+  path?: string;
+  title?: string;
+  category?: string | null;
+  domain?: string | null;
+  keywords?: string[];
+  related?: RelatedNode[];
+  preview?: string;
+  content?: string;
+  meta?: Record<string, unknown>;
+};
+
+type LocalSearchResult = {
+  path: string;
+  title: string;
+  category?: string | null;
+  domain?: string | null;
+  keywords?: string[];
+  score: number;
+  snippet?: string;
+};
+
+type LocalSearchResponse = {
+  ok?: boolean;
+  duration_ms?: number;
+  results?: LocalSearchResult[];
+};
+
+function formatBytes(n?: number | null) {
+  if (n == null) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
 function ConnectorBadge({ connector }: { connector?: ConnectorSummary }) {
   const { t } = useTranslation();
   if (connector?.enabled) {
@@ -101,6 +188,36 @@ function ConnectorBadge({ connector }: { connector?: ConnectorSummary }) {
   return (
     <Badge variant="outline" className="text-muted-foreground">
       <CircleDashed size={12} /> {t("knowledgeBase.available")}
+    </Badge>
+  );
+}
+
+function useCategoryLabel() {
+  const { t } = useTranslation();
+  return (c: string | null | undefined): string | null => {
+    if (!c) return null;
+    switch (c) {
+      case "概念": return t("knowledgeBase.catConcept");
+      case "人物": return t("knowledgeBase.catPerson");
+      case "典籍": case "书籍": return t("knowledgeBase.catClassic");
+      case "方剂": return t("knowledgeBase.catFormula");
+      case "穴位": return t("knowledgeBase.catAcupoint");
+      case "脏腑": return t("knowledgeBase.catOrgan");
+      case "文档": return t("knowledgeBase.catDocument");
+      case "目录": return t("knowledgeBase.catDirectory");
+      default: return t("knowledgeBase.catOther");
+    }
+  };
+}
+
+function CategoryBadge({ category }: { category?: string | null }) {
+  const label = useCategoryLabel()(category);
+  const color = CATEGORY_COLORS[category || ""] || CATEGORY_COLORS["其他"];
+  if (!label) return null;
+  return (
+    <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px]" style={{ borderColor: color }}>
+      <span className="mr-1 inline-block size-1.5 rounded-full" style={{ background: color }} />
+      {label}
     </Badge>
   );
 }
@@ -189,6 +306,244 @@ export function KnowledgeBaseView({
   useEffect(() => {
     void fetchConnectors();
   }, [fetchConnectors]);
+
+  /* ── 本地知识库：状态 ── */
+  const [localConfig, setLocalConfig] = useState<LocalConfig | null>(null);
+  const [localUnavailable, setLocalUnavailable] = useState(false);
+  const [scanningLocal, setScanningLocal] = useState(false);
+  const [configDialogOpen, setConfigDialogOpen] = useState(false);
+  const [configRootDraft, setConfigRootDraft] = useState("");
+  const [savingConfig, setSavingConfig] = useState(false);
+  const [browsePath, setBrowsePath] = useState("");
+  const [browseEntries, setBrowseEntries] = useState<BrowseEntry[]>([]);
+  const [browseLoading, setBrowseLoading] = useState(false);
+  const [docPath, setDocPath] = useState<string | null>(null);
+  const [docData, setDocData] = useState<DocResponse | null>(null);
+  const [docLoading, setDocLoading] = useState(false);
+  const [localSearchQuery, setLocalSearchQuery] = useState("");
+  const [localSearching, setLocalSearching] = useState(false);
+  const [localSearchResults, setLocalSearchResults] = useState<LocalSearchResult[] | null>(null);
+
+  /* ── AI 学习：动态图谱 ── */
+  const [dynStats, setDynStats] = useState<Record<string, unknown> | null>(null);
+  const [learningPath, setLearningPath] = useState("");
+  const [learningLoading, setLearningLoading] = useState(false);
+  const [learningResult, setLearningResult] = useState<Record<string, unknown> | null>(null);
+  const [communityLoading, setCommunityLoading] = useState(false);
+  const [communityResult, setCommunityResult] = useState<Record<string, unknown> | null>(null);
+
+  const fetchDynStats = useCallback(async () => {
+    try {
+      const response = await safeFetch(`${apiBaseUrl}/api/knowledge/local/graph/dynamic`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ operation: "getStats" }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (response.ok) setDynStats(await response.json());
+    } catch {
+      setDynStats(null);
+    }
+  }, [apiBaseUrl]);
+
+  useEffect(() => {
+    if (serviceRunning) void fetchDynStats();
+  }, [serviceRunning, fetchDynStats]);
+
+  const handleIngestLearn = async () => {
+    const path = learningPath.trim();
+    if (!path) {
+      toast.error(t("knowledgeBase.learnPathRequired"));
+      return;
+    }
+    setLearningLoading(true);
+    setLearningResult(null);
+    try {
+      const response = await safeFetch(`${apiBaseUrl}/api/knowledge/local/learn/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.detail || data?.message || response.statusText);
+      setLearningResult(data);
+      await fetchDynStats();
+      toast.success(t("knowledgeBase.learnDone"));
+    } catch (error) {
+      toast.error(t("knowledgeBase.requestFailed", { error: String(error) }));
+    } finally {
+      setLearningLoading(false);
+    }
+  };
+
+  const handleCommunityDetect = async () => {
+    setCommunityLoading(true);
+    setCommunityResult(null);
+    try {
+      const response = await safeFetch(`${apiBaseUrl}/api/knowledge/local/learn/communities`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ min_cluster: 3 }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.detail || data?.message || response.statusText);
+      setCommunityResult(data);
+      toast.success(t("knowledgeBase.communityDone"));
+    } catch (error) {
+      toast.error(t("knowledgeBase.requestFailed", { error: String(error) }));
+    } finally {
+      setCommunityLoading(false);
+    }
+  };
+
+  const fetchLocalConfig = useCallback(async () => {
+    try {
+      const response = await safeFetch(`${apiBaseUrl}/api/knowledge/local/config`, {
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setLocalConfig(await response.json());
+      setLocalUnavailable(false);
+    } catch {
+      // 后端 local 端点可能尚未就绪：静默降级为不可用占位，不打扰用户
+      setLocalUnavailable(true);
+    }
+  }, [apiBaseUrl]);
+
+  const fetchBrowse = useCallback(async (rel: string) => {
+    setBrowseLoading(true);
+    try {
+      const response = await safeFetch(
+        `${apiBaseUrl}/api/knowledge/local/browse?path=${encodeURIComponent(rel)}&limit=200`,
+        { signal: AbortSignal.timeout(20_000) },
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as BrowseResponse;
+      setBrowseEntries(Array.isArray(data.entries) ? data.entries : []);
+    } catch {
+      setBrowseEntries([]);
+    } finally {
+      setBrowseLoading(false);
+    }
+  }, [apiBaseUrl]);
+
+  useEffect(() => {
+    void fetchLocalConfig();
+  }, [fetchLocalConfig]);
+
+  useEffect(() => {
+    void fetchBrowse(browsePath);
+  }, [fetchBrowse, browsePath]);
+
+  const handleLocalScan = async () => {
+    setScanningLocal(true);
+    try {
+      const response = await safeFetch(`${apiBaseUrl}/api/knowledge/local/scan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh: true }),
+        signal: AbortSignal.timeout(120_000),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data?.ok !== false) {
+        toast.success(`${t("knowledgeBase.localScanSuccess")}${data?.message ? `：${data.message}` : ""}`);
+      } else {
+        toast.error(t("knowledgeBase.localScanFailed"));
+      }
+    } catch {
+      toast.error(t("knowledgeBase.localScanFailed"));
+    } finally {
+      setScanningLocal(false);
+      void fetchLocalConfig();
+      void fetchBrowse(browsePath);
+    }
+  };
+
+  const openConfigDialog = () => {
+    setConfigRootDraft(localConfig?.root || "");
+    setConfigDialogOpen(true);
+  };
+
+  const saveLocalConfig = async () => {
+    setSavingConfig(true);
+    try {
+      const response = await safeFetch(`${apiBaseUrl}/api/knowledge/local/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root: configRootDraft.trim() }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (response.ok && data?.ok !== false) {
+        toast.success(t("knowledgeBase.localScanSuccess"));
+        setConfigDialogOpen(false);
+        await fetchLocalConfig();
+      } else {
+        toast.error(t("knowledgeBase.requestFailed", { error: data?.detail?.message || data?.detail || response.statusText }));
+      }
+    } catch (error) {
+      toast.error(t("knowledgeBase.requestFailed", { error: String(error) }));
+    } finally {
+      setSavingConfig(false);
+    }
+  };
+
+  const openDoc = async (relPath: string) => {
+    setDocPath(relPath);
+    setDocLoading(true);
+    setDocData(null);
+    try {
+      const response = await safeFetch(
+        `${apiBaseUrl}/api/knowledge/local/doc?path=${encodeURIComponent(relPath)}`,
+        { signal: AbortSignal.timeout(30_000) },
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setDocData((await response.json()) as DocResponse);
+    } catch {
+      setDocData({
+        ok: false,
+        path: relPath,
+        title: relPath,
+        category: null,
+        domain: null,
+        keywords: [],
+        related: [],
+        preview: t("knowledgeBase.localDocNoContent"),
+        content: "",
+      });
+    } finally {
+      setDocLoading(false);
+    }
+  };
+
+  const runLocalSearch = async () => {
+    if (!localSearchQuery.trim()) return;
+    setLocalSearching(true);
+    try {
+      const response = await safeFetch(`${apiBaseUrl}/api/knowledge/local/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: localSearchQuery.trim(), limit: 10, include_body: false }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      const data = (await response.json()) as LocalSearchResponse;
+      setLocalSearchResults(Array.isArray(data.results) ? data.results : []);
+    } catch {
+      setLocalSearchResults([]);
+    } finally {
+      setLocalSearching(false);
+    }
+  };
+
+  const crumbs = browsePath ? browsePath.split("/").filter(Boolean) : [];
+
+  const fmtScanTime = (iso?: string | null) => {
+    if (!iso) return t("knowledgeBase.localNeverScanned");
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+  };
 
   const selectedKnowledgeBase = useMemo(
     () => knowledgeBases.find((item) => selectedIds.includes(item.id)),
@@ -452,10 +807,270 @@ export function KnowledgeBaseView({
         </CardHeader>
       </Card>
 
+      {/* ── 本地知识库：状态卡 ── */}
+      <Card className="gap-0 overflow-hidden border-border/80 py-0 shadow-sm">
+        <CardHeader className="gap-3 px-5 pb-3 pt-5">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <CardTitle className="text-base">{t("knowledgeBase.localTitle")}</CardTitle>
+              <CardDescription className="mt-1">{t("knowledgeBase.localSubtitle")}</CardDescription>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="secondary" size="sm" onClick={() => void handleLocalScan()} disabled={scanningLocal}>
+                {scanningLocal ? <Loader2 size={14} className="animate-spin" /> : <ScanLine size={14} />}
+                {scanningLocal ? t("knowledgeBase.localScanning") : t("knowledgeBase.localScan")}
+              </Button>
+              <Button variant="outline" size="sm" onClick={openConfigDialog}>
+                <Settings2 size={14} /> {t("knowledgeBase.localConfig")}
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="px-5 pb-5">
+          {localUnavailable ? (
+            <div className="rounded-lg border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
+              {t("knowledgeBase.localUnavailable")}
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <FolderOpen size={14} className="shrink-0 text-primary" />
+                <span className="text-muted-foreground">{t("knowledgeBase.localRoot")}:</span>
+                <span className="break-all font-mono text-[11px]">{localConfig?.root || "—"}</span>
+                {localConfig && localConfig.root_exists === false && (
+                  <Badge variant="outline" className="border-red-400/40 px-1.5 py-0 text-[10px] text-red-600">
+                    {t("knowledgeBase.localRootMissing")}
+                  </Badge>
+                )}
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+                {[
+                  { label: t("knowledgeBase.localFiles"), value: localConfig?.stats?.files ?? "—" },
+                  { label: t("knowledgeBase.localDirs"), value: localConfig?.stats?.dirs ?? "—" },
+                  { label: t("knowledgeBase.localMetaFiles"), value: localConfig?.stats?.meta_files ?? "—" },
+                  { label: t("knowledgeBase.localIndexed"), value: localConfig?.stats?.indexed ?? "—" },
+                  { label: t("knowledgeBase.localLastScan"), value: fmtScanTime(localConfig?.stats?.last_scan_at) },
+                ].map((item) => (
+                  <div key={item.label} className="rounded-lg border bg-muted/[0.14] px-3 py-2">
+                    <div className="truncate text-[10px] text-muted-foreground">{item.label}</div>
+                    <div className="mt-0.5 truncate text-sm font-semibold" title={String(item.value)}>{item.value}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ── AI 学习：动态知识图谱 ── */}
+      <Card className="gap-0 overflow-hidden border-border/80 py-0 shadow-sm">
+        <CardHeader className="gap-2 px-5 pb-3 pt-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <CardTitle className="text-base">{t("knowledgeBase.learnTitle")}</CardTitle>
+              <CardDescription className="mt-1">{t("knowledgeBase.learnSubtitle")}</CardDescription>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={() => void fetchDynStats()} disabled={learningLoading}>
+                <RefreshCw size={14} /> {t("knowledgeBase.refresh")}
+              </Button>
+              <Button variant="secondary" size="sm" onClick={() => void handleCommunityDetect()} disabled={communityLoading}>
+                {communityLoading ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+                {communityLoading ? t("knowledgeBase.communityRunning") : t("knowledgeBase.communityDetect")}
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3 px-5 pb-5">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {[
+              { label: t("knowledgeBase.learnDynNodes"), value: dynStats?.nodes ?? "—" },
+              { label: t("knowledgeBase.learnDynEdges"), value: dynStats?.edges ?? "—" },
+              { label: t("knowledgeBase.learnVersion"), value: dynStats?.version ?? "—" },
+              { label: t("knowledgeBase.localLastScan"), value: fmtScanTime(String(dynStats?.updated_at ?? "")) },
+            ].map((item) => (
+              <div key={item.label} className="rounded-lg border bg-muted/[0.14] px-3 py-2">
+                <div className="truncate text-[10px] text-muted-foreground">{item.label}</div>
+                <div className="mt-0.5 truncate text-sm font-semibold" title={String(item.value)}>{String(item.value)}</div>
+              </div>
+            ))}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              value={learningPath}
+              onChange={(event) => setLearningPath(event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") void handleIngestLearn(); }}
+              placeholder={t("knowledgeBase.learnPathPlaceholder")}
+              className="max-w-md"
+            />
+            <Button size="sm" onClick={() => void handleIngestLearn()} disabled={learningLoading}>
+              {learningLoading ? <Loader2 size={14} className="animate-spin" /> : <BookOpen size={14} />}
+              {learningLoading ? t("knowledgeBase.learnRunning") : t("knowledgeBase.learnIngest")}
+            </Button>
+          </div>
+          {learningResult && (
+            <div className="rounded-lg border border-primary/20 bg-primary/[0.05] px-3 py-2 text-xs">
+              {t("knowledgeBase.learnResult", {
+                doc: String(learningResult.document ?? ""),
+                nodes: String(learningResult.created_nodes ?? 0),
+                edges: String(learningResult.created_edges ?? 0),
+                totalNodes: String(learningResult.total_nodes ?? 0),
+                totalEdges: String(learningResult.total_edges ?? 0),
+              })}
+            </div>
+          )}
+          {communityResult && (
+            <div className="rounded-lg border border-border/60 px-3 py-2 text-xs text-muted-foreground">
+              <div className="mb-1 font-medium text-foreground">{t("knowledgeBase.communityTitle")}</div>
+              {(() => {
+                const communities = Array.isArray(communityResult.communities) ? communityResult.communities : [];
+                const top = communities.filter((c: { size?: number }) => (c.size ?? 1) >= 3).slice(0, 6);
+                if (top.length === 0) return <span>{t("knowledgeBase.communityNone")}</span>;
+                return (
+                  <ul className="space-y-0.5">
+                    {top.map((c: { label?: string; size?: number; members?: string[] }, idx: number) => (
+                      <li key={`${c.label}-${idx}`} className="flex items-center gap-2">
+                        <span className="truncate">{c.label}</span>
+                        <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px]">{c.size ?? 0}</Badge>
+                      </li>
+                    ))}
+                  </ul>
+                );
+              })()}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <div className="grid gap-3 lg:grid-cols-2">
+        {/* ── 文档浏览 ── */}
+        <Card className="gap-0 overflow-hidden border-border/80 py-0 shadow-sm">
+          <CardHeader className="gap-1 px-5 pb-3 pt-5">
+            <CardTitle className="text-sm">{t("knowledgeBase.localBrowseTitle")}</CardTitle>
+            <CardDescription className="text-xs">{t("knowledgeBase.localBrowseSubtitle")}</CardDescription>
+          </CardHeader>
+          <CardContent className="px-3 pb-4">
+            <div className="mb-2 flex flex-wrap items-center gap-1 px-2 text-xs">
+              <button type="button" className="inline-flex items-center text-primary hover:underline" onClick={() => setBrowsePath("")}>
+                <Home size={11} className="mr-0.5" />
+                {t("knowledgeBase.localRootCrumb")}
+              </button>
+              {crumbs.map((c, i) => (
+                <span key={`${c}-${i}`} className="flex items-center gap-1">
+                  <ChevronRight size={11} className="text-muted-foreground" />
+                  <button
+                    type="button"
+                    className={i === crumbs.length - 1 ? "font-medium" : "text-primary hover:underline"}
+                    onClick={() => setBrowsePath(crumbs.slice(0, i + 1).join("/"))}
+                  >
+                    {c}
+                  </button>
+                </span>
+              ))}
+            </div>
+            <div className="max-h-64 overflow-y-auto rounded-lg border border-border/60">
+              {browseLoading ? (
+                <div className="flex items-center justify-center gap-2 py-6 text-xs text-muted-foreground">
+                  <Loader2 size={14} className="animate-spin" />
+                  {t("knowledgeBase.localBrowseLoading")}
+                </div>
+              ) : browseEntries.length === 0 ? (
+                <div className="py-6 text-center text-xs text-muted-foreground">{t("knowledgeBase.localBrowseEmpty")}</div>
+              ) : (
+                browseEntries.map((entry) => (
+                  <button
+                    key={entry.rel_path}
+                    type="button"
+                    className="flex w-full items-center gap-2 border-b border-border/40 px-3 py-2 text-left text-xs last:border-b-0 hover:bg-muted/50"
+                    onClick={() => {
+                      if (entry.is_dir) setBrowsePath(entry.rel_path);
+                      else if (entry.is_doc) void openDoc(entry.rel_path);
+                    }}
+                  >
+                    {entry.is_dir ? (
+                      <Folder size={14} className="shrink-0 text-muted-foreground" />
+                    ) : (
+                      <FileText size={14} className="shrink-0 text-primary" />
+                    )}
+                    <span className="min-w-0 flex-1 truncate font-medium">{entry.title || entry.name}</span>
+                    {!entry.is_dir && !entry.is_doc && (
+                      <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px] text-muted-foreground">
+                        {t("knowledgeBase.localUnindexed")}
+                      </Badge>
+                    )}
+                    <CategoryBadge category={entry.category} />
+                    <span className="shrink-0 text-[10px] text-muted-foreground">{formatBytes(entry.size)}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* ── 本地检索 ── */}
+        <Card className="gap-0 overflow-hidden border-border/80 py-0 shadow-sm">
+          <CardHeader className="gap-1 px-5 pb-3 pt-5">
+            <CardTitle className="text-sm">{t("knowledgeBase.localSearchTitle")}</CardTitle>
+            <CardDescription className="text-xs">{t("knowledgeBase.localSearchSubtitle")}</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3 px-5 pb-4">
+            <div className="flex gap-2">
+              <Input
+                value={localSearchQuery}
+                onChange={(event) => setLocalSearchQuery(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") void runLocalSearch(); }}
+                placeholder={t("knowledgeBase.localSearchPlaceholder")}
+              />
+              <Button variant="secondary" onClick={() => void runLocalSearch()} disabled={!localSearchQuery.trim() || localSearching}>
+                {localSearching ? <Loader2 size={15} className="animate-spin" /> : <Search size={15} />}
+                {t("knowledgeBase.localSearchButton")}
+              </Button>
+            </div>
+            {localSearchResults !== null && (
+              localSearchResults.length === 0 ? (
+                <div className="text-xs text-muted-foreground">{t("knowledgeBase.localSearchEmpty")}</div>
+              ) : (
+                <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+                  {localSearchResults.map((r) => (
+                    <button
+                      key={r.path}
+                      type="button"
+                      className="w-full rounded-lg border bg-muted/[0.16] px-3 py-2 text-left transition-colors hover:border-primary/35"
+                      onClick={() => void openDoc(r.path)}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="min-w-0 flex-1 truncate text-sm font-medium">{r.title}</span>
+                        <CategoryBadge category={r.category} />
+                        <span className="shrink-0 text-[10px] text-muted-foreground">
+                          {typeof r.score === "number" ? r.score.toFixed(2) : r.score} {t("knowledgeBase.localScore")}
+                        </span>
+                      </div>
+                      {r.snippet && (
+                        <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-muted-foreground">{r.snippet}</div>
+                      )}
+                      {(r.keywords || []).length > 0 && (
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {(r.keywords || []).slice(0, 5).map((k) => (
+                            <span key={k} className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{k}</span>
+                          ))}
+                        </div>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* ── 知识图谱（React Flow 2D） ── */}
+      <KnowledgeGraph apiBaseUrl={apiBaseUrl} />
+
       <div className="space-y-3">
         <div>
-          <h2 className="text-base font-semibold">{t("knowledgeBase.connectorsTitle")}</h2>
-          <p className="mt-1 text-sm text-muted-foreground">{t("knowledgeBase.connectorsSubtitle")}</p>
+          <h2 className="text-base font-semibold">{t("knowledgeBase.cloudTitle")}</h2>
+          <p className="mt-1 text-sm text-muted-foreground">{t("knowledgeBase.cloudSubtitle")}</p>
         </div>
 
         <div className="grid gap-3 lg:grid-cols-2">
@@ -821,6 +1436,104 @@ export function KnowledgeBaseView({
               {t("knowledgeBase.save")}
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── 本地库配置弹窗（PUT config） ── */}
+      <Dialog open={configDialogOpen} onOpenChange={setConfigDialogOpen}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2"><Settings2 size={18} /> {t("knowledgeBase.localConfigDialogTitle")}</DialogTitle>
+            <DialogDescription>{t("knowledgeBase.localConfigDialogDesc")}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-1">
+            <div className="space-y-2">
+              <Label htmlFor="local-root">{t("knowledgeBase.localRootPathLabel")}</Label>
+              <Input
+                id="local-root"
+                value={configRootDraft}
+                onChange={(event) => setConfigRootDraft(event.target.value)}
+                placeholder={t("knowledgeBase.localRootPathPlaceholder")}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfigDialogOpen(false)}>{t("knowledgeBase.cancel")}</Button>
+            <Button onClick={() => void saveLocalConfig()} disabled={savingConfig || !configRootDraft.trim()}>
+              {savingConfig && <Loader2 size={14} className="animate-spin" />}
+              {t("knowledgeBase.save")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ── 文档详情弹窗（GET doc） ── */}
+      <Dialog open={docPath !== null} onOpenChange={(open) => { if (!open) setDocPath(null); }}>
+        <DialogContent className="max-h-[86vh] max-w-2xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <FileText size={18} /> {docData?.title || docPath || t("knowledgeBase.localDocDialogTitle")}
+            </DialogTitle>
+            <DialogDescription>{docData?.path}</DialogDescription>
+          </DialogHeader>
+          {docLoading ? (
+            <div className="flex items-center justify-center gap-2 py-8 text-xs text-muted-foreground">
+              <Loader2 size={16} className="animate-spin" />
+              {t("knowledgeBase.localDocLoading")}
+            </div>
+          ) : docData ? (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <CategoryBadge category={docData.category} />
+                {docData.domain && (
+                  <Badge variant="secondary" className="text-[10px]">
+                    {t("knowledgeBase.localDocDomain")}: {docData.domain}
+                  </Badge>
+                )}
+              </div>
+              {(docData.keywords || []).length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-xs text-muted-foreground">{t("knowledgeBase.localDocKeywords")}:</span>
+                  {docData.keywords!.map((k) => (
+                    <Badge key={k} variant="outline" className="px-1.5 py-0 text-[10px]">{k}</Badge>
+                  ))}
+                </div>
+              )}
+              {docData.preview && (
+                <div className="space-y-1">
+                  <div className="text-xs font-semibold">{t("knowledgeBase.localDocPreview")}</div>
+                  <div className="whitespace-pre-wrap rounded-lg border bg-muted/[0.15] px-3 py-2 text-xs leading-5 text-muted-foreground">
+                    {docData.preview}
+                  </div>
+                </div>
+              )}
+              {docData.content && docData.content !== docData.preview && (
+                <div className="space-y-1">
+                  <div className="text-xs font-semibold">{t("knowledgeBase.localDocContent")}</div>
+                  <div className="max-h-72 overflow-y-auto whitespace-pre-wrap rounded-lg border px-3 py-2 text-xs leading-5">
+                    {docData.content}
+                  </div>
+                </div>
+              )}
+              {(docData.related || []).length > 0 && (
+                <div className="space-y-1.5">
+                  <div className="text-xs font-semibold">{t("knowledgeBase.localDocRelated")}</div>
+                  {docData.related!.map((n) => (
+                    <button
+                      key={n.id}
+                      type="button"
+                      className="flex w-full items-center gap-2 rounded-lg border px-3 py-2 text-left text-xs hover:bg-muted/50"
+                      onClick={() => void openDoc(n.path)}
+                    >
+                      <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: CATEGORY_COLORS[n.category] || CATEGORY_COLORS["其他"] }} />
+                      <span className="min-w-0 flex-1 truncate font-medium">{n.label}</span>
+                      {n.domain && <span className="shrink-0 text-[10px] text-muted-foreground">{n.domain}</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : null}
         </DialogContent>
       </Dialog>
 

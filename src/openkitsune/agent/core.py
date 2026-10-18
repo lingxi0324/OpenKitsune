@@ -10,6 +10,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from openkitsune.agent.lifecycle_constraints import (
+    assert_closure,
+    assert_complete_mapping,
+)
 from openkitsune.agent.safety.destructive_intent import (
     build_destructive_intent_question,
     check_trust_mode_skip,
@@ -48,6 +52,7 @@ NODE_VALIDATE = "validate_input"
 NODE_RISK_GATE = "classify_risk"
 NODE_RUN_LOOP = "run_loop"
 NODE_FINALIZE = "finalize"
+NODE_REFLECT = "reflect"  # 复盘沉淀：任务收束后显式复盘，再归入终点（闭环）
 NODE_ERROR = "error"
 
 # Routing labels emitted by RiskGate -> next-node mapping.
@@ -113,7 +118,12 @@ def build_agent_lifecycle_graph() -> StateGraph:
     Topology: ``START -> init -> validate_input -> classify_risk``;
     ``classify_risk`` branches into ``run_loop`` / ``finalize`` /
     ``error`` based on a :class:`RiskGateDecision` label; ``run_loop
-    -> finalize -> END``; ``error -> finalize -> END``.
+    -> finalize``; ``error -> finalize``; ``finalize -> reflect ->
+    END``. The ``reflect`` node makes task closure explicit (runtime
+    retrospect hooks are already dispatched in ``_finalize_session``);
+    the graph then closes on itself via ``assert_closure`` — every
+    registered node must be reachable from the entry and must have an
+    exit (no isolated nodes, no dead heads).
 
     The graph is purely a routing description / introspection point
     for callers; execution goes through ``_RuntimeAgentBase.run_task``.
@@ -125,6 +135,7 @@ def build_agent_lifecycle_graph() -> StateGraph:
         NODE_RISK_GATE,
         NODE_RUN_LOOP,
         NODE_FINALIZE,
+        NODE_REFLECT,
         NODE_ERROR,
     ):
         g.add_node(node)
@@ -149,8 +160,11 @@ def build_agent_lifecycle_graph() -> StateGraph:
     )
     g.add_edge(NODE_RUN_LOOP, NODE_FINALIZE)
     g.add_edge(NODE_ERROR, NODE_FINALIZE)
-    g.add_edge(NODE_FINALIZE, END)
+    g.add_edge(NODE_FINALIZE, NODE_REFLECT)
+    g.add_edge(NODE_REFLECT, END)
     g.validate()
+    assert_closure(g)
+    assert_complete_mapping()  # 门序/60 态/九角色/四制衡/五策略/五相克 完整性自检
     return g
 
 

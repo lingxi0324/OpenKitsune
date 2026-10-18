@@ -1,0 +1,35 @@
+LANG = "fr"
+
+EXTRA = {
+ "common": {
+  "loading": "Traitement...",
+  "error": "Définissez d'abord l'espace de travail",
+  "back": "Retour",
+  "add": "Ajouter",
+  "retry": "Réessayer",
+  "cancel": "Annuler",
+  "save": "Enregistrer",
+  "close": "Fermer",
+  "confirm": "Confirmer",
+  "delete": "Supprimer",
+  "search": "Rechercher",
+  "noData": "Aucune donnée",
+  "noResults": "Aucun résultat",
+  "optional": "facultatif",
+  "missingFields": "Manquant",
+  "confirmDeleteMsg": "Voulez-vous vraiment supprimer",
+  "custom": "Personnalisé...",
+  "prevPage": "Précédent",
+  "nextPage": "Suivant",
+  "pageInfo": "Page {{page}} / {{total}}",
+  "refresh": "Actualiser",
+  "copy": "Copier",
+  "copied": "Copié",
+  "confirmTitle": "Confirmer l'action",
+  "enabled": "{{label}} activé",
+  "disabled": "{{label}} désactivé",
+  "loadingSkills": "Chargement de la liste des compétences...",
+  "skillsNotLoaded": "La liste des compétences n'a pas été chargée. Actualisez d'abord les compétences.",
+  "savingSkillState": "Enregistrement de l'état d'activation des compétences...",
+ }
+}

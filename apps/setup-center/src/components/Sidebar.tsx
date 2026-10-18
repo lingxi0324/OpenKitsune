@@ -9,7 +9,7 @@ import {
   IconZap, IconPlug, IconCalendar,
   IconBug, IconBrain, IconUsers, IconBot,
   IconGear, IconBook, IconStorefront, IconPuzzle, IconFingerprint, IconLayoutGrid,
-  IconShield, IconRadar, IconBuilding, IconBarChart, IconRefresh, IconHelp,
+  IconShield, IconBuilding, IconBarChart, IconRefresh, IconHelp,
   IconAlertCircle, IconKanban,
 } from "../icons";
 import logoUrl from "../assets/logo.png";
@@ -64,25 +64,43 @@ const stepIcons: Partial<Record<StepId, React.ReactNode>> = {
   advanced: <IconGear size={14} />,
 };
 
-type NavGroupId = "capabilities" | "apps" | "monitor" | "multiAgent" | "store";
+type NavGroupId =
+  | "tail1" | "tail2" | "tail3" | "tail4" | "tail5"
+  | "tail6" | "tail7" | "tail8";
 const GROUP_ICON_SIZE = 16;
-const CAPABILITY_VIEWS: ViewId[] = ["skills", "mcp", "plugins", "knowledge", "memory", "scheduler"];
-const MONITOR_VIEWS: ViewId[] = ["token_stats", "skill_usage", "security", "pending_approvals"];
-const MULTI_AGENT_VIEWS: ViewId[] = ["dashboard", "kanban", "org_editor", "pixel_office", "agent_manager"];
-const STORE_VIEWS: ViewId[] = ["agent_store", "skill_store"];
+
+// ── 九分类导航（按功能命名）──
+// 1 聊天 / 2 消息 / 3 能力 / 4 监控 / 5 安全 / 6 协作 / 7 市场 / 8 工具 / 9 配置与支持（底部应用菜单区）
+
+const TAIL_VIEWS: Record<string, ViewId[]> = {
+  tail1: ["chat"],
+  tail2: ["im"],
+  tail3: ["skills", "knowledge", "memory", "scheduler"],
+  tail4: ["status", "token_stats", "skill_usage"],
+  tail5: ["security", "pending_approvals"],
+  tail6: ["dashboard", "kanban", "org_editor", "pixel_office", "agent_manager"],
+  tail7: ["agent_store", "skill_store", "plugins"],
+  tail8: ["mcp"],
+};
 
 const BETA_SUP = <sup style={{ fontSize: 9, color: "var(--primary, #3b82f6)", fontWeight: 600 }}>Beta</sup>;
 
 function NavGroupHeader({
   collapsed: sidebarCollapsed,
+  tailIndex,
+  tailColor,
   icon,
   label,
+  luoshi,
   expanded,
   onToggle,
 }: {
   collapsed: boolean;
+  tailIndex: number;
+  tailColor: string;
   icon: React.ReactNode;
   label: string;
+  luoshi: string;
   expanded: boolean;
   onToggle: () => void;
 }) {
@@ -91,15 +109,17 @@ function NavGroupHeader({
       {!sidebarCollapsed ? (
         <>
           <span className="navGroupLabelWrap">
+            <span className="navTailIndex" style={{ background: tailColor }}>{tailIndex}</span>
             <span className="navGroupIcon">{icon}</span>
             <span className="navGroupLabel">{label}</span>
+            {luoshi && <span className="navTailLuoshi">{luoshi}</span>}
           </span>
           <span className="navGroupChevron">
             {expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
           </span>
         </>
       ) : (
-        <span className="navGroupIcon navGroupIconCollapsed">{icon}</span>
+        <span className="navTailIndex navTailIndexCollapsed" style={{ background: tailColor }}>{tailIndex}</span>
       )}
     </div>
   );
@@ -136,11 +156,14 @@ export function Sidebar({
   };
 
   const [expandedGroups, setExpandedGroups] = useState<Record<NavGroupId, boolean>>({
-    capabilities: false,
-    apps: false,
-    monitor: false,
-    multiAgent: false,
-    store: false,
+    tail1: false,
+    tail2: false,
+    tail3: false,
+    tail4: false,
+    tail5: false,
+    tail6: false,
+    tail7: false,
+    tail8: false,
   });
 
   const toggleGroup = useCallback((id: NavGroupId) => {
@@ -320,23 +343,26 @@ export function Sidebar({
   useEffect(() => {
     if (prevViewRef.current === view) return;
     prevViewRef.current = view;
-    const groupOf = (v: ViewId): NavGroupId | null =>
-      CAPABILITY_VIEWS.includes(v) ? "capabilities"
-        : MONITOR_VIEWS.includes(v) ? "monitor"
-        : MULTI_AGENT_VIEWS.includes(v) ? "multiAgent"
-        : STORE_VIEWS.includes(v) ? "store"
-        : (typeof v === "string" && v.startsWith("plugin_app:")) ? "apps"
-        : null;
+    const groupOf = (v: ViewId): NavGroupId | null => {
+      for (const [g, views] of Object.entries(TAIL_VIEWS) as [NavGroupId, ViewId[]][]) {
+        if (views.includes(v)) return g;
+      }
+      return (typeof v === "string" && v.startsWith("plugin_app:")) ? "tail7" : null;
+    };
     const g = groupOf(view);
     if (g) setExpandedGroups(prev => ({ ...prev, [g]: true }));
   }, [view]);
 
-  const capExpanded = expandedGroups.capabilities;
-  const appsExpanded = expandedGroups.apps;
-  const monExpanded = expandedGroups.monitor;
-  const maExpanded = expandedGroups.multiAgent;
-  const stExpanded = expandedGroups.store;
-  const accountEnabled = accountCapability?.enabled === true;
+  const tail1Expanded = expandedGroups.tail1;
+  const tail2Expanded = expandedGroups.tail2;
+  const tail3Expanded = expandedGroups.tail3;
+  const tail4Expanded = expandedGroups.tail4;
+  const tail5Expanded = expandedGroups.tail5;
+  const tail6Expanded = expandedGroups.tail6;
+  const tail7Expanded = expandedGroups.tail7;
+  const tail8Expanded = expandedGroups.tail8;
+  // 强制关闭 OpenKitsune 账户登录体系，统一使用本地应用菜单
+  const accountEnabled = false; // accountCapability?.enabled === true;
   const accountUsesOpenKitsuneBrand = accountCapability?.provider === "openkitsune";
   const accountProviderName = accountCapability?.display_name || t("sidebar.account");
   const accountEmail = accountSnapshot?.profile?.email;
@@ -478,6 +504,12 @@ export function Sidebar({
             </div>
           )}
         </div>
+        {!collapsed && (
+          <div className="nineTailsBanner">
+            <span className="nineTailsMark"><IconLayoutGrid size={20} /></span>
+            <span className="nineTailsText">{t("sidebar.nineTails")}</span>
+          </div>
+        )}
       </div>}
 
       {configMode ? (
@@ -521,35 +553,39 @@ export function Sidebar({
           </div>
         </div>
       ) : <div className="sidebarNav">
-        {/* ── Primary: always visible ── */}
-        <div className={`navItem ${view === "chat" ? "navItemActive" : ""}`} onClick={() => onViewChange("chat")} role="button" tabIndex={0} title={t("sidebar.chat")}>
-          <IconChat size={16} /> {!collapsed && <span>{t("sidebar.chat")}</span>}
-        </div>
-        {!disabledViews.includes("im") && (
-          <div className={`navItem ${view === "im" ? "navItemActive" : ""}`} onClick={() => onViewChange("im")} role="button" tabIndex={0} title={t("sidebar.im")}>
-            <IconIM size={16} /> {!collapsed && <span>{t("sidebar.im")}</span>}
+        {/* ═══ 1 聊天 ═══ */}
+        <NavGroupHeader collapsed={collapsed} tailIndex={1} tailColor="var(--tail1)" icon={<IconChat size={GROUP_ICON_SIZE} />} label={t("sidebar.tail1Name")} luoshi={t("sidebar.tail1Luoshi")} expanded={tail1Expanded} onToggle={() => toggleGroup("tail1")} />
+        {(collapsed || tail1Expanded) && (
+          <div className="navGroupItems">
+            <div className={`navItem ${view === "chat" ? "navItemActive" : ""}`} onClick={() => onViewChange("chat")} role="button" tabIndex={0} title={t("sidebar.chat")}>
+              <IconChat size={16} /> {!collapsed && <span>{t("sidebar.chat")}</span>}
+            </div>
           </div>
         )}
-        <div className={`navItem ${view === "status" ? "navItemActive" : ""}`} onClick={async () => { onViewChange("status"); try { await onRefreshStatus(); } catch { /* ignore */ } }} role="button" tabIndex={0} title={t("sidebar.status")}>
-          <IconStatus size={16} /> {!collapsed && <span>{t("sidebar.status")}</span>}
-        </div>
-        {/* ── Group: Capabilities ── */}
-        <NavGroupHeader collapsed={collapsed} icon={<IconPuzzle size={GROUP_ICON_SIZE} />} label={t("sidebar.groupCapabilities")} expanded={capExpanded} onToggle={() => toggleGroup("capabilities")} />
-        {(collapsed || capExpanded) && (
+
+        {/* ═══ 2 消息 ═══ */}
+        {!disabledViews.includes("im") && (
+          <>
+            <NavGroupHeader collapsed={collapsed} tailIndex={2} tailColor="var(--tail2)" icon={<IconIM size={GROUP_ICON_SIZE} />} label={t("sidebar.tail2Name")} luoshi={t("sidebar.tail2Luoshi")} expanded={tail2Expanded} onToggle={() => toggleGroup("tail2")} />
+            {(collapsed || tail2Expanded) && (
+              <div className="navGroupItems">
+                <div className={`navItem ${view === "im" ? "navItemActive" : ""}`} onClick={() => onViewChange("im")} role="button" tabIndex={0} title={t("sidebar.im")}>
+                  <IconIM size={16} /> {!collapsed && <span>{t("sidebar.im")}</span>}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ═══ 3 能力 ═══ */}
+        <NavGroupHeader collapsed={collapsed} tailIndex={3} tailColor="var(--tail3)" icon={<IconBrain size={GROUP_ICON_SIZE} />} label={t("sidebar.tail3Name")} luoshi={t("sidebar.tail3Luoshi")} expanded={tail3Expanded} onToggle={() => toggleGroup("tail3")} />
+        {(collapsed || tail3Expanded) && (
           <div className="navGroupItems">
             {!disabledViews.includes("skills") && (
               <div className={`navItem ${view === "skills" ? "navItemActive" : ""}`} onClick={() => onViewChange("skills")} role="button" tabIndex={0} title={t("sidebar.skills")}>
                 <IconSkills size={16} /> {!collapsed && <span>{t("sidebar.skills")}</span>}
               </div>
             )}
-            {!disabledViews.includes("mcp") && (
-              <div className={`navItem ${view === "mcp" ? "navItemActive" : ""}`} onClick={() => onViewChange("mcp")} role="button" tabIndex={0} title="MCP">
-                <IconPlug size={16} /> {!collapsed && <span>MCP</span>}
-              </div>
-            )}
-            <div className={`navItem ${view === "plugins" ? "navItemActive" : ""}`} onClick={() => onViewChange("plugins")} role="button" tabIndex={0} title={t("sidebar.plugins")}>
-              <IconPuzzle size={16} /> {!collapsed && <span>{t("sidebar.plugins")}</span>}
-            </div>
             <div className={`navItem ${view === "knowledge" ? "navItemActive" : ""}`} onClick={() => onViewChange("knowledge")} role="button" tabIndex={0} title={t("sidebar.knowledge")}>
               <IconBook size={16} /> {!collapsed && <span>{t("sidebar.knowledge")} {BETA_SUP}</span>}
             </div>
@@ -562,48 +598,26 @@ export function Sidebar({
           </div>
         )}
 
-        {/* ── Group: Apps (Plugin 2.0 UI plugins) ── */}
-        {pluginApps.length > 0 && (
-          <>
-            <NavGroupHeader collapsed={collapsed} icon={<IconLayoutGrid size={GROUP_ICON_SIZE} />} label={t("sidebar.groupApps", "Apps")} expanded={appsExpanded} onToggle={() => toggleGroup("apps")} />
-            {(collapsed || appsExpanded) && (
-              <div className="navGroupItems">
-                {pluginApps.map(app => {
-                  const appViewId: ViewId = `plugin_app:${app.id}`;
-                  const appTitle = pickAppTitle(app);
-                  return (
-                    <div
-                      key={app.id}
-                      className={`navItem ${view === appViewId ? "navItemActive" : ""}`}
-                      onClick={() => onViewChange(appViewId)}
-                      role="button"
-                      tabIndex={0}
-                      title={appTitle}
-                    >
-                      {app.icon_url ? (
-                        <img src={`${httpApiBase}${app.icon_url}`} alt="" style={{ width: 16, height: 16, borderRadius: 2 }} />
-                      ) : (
-                        <IconLayoutGrid size={16} />
-                      )}
-                      {!collapsed && <span>{appTitle}</span>}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </>
-        )}
-
-        {/* ── Group: Monitor ── */}
-        <NavGroupHeader collapsed={collapsed} icon={<IconRadar size={GROUP_ICON_SIZE} />} label={t("sidebar.groupMonitor")} expanded={monExpanded} onToggle={() => toggleGroup("monitor")} />
-        {(collapsed || monExpanded) && (
+        {/* ═══ 4 监控 ═══ */}
+        <NavGroupHeader collapsed={collapsed} tailIndex={4} tailColor="var(--tail4)" icon={<IconStatus size={GROUP_ICON_SIZE} />} label={t("sidebar.tail4Name")} luoshi={t("sidebar.tail4Luoshi")} expanded={tail4Expanded} onToggle={() => toggleGroup("tail4")} />
+        {(collapsed || tail4Expanded) && (
           <div className="navGroupItems">
+            <div className={`navItem ${view === "status" ? "navItemActive" : ""}`} onClick={async () => { onViewChange("status"); try { await onRefreshStatus(); } catch { /* ignore */ } }} role="button" tabIndex={0} title={t("sidebar.status")}>
+              <IconStatus size={16} /> {!collapsed && <span>{t("sidebar.status")}</span>}
+            </div>
             <div className={`navItem ${view === "token_stats" ? "navItemActive" : ""}`} onClick={() => onViewChange("token_stats")} role="button" tabIndex={0} title={t("sidebar.tokenStats")} style={disabledViews.includes("token_stats") ? { opacity: 0.4 } : undefined}>
               <IconZap size={16} /> {!collapsed && <span>{t("sidebar.tokenStats")}</span>}
             </div>
             <div className={`navItem ${view === "skill_usage" ? "navItemActive" : ""}`} onClick={() => onViewChange("skill_usage")} role="button" tabIndex={0} title={t("sidebar.skillUsage")}>
               <IconBarChart size={16} /> {!collapsed && <span>{t("sidebar.skillUsage")}</span>}
             </div>
+          </div>
+        )}
+
+        {/* ═══ 5 安全 ═══ */}
+        <NavGroupHeader collapsed={collapsed} tailIndex={5} tailColor="var(--tail5)" icon={<IconShield size={GROUP_ICON_SIZE} />} label={t("sidebar.tail5Name")} luoshi={t("sidebar.tail5Luoshi")} expanded={tail5Expanded} onToggle={() => toggleGroup("tail5")} />
+        {(collapsed || tail5Expanded) && (
+          <div className="navGroupItems">
             <div className={`navItem ${view === "security" ? "navItemActive" : ""}`} onClick={() => onViewChange("security")} role="button" tabIndex={0} title={t("sidebar.security")}>
               <IconShield size={16} /> {!collapsed && <span>{t("sidebar.security")}</span>}
             </div>
@@ -621,9 +635,9 @@ export function Sidebar({
           </div>
         )}
 
-        {/* ── Group: Multi-Agent ── */}
-        <NavGroupHeader collapsed={collapsed} icon={<IconBot size={GROUP_ICON_SIZE} />} label={t("sidebar.groupMultiAgent")} expanded={maExpanded} onToggle={() => toggleGroup("multiAgent")} />
-        {(collapsed || maExpanded) && (
+        {/* ═══ 6 协作 ═══ */}
+        <NavGroupHeader collapsed={collapsed} tailIndex={6} tailColor="var(--tail6)" icon={<IconUsers size={GROUP_ICON_SIZE} />} label={t("sidebar.tail6Name")} luoshi={t("sidebar.tail6Luoshi")} expanded={tail6Expanded} onToggle={() => toggleGroup("tail6")} />
+        {(collapsed || tail6Expanded) && (
           <div className="navGroupItems">
             <div className={`navItem ${view === "dashboard" ? "navItemActive" : ""}`} onClick={() => onViewChange("dashboard")} role="button" tabIndex={0} title={t("sidebar.dashboard")}>
               <IconUsers size={16} /> {!collapsed && <span>{t("sidebar.dashboard")} {BETA_SUP}</span>}
@@ -643,17 +657,55 @@ export function Sidebar({
           </div>
         )}
 
-        {/* ── Group: Store ── */}
-        {storeVisible && (
-          <>
-            <NavGroupHeader collapsed={collapsed} icon={<IconStorefront size={GROUP_ICON_SIZE} />} label={t("sidebar.groupStore")} expanded={stExpanded} onToggle={() => toggleGroup("store")} />
-            {(collapsed || stExpanded) && (
-              <div className="navGroupItems">
+        {/* ═══ 7 市场 ═══ */}
+        <NavGroupHeader collapsed={collapsed} tailIndex={7} tailColor="var(--tail7)" icon={<IconStorefront size={GROUP_ICON_SIZE} />} label={t("sidebar.tail7Name")} luoshi={t("sidebar.tail7Luoshi")} expanded={tail7Expanded} onToggle={() => toggleGroup("tail7")} />
+        {(collapsed || tail7Expanded) && (
+          <div className="navGroupItems">
+            {storeVisible && (
+              <>
                 <div className={`navItem ${view === "agent_store" ? "navItemActive" : ""}`} onClick={() => onViewChange("agent_store")} role="button" tabIndex={0} title={t("sidebar.agentStore")}>
                   <IconStorefront size={16} /> {!collapsed && <span>{t("sidebar.agentStore")} {BETA_SUP}</span>}
                 </div>
                 <div className={`navItem ${view === "skill_store" ? "navItemActive" : ""}`} onClick={() => onViewChange("skill_store")} role="button" tabIndex={0} title={t("sidebar.skillStore")}>
                   <IconPuzzle size={16} /> {!collapsed && <span>{t("sidebar.skillStore")} {BETA_SUP}</span>}
+                </div>
+              </>
+            )}
+            <div className={`navItem ${view === "plugins" ? "navItemActive" : ""}`} onClick={() => onViewChange("plugins")} role="button" tabIndex={0} title={t("sidebar.plugins")}>
+              <IconPuzzle size={16} /> {!collapsed && <span>{t("sidebar.plugins")}</span>}
+            </div>
+            {pluginApps.map(app => {
+              const appViewId: ViewId = `plugin_app:${app.id}`;
+              const appTitle = pickAppTitle(app);
+              return (
+                <div
+                  key={app.id}
+                  className={`navItem ${view === appViewId ? "navItemActive" : ""}`}
+                  onClick={() => onViewChange(appViewId)}
+                  role="button"
+                  tabIndex={0}
+                  title={appTitle}
+                >
+                  {app.icon_url ? (
+                    <img src={`${httpApiBase}${app.icon_url}`} alt="" style={{ width: 16, height: 16, borderRadius: 2 }} />
+                  ) : (
+                    <IconLayoutGrid size={16} />
+                  )}
+                  {!collapsed && <span>{appTitle}</span>}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* ═══ 8 工具 ═══ */}
+        {!disabledViews.includes("mcp") && (
+          <>
+            <NavGroupHeader collapsed={collapsed} tailIndex={8} tailColor="var(--tail8)" icon={<IconPlug size={GROUP_ICON_SIZE} />} label={t("sidebar.tail8Name")} luoshi={t("sidebar.tail8Luoshi")} expanded={tail8Expanded} onToggle={() => toggleGroup("tail8")} />
+            {(collapsed || tail8Expanded) && (
+              <div className="navGroupItems">
+                <div className={`navItem ${view === "mcp" ? "navItemActive" : ""}`} onClick={() => onViewChange("mcp")} role="button" tabIndex={0} title="MCP">
+                  <IconPlug size={16} /> {!collapsed && <span>MCP</span>}
                 </div>
               </div>
             )}
@@ -662,6 +714,13 @@ export function Sidebar({
       </div>}
 
       <div className="sidebarAccountArea" ref={accountAreaRef}>
+        {!collapsed && (
+          <div className="sidebarTailRootHeader">
+            <span className="sidebarTailRootBadge">9</span>
+            <span className="sidebarTailRootName">{t("sidebar.tail9Name")}</span>
+            {t("sidebar.tail9Luoshi") && <span className="sidebarTailRootLuoshi">{t("sidebar.tail9Luoshi")}</span>}
+          </div>
+        )}
         {accountMenuOpen && (
           <div
             className="sidebarAccountMenu"

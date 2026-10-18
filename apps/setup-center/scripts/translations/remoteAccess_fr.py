@@ -1,0 +1,38 @@
+LANG = "fr"
+
+EXTRA = {
+ "remoteAccess": {
+  "quickCopy": "Copier rapidement l'adresse",
+  "wizard": "Assistant d'accès à distance",
+  "title": "Accès à distance",
+  "desc": "Permettez à d'autres appareils d'accéder à OpenKitsune Web via le réseau local",
+  "serviceOk": "Service en cours d'exécution",
+  "serviceOff": "Service non démarré",
+  "externalOn": "Accès externe activé",
+  "externalOff": "Accès externe désactivé",
+  "enableExternal": "Activer et redémarrer",
+  "enabling": "Activation...",
+  "lanIp": "IP du réseau local",
+  "lanIpNone": "Aucune IP locale détectée",
+  "webPwdSet": "Mot de passe Web défini",
+  "webPwdNotSet": "Mot de passe Web non défini (recommandé)",
+  "goSetPwd": "Configurer",
+  "port": "Port",
+  "accessUrl": "URL d'accès",
+  "copyUrl": "Copier l'URL",
+  "urlCopied": "URL copiée dans le presse-papiers",
+  "scanQr": "Scannez le code QR avec votre téléphone pour ouvrir",
+  "qrDisabledHint": "Activez d'abord l'accès externe",
+  "stepsTitle": "Étapes",
+  "step1": "Assurez-vous que « Accès externe » ci-dessus indique activé",
+  "step2": "Assurez-vous que votre téléphone/tablette est sur le même WiFi que cet ordinateur",
+  "step3": "Scannez le code QR ou copiez l'URL dans un navigateur",
+  "step4": "Saisissez le mot de passe d'accès Web pour vous connecter",
+  "faqTitle": "Questions fréquentes",
+  "faq1": "Impossible d'accéder ? Vérifiez si le pare-feu Windows autorise le port",
+  "faq2": "Délai dépassé ? Confirmez que les appareils sont sur le même réseau local/WiFi",
+  "faq3": "Mot de passe oublié ? Réinitialisez-le dans « Configuration avancée → Mot de passe Web »",
+  "copyNotReady": "Accès externe désactivé. URL copiée, mais les autres appareils ne peuvent pas encore se connecter",
+  "selectIp": "Sélectionner l'adresse IP",
+ }
+}

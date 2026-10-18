@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import type { EnvMap, ViewId, WorkspaceSummary } from "../types";
 import type { Theme } from "../theme";
 import { THEME_OPTIONS, THEME_GROUP_OPTIONS, THEME_SWATCHES, isClassicTheme } from "../theme";
-import { setLanguage, getLanguagePref } from "../i18n";
+import { setLanguage, getLanguagePref, APP_LANGUAGES, LANGUAGE_NATIVE_NAMES, type AppLanguage } from "../i18n";
 import {
   DotGreen, DotGray,
   IconLink, IconPower, IconRefresh,
@@ -506,10 +506,11 @@ export function Topbar({
             <DropdownMenuContent align="end" className="min-w-[140px]">
               <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">{t("topbar.langLabel", "语言")}</DropdownMenuLabel>
               <DropdownMenuSeparator />
-              <DropdownMenuRadioGroup value={getLanguagePref()} onValueChange={(v) => setLanguage(v as "auto" | "zh" | "en")}>
+              <DropdownMenuRadioGroup value={getLanguagePref()} onValueChange={(v) => setLanguage(v as AppLanguage)}>
                 <DropdownMenuRadioItem value="auto">{t("topbar.langAuto", "跟随系统")}</DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="zh">中文</DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="en">English</DropdownMenuRadioItem>
+                {APP_LANGUAGES.map((code) => (
+                  <DropdownMenuRadioItem key={code} value={code}>{LANGUAGE_NATIVE_NAMES[code]}</DropdownMenuRadioItem>
+                ))}
               </DropdownMenuRadioGroup>
             </DropdownMenuContent>
           </DropdownMenu>

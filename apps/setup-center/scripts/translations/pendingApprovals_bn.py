@@ -1,0 +1,38 @@
+LANG = "bn"
+
+EXTRA = {
+ "pendingApprovals": {
+  "title": "মুলতুবি অনুমোদন",
+  "subtitle": "অব্যবহৃত কাজ থেকে আসা টুল কল যার জন্য owner-এর অনুমোদন প্রয়োজন",
+  "serviceNotRunning": "সার্ভিস চলছে না, মুলতুবি অনুমোদন দেখা যাচ্ছে না",
+  "noEntries": "কোনো মুলতুবি অনুমোদন নেই",
+  "filterActive": "মুলতুবি",
+  "filterAll": "সব",
+  "approve": "অনুমোদন",
+  "deny": "অস্বীকার",
+  "approved": "অনুমোদিত — কাজটি স্বয়ংক্রিয়ভাবে আবার শুরু হবে",
+  "denied": "অস্বীকৃত",
+  "taskResumed": "সংশ্লিষ্ট কাজ পুনরায় সময় নির্ধারিত হয়েছে, কয়েক সেকেন্ডে সম্পাদিত হবে",
+  "resolveFailed": "অনুমোদন প্রক্রিয়া ব্যর্থ",
+  "statusPending": "মুলতুবি",
+  "statusApproved": "অনুমোদিত",
+  "statusDenied": "অস্বীকৃত",
+  "statusExpired": "মেয়াদোত্তীর্ণ",
+  "stat_pending": "মুলতুবি",
+  "stat_approved": "অনুমোদিত",
+  "stat_denied": "অস্বীকৃত",
+  "stat_expired": "মেয়াদোত্তীর্ণ",
+  "createdAt": "তৈরির সময়",
+  "expiresAt": "মেয়াদ শেষ: {{time}}",
+  "strategy": "কৌশল",
+  "taskId": "কাজের ID",
+  "sessionId": "সেশনের ID",
+  "approvalClass": "অনুমোদনের শ্রেণি",
+  "resolvedAt": "নিষ্পত্তির সময়",
+  "resolvedBy": "নিষ্পত্তিকারী",
+  "note": "মন্তব্য",
+  "viewParams": "টুল প্যারামিটার দেখুন",
+  "notePlaceholder": "ঐচ্ছিক: অনুমোদন মন্তব্য যোগ করুন...",
+  "expired": "মেয়াদোত্তীর্ণ",
+ }
+}

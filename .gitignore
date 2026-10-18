@@ -64,6 +64,9 @@ env/
 *.log
 logs/
 
+# Source backups (openkitsune backup create)
+backups/
+
 # Cache
 .cache/
 .pytest_cache/

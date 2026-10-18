@@ -40,6 +40,9 @@ AUTH_EXEMPT_PATHS = frozenset(
     {
         "/",
         "/api/health",
+        # 供前端轮询的只读构建标识（见 api/routes/build_info.py 的
+        # "intentionally unauthenticated" 约定），未登录时也应可读。
+        "/api/build-info",
         "/api/account/capability",
         "/api/auth/login",
         "/api/auth/logout",

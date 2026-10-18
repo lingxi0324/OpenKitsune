@@ -10,6 +10,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from openkitsune.agent.lifecycle_constraints import (
+    assert_routing_coverage,
+    assert_routing_functional,
+)
+from openkitsune.agent.route_derivation import (
+    assert_derivation_equivalent,
+    derive_decision_to_label,
+)
 from openkitsune.core._reasoning_runtime import (
     Checkpoint,
     Decision,
@@ -58,21 +66,14 @@ NODE_OBSERVE = "observe"
 NODE_VERIFY = "verify"
 NODE_FINALIZE = "finalize"
 
-# Routing label map keyed off ``DecisionType.value`` strings.
-_DECISION_TO_LABEL: dict[str, str] = {
-    # Real DecisionType.value strings from the runtime enum.
-    "tool_calls": "act",
-    "final_answer": "verify",
-    # Extended exit-reason tokens used by ``_last_exit_reason``.
-    # Not DecisionType values, but the routing map accepts them so a
-    # caller can pass either form.
-    "tool_use": "act",
-    "ask_user": "finalize",
-    "continue": "reason",
-    "error": "finalize",
-    "max_iterations": "finalize",
-    "verify_incomplete": "reason",
-}
+# Routing label map derived from decision-intent signatures (route_derivation).
+# 逐条手写路由已替换为『意图签名 + 处置规则』推导；构建期断言严格等价，
+# 行为与原字面表零变化。新决策词汇只需在 route_derivation._DECISION_INTENT
+# 声明意图，路由自动归位（不重复设计）。
+_DECISION_TO_LABEL: dict[str, str] = derive_decision_to_label()
+
+# 构建期自检：推导表与既有行为等价 + 完备（全词可达）+ 函数性（无悬空节点）
+assert_derivation_equivalent()
 
 
 class GuardVerdict:
@@ -110,6 +111,16 @@ def _decision_kind(result: Any) -> str:
     if hasattr(result, "value"):
         return result.value
     return str(result)
+
+
+# 制衡/递生守卫：实现与词根常量下沉至 core/_reasoning_runtime.py（单一事实源），
+# 运行时主循环在决策分发点强制调用；此处仅复用同一实现，避免重复设计。
+# 语义约定（True = 通过）：_no_self_verify 禁止产出+验证同现（自证嫌疑）；
+# _feedforward_complete 要求前序工具产物完整可消费（空产物拦截、失败放行）。
+from openkitsune.core._reasoning_runtime import (
+    _feedforward_complete,
+    _no_self_verify,
+)
 
 
 def build_reasoning_graph() -> StateGraph:
@@ -152,6 +163,10 @@ def build_reasoning_graph() -> StateGraph:
     )
     g.add_edge(NODE_FINALIZE, END)
     g.validate()
+    # 完备/归位可推导：路由表须覆盖全部已知决策词汇且无悬空目标，
+    # 未知决策不得静默落入默认分支（fail-fast 于构建期）。
+    assert_routing_coverage(_DECISION_TO_LABEL, {dt.value for dt in DecisionType})
+    assert_routing_functional(_DECISION_TO_LABEL)
     return g
 
 
@@ -260,6 +275,43 @@ class ReasoningEngine(_RuntimeReasoningBase):
 
         recoverable = has_recoverable_tool_issue(tool_results)
         verdicts.append(GuardVerdict("recoverable_tool_issue", True, f"recoverable={recoverable}"))
+
+        return verdicts
+
+    def evaluate_constraint_guards(
+        self,
+        text: str,
+        tool_results: list[dict] | None = None,
+    ) -> list[GuardVerdict]:
+        """评估内在约束守卫（制衡 + 递生），独立于既有守卫契约。
+
+        设计说明：``evaluate_decision`` 的守卫集是封闭契约
+        （tests/unit/test_response_text_execution_inference_removed.py
+        断言其守卫名列表精确为 3 条，且守卫不得从响应文本推断执行）。
+        故内在约束守卫由本方法独立承载，调用方可按需组合：
+
+        - ``no_self_verify``（制衡）：产出声明与验证声明同现 ⇒ 自证嫌疑；
+        - ``feedforward_complete``（递生）：前序工具执行产物须完整可消费。
+        """
+        verdicts: list[GuardVerdict] = []
+
+        self_verify_ok = _no_self_verify(text)
+        verdicts.append(
+            GuardVerdict(
+                "no_self_verify",
+                self_verify_ok,
+                "self-verification suspected" if not self_verify_ok else None,
+            )
+        )
+
+        feedforward_ok = _feedforward_complete(tool_results)
+        verdicts.append(
+            GuardVerdict(
+                "feedforward_complete",
+                feedforward_ok,
+                "incomplete tool product" if not feedforward_ok else None,
+            )
+        )
 
         return verdicts
 

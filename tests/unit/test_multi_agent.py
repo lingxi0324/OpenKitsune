@@ -224,8 +224,8 @@ class TestAgentProfile:
 
     def test_from_dict_applies_name_invariant(self):
         # JSON missing name_i18n entirely (legacy on-disk profile).
-        p = AgentProfile.from_dict({"id": "x", "name": "小秋"})
-        assert p.name_i18n.get("zh") == "小秋"
+        p = AgentProfile.from_dict({"id": "x", "name": "涂山汐"})
+        assert p.name_i18n.get("zh") == "涂山汐"
 
     # ---- derive() mirror on name override ----
 
@@ -389,8 +389,8 @@ class TestProfileStore:
         """改 name 时应自动镜像到 name_i18n['zh']，避免 UI 显示双名漂移。
 
         Regression: UI 通过 PUT /api/agents/profiles/{id} 只传 {name: "中秋"}
-        而不传 name_i18n 时，旧 name_i18n.zh "小秋" 会残留，造成 system prompt
-        显示 "中秋" 但 IM/像素办公室/日志显示 "小秋" 的精神分裂状态。
+        而不传 name_i18n 时，旧 name_i18n.zh "涂山汐" 会残留，造成 system prompt
+        显示 "中秋" 但 IM/像素办公室/日志显示 "涂山汐" 的精神分裂状态。
         """
         store.save(
             _make_profile(name="Old Name", name_i18n={"zh": "旧名", "en": "Old Name"}),
@@ -432,7 +432,7 @@ class TestProfileStore:
         """SYSTEM Profile 加载时若 name 与 name_i18n['zh'] 漂移，应自动镜像并落盘。
 
         Regression: 老版本 ProfileStore.update 不同步 name 到 name_i18n['zh']，
-        升级到新版本的用户磁盘上仍残留 `name="中秋", name_i18n.zh="小秋"`
+        升级到新版本的用户磁盘上仍残留 `name="中秋", name_i18n.zh="涂山汐"`
         这种内部不自洽状态。新 __post_init__ 兜底规则只在 name_i18n.zh 为空时
         才填值，无法修这种已有非空但漂移的情况。
         ProfileStore._load_all 现在对 SYSTEM 型 profile 做额外自愈，确保
@@ -448,7 +448,7 @@ class TestProfileStore:
             "name": "中秋",
             "description": "新描述",
             "type": "system",
-            "name_i18n": {"zh": "小秋", "en": "Kitsune"},
+            "name_i18n": {"zh": "涂山汐", "en": "Kitsune"},
             "description_i18n": {"zh": "旧描述", "en": "Stale"},
         }
         stale_path.write_text(_json.dumps(stale_payload, ensure_ascii=False), encoding="utf-8")
@@ -514,9 +514,9 @@ class TestProfileStore:
         path = profiles_dir / "default.json"
         payload = {
             "id": "default",
-            "name": "小秋",
+            "name": "涂山汐",
             "type": "system",
-            "name_i18n": {"zh": "小秋", "en": "Kitsune"},
+            "name_i18n": {"zh": "涂山汐", "en": "Kitsune"},
         }
         raw_before = _json.dumps(payload, ensure_ascii=False)
         path.write_text(raw_before, encoding="utf-8")

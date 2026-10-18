@@ -56,6 +56,17 @@
   --texture-dot: rgba(17, 24, 39, 0.045);
   --texture-line: rgba(17, 24, 39, 0.022);
   --texture-opacity: 0.5;
+
+  /* ── 九分类导航色（功能分组序号徽标）── */
+  --tail1: #2f6fb3; /* 1 聊天 */
+  --tail2: #b8863b; /* 2 消息 */
+  --tail3: #3e8e5a; /* 3 能力 */
+  --tail4: #3b9c8a; /* 4 监控 */
+  --tail5: #b09a3e; /* 5 安全 */
+  --tail6: #8a8fa8; /* 6 协作 */
+  --tail7: #b5893a; /* 7 市场 */
+  --tail8: #9a6a3a; /* 8 工具 */
+  --tail9: #c2493a; /* 9 配置与支持 */
 }
 
 :root[data-theme="dark"] {
@@ -116,6 +127,17 @@
   --texture-dot: rgba(255, 255, 255, 0.035);
   --texture-line: rgba(255, 255, 255, 0.018);
   --texture-opacity: 0.5;
+
+  /* ── 九分类导航色（暗色微调提亮）── */
+  --tail1: #5b9bd5;
+  --tail2: #d4a35c;
+  --tail3: #5cb885;
+  --tail4: #55b8a5;
+  --tail5: #d0bc62;
+  --tail6: #aab0c4;
+  --tail7: #d4ab62;
+  --tail8: #c08d58;
+  --tail9: #e07a68;
 }
 
 /* ── Daltonized (colorblind-friendly) themes ── */
@@ -1693,6 +1715,139 @@ a:hover {
   opacity: 0.6;
 }
 
+/* ─── 九分类导航序号徽标 ─── */
+.navTailIndex {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35) inset;
+  transition: transform 0.15s;
+}
+
+.navTailIndexCollapsed {
+  width: 22px;
+  min-width: 22px;
+  height: 22px;
+  font-size: 12px;
+}
+
+.navGroupHeader:hover .navTailIndex {
+  transform: scale(1.08);
+}
+
+.navTailLuoshi {
+  font-size: 10px;
+  line-height: 1;
+  color: var(--muted2);
+  background: var(--bg-subtle);
+  border: 1px solid var(--line);
+  padding: 2px 5px;
+  border-radius: 5px;
+  letter-spacing: 0.4px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  font-weight: 500;
+}
+
+.navGroupHeader:hover .navTailLuoshi {
+  color: var(--text);
+}
+
+/* ─── 功能导航横幅（品牌区下方） ─── */
+.nineTailsBanner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--tail1) 10%, transparent),
+    color-mix(in srgb, var(--tail9) 8%, transparent)
+  );
+  border: 1px solid var(--line);
+}
+
+.nineTailsMark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--brand);
+  flex-shrink: 0;
+}
+
+.nineTailsText {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nineTailsNine {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--tail9);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* ─── 配置与支持区标注（底部） ─── */
+.sidebarTailRootHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px 8px;
+}
+
+.sidebarTailRootBadge {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--tail9);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.sidebarTailRootName {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.sidebarTailRootLuoshi {
+  font-size: 10px;
+  color: var(--muted2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .navGroupItems {
   position: relative;
   margin: 4px 0 6px 14px;
@@ -1738,6 +1893,11 @@ a:hover {
   justify-content: center;
   min-height: 38px;
   padding: 8px 0;
+}
+
+.sidebarCollapsed .nineTailsBanner,
+.sidebarCollapsed .sidebarTailRootHeader {
+  display: none;
 }
 
 /* ─── Config section (collapsible) ─── */

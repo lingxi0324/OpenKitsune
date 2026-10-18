@@ -1,0 +1,38 @@
+LANG = "fr"
+
+EXTRA = {
+ "pendingApprovals": {
+  "title": "Approbations en attente",
+  "subtitle": "Appels d'outils de tâches non supervisées en attente d'approbation du owner",
+  "serviceNotRunning": "Service non démarré, impossible d'afficher les approbations en attente",
+  "noEntries": "Aucune approbation en attente",
+  "filterActive": "Actives",
+  "filterAll": "Toutes",
+  "approve": "Approuver",
+  "deny": "Refuser",
+  "approved": "Approuvée — la tâche reprendra automatiquement",
+  "denied": "Refusée",
+  "taskResumed": "Tâche associée replanifiée, exécution dans quelques secondes",
+  "resolveFailed": "Échec de la résolution de l'approbation",
+  "statusPending": "En attente",
+  "statusApproved": "Approuvée",
+  "statusDenied": "Refusée",
+  "statusExpired": "Expirée",
+  "stat_pending": "En attente",
+  "stat_approved": "Approuvée",
+  "stat_denied": "Refusée",
+  "stat_expired": "Expirée",
+  "createdAt": "Créée le",
+  "expiresAt": "Expire à : {{time}}",
+  "strategy": "Stratégie",
+  "taskId": "ID de tâche",
+  "sessionId": "ID de session",
+  "approvalClass": "Classe d'approbation",
+  "resolvedAt": "Résolue à",
+  "resolvedBy": "Résolue par",
+  "note": "Note",
+  "viewParams": "Voir les paramètres de l'outil",
+  "notePlaceholder": "Facultatif : ajouter une note...",
+  "expired": "Expirée",
+ }
+}

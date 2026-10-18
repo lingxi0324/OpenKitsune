@@ -637,6 +637,19 @@ def build_system_prompt(
         except Exception as e:
             logger.debug("Failed to build lingxi presence section: %s", e)
 
+    # 6.597 九尾内核·狐心裁决注入：由 KitsuneHeartBridge.get_session_context() 提供，
+    # 仅在存在结构化心判时注入（模式/情绪/潜台词/风险/伦理/记忆/目标/工具/创意），
+    # 不注入则不改变任何现有 prompt 行为；安全底线与诚实原则不受心判影响。
+    if isinstance(session_context, dict) and session_context.get("kitsune_heart"):
+        try:
+            from .kitsune_section import build_kitsune_heart_section
+
+            _kh_section = build_kitsune_heart_section(session_context["kitsune_heart"])
+            if _kh_section:
+                runtime_parts.append(_kh_section)
+        except Exception as e:
+            logger.debug("Failed to build kitsune heart section: %s", e)
+
     # 6.6 架构概况（powered by {model}，区分主/子 Agent）
 
     arch_section = _build_arch_section(

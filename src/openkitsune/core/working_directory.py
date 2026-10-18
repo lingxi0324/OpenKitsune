@@ -60,6 +60,16 @@ def normalize_working_directory(
     if raw.startswith("\\\\"):
         raise WorkingDirectoryError("UNC working directories are not supported")
 
+    # WSL / 非 Windows 平台兼容：历史会话遗留的 Windows 绝对路径
+    # （如 C:\Users\...）在 POSIX 语义下 is_absolute() 为 False，会把
+    # sessions.json 里所有旧会话的 history/消息接口打成 500。
+    # 此处将其映射为 /mnt/<drive>/...，仅 os.name != "nt" 时生效，
+    # Windows 侧行为完全不变。
+    if os.name != "nt" and len(raw) >= 2 and raw[1] == ":" and raw[0].isalpha():
+        drive = raw[0].lower()
+        rest = raw[2:].lstrip("\\/").replace("\\", "/")
+        raw = f"/mnt/{drive}/{rest}"
+
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
         raise WorkingDirectoryError("working_directory must be an absolute path")

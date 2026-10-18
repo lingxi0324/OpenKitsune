@@ -1,0 +1,35 @@
+LANG = "ar"
+
+EXTRA = {
+ "common": {
+  "loading": "جارٍ المعالجة...",
+  "error": "يرجى ضبط مساحة العمل أولًا",
+  "back": "رجوع",
+  "add": "إضافة",
+  "retry": "إعادة المحاولة",
+  "cancel": "إلغاء",
+  "save": "حفظ",
+  "close": "إغلاق",
+  "confirm": "تأكيد",
+  "delete": "حذف",
+  "search": "بحث",
+  "noData": "لا توجد بيانات",
+  "noResults": "لا توجد نتائج",
+  "optional": "اختياري",
+  "missingFields": "ناقص",
+  "confirmDeleteMsg": "هل أنت متأكد من حذف",
+  "custom": "مخصص...",
+  "prevPage": "السابق",
+  "nextPage": "التالي",
+  "pageInfo": "صفحة {{page}} / {{total}}",
+  "refresh": "تحديث",
+  "copy": "نسخ",
+  "copied": "تم النسخ",
+  "confirmTitle": "تأكيد العملية",
+  "enabled": "تم تفعيل {{label}}",
+  "disabled": "تم تعطيل {{label}}",
+  "loadingSkills": "جارٍ قراءة قائمة المهارات...",
+  "skillsNotLoaded": "لم يتم قراءة قائمة المهارات، يرجى تحديث المهارات أولًا.",
+  "savingSkillState": "جارٍ حفظ حالة تفعيل المهارات...",
+ }
+}

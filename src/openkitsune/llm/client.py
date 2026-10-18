@@ -416,14 +416,25 @@ class LLMClient:
         results: dict[str, str] = {}
         for name, provider in self._providers.items():
             try:
+                # [fix 2026-10-17] 推理模型（如 Qwen3.6 -rea on）会把少量 token
+                # 全部烧在思考前缀上，max_tokens=1 必然返回 content 为空 → 被误判
+                # "无可见内容"。探测预算提高到 64 token，并接受 reasoning_content
+                # 作为"端点已响应"的有效信号（仅 content/reasoning 全空才算失败）。
                 request = LLMRequest(
                     messages=[Message(role="user", content="hi")],
                     system="Respond with 'ok'",
-                    max_tokens=1,
+                    max_tokens=64,
                 )
                 response = await asyncio.wait_for(provider.chat(request), timeout=15.0)
-                if response.usage.output_tokens > 0 and not response.content:
-                    raise RuntimeError("endpoint returned output tokens but no visible content")
+                if (
+                    response.usage.output_tokens > 0
+                    and not response.content
+                    and not response.reasoning_content
+                ):
+                    raise RuntimeError(
+                        "endpoint returned output tokens but neither visible "
+                        "content nor reasoning_content"
+                    )
                 results[name] = "ok"
                 logger.info(f"[HealthCheck] endpoint={name} status=ok")
             except AuthenticationError as e:

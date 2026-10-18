@@ -138,6 +138,12 @@ export function AdvancedView(props: AdvancedViewProps) {
   const [backupHistory, setBackupHistory] = useState<Array<{ filename: string; path: string; size_bytes: number; created_at: string; manifest?: any }>>([]);
   const [backupShowHistory, setBackupShowHistory] = useState(false);
 
+  const [sourceBackups, setSourceBackups] = useState<Array<{ filename: string; path: string; size_bytes: number; created_at: string; manifest?: any }>>([]);
+  const [sourceBackupDir, setSourceBackupDir] = useState("");
+  const [sourceBackupShow, setSourceBackupShow] = useState(false);
+  const [sourceBackupIncludeEnv, setSourceBackupIncludeEnv] = useState(false);
+  const [sourceBackupBusy, setSourceBackupBusy] = useState(false);
+
   const [factoryResetOpen, setFactoryResetOpen] = useState(false);
   const [factoryResetConfirmText, setFactoryResetConfirmText] = useState("");
 
@@ -369,6 +375,64 @@ export function AdvancedView(props: AdvancedViewProps) {
         setEnvDraft((prev) => envSet(prev, "BACKUP_PATH", selected));
       }
     } catch (e) { notifyError(String(e)); }
+  }
+
+  // ── Source-code backup ──
+
+  async function loadSourceBackups() {
+    if (!shouldUseHttpApi()) return;
+    try {
+      const res = await safeFetch(`${httpApiBase()}/api/workspace/source-backups`, { signal: AbortSignal.timeout(10_000) });
+      const data = await res.json();
+      setSourceBackups(data.backups || []);
+      setSourceBackupDir(data.backup_dir || "");
+    } catch { setSourceBackups([]); }
+  }
+
+  async function runSourceBackupNow() {
+    if (!shouldUseHttpApi()) { notifyError(t("adv.needService")); return; }
+    setSourceBackupBusy(true);
+    const _busyId = notifyLoading(t("adv.sourceBackupRunning"));
+    try {
+      const res = await safeFetch(`${httpApiBase()}/api/workspace/source-backups`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ include_env: sourceBackupIncludeEnv }),
+        signal: AbortSignal.timeout(180_000),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      notifySuccess(t("adv.sourceBackupDone", { name: data.filename || "" }));
+      setSourceBackupShow(true);
+      await loadSourceBackups();
+    } catch (e) { notifyError(String(e)); } finally { dismissLoading(_busyId); setSourceBackupBusy(false); }
+  }
+
+  async function executeSourceRestore(zipPath: string) {
+    setSourceBackupBusy(true);
+    const _busyId = notifyLoading(t("adv.sourceBackupRestoring"));
+    try {
+      const res = await safeFetch(`${httpApiBase()}/api/workspace/source-backups/restore`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ zip_path: zipPath, safety_backup: true }),
+        signal: AbortSignal.timeout(180_000),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || res.statusText);
+      notifySuccess(t("adv.sourceBackupRestoreDone", { count: data.restored_count ?? 0 }));
+      await loadSourceBackups();
+    } catch (e) { notifyError(String(e)); } finally { dismissLoading(_busyId); setSourceBackupBusy(false); }
+  }
+
+  function runSourceRestore(zipPath: string) {
+    askConfirm(t("adv.sourceBackupRestoreConfirm"), () => { void executeSourceRestore(zipPath); });
+  }
+
+  function toggleSourceBackupList() {
+    const next = !sourceBackupShow;
+    setSourceBackupShow(next);
+    if (next) void loadSourceBackups();
   }
 
   // ── Migration ──
@@ -902,6 +966,62 @@ export function AdvancedView(props: AdvancedViewProps) {
             </div>
           </Section>
         )}
+
+        <Section title={t("adv.sourceBackupTitle")} subtitle={t("adv.sourceBackupHint")} className="mt-2">
+          <div className="space-y-3">
+            <div className="flex gap-2 flex-wrap items-center">
+              <Button variant="outline" size="sm" onClick={runSourceBackupNow} disabled={sourceBackupBusy || !shouldUseHttpApi()}>
+                {t("adv.sourceBackupNow")}
+              </Button>
+              <Button variant="outline" size="sm" onClick={toggleSourceBackupList} disabled={sourceBackupBusy || !shouldUseHttpApi()}>
+                {sourceBackupShow ? t("adv.sourceBackupHide") : t("adv.sourceBackupHistory")}
+              </Button>
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="source-backup-env"
+                  checked={sourceBackupIncludeEnv}
+                  onCheckedChange={(v) => setSourceBackupIncludeEnv(!!v)}
+                />
+                <Label htmlFor="source-backup-env" className="cursor-pointer">{t("adv.sourceBackupIncludeEnv")}</Label>
+              </div>
+            </div>
+
+            {!shouldUseHttpApi() && (
+              <p className="text-xs text-muted-foreground">{t("adv.needService")}</p>
+            )}
+
+            {sourceBackupDir && (
+              <p className="text-xs text-muted-foreground break-all">
+                {t("adv.sourceBackupDir", { dir: sourceBackupDir })}
+              </p>
+            )}
+
+            {sourceBackupShow && (
+              sourceBackups.length === 0 ? (
+                <p className="text-xs text-muted-foreground">{t("adv.sourceBackupNoHistory")}</p>
+              ) : (
+                <div className="flex flex-col gap-1">
+                  {sourceBackups.map((b) => (
+                    <div key={b.filename} className="flex justify-between items-center text-xs py-1 px-2 rounded-md bg-muted/30 gap-2">
+                      <div className="min-w-0">
+                        <div className="font-mono truncate">{b.filename}</div>
+                        <div className="text-muted-foreground">
+                          {new Date(b.manifest?.created_at || b.created_at).toLocaleString()}
+                        </div>
+                      </div>
+                      <span className="text-muted-foreground whitespace-nowrap">
+                        {(b.size_bytes / 1024 / 1024).toFixed(1)} MB
+                      </span>
+                      <Button variant="outline" size="sm" onClick={() => runSourceRestore(b.path)} disabled={sourceBackupBusy}>
+                        {t("adv.sourceBackupRestore")}
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )
+            )}
+          </div>
+        </Section>
 
         {IS_TAURI && (
           <Section title={t("adv.migrateTitle")} subtitle={t("adv.migrateHint")} className="mt-2">

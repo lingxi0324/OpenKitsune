@@ -80,14 +80,29 @@ class KeyringTokenStore:
         digest = hashlib.sha256(self.username.encode()).hexdigest()[:24]
         self._fallback_path = base / f"{digest}.refresh_token"
         self._keyring_unavailable_reason: str | None = None
+        # 探测结果缓存字段必须在 __init__ 中初始化：此前只在 _keyring() 内赋值，
+        # 首次调用读取 _keyring_probe_done 会抛 AttributeError，导致
+        # /api/account/status 每次轮询 500（WSL headless 实测）。
+        self._keyring_probe_done: bool = False
+        self._keyring_module = None
 
     def _keyring(self):
-        """Return the keyring module when usable, else None (idempotent probe)."""
+        """Return the keyring module when usable, else None (idempotent probe).
+
+        [fix 2026-10-18] 探测结果按进程缓存一次；后续调用不再重复 import /
+        get_keyring()。探测成功但实际操作抛 NoKeyringError（WSL headless 下
+        默认 fail 后端）时，由调用方把本缓存清空并置“不可用”，从此静默走文件。
+        """
+        if self._keyring_probe_done:
+            return self._keyring_module
+        self._keyring_probe_done = True
+        self._keyring_module = None
         try:
             import keyring
 
             # 触发一次后端探测：无可用后端时 keyring 会抛 RuntimeError。
             keyring.get_keyring()
+            self._keyring_module = keyring
             return keyring
         except Exception as exc:
             if self._keyring_unavailable_reason is None:
@@ -100,6 +115,13 @@ class KeyringTokenStore:
                 )
             return None
 
+    def _disable_keyring(self, exc: Exception) -> None:
+        """探测成功但实际操作失败（如 headless NoKeyringError）时永久降级到文件。"""
+        self._keyring_module = None
+        self._keyring_probe_done = True
+        if self._keyring_unavailable_reason is None:
+            self._keyring_unavailable_reason = f"{type(exc).__name__}: {exc}"
+
     async def load_refresh_token(self) -> str | None:
         def _load() -> str | None:
             kr = self._keyring()
@@ -109,6 +131,7 @@ class KeyringTokenStore:
                     if token:
                         return token
                 except Exception as exc:
+                    self._disable_keyring(exc)
                     logger.warning(
                         "keyring read failed (%s); using file fallback",
                         type(exc).__name__,
@@ -125,6 +148,7 @@ class KeyringTokenStore:
                     kr.set_password(self.service, self.username, token)
                     return
                 except Exception as exc:
+                    self._disable_keyring(exc)
                     logger.warning(
                         "keyring write failed (%s); using file fallback",
                         type(exc).__name__,
@@ -139,8 +163,9 @@ class KeyringTokenStore:
             if kr is not None:
                 try:
                     kr.delete_password(self.service, self.username)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._disable_keyring(exc)
+
             try:
                 self._fallback_path.unlink(missing_ok=True)
             except Exception:

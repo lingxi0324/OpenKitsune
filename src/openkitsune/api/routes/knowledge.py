@@ -396,3 +396,324 @@ async def search_bailian_knowledge(body: BailianSearchRequest) -> dict:
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "results": results,
     }
+
+
+# ---------------------------------------------------------------------------
+# Local knowledge-base (lynzie document library + knowledge graph)
+# Contract: temp/kb_integration_contract.md — frozen, do not rename fields.
+# ---------------------------------------------------------------------------
+
+from openkitsune.knowledge import local_kb  # noqa: E402
+
+
+class LocalKBRootRequest(BaseModel):
+    root: str = Field(min_length=1, max_length=1024)
+
+
+class LocalKBScanRequest(BaseModel):
+    refresh: bool = False
+
+
+class LocalKBSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(default=10, ge=1, le=100)
+    include_body: bool = False
+
+
+def _local_guard(exc: local_kb.LocalKBError) -> HTTPException:
+    return HTTPException(status_code=400, detail=exc.message)
+
+
+@router.get("/local/config")
+async def get_local_kb_config() -> dict:
+    return local_kb.config_status()
+
+
+@router.put("/local/config")
+async def put_local_kb_config(body: LocalKBRootRequest) -> dict:
+    try:
+        local_kb.persist_root(body.root)
+    except local_kb.LocalKBError as exc:
+        raise _local_guard(exc) from exc
+    return local_kb.config_status()
+
+
+@router.post("/local/scan")
+async def scan_local_knowledge(body: LocalKBScanRequest) -> dict:
+    started = time.perf_counter()
+    if body.refresh or local_kb.load_cache() is None:
+        result = local_kb.scan(local_kb.resolve_root())
+        local_kb.save_cache(result)
+        stats = result["stats"]
+        duration_ms = stats["duration_ms"]
+    else:
+        cached = local_kb.load_cache() or {}
+        stats = cached.get("stats") or {}
+        duration_ms = round((time.perf_counter() - started) * 1000)
+    return {
+        "ok": True,
+        "message": "本地知识库扫描完成",
+        "duration_ms": duration_ms,
+        "stats": {
+            "total_files": stats.get("total_files", 0),
+            "indexed_files": stats.get("indexed_files", 0),
+            "dirs": stats.get("dirs", 0),
+            "meta_files": stats.get("meta_files", 0),
+            "skipped": stats.get("skipped", 0),
+            "failed": stats.get("failed", []),
+        },
+    }
+
+
+@router.get("/local/browse")
+async def browse_local_knowledge(
+    path: str = "", limit: int = 200
+) -> dict:
+    try:
+        return local_kb.browse(path or None, limit=limit)
+    except local_kb.LocalKBError as exc:
+        raise _local_guard(exc) from exc
+
+
+@router.get("/local/doc")
+async def read_local_knowledge_doc(path: str) -> dict:
+    try:
+        return local_kb.read_doc(path)
+    except local_kb.LocalKBError as exc:
+        raise _local_guard(exc) from exc
+
+
+@router.post("/local/search")
+async def search_local_knowledge(body: LocalKBSearchRequest) -> dict:
+    return local_kb.search(
+        body.query, limit=body.limit, include_body=body.include_body
+    )
+
+
+@router.get("/local/graph")
+async def local_knowledge_graph(
+    limit: int = 600, category: str = "all", q: str | None = None
+) -> dict:
+    return local_kb.graph(limit=limit, category=category, q=q)
+
+
+# ---------------------------------------------------------------------------
+# Document parsing & AI learning (port of CM-agentic documentParse +
+# dynamic-graph learning engine)
+# ---------------------------------------------------------------------------
+
+from openkitsune.knowledge import learning  # noqa: E402
+from openkitsune.knowledge.parsers import (  # noqa: E402
+    FileTooLarge,
+    MissingDependency,
+    ParseError,
+    UnsupportedFormat,
+    parse_document,
+)
+
+
+class LocalParseRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    format: str = Field(default="text", pattern="^(text|json)$")
+    max_chars: int = Field(default=8000, ge=100, le=50000)
+    ocr_max_pages: int | None = Field(default=None, ge=1, le=200)
+
+
+@router.post("/local/parse")
+async def parse_local_document(body: LocalParseRequest) -> dict:
+    """Parse a PDF / Word / Excel / CSV document inside the knowledge root.
+
+    Scanned PDFs (no text layer) are OCR'd automatically; ``ocr_max_pages``
+    caps how many pages are rendered for long scanned documents.
+    """
+    started = time.perf_counter()
+    try:
+        root = local_kb.resolve_root()
+        target = local_kb.resolve_safe(root, body.path)
+    except local_kb.LocalKBError as exc:
+        raise _local_guard(exc) from exc
+    try:
+        parsed = parse_document(target, ocr_max_pages=body.ocr_max_pages)
+    except FileTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except UnsupportedFormat as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
+    except MissingDependency as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ParseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    payload = parsed.render_json() if body.format == "json" else parsed.render_text(body.max_chars)
+    return {
+        "ok": True,
+        "path": body.path,
+        "format": parsed.format,
+        "metadata": parsed.metadata,
+        "duration_ms": round((time.perf_counter() - started) * 1000),
+        "content": payload,
+    }
+
+
+class LocalOCRRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    dpi: int = Field(default=150, ge=72, le=300)
+    max_pages: int | None = Field(default=None, ge=1, le=200)
+
+
+@router.post("/local/ocr")
+async def ocr_local_document(body: LocalOCRRequest) -> dict:
+    """Explicitly OCR a scanned PDF or image inside the knowledge root."""
+    from openkitsune.knowledge import ocr
+
+    try:
+        root = local_kb.resolve_root()
+        target = local_kb.resolve_safe(root, body.path)
+    except local_kb.LocalKBError as exc:
+        raise _local_guard(exc) from exc
+    started = time.perf_counter()
+    suffix = target.suffix.lower()
+    if suffix == ".pdf":
+        result = ocr.extract_pdf_text(target, dpi=body.dpi, max_pages=body.max_pages or ocr.MAX_PAGES)
+    elif suffix in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}:
+        result = ocr.extract_image_text(target)
+    else:
+        raise HTTPException(status_code=415, detail=f"OCR 仅支持 PDF / 图片，当前: {suffix}")
+    if not result.get("ok"):
+        raise HTTPException(status_code=503, detail=result.get("error") or "OCR 失败")
+    return {
+        "ok": True,
+        "path": body.path,
+        "cached": result.get("cached", False),
+        "pages": result.get("pages", 0),
+        "recognized_pages": result.get("recognized_pages", 0),
+        "duration_ms": round((time.perf_counter() - started) * 1000),
+        "text": result.get("text", ""),
+    }
+
+
+class LocalIngestRequest(BaseModel):
+    path: str | None = Field(default=None, max_length=1024)
+    title: str | None = Field(default=None, max_length=256)
+    text: str | None = Field(default=None, max_length=200_000)
+    category_hint: str | None = Field(default=None, max_length=32)
+
+
+@router.post("/local/learn/ingest")
+async def learn_ingest_document(body: LocalIngestRequest) -> dict:
+    """AI learning: ingest a document into the dynamic knowledge graph."""
+    source_path = None
+    title = body.title
+    text = body.text or ""
+    if body.path:
+        try:
+            root = local_kb.resolve_root()
+            target = local_kb.resolve_safe(root, body.path)
+            source_path = body.path
+            parsed = parse_document(target)
+            if not text:
+                text = parsed.render_text(max_chars=20_000)
+            if not title:
+                title = target.stem
+        except local_kb.LocalKBError as exc:
+            raise _local_guard(exc) from exc
+        except (ParseError, FileTooLarge, UnsupportedFormat, MissingDependency) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not title:
+        raise HTTPException(status_code=400, detail="缺少文档标题（title）")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="文档内容为空，无法学习")
+    return learning.ingest_document(title, text, source_path, body.category_hint)
+
+
+class LocalStrengthenRequest(BaseModel):
+    node_ids: list[str] = Field(default_factory=list, max_length=100)
+    co_occur: list[list[str]] = Field(default_factory=list, max_length=200)
+
+
+@router.post("/local/learn/strengthen")
+async def learn_strengthen(body: LocalStrengthenRequest) -> dict:
+    """Hebbian-style reinforcement on the dynamic graph."""
+    co_occur = [tuple(pair) for pair in body.co_occur if len(pair) == 2]
+    return learning.strengthen(body.node_ids, co_occur)
+
+
+@router.post("/local/learn/communities")
+async def learn_communities(min_cluster: int = 3) -> dict:
+    """Community detection over the dynamic graph (label propagation)."""
+    return learning.community_detect(min_cluster=min_cluster)
+
+
+@router.post("/local/search/hybrid")
+async def hybrid_search_local(body: LocalKBSearchRequest) -> dict:
+    """Keyword + graph-neighborhood hybrid retrieval."""
+    return learning.hybrid_search(body.query, limit=body.limit)
+
+
+class DynamicGraphRequest(BaseModel):
+    operation: str = Field(
+        pattern="^(addNode|updateNode|removeNode|getNode|listNodes|addRelation|"
+        "removeRelation|getRelated|getStats|exportJson|clearAll)$"
+    )
+    label: str | None = Field(default=None, max_length=256)
+    category: str | None = Field(default=None, max_length=32)
+    description: str | None = Field(default=None, max_length=2000)
+    color: str | None = Field(default=None, max_length=32)
+    source_path: str | None = Field(default=None, max_length=1024)
+    node_id: str | None = Field(default=None, max_length=256)
+    source: str | None = Field(default=None, max_length=256)
+    target: str | None = Field(default=None, max_length=256)
+    relation: str | None = Field(default=None, max_length=64)
+    weight: float | None = Field(default=None, ge=0.0, le=10.0)
+    edge_id: str | None = Field(default=None, max_length=256)
+    limit: int = Field(default=100, ge=1, le=500)
+    x: float | None = None
+    y: float | None = None
+
+
+def _require(value, name: str) -> str:
+    if not value:
+        raise HTTPException(status_code=400, detail=f"缺少参数: {name}")
+    return value
+
+
+@router.post("/local/graph/dynamic")
+async def dynamic_graph_op(body: DynamicGraphRequest) -> dict:
+    """Dynamic knowledge-graph operations (addNode/addRelation/listNodes/...)."""
+    op = body.operation
+    try:
+        if op in ("addNode", "updateNode"):
+            return learning.add_node(
+                _require(body.label, "label"),
+                category=body.category,
+                description=body.description or "",
+                color=body.color,
+                source_path=body.source_path,
+                node_id=body.node_id,
+                x=body.x,
+                y=body.y,
+            )
+        if op == "removeNode":
+            return learning.remove_node(_require(body.node_id, "node_id"))
+        if op == "getNode":
+            return learning.get_node(_require(body.node_id, "node_id"))
+        if op == "listNodes":
+            return learning.list_nodes(limit=body.limit, category=body.category)
+        if op == "addRelation":
+            return learning.add_relation(
+                _require(body.source, "source"),
+                _require(body.target, "target"),
+                label=body.relation or "关联",
+                weight=body.weight,
+            )
+        if op == "removeRelation":
+            return learning.remove_relation(_require(body.edge_id, "edge_id"))
+        if op == "getRelated":
+            return learning.get_related(_require(body.node_id, "node_id"), limit=body.limit)
+        if op == "getStats":
+            return learning.get_stats()
+        if op == "exportJson":
+            return learning.export_json()
+        if op == "clearAll":
+            return learning.clear_all()
+    except learning.LearningError as exc:
+        raise HTTPException(status_code=400, detail=exc.message) from exc
+    raise HTTPException(status_code=400, detail=f"不支持的操作: {op}")

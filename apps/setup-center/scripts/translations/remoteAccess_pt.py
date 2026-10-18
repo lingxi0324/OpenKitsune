@@ -1,0 +1,38 @@
+LANG = "pt"
+
+EXTRA = {
+ "remoteAccess": {
+  "quickCopy": "Copiar endereço rapidamente",
+  "wizard": "Assistente de acesso remoto",
+  "title": "Acesso remoto",
+  "desc": "Permita que outros dispositivos acessem o OpenKitsune Web via LAN",
+  "serviceOk": "Serviço em execução",
+  "serviceOff": "Serviço não está em execução",
+  "externalOn": "Acesso externo ativado",
+  "externalOff": "Acesso externo desativado",
+  "enableExternal": "Ativar e reiniciar",
+  "enabling": "Ativando...",
+  "lanIp": "IP da LAN",
+  "lanIpNone": "Nenhum IP de LAN detectado",
+  "webPwdSet": "Senha da Web definida",
+  "webPwdNotSet": "Senha da Web não definida (recomendado)",
+  "goSetPwd": "Configurar",
+  "port": "Porta",
+  "accessUrl": "URL de acesso",
+  "copyUrl": "Copiar URL",
+  "urlCopied": "URL copiada para a área de transferência",
+  "scanQr": "Escaneie o QR code com o celular para abrir",
+  "qrDisabledHint": "Ative o acesso externo primeiro",
+  "stepsTitle": "Passos",
+  "step1": "Certifique-se de que «Acesso externo» acima apareça como ativado",
+  "step2": "Certifique-se de que seu celular/tablet esteja no mesmo WiFi deste computador",
+  "step3": "Escaneie o QR code ou copie a URL para um navegador",
+  "step4": "Digite a senha de acesso Web para entrar",
+  "faqTitle": "Perguntas frequentes",
+  "faq1": "Não consegue acessar? Verifique se o firewall do Windows permite a porta",
+  "faq2": "Tempo esgotado? Confirme se os dispositivos estão na mesma LAN/WiFi",
+  "faq3": "Esqueceu a senha? Redefina em «Configurações avançadas → Senha da Web»",
+  "copyNotReady": "Acesso externo desativado. URL copiada, mas outros dispositivos ainda não podem se conectar",
+  "selectIp": "Selecionar endereço IP",
+ }
+}

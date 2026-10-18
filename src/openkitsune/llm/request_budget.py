@@ -52,7 +52,7 @@ def validate_request_body(body: dict, config) -> None:
         reserve = min(reserve, max(window // 4, 1))
     # This is deliberately an estimate. Endpoint usage remains the calibration source.
     estimate = _estimated_body_tokens(body)
-    logger.info(
+    logger.debug(
         "Request budget endpoint=%s estimated_input=%s reserve=%s window=%s bytes=%s",
         config.name,
         estimate,
@@ -84,7 +84,7 @@ def validate_request_body(body: dict, config) -> None:
             if before != after:
                 break
             equal += 1
-        logger.info(
+        logger.debug(
             "Prompt prefix endpoint=%s session=%s matching_full_kib=%s prompt_bytes=%s",
             config.name,
             tracking.session_id,

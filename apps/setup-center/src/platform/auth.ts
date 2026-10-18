@@ -2,19 +2,22 @@
 // Handles JWT access/refresh token lifecycle.
 // Tauri local: no-ops (backend exempts 127.0.0.1). Tauri remote: same as Capacitor.
 
-import { IS_TAURI, IS_CAPACITOR, IS_LOCAL_WEB } from "./detect";
+import { IS_TAURI, IS_CAPACITOR } from "./detect";
 
 const ACCESS_TOKEN_KEY = "openkitsune_access_token";
 
 let _tauriRemoteMode = false;
-let _localAuthMode = IS_LOCAL_WEB;
+// Local-auth mode is only granted by the backend (/api/auth/check reports
+// method="local"). Never infer it from window.location.hostname: under WSL2 +
+// Windows portproxy the browser is on 127.0.0.1 while the backend sees a
+// non-loopback peer and requires a token.
+let _localAuthMode = false;
 let _passwordUserSet = true;
 
 /** Enable/disable auth for Tauri desktop connecting to a remote backend. */
 export function setTauriRemoteMode(enabled: boolean): void {
   _tauriRemoteMode = enabled;
-  // Reset for Tauri remote; IS_LOCAL_WEB always keeps local mode on.
-  _localAuthMode = IS_LOCAL_WEB;
+  _localAuthMode = false;
 }
 export function isTauriRemoteMode(): boolean { return _tauriRemoteMode; }
 

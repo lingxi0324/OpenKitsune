@@ -1,0 +1,38 @@
+LANG = "ar"
+
+EXTRA = {
+ "pendingApprovals": {
+  "title": "الموافقات المعلقة",
+  "subtitle": "استدعاءات أدوات من مهام غير مراقبة تتطلب موافقة الـ owner",
+  "serviceNotRunning": "الخدمة غير قيد التشغيل، لا يمكن عرض الموافقات المعلقة",
+  "noEntries": "لا توجد موافقات معلقة",
+  "filterActive": "معلقة",
+  "filterAll": "الكل",
+  "approve": "موافقة",
+  "deny": "رفض",
+  "approved": "تمت الموافقة — ستُستأنف المهمة تلقائيًا",
+  "denied": "تم الرفض",
+  "taskResumed": "أُعيدت جدولة المهمة المرتبطة، وستُنفَّذ خلال ثوانٍ",
+  "resolveFailed": "فشلت عملية الموافقة",
+  "statusPending": "معلقة",
+  "statusApproved": "تمت الموافقة",
+  "statusDenied": "تم الرفض",
+  "statusExpired": "منتهية",
+  "stat_pending": "معلقة",
+  "stat_approved": "تمت الموافقة",
+  "stat_denied": "تم الرفض",
+  "stat_expired": "منتهية",
+  "createdAt": "وقت الإنشاء",
+  "expiresAt": "تنتهي عند: {{time}}",
+  "strategy": "الاستراتيجية",
+  "taskId": "معرف المهمة",
+  "sessionId": "معرف الجلسة",
+  "approvalClass": "فئة الموافقة",
+  "resolvedAt": "وقت المعالجة",
+  "resolvedBy": "المعالِج",
+  "note": "ملاحظة",
+  "viewParams": "عرض معلمات الأداة",
+  "notePlaceholder": "اختياري: أضف ملاحظة موافقة...",
+  "expired": "منتهية",
+ }
+}

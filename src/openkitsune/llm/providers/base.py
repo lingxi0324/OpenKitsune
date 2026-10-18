@@ -595,15 +595,24 @@ class LLMProvider(ABC):
         try:
             from ..types import Message
 
+            # [fix 2026-10-17] 推理模型（-rea on）会把少量 token 全烧在思考前缀上：
+            # max_tokens=10 时 content 常为空、reasoning_content 有值，旧判据
+            # "有输出但无 content → 结构性问题" 会把健康端点误标为 unhealthy，
+            # 引发 failover 抖动。预算提到 64，且 content/reasoning 全空才算异常。
             request = LLMRequest(
                 messages=[Message(role="user", content="Hi")],
-                max_tokens=10,
+                max_tokens=64,
             )
             response = await self.chat(request)
-            if response.usage.output_tokens > 0 and not response.content:
+            if (
+                response.usage.output_tokens > 0
+                and not response.content
+                and not response.reasoning_content
+            ):
                 error = (
-                    "Endpoint returned output tokens but no visible content. "
-                    "The API proxy may be stripping model output."
+                    "Endpoint returned output tokens but neither visible "
+                    "content nor reasoning_content. The API proxy may be "
+                    "stripping model output."
                 )
                 if dry_run:
                     raise RuntimeError(error)

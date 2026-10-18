@@ -1,0 +1,38 @@
+LANG = "pt"
+
+EXTRA = {
+ "pendingApprovals": {
+  "title": "Aprovações pendentes",
+  "subtitle": "Chamadas de ferramentas de tarefas não supervisionadas que exigem aprovação do owner",
+  "serviceNotRunning": "Serviço não está em execução, não é possível ver as aprovações pendentes",
+  "noEntries": "Sem aprovações pendentes",
+  "filterActive": "Pendentes",
+  "filterAll": "Todas",
+  "approve": "Aprovar",
+  "deny": "Negar",
+  "approved": "Aprovada — a tarefa será retomada automaticamente",
+  "denied": "Negada",
+  "taskResumed": "Tarefa associada reagendada, será executada em segundos",
+  "resolveFailed": "Falha ao resolver a aprovação",
+  "statusPending": "Pendente",
+  "statusApproved": "Aprovada",
+  "statusDenied": "Negada",
+  "statusExpired": "Expirada",
+  "stat_pending": "Pendente",
+  "stat_approved": "Aprovada",
+  "stat_denied": "Negada",
+  "stat_expired": "Expirada",
+  "createdAt": "Criada em",
+  "expiresAt": "Expira às: {{time}}",
+  "strategy": "Estratégia",
+  "taskId": "ID da tarefa",
+  "sessionId": "ID da sessão",
+  "approvalClass": "Classe de aprovação",
+  "resolvedAt": "Resolvida às",
+  "resolvedBy": "Resolvida por",
+  "note": "Nota",
+  "viewParams": "Ver parâmetros da ferramenta",
+  "notePlaceholder": "Opcional: adicione uma nota...",
+  "expired": "Expirada",
+ }
+}

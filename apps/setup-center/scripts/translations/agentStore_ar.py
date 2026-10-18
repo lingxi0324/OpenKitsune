@@ -1,0 +1,36 @@
+LANG = "ar"
+
+EXTRA = {
+ "agentStore": {
+  "subtitle": "اكتشف وثبّت Agents من مجتمع OpenKitsune (يتطلب اتصالًا بالشبكة؛ الاستيراد/التصدير المحلي غير متأثر)",
+  "searchPlaceholder": "البحث عن Agent...",
+  "allCategories": "كل الفئات",
+  "catCustomerService": "خدمة العملاء",
+  "catDevelopment": "تطوير",
+  "catBusiness": "أعمال",
+  "catCreative": "إبداع",
+  "catEducation": "تعليم",
+  "catProductivity": "إنتاجية",
+  "catGeneral": "عامة",
+  "sortDownloads": "حسب التنزيلات",
+  "sortRating": "حسب التقييم",
+  "sortNewest": "الأحدث",
+  "searching": "جارٍ البحث...",
+  "downloads": "{{count}} تنزيل",
+  "install": "تثبيت",
+  "installing": "جارٍ التثبيت...",
+  "installSuccess": "تم تثبيت {{name}} بنجاح",
+  "installFail": "فشل التثبيت: {{msg}}",
+  "connectFail": "تعذّر الاتصال بمتجر Agents البعيد",
+  "offlineHint": "المتجر البعيد غير متاح مؤقتًا. الوظائف المحلية غير متأثرة.\nيمكنك متابعة استخدام الاستيراد/التصدير المحلي لـ Agents في «إدارة Agents» بالشريط الجانبي،\nأو مشاركة واستيراد Agents مباشرة عبر ملفات .kitsune-agent.",
+  "retry": "إعادة محاولة الاتصال",
+  "empty": "لا توجد Agents متاحة",
+  "featured": "مميزة",
+  "noDesc": "لا يوجد وصف",
+  "confirmTitle": "تأكيد تثبيت Agent",
+  "confirmDesc": "أنت على وشك تثبيت \"{{name}}\" من مركز Agents في OpenKitsune. قد يتضمن هذا Agent تبعيات خارجية تابعة لجهات خارجية سيتم جلبها من مستودعاتها الأصلية أثناء التثبيت.",
+  "confirmInstall": "تأكيد التثبيت",
+  "license": "رخصة المصدر المفتوح",
+  "licenseNotice": "بالتثبيت، فإنك توافق على الالتزام بشروط رخصة المصدر المفتوح لهذا Agent وتبعياته. تُجلب Skills الخارجية من مستودعات GitHub الأصلية ولا يعيد توزيعها هذا المنصّة. للإبلاغ عن انتهاك: zacon365@gmail.com.",
+ }
+}

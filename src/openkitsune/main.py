@@ -123,6 +123,11 @@ from .cli.plugins_cmd import plugins_app as _plugins_app  # noqa: E402
 
 app.add_typer(_plugins_app, name="plugins")
 
+# Sub-app: ``openkitsune backup ...`` (see ``cli/backup_cmd.py``).
+from .cli.backup_cmd import backup_app as _backup_app  # noqa: E402
+
+app.add_typer(_backup_app, name="backup")
+
 # Rich 控制台
 console = Console()
 

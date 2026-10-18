@@ -1002,11 +1002,14 @@ class TaskExecutor:
         )
 
         # 系统任务也需要超时保护，避免 selfcheck 等任务无限运行
+        # [fix 2026-10-17] memory_nudge_review 超时改为可配置（默认 180s）：
+        # 35B 推理模型先思考后回答，2048 token 生成可达 ~90s+，120s 固定超时
+        # 在并发/排队下必然超时。
         SYSTEM_TASK_TIMEOUTS = {
             "system:daily_selfcheck": max(settings.scheduler_task_timeout, 1200),
             "system:daily_memory": 1800,  # 30 分钟（含 LLM review 大量记忆）
             "system:workspace_backup": 300,  # 5 分钟
-            "system:memory_nudge_review": 120,  # 2 分钟（轻量 LLM 审视）
+            "system:memory_nudge_review": max(settings.memory_nudge_timeout, 120),
         }
         timeout = SYSTEM_TASK_TIMEOUTS.get(action)
         budget_tokens = (
@@ -1051,6 +1054,12 @@ class TaskExecutor:
                         result_msg = (
                             "系统自检超过后台保护时长，已停止本轮检查。"
                             "已保存的部分报告会保留，后续问题下次继续处理。"
+                        )
+                        logger.warning(f"TaskExecutor: {result_msg}")
+                        return True, result_msg
+                    if action == "system:memory_nudge_review":
+                        result_msg = (
+                            "记忆回顾超过保护时长，已停止本轮（下次周期自动重试）。"
                         )
                         logger.warning(f"TaskExecutor: {result_msg}")
                         return True, result_msg
@@ -1214,7 +1223,11 @@ class TaskExecutor:
 
             nudge_interval = settings.memory_nudge_interval
 
-            recent_turns = store.get_global_recent_turns(limit=nudge_interval)
+            # [fix 2026-10-17] 输入轮次封顶 20 轮、文本封顶 8000 字符，
+            # 避免 interval 配大或单轮很长时 prefill 过久导致超时。
+            recent_turns = store.get_global_recent_turns(
+                limit=min(max(nudge_interval, 1), 20)
+            )
             if not recent_turns:
                 return True, "No recent conversation turns to review"
 
@@ -1222,7 +1235,7 @@ class TaskExecutor:
                 f"[{t.get('role', 'unknown')}]: {coerce_text(t.get('content'))[:500]}"
                 for t in recent_turns
                 if t.get("content")
-            )
+            )[:8000]
 
             if not conversation_text.strip():
                 return True, "Recent turns have no meaningful content"
@@ -1239,7 +1252,12 @@ class TaskExecutor:
                 '"type" (fact/preference/skill/rule/context), '
                 '"content" (the memory text), '
                 '"importance" (1-5). '
-                "If nothing worth remembering, return an empty array [].\n\n"
+                "If nothing worth remembering, return an empty array []. "
+                # [fix 2026-10-17] 本模型默认开思考模式，明确要求不要思考过程、
+                # 不要 markdown 围栏，尽量把 token 预算留给 JSON 本体。
+                "Do not think aloud or include any reasoning in the output. "
+                "No markdown code fences, no explanations. "
+                "Output ONLY the raw JSON array.\n\n"
                 f"Conversation:\n{conversation_text}"
             )
 
@@ -1256,7 +1274,10 @@ class TaskExecutor:
                 )
             )
             try:
-                response = await brain.think_lightweight(review_prompt, max_tokens=2048)
+                # [fix 2026-10-17] 2048→1024：35B 推理模型 ~22 tok/s，
+                # 2048 token 生成 ~90s+，与 120s 超时几乎必然冲突；
+                # 记忆提取 JSON 数百 token 足够，1024 兼顾思考+正文。
+                response = await brain.think_lightweight(review_prompt, max_tokens=1024)
             finally:
                 reset_tracking_context(_tracking_token)
             raw = response.content.strip()

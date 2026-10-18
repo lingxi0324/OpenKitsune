@@ -1097,8 +1097,9 @@ class ConfigHandler:
             changes.append(f"- 主题: {theme}")
 
         if language:
-            if language not in ("zh", "en"):
-                return f"❌ language 只支持 zh/en，收到: {language}"
+            supported_langs = ("zh", "en", "hi", "es", "ar", "fr", "bn", "pt", "ru")
+            if language not in supported_langs:
+                return f"❌ language 只支持 {'/'.join(supported_langs)}，收到: {language}"
             updates["ui_language"] = language
             ui_pref["language"] = language
             changes.append(f"- 语言: {language}")

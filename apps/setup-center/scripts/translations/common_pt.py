@@ -1,0 +1,35 @@
+LANG = "pt"
+
+EXTRA = {
+ "common": {
+  "loading": "Processando...",
+  "error": "Defina o workspace primeiro",
+  "back": "Voltar",
+  "add": "Adicionar",
+  "retry": "Repetir",
+  "cancel": "Cancelar",
+  "save": "Salvar",
+  "close": "Fechar",
+  "confirm": "Confirmar",
+  "delete": "Excluir",
+  "search": "Pesquisar",
+  "noData": "Sem dados",
+  "noResults": "Sem resultados",
+  "optional": "opcional",
+  "missingFields": "Ausentes",
+  "confirmDeleteMsg": "Tem certeza de que deseja excluir",
+  "custom": "Personalizado...",
+  "prevPage": "Anterior",
+  "nextPage": "Próximo",
+  "pageInfo": "Página {{page}} / {{total}}",
+  "refresh": "Atualizar",
+  "copy": "Copiar",
+  "copied": "Copiado",
+  "confirmTitle": "Confirmar ação",
+  "enabled": "{{label}} ativado",
+  "disabled": "{{label}} desativado",
+  "loadingSkills": "Lendo a lista de habilidades...",
+  "skillsNotLoaded": "A lista de habilidades não foi lida. Atualize as habilidades primeiro.",
+  "savingSkillState": "Salvando o estado de ativação das habilidades...",
+ }
+}

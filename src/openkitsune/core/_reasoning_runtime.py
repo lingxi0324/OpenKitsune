@@ -629,6 +629,62 @@ from ..runtime.state_graph.guards.tool_filters import (
     should_block_tool as _should_block_tool,
 )
 
+# ═══════════════════════════════════════════════════════════════
+# 制衡 / 递生守卫（单一事实源）
+# agent/reasoning.py 的 evaluate_constraint_guards 复用同一实现，
+# 运行时主循环在决策分发点强制调用，避免自证闭环与空产物消费。
+# ═══════════════════════════════════════════════════════════════
+
+# 产出声明词根（覆盖无“了”形态）
+_PRODUCE_HINTS: tuple[str, ...] = ("完成", "实现", "生成", "写出", "产出", "创建")
+# 验证声明词根
+_VERIFY_HINTS: tuple[str, ...] = ("验证", "测试通过", "检查通过", "确认无误", "自测通过")
+
+
+def _no_self_verify(text: str) -> bool:
+    """True 表示通过：回复不得同时声明『产出』与『验证』（异源要求）。
+
+    运行时接入用 ``not _no_self_verify(...)`` 判定自证嫌疑。
+    """
+    t = text or ""
+    produced = any(h in t for h in _PRODUCE_HINTS)
+    verified = any(h in t for h in _VERIFY_HINTS)
+    return not (produced and verified)
+
+
+def _feedforward_complete(tool_results: list[dict] | None) -> bool:
+    """True 表示通过：前序工具执行产物须完整可消费（失败结果除外）。"""
+    results = [r for r in (tool_results or []) if isinstance(r, dict)]
+    if not results:
+        return True
+    incomplete = [
+        r
+        for r in results
+        if not r.get("is_error")
+        and not (r.get("output") or r.get("content") or r.get("result"))
+    ]
+    return not incomplete
+
+
+def _apply_feedforward_guard(tool_results: list[dict]) -> int:
+    """对工具结果执行递生守卫：空产物（非失败）转错误提示，返回拦截数。
+
+    就地修改列表元素；调用点位于工具结果汇总（all_tool_results.extend）之前，
+    使 LLM 只看到可消费的产物或明确的失败说明。
+    """
+    n = 0
+    for r in tool_results:
+        if not r.get("is_error") and not (
+            r.get("output") or r.get("content") or r.get("result")
+        ):
+            r["is_error"] = True
+            r["content"] = (
+                "[系统] 工具执行未产生任何输出（空产物），产物不可消费。"
+                "请改用其他工具、补充参数或调整调用方式后重试。"
+            )
+            n += 1
+    return n
+
 
 class DecisionType(Enum):
     """LLM 决策类型"""
@@ -3060,6 +3116,52 @@ class ReasoningEngine:
 
                     consecutive_tool_rounds = 0
 
+                    # 制衡守卫：产出声明与验证声明同现 ⇒ 自证嫌疑。
+                    # 不得直接进入终态，注入回退提示后回推理重新决策（≤2 次）。
+                    if not _no_self_verify(decision.text_content or ""):
+                        _self_verify_count = getattr(state, "_self_verify_count", 0)
+                        if _self_verify_count < 2:
+                            state._self_verify_count = _self_verify_count + 1
+                            logger.warning(
+                                "[ReAct-Stream] no_self_verify: self-verification "
+                                "suspected, redirecting to reason (#%d)",
+                                state._self_verify_count,
+                            )
+                            working_messages.append(
+                                {
+                                    "role": "assistant",
+                                    "content": decision.assistant_content
+                                    or [
+                                        {
+                                            "type": "text",
+                                            "text": decision.text_content or "",
+                                        }
+                                    ],
+                                    **(
+                                        {"reasoning_content": decision.thinking_content}
+                                        if decision.thinking_content
+                                        else {}
+                                    ),
+                                }
+                            )
+                            working_messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "检测到你在同一回复中既声明产出又声明验证通过"
+                                        "（自证嫌疑）。请先给出可独立核验的证据"
+                                        "（如工具执行结果或外部验证步骤），"
+                                        "不要自行确认自己的产物。"
+                                    ),
+                                }
+                            )
+                            yield {
+                                "type": "chain_text",
+                                "content": "⚠️ 检测到自证嫌疑，已要求重新核验",
+                            }
+                            react_trace.append(_iter_trace)
+                            continue
+
                     # 任务完成度验证（与 run() 一致）
                     result = await self._handle_final_answer(
                         decision=decision,
@@ -3612,6 +3714,8 @@ class ReasoningEngine:
                             if _security_confirm_interrupted_ask:
                                 break
 
+                        # 递生守卫：空工具产物不可消费（就地转错误提示）
+                        _apply_feedforward_guard(tool_results_for_msg)
                         all_tool_results.extend(tool_results_for_msg)
                         if _security_confirm_interrupted_ask:
                             continue
@@ -4475,6 +4579,8 @@ class ReasoningEngine:
                         return
 
                     if decision.tool_calls:
+                        # 递生守卫：空工具产物不可消费（就地转错误提示）
+                        _apply_feedforward_guard(tool_results_for_msg)
                         all_tool_results.extend(tool_results_for_msg)
 
                         if _non_denied_tool_names:

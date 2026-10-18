@@ -1,0 +1,38 @@
+LANG = "es"
+
+EXTRA = {
+ "remoteAccess": {
+  "quickCopy": "Copiar dirección rápidamente",
+  "wizard": "Asistente de acceso remoto",
+  "title": "Acceso remoto",
+  "desc": "Permite que otros dispositivos accedan a OpenKitsune Web por LAN",
+  "serviceOk": "Servicio en ejecución",
+  "serviceOff": "Servicio no en ejecución",
+  "externalOn": "Acceso externo activado",
+  "externalOff": "Acceso externo desactivado",
+  "enableExternal": "Activar y reiniciar",
+  "enabling": "Activando...",
+  "lanIp": "IP de LAN",
+  "lanIpNone": "No se detectó IP de LAN",
+  "webPwdSet": "Contraseña web establecida",
+  "webPwdNotSet": "Contraseña web no establecida (recomendado)",
+  "goSetPwd": "Configurar",
+  "port": "Puerto",
+  "accessUrl": "URL de acceso",
+  "copyUrl": "Copiar URL",
+  "urlCopied": "URL copiada al portapapeles",
+  "scanQr": "Escanea el código QR con tu teléfono para abrir",
+  "qrDisabledHint": "Activa el acceso externo primero",
+  "stepsTitle": "Pasos",
+  "step1": "Asegúrate de que «Acceso externo» de arriba aparezca como activado",
+  "step2": "Asegúrate de que tu teléfono/tablet esté en el mismo WiFi que este equipo",
+  "step3": "Escanea el código QR o copia la URL en un navegador",
+  "step4": "Introduce la contraseña de acceso web para iniciar sesión",
+  "faqTitle": "Preguntas frecuentes",
+  "faq1": "¿No puedes acceder? Comprueba si el firewall de Windows permite el puerto",
+  "faq2": "¿Tiempo de espera agotado? Confirma que los dispositivos estén en la misma LAN/WiFi",
+  "faq3": "¿Olvidaste la contraseña? Restablécela en «Configuración avanzada → Contraseña web»",
+  "copyNotReady": "El acceso externo está desactivado. URL copiada, pero otros dispositivos no pueden conectarse aún",
+  "selectIp": "Seleccionar dirección IP",
+ }
+}
