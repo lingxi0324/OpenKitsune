@@ -2,8 +2,8 @@
 rem ============================================================
 rem OpenKitsune launcher wrapper - delegates to start.ps1
 rem Usage: start.bat [port]
-rem Always runs with live WSL serve log and pauses before exit,
-rem so the window never disappears before you can read errors.
+rem Windows-native launcher: runs .venv\Scripts\python.exe -m openkitsune serve
+rem and keeps the window open with live service logs.
 rem ============================================================
 title OpenKitsune Launcher
 setlocal EnableDelayedExpansion
