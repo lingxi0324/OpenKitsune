@@ -93,14 +93,20 @@ if ($Missing.Count -gt 0) {
 
 # ---------- 4. 端口占用检查 ----------
 $already = $false
-try {
-    $c = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop | Select-Object -First 1
-    if ($c) {
-        $owner = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
-        Write-Host "  [OK] 端口 $Port 已有服务（$($owner.ProcessName)，PID $($c.OwningProcess)），直接打开浏览器" -ForegroundColor Green
+$listener = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($listener) {
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue
+    $cmdline = if ($proc) { [string]$proc.CommandLine } else { "" }
+    if ($cmdline -match 'openkitsune\s+serve') {
+        Write-Host "  [OK] Windows 版已在端口 $Port 运行（PID $($listener.OwningProcess)），直接打开浏览器" -ForegroundColor Green
         $already = $true
+    } else {
+        Write-Host "  [FAIL] 端口 $Port 被其他进程占用（可能是 WSL 版）：$($proc.Name) PID $($listener.OwningProcess)" -ForegroundColor Red
+        Write-Host "         请先停止 WSL 服务，再启动 Windows 版" -ForegroundColor DarkGray
+        if ($ShowLog) { Read-Host "  按回车退出" }
+        exit 1
     }
-} catch { }
+}
 
 # ---------- 5. 启动 Windows 原生服务 ----------
 if (-not $already) {

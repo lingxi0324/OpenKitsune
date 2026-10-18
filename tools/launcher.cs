@@ -5,9 +5,11 @@ using System.Threading;
 
 public static class OpenKitsuneLauncher
 {
-    private static readonly string ProjectRoot = @"C:\Users\Administrator\.OpenKitsune\OpenKitsune";
+    private static readonly string ProjectRoot = @"E:\agents\OpenKitsune-main";
     private static readonly string StartPs1 = Path.Combine(ProjectRoot, "start.ps1");
-    private static readonly string LogRoot = @"C:\Users\Administrator\.OpenKitsune\logs";
+    private static readonly string LogRoot = Path.Combine(ProjectRoot, "data", "logs");
+    private static readonly string ServeLog = Path.Combine(LogRoot, "serve_win.log");
+    private static readonly string ServeErr = Path.Combine(LogRoot, "serve_win.err");
 
     [STAThread]
     public static void Main()
@@ -51,16 +53,16 @@ public static class OpenKitsuneLauncher
                     Console.ForegroundColor = ConsoleColor.Green;
                     Console.WriteLine("启动成功：浏览器已打开（http://127.0.0.1:18900/web/），服务已就绪。");
                     Console.ResetColor();
-                    Console.WriteLine("本次启动日志: " + FindLatestLog(LogRoot));
+                    Console.WriteLine("服务日志: " + ServeLog);
                     Console.WriteLine();
                     Console.WriteLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                    Console.WriteLine("以下为 WSL 服务实时日志（窗口常驻；关闭此窗口不影响服务运行）");
+                    Console.WriteLine("以下为 Windows 服务实时日志（窗口常驻；关闭此窗口不影响服务运行）");
                     Console.WriteLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     try { Console.Title = "OpenKitsune · 运行中（服务日志）"; } catch { }
 
-                    // 实时滚动 WSL 服务日志，直到用户关闭窗口 / 按键中断
-                    ProcessStartInfo tail = new ProcessStartInfo("wsl.exe");
-                    tail.Arguments = "-d Ubuntu -- tail -f /home/administrator/.openkitsune/OpenKitsune/data/logs/serve_wsl.log";
+                    // 实时滚动 Windows 服务日志，直到用户关闭窗口 / 按键中断
+                    ProcessStartInfo tail = new ProcessStartInfo("powershell.exe");
+                    tail.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command \"Get-Content -LiteralPath '" + ServeLog + "' -Tail 20 -Wait\"";
                     tail.UseShellExecute = false;
                     tail.CreateNoWindow = false;
                     Process t = Process.Start(tail);
@@ -75,8 +77,8 @@ public static class OpenKitsuneLauncher
                     Console.WriteLine("启动失败（退出码 " + code + "）。");
                     Console.ResetColor();
                     Console.WriteLine("排查日志：");
-                    Console.WriteLine("  本次启动: " + FindLatestLog(LogRoot));
-                    Console.WriteLine("  WSL 服务: wsl -d Ubuntu -- tail -n 50 /home/administrator/.openkitsune/OpenKitsune/data/logs/serve_wsl.log");
+                    Console.WriteLine("  服务日志: " + ServeLog);
+                    Console.WriteLine("  错误日志: " + ServeErr);
                     Console.WriteLine("  手工启动试跑: powershell -ExecutionPolicy Bypass -File \"" + StartPs1 + "\"");
                     Pause();
                 }
@@ -88,19 +90,6 @@ public static class OpenKitsuneLauncher
                 Pause();
             }
         }
-    }
-
-    private static string FindLatestLog(string dir)
-    {
-        try
-        {
-            if (!Directory.Exists(dir)) return "(未生成，检查 " + dir + ")";
-            string[] files = Directory.GetFiles(dir, "launcher_*.log");
-            if (files.Length == 0) return "(未生成 launcher_*.log)";
-            Array.Sort(files);
-            return files[files.Length - 1];
-        }
-        catch { return "(无法读取日志目录)"; }
     }
 
     private static void Pause()
