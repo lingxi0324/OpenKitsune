@@ -13,11 +13,11 @@ from pathlib import Path
 
 import pytest
 
-from openkitsune.memory.openkitsune_brain import (
-    OpenKitsuneBrainRetrievalSource,
-    _default_brain_home,
-    _normalize_brain_home,
-    create_openkitsune_brain_provider,
+from openkitsune.memory.okmem_provider import (
+    OkmemRetrievalSource,
+    _default_okmem_home,
+    _normalize_okmem_home,
+    create_okmem_provider,
 )
 from openkitsune.memory.public_api import MemoryRecord
 
@@ -40,7 +40,7 @@ class _StubProvider:
 
 
 async def test_retrieval_source_maps_records() -> None:
-    source = OpenKitsuneBrainRetrievalSource(_StubProvider())
+    source = OkmemRetrievalSource(_StubProvider())
     items = await source.retrieve("河图洛书", limit=3)
 
     assert source.source_name == "openkitsune-brain"
@@ -54,20 +54,20 @@ async def test_retrieval_source_maps_records() -> None:
 def test_normalize_windows_path_for_wsl(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(os, "name", "posix")
     assert (
-        _normalize_brain_home(r"E:\agents\openkitsune-brain")
+        _normalize_okmem_home(r"E:\agents\openkitsune-brain")
         == "/mnt/e/agents/openkitsune-brain"
     )
     assert (
-        _normalize_brain_home("E:/agents/openkitsune-brain")
+        _normalize_okmem_home("E:/agents/openkitsune-brain")
         == "/mnt/e/agents/openkitsune-brain"
     )
-    assert _normalize_brain_home("/mnt/e/agents/openkitsune-brain") == (
+    assert _normalize_okmem_home("/mnt/e/agents/openkitsune-brain") == (
         "/mnt/e/agents/openkitsune-brain"
     )
 
 
 def test_default_home_has_expected_name() -> None:
-    assert Path(_default_brain_home()).name == "openkitsune-brain"
+    assert Path(_default_okmem_home()).name == "openkitsune-brain"
 
 
 @pytest.mark.skipif(
@@ -75,7 +75,7 @@ def test_default_home_has_expected_name() -> None:
     reason="openkitsune-brain 数据目录未挂载到 WSL",
 )
 async def test_live_provider_reads_legacy_store() -> None:
-    provider = create_openkitsune_brain_provider(home=str(LIVE_HOME), auto_embed=False)
+    provider = create_okmem_provider(home=str(LIVE_HOME), auto_embed=False)
     try:
         stats = await provider.stats()
         assert "by_fmt" in stats["okmem"]

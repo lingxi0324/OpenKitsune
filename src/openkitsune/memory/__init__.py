@@ -16,13 +16,13 @@ OpenKitsune 记忆系统 (v2)
 from .consolidator import MemoryConsolidator
 from .extractor import MemoryExtractor
 from .manager import MemoryManager
-from .openkitsune_brain import (
-    BRAIN_TOOL_NAMES,
-    BRAIN_TOOL_SCHEMAS,
-    OpenKitsuneBrainProvider,
-    OpenKitsuneBrainRetrievalSource,
-    create_openkitsune_brain_provider,
-    dispatch_brain_tool,
+from .okmem_provider import (
+    OKMEM_TOOL_NAMES,
+    OKMEM_TOOL_SCHEMAS,
+    OkmemProvider,
+    OkmemRetrievalSource,
+    create_okmem_provider,
+    dispatch_okmem_tool,
 )
 from .public_api import (
     MEMORY_TOOL_NAMES,
@@ -95,10 +95,10 @@ __all__ = [
     "MEMORY_TOOL_SCHEMAS",
     "MEMORY_TOOL_NAMES",
     # openkitsune-brain integration
-    "OpenKitsuneBrainProvider",
-    "OpenKitsuneBrainRetrievalSource",
-    "create_openkitsune_brain_provider",
-    "dispatch_brain_tool",
-    "BRAIN_TOOL_SCHEMAS",
-    "BRAIN_TOOL_NAMES",
+    "OkmemProvider",
+    "OkmemRetrievalSource",
+    "create_okmem_provider",
+    "dispatch_okmem_tool",
+    "OKMEM_TOOL_SCHEMAS",
+    "OKMEM_TOOL_NAMES",
 ]

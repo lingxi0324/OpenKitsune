@@ -786,28 +786,28 @@ class Agent:
             logger.debug("[Knowledge] cloud retrieval providers unavailable: %s", e)
 
         # openkitsune-brain 外部记忆源（okmem + 知识库 + 案例库，只读/增强模式）
-        self._openkitsune_brain_source = None
-        self._openkitsune_brain_provider = None
+        self._okmem_source = None
+        self._okmem_provider = None
         try:
-            from ..memory.openkitsune_brain import (
-                OpenKitsuneBrainRetrievalSource,
-                create_openkitsune_brain_provider,
+            from ..memory.okmem_provider import (
+                OkmemRetrievalSource,
+                create_okmem_provider,
             )
 
-            flag = os.environ.get("OPENKITSUNE_BRAIN_MEMORY", "1").strip().lower()
+            flag = os.environ.get("OPENKITSUNE_OKMEM_ENABLED", "1").strip().lower()
             if flag not in ("0", "false", "off", "no"):
-                provider = create_openkitsune_brain_provider()
-                source = OpenKitsuneBrainRetrievalSource(provider)
-                self._openkitsune_brain_provider = provider
-                self._openkitsune_brain_source = source
+                provider = create_okmem_provider()
+                source = OkmemRetrievalSource(provider)
+                self._okmem_provider = provider
+                self._okmem_source = source
                 self.memory_manager.retrieval_engine._external_sources.append(source)
                 logger.info(
-                    "[BrainMemory] external retrieval source registered (home=%s, okmem=%s)",
+                    "[Okmem] external retrieval source registered (home=%s, okmem=%s)",
                     provider.home,
                     provider.okmem_available,
                 )
         except Exception as e:
-            logger.debug("[BrainMemory] external retrieval source unavailable: %s", e)
+            logger.debug("[Okmem] external retrieval source unavailable: %s", e)
         self._active_agent_lifecycle_runs: dict[str, dict[str, Any]] = {}
 
         # 用户档案管理器
@@ -1421,11 +1421,11 @@ class Agent:
         # 子进程启动失败只记录日志，绝不阻断 Agent 初始化；sub-agent 不重复拉起。
         if not lightweight:
             try:
-                from ..memory.brain_stack import start_brain_stack
+                from ..memory.okmem_stack import start_okmem_stack
 
-                logger.info("[BrainStack] autostart: %s", start_brain_stack())
+                logger.info("[OkmemStack] autostart: %s", start_okmem_stack())
             except Exception as e:  # noqa: BLE001 -- 外部记忆栈不可用不能阻断宿主
-                logger.debug("[BrainStack] autostart failed: %s", e)
+                logger.debug("[OkmemStack] autostart failed: %s", e)
 
         # 自动生成/加载设备 ID（用于平台认证）
         if not settings.hub_device_id:
@@ -9229,18 +9229,18 @@ class Agent:
             logger.warning(f"Failed to await memory pending tasks: {e}")
 
         # 关闭 openkitsune-brain 外部记忆源（释放 okmem 连接与线程池）
-        brain_source = getattr(self, "_openkitsune_brain_source", None)
-        if brain_source is not None:
+        okmem_source = getattr(self, "_okmem_source", None)
+        if okmem_source is not None:
             try:
                 sources = getattr(self.memory_manager.retrieval_engine, "_external_sources", None)
                 if sources is not None:
                     with contextlib.suppress(ValueError):
-                        sources.remove(brain_source)
-                brain_source.close()
+                        sources.remove(okmem_source)
+                okmem_source.close()
             except Exception as e:
-                logger.debug(f"[BrainMemory] close failed: {e}")
-            self._openkitsune_brain_source = None
-            self._openkitsune_brain_provider = None
+                logger.debug(f"[Okmem] close failed: {e}")
+            self._okmem_source = None
+            self._okmem_provider = None
 
         # Flush TodoStore 并停止防抖循环
         try:
@@ -9263,11 +9263,11 @@ class Agent:
         if get_primary_agent() is self:
             # 回收随宿主拉起的 openkitsune-brain 记忆栈（外部实例不受影响）
             try:
-                from ..memory.brain_stack import stop_brain_stack
+                from ..memory.okmem_stack import stop_okmem_stack
 
-                await asyncio.to_thread(stop_brain_stack)
+                await asyncio.to_thread(stop_okmem_stack)
             except Exception as e:  # noqa: BLE001 -- 收尾失败不能阻断 shutdown
-                logger.debug(f"[BrainStack] stop failed: {e}")
+                logger.debug(f"[OkmemStack] stop failed: {e}")
             set_primary_agent(None)
 
         self._running = False

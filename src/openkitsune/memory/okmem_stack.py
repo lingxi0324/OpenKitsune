@@ -3,7 +3,7 @@
 ``openkitsune-brain`` 是独立工程（默认 ``E:\\agents\\openkitsune-brain``），
 记忆能力分两层：
 
-- **进程内层**：``memory/openkitsune_brain.py`` 直接调用 ``okmem`` 读写记忆，
+- **进程内层**：``memory/okmem_provider.py`` 直接调用 ``okmem`` 读写记忆，
   不依赖任何常驻服务；
 - **常驻服务层**：``fusion-memory``（Rust，默认 :4014）负责三速记忆与知识库
   索引，``brain-bus``（Python FastAPI，默认 :8641）暴露 ``/api/memory/*``
@@ -15,14 +15,14 @@
 
 环境变量::
 
-    OPENKITSUNE_BRAIN_AUTOSTART          1/0，总开关（默认 1）
-    OPENKITSUNE_BRAIN_HOME               工程根目录
-    OPENKITSUNE_BRAIN_FUSION_AUTOSTART   1/0，是否拉起 fusion-memory（默认 1）
-    OPENKITSUNE_BRAIN_BUS_AUTOSTART      1/0，是否拉起 brain-bus（默认 1）
-    OPENKITSUNE_BRAIN_FUSION_PORT        fusion-memory 端口（默认 4014）
-    OPENKITSUNE_BRAIN_BUS_PORT           brain-bus 端口（默认 8641）
-    OPENKITSUNE_BRAIN_STOP_ON_EXIT       宿主退出时停止子进程（默认 1）
-    OPENKITSUNE_BRAIN_HEALTH_TIMEOUT     健康探针超时秒数（默认 30）
+    OPENKITSUNE_OKMEM_AUTOSTART          1/0，总开关（默认 1）
+    OPENKITSUNE_OKMEM_HOME               工程根目录
+    OPENKITSUNE_OKMEM_FUSION_AUTOSTART   1/0，是否拉起 fusion-memory（默认 1）
+    OPENKITSUNE_OKMEM_BUS_AUTOSTART      1/0，是否拉起 brain-bus（默认 1）
+    OPENKITSUNE_OKMEM_FUSION_PORT        fusion-memory 端口（默认 4014）
+    OPENKITSUNE_OKMEM_BUS_PORT           brain-bus 端口（默认 8641）
+    OPENKITSUNE_OKMEM_STOP_ON_EXIT       宿主退出时停止子进程（默认 1）
+    OPENKITSUNE_OKMEM_HEALTH_TIMEOUT     健康探针超时秒数（默认 30）
 """
 
 from __future__ import annotations
@@ -78,10 +78,10 @@ def _env_port(env: Mapping[str, str], name: str, default: int) -> int:
     try:
         port = int(raw)
     except ValueError:
-        logger.warning("[BrainStack] %s=%r is not a valid port, using %d", name, raw, default)
+        logger.warning("[OkmemStack] %s=%r is not a valid port, using %d", name, raw, default)
         return default
     if not 1 <= port <= 65535:
-        logger.warning("[BrainStack] %s=%r out of range, using %d", name, raw, default)
+        logger.warning("[OkmemStack] %s=%r out of range, using %d", name, raw, default)
         return default
     return port
 
@@ -107,13 +107,13 @@ def _normalize_home(raw: str) -> Path:
     return Path(raw).expanduser()
 
 
-def resolve_brain_home(env: Mapping[str, str] | None = None) -> Path:
+def resolve_okmem_home(env: Mapping[str, str] | None = None) -> Path:
     """解析 openkitsune-brain 工程根目录。
 
     优先级：环境变量 > WSL 挂载 / Windows 固定路径 > 用户目录。
     """
     source = os.environ if env is None else env
-    raw = str(source.get("OPENKITSUNE_BRAIN_HOME", "")).strip()
+    raw = str(source.get("OPENKITSUNE_OKMEM_HOME", "")).strip()
     if raw:
         return _normalize_home(raw)
 
@@ -131,7 +131,7 @@ def resolve_brain_home(env: Mapping[str, str] | None = None) -> Path:
 
 
 @dataclass(frozen=True)
-class BrainStackConfig:
+class OkmemStackConfig:
     """记忆栈启动配置（全部来自环境变量，可测试注入）。"""
 
     home: Path
@@ -145,26 +145,26 @@ class BrainStackConfig:
     fusion_data_dir: str = "data/fusion-memory"
 
     @classmethod
-    def from_env(cls, environ: Mapping[str, str] | None = None) -> BrainStackConfig:
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> OkmemStackConfig:
         env = os.environ if environ is None else environ
         return cls(
-            home=resolve_brain_home(env),
-            autostart=_env_flag(env, "OPENKITSUNE_BRAIN_AUTOSTART", True),
-            fusion_autostart=_env_flag(env, "OPENKITSUNE_BRAIN_FUSION_AUTOSTART", True),
-            bus_autostart=_env_flag(env, "OPENKITSUNE_BRAIN_BUS_AUTOSTART", True),
-            fusion_port=_env_port(env, "OPENKITSUNE_BRAIN_FUSION_PORT", DEFAULT_FUSION_PORT),
-            bus_port=_env_port(env, "OPENKITSUNE_BRAIN_BUS_PORT", DEFAULT_BUS_PORT),
-            stop_on_exit=_env_flag(env, "OPENKITSUNE_BRAIN_STOP_ON_EXIT", True),
-            health_timeout_s=_env_seconds(env, "OPENKITSUNE_BRAIN_HEALTH_TIMEOUT", 30.0),
+            home=resolve_okmem_home(env),
+            autostart=_env_flag(env, "OPENKITSUNE_OKMEM_AUTOSTART", True),
+            fusion_autostart=_env_flag(env, "OPENKITSUNE_OKMEM_FUSION_AUTOSTART", True),
+            bus_autostart=_env_flag(env, "OPENKITSUNE_OKMEM_BUS_AUTOSTART", True),
+            fusion_port=_env_port(env, "OPENKITSUNE_OKMEM_FUSION_PORT", DEFAULT_FUSION_PORT),
+            bus_port=_env_port(env, "OPENKITSUNE_OKMEM_BUS_PORT", DEFAULT_BUS_PORT),
+            stop_on_exit=_env_flag(env, "OPENKITSUNE_OKMEM_STOP_ON_EXIT", True),
+            health_timeout_s=_env_seconds(env, "OPENKITSUNE_OKMEM_HEALTH_TIMEOUT", 30.0),
         )
 
 
-def fusion_binary(config: BrainStackConfig) -> Path:
+def fusion_binary(config: OkmemStackConfig) -> Path:
     """fusion-memory 可执行文件路径（``target/release``）。"""
     return config.home / "target" / "release" / _FUSION_BINARY
 
 
-def build_fusion_command(config: BrainStackConfig) -> list[str]:
+def build_fusion_command(config: OkmemStackConfig) -> list[str]:
     """构造 fusion-memory 启动命令（与 ``scripts/start-memory-stack.ps1`` 对齐）。"""
     return [
         str(fusion_binary(config)),
@@ -195,7 +195,7 @@ def _resolve_python() -> str | None:
         return None
 
 
-def build_bus_command(config: BrainStackConfig, python: str | None = None) -> list[str]:
+def build_bus_command(config: OkmemStackConfig, python: str | None = None) -> list[str]:
     """构造 brain-bus 启动命令，复用项目解释器（保证依赖一致）。"""
     script = config.home / "services" / "brain-bus" / "server.py"
     interpreter = python or _resolve_python() or "python"
@@ -203,7 +203,7 @@ def build_bus_command(config: BrainStackConfig, python: str | None = None) -> li
 
 
 def build_bus_env(
-    config: BrainStackConfig, base: Mapping[str, str] | None = None
+    config: OkmemStackConfig, base: Mapping[str, str] | None = None
 ) -> dict[str, str]:
     """构造 brain-bus 子进程环境：把工程根目录加入 ``PYTHONPATH``。"""
     env = dict(os.environ if base is None else base)
@@ -250,11 +250,11 @@ class _Service:
     health: str = "unknown"
 
 
-class BrainStackSupervisor:
+class OkmemStackSupervisor:
     """管理 fusion-memory / brain-bus 两个伴随子进程的生命周期。"""
 
-    def __init__(self, config: BrainStackConfig | None = None) -> None:
-        self.config = config or BrainStackConfig.from_env()
+    def __init__(self, config: OkmemStackConfig | None = None) -> None:
+        self.config = config or OkmemStackConfig.from_env()
         self._lock = threading.Lock()
         self._started = False
         self._atexit_registered = False
@@ -278,11 +278,11 @@ class BrainStackSupervisor:
             self._started = True
 
             if not self.config.autostart:
-                logger.debug("[BrainStack] autostart disabled by OPENKITSUNE_BRAIN_AUTOSTART")
+                logger.debug("[OkmemStack] autostart disabled by OPENKITSUNE_OKMEM_AUTOSTART")
                 return self.status()
             if not self.config.home.is_dir():
                 logger.warning(
-                    "[BrainStack] home not found: %s (记忆栈未启动)", self.config.home
+                    "[OkmemStack] home not found: %s (记忆栈未启动)", self.config.home
                 )
                 return self.status()
 
@@ -305,14 +305,14 @@ class BrainStackSupervisor:
             service.external = True
             service.health = "external"
             logger.info(
-                "[BrainStack] fusion-memory already listening on :%d (reuse)", service.port
+                "[OkmemStack] fusion-memory already listening on :%d (reuse)", service.port
             )
             return
         binary = fusion_binary(self.config)
         if not binary.exists():
             service.health = "missing-binary"
             logger.warning(
-                "[BrainStack] fusion-memory binary missing: %s "
+                "[OkmemStack] fusion-memory binary missing: %s "
                 "(run `cargo build --release -p openkitsune-memory` in %s)",
                 binary,
                 self.config.home,
@@ -328,18 +328,18 @@ class BrainStackSupervisor:
         if _port_open(service.port):
             service.external = True
             service.health = "external"
-            logger.info("[BrainStack] brain-bus already listening on :%d (reuse)", service.port)
+            logger.info("[OkmemStack] brain-bus already listening on :%d (reuse)", service.port)
             return
         script = self.config.home / "services" / "brain-bus" / "server.py"
         if not script.exists():
             service.health = "missing-script"
-            logger.warning("[BrainStack] brain-bus script missing: %s", script)
+            logger.warning("[OkmemStack] brain-bus script missing: %s", script)
             return
         python = _resolve_python()
         if python is None:
             service.health = "no-python"
             logger.warning(
-                "[BrainStack] no usable Python interpreter for brain-bus "
+                "[OkmemStack] no usable Python interpreter for brain-bus "
                 "(frozen build without project venv)"
             )
             return
@@ -386,14 +386,14 @@ class BrainStackSupervisor:
             for handle in log_files:
                 handle.close()
             service.health = f"spawn-failed: {exc}"
-            logger.warning("[BrainStack] %s spawn failed: %s", service.name, exc)
+            logger.warning("[OkmemStack] %s spawn failed: %s", service.name, exc)
             return
 
         service.process = process
         service.log_files = log_files
         service.health = "starting"
         logger.info(
-            "[BrainStack] %s started on :%d (pid=%s)",
+            "[OkmemStack] %s started on :%d (pid=%s)",
             service.name,
             service.port,
             process.pid,
@@ -433,7 +433,7 @@ class BrainStackSupervisor:
                     service.health = f"exited({process.returncode})"
                     pending.discard(name)
                     logger.warning(
-                        "[BrainStack] %s exited with code %s; see %s",
+                        "[OkmemStack] %s exited with code %s; see %s",
                         name,
                         process.returncode,
                         self.config.home / "logs" / f"host-{name}.err.log",
@@ -444,7 +444,7 @@ class BrainStackSupervisor:
             service = self._services[name]
             if service.health == "starting":
                 service.health = "timeout"
-        logger.info("[BrainStack] health: %s", {name: s.health for name, s in self._services.items()})
+        logger.info("[OkmemStack] health: %s", {name: s.health for name, s in self._services.items()})
 
     def status(self) -> dict[str, Any]:
         services: dict[str, dict[str, Any]] = {}
@@ -510,30 +510,30 @@ class BrainStackSupervisor:
             service.process = None
 
 
-_supervisor: BrainStackSupervisor | None = None
+_supervisor: OkmemStackSupervisor | None = None
 _supervisor_lock = threading.Lock()
 
 
-def get_brain_stack_supervisor() -> BrainStackSupervisor:
+def get_okmem_stack_supervisor() -> OkmemStackSupervisor:
     global _supervisor
     with _supervisor_lock:
         if _supervisor is None:
-            _supervisor = BrainStackSupervisor()
+            _supervisor = OkmemStackSupervisor()
         return _supervisor
 
 
-def start_brain_stack() -> dict[str, Any]:
+def start_okmem_stack() -> dict[str, Any]:
     """启动记忆栈；任何异常都降级为日志，不阻断宿主启动。"""
     try:
-        return get_brain_stack_supervisor().start()
+        return get_okmem_stack_supervisor().start()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("[BrainStack] autostart failed: %s", exc, exc_info=True)
+        logger.warning("[OkmemStack] autostart failed: %s", exc, exc_info=True)
         return {"enabled": False, "error": str(exc)}
 
 
-def stop_brain_stack(*, force: bool = False) -> None:
+def stop_okmem_stack(*, force: bool = False) -> None:
     """停止本进程拉起的记忆栈子进程。"""
     try:
-        get_brain_stack_supervisor().stop(force=force)
+        get_okmem_stack_supervisor().stop(force=force)
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[BrainStack] stop failed: %s", exc)
+        logger.debug("[OkmemStack] stop failed: %s", exc)

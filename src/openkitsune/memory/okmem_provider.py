@@ -14,16 +14,16 @@
 接入方式::
 
     from openkitsune.memory import create_memory_api
-    from openkitsune.memory.openkitsune_brain import create_openkitsune_brain_provider
+    from openkitsune.memory.okmem_provider import create_okmem_provider
 
     api = create_memory_api(agent.memory_manager)
-    api.register_provider(create_openkitsune_brain_provider(), mode="augment")
+    api.register_provider(create_okmem_provider(), mode="augment")
 
     hits = await api.search("河图洛书 五行")
     context = await api.get_injection_context("帮我复习五行与五脏")
 
 除标准 Provider 方法外，本适配器还把 okmem 的高价值方法暴露为工具，
-见 :data:`BRAIN_TOOL_SCHEMAS` 与 :func:`dispatch_brain_tool`。
+见 :data:`OKMEM_TOOL_SCHEMAS` 与 :func:`dispatch_okmem_tool`。
 
 读取策略：
 - 不做静默截断。``search`` / ``get`` 返回的都是显式内容页，附带
@@ -68,7 +68,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _normalize_brain_home(value: str | Path) -> str:
+def _normalize_okmem_home(value: str | Path) -> str:
     """把 Windows 盘符路径转换为 WSL 挂载路径（仅在非 Windows 平台）。"""
     raw = str(value or "").strip()
     if not raw or os.name == "nt":
@@ -80,14 +80,14 @@ def _normalize_brain_home(value: str | Path) -> str:
     return raw
 
 
-def _default_brain_home() -> str:
+def _default_okmem_home() -> str:
     """自动选择可用的 openkitsune-brain 数据目录。
 
     优先级：环境变量 > WSL 挂载路径 > Windows 路径 > 用户目录。
     """
-    env_home = os.environ.get("OPENKITSUNE_BRAIN_HOME")
+    env_home = os.environ.get("OPENKITSUNE_OKMEM_HOME")
     if env_home:
-        return _normalize_brain_home(env_home)
+        return _normalize_okmem_home(env_home)
 
     candidates = (
         Path("/mnt/e/agents/openkitsune-brain"),
@@ -100,7 +100,7 @@ def _default_brain_home() -> str:
     return str(candidates[-1])
 
 
-DEFAULT_BRAIN_HOME = _default_brain_home()
+DEFAULT_OKMEM_HOME = _default_okmem_home()
 
 # 公共记忆类型 → okmem 九格式
 _OKMEM_FMT_BY_TYPE = {
@@ -368,11 +368,11 @@ def _count_tables(db: Path, names: tuple[str, ...]) -> dict[str, int]:
         finally:
             conn.close()
     except sqlite3.Error as exc:
-        logger.warning("[BrainMemory] count %s failed: %s", db, exc)
+        logger.warning("[Okmem] count %s failed: %s", db, exc)
     return result
 
 
-class OpenKitsuneBrainProvider:
+class OkmemProvider:
     """openkitsune-brain 记忆 Provider（okmem 读写 + 知识库只读）。"""
 
     name = "openkitsune-brain"
@@ -392,7 +392,7 @@ class OpenKitsuneBrainProvider:
         content_page_size: int = _DEFAULT_CONTENT_PAGE_SIZE,
     ) -> None:
         self.name = name or "openkitsune-brain"
-        self.home = Path(home or DEFAULT_BRAIN_HOME)
+        self.home = Path(home or DEFAULT_OKMEM_HOME)
         self.okmem_db = Path(
             okmem_db or os.environ.get("OKMEM_DB") or self.home / "data" / "okmem" / "memory.db"
         )
@@ -607,7 +607,7 @@ class OpenKitsuneBrainProvider:
             )
         except Exception as exc:  # noqa: BLE001 —— 外部项目不可用不能阻断宿主
             self._okmem_error = str(exc)
-            logger.warning("[BrainMemory] okmem unavailable at %s: %s", self.home, exc)
+            logger.warning("[Okmem] okmem unavailable at %s: %s", self.home, exc)
             return None
         return self._ms
 
@@ -621,7 +621,7 @@ class OpenKitsuneBrainProvider:
         try:
             self._executor.submit(self._close_sync).result(timeout=10)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[BrainMemory] close failed: %s", exc)
+            logger.debug("[Okmem] close failed: %s", exc)
         finally:
             self._executor.shutdown(wait=False)
 
@@ -957,7 +957,7 @@ class OpenKitsuneBrainProvider:
                     if add("【okmem 工作集】\n" + page) and len(page) < len(text):
                         add(
                             f"[okmem 工作集未完全加载：{len(page)}/{len(text)} 字，"
-                            "可调用 brain_progress 或 memory_read 继续]"
+                            "可调用 okmem_progress 或 memory_read 继续]"
                         )
                         manifest.append(
                             {
@@ -969,7 +969,7 @@ class OpenKitsuneBrainProvider:
                             }
                         )
             except Exception as exc:  # noqa: BLE001
-                logger.debug("[BrainMemory] assemble failed: %s", exc)
+                logger.debug("[Okmem] assemble failed: %s", exc)
 
             signal = detect_emotion_signal(query)
             if signal["confidence"] >= 0.5:
@@ -1509,7 +1509,7 @@ class OpenKitsuneBrainProvider:
             finally:
                 conn.close()
         except sqlite3.Error as exc:
-            logger.warning("[BrainMemory] knowledge search failed: %s", exc)
+            logger.warning("[Okmem] knowledge search failed: %s", exc)
             return []
 
         records: list[MemoryRecord] = []
@@ -1592,7 +1592,7 @@ class OpenKitsuneBrainProvider:
             finally:
                 conn.close()
         except sqlite3.Error as exc:
-            logger.debug("[BrainMemory] entity search failed: %s", exc)
+            logger.debug("[Okmem] entity search failed: %s", exc)
             return []
 
         records: list[MemoryRecord] = []
@@ -1653,7 +1653,7 @@ class OpenKitsuneBrainProvider:
             finally:
                 conn.close()
         except sqlite3.Error as exc:
-            logger.debug("[BrainMemory] knowledge FTS search failed: %s", exc)
+            logger.debug("[Okmem] knowledge FTS search failed: %s", exc)
             return []
 
         records: list[MemoryRecord] = []
@@ -1711,7 +1711,7 @@ class OpenKitsuneBrainProvider:
             finally:
                 conn.close()
         except sqlite3.Error as exc:
-            logger.warning("[BrainMemory] knowledge FTS get failed: %s", exc)
+            logger.warning("[Okmem] knowledge FTS get failed: %s", exc)
             return None
         if row is None:
             return None
@@ -1756,7 +1756,7 @@ class OpenKitsuneBrainProvider:
             finally:
                 conn.close()
         except sqlite3.Error as exc:
-            logger.warning("[BrainMemory] knowledge get failed: %s", exc)
+            logger.warning("[Okmem] knowledge get failed: %s", exc)
             return None
         if row is None:
             return None
@@ -1855,7 +1855,7 @@ class OpenKitsuneBrainProvider:
             finally:
                 conn.close()
         except sqlite3.Error as exc:
-            logger.warning("[BrainMemory] knowledge content read failed: %s", exc)
+            logger.warning("[Okmem] knowledge content read failed: %s", exc)
             return None
         return str(row[0] or "") if row else None
 
@@ -1877,7 +1877,7 @@ class OpenKitsuneBrainProvider:
             finally:
                 conn.close()
         except sqlite3.Error as exc:
-            logger.warning("[BrainMemory] knowledge FTS content read failed: %s", exc)
+            logger.warning("[Okmem] knowledge FTS content read failed: %s", exc)
             return None
         return str(row[0] or "") if row else None
 
@@ -2004,8 +2004,8 @@ class OpenKitsuneBrainProvider:
         return merged
 
 
-class OpenKitsuneBrainRetrievalSource:
-    """把 :class:`OpenKitsuneBrainProvider` 适配为 RetrievalEngine 的外部检索源。
+class OkmemRetrievalSource:
+    """把 :class:`OkmemProvider` 适配为 RetrievalEngine 的外部检索源。
 
     ``MemoryManager.retrieval_engine._external_sources`` 只要求
     ``source_name`` + ``async retrieve(query, limit)``，本适配器把 Provider 的
@@ -2014,8 +2014,8 @@ class OpenKitsuneBrainRetrievalSource:
 
     source_name = "openkitsune-brain"
 
-    def __init__(self, provider: OpenKitsuneBrainProvider | None = None) -> None:
-        self.provider = provider or create_openkitsune_brain_provider()
+    def __init__(self, provider: OkmemProvider | None = None) -> None:
+        self.provider = provider or create_okmem_provider()
 
     async def retrieve(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         records = await self.provider.search(query, limit=limit)
@@ -2044,9 +2044,9 @@ def _record_label(record: MemoryRecord) -> str:
 # 工具描述与分发
 # ---------------------------------------------------------------------------
 
-BRAIN_TOOL_SCHEMAS: list[dict[str, Any]] = [
+OKMEM_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
-        "name": "brain_recall",
+        "name": "okmem_recall",
         "category": "Memory",
         "description": (
             "Run the openkitsune-brain six-pool active recall pipeline and return "
@@ -2067,7 +2067,7 @@ BRAIN_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "brain_knowledge_search",
+        "name": "okmem_knowledge_search",
         "category": "Memory",
         "description": "Search the fusion-memory knowledge base (TCM / xuan-yi notes).",
         "input_schema": {
@@ -2080,7 +2080,7 @@ BRAIN_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "brain_save_turn",
+        "name": "okmem_save_turn",
         "category": "Memory",
         "description": "Persist one conversation turn (user / assistant) into okmem.",
         "input_schema": {
@@ -2093,7 +2093,7 @@ BRAIN_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "brain_proactive_review",
+        "name": "okmem_proactive_review",
         "category": "Memory",
         "description": "Get the proactive review queue: conflicts, weak memories, open hypotheses, tasks.",
         "input_schema": {
@@ -2102,13 +2102,13 @@ BRAIN_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "brain_health",
+        "name": "okmem_health",
         "category": "Memory",
         "description": "Get the openkitsune-brain memory health report.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
-        "name": "brain_progress",
+        "name": "okmem_progress",
         "category": "Memory",
         "description": "Get the L1 progress snapshot (goal / tasks / decisions / next action).",
         "input_schema": {
@@ -2117,7 +2117,7 @@ BRAIN_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "brain_backfill",
+        "name": "okmem_backfill",
         "category": "Memory",
         "description": (
             "Backfill fusion-memory knowledge base notes into okmem. "
@@ -2139,7 +2139,7 @@ BRAIN_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "brain_record_emotion",
+        "name": "okmem_record_emotion",
         "category": "Memory",
         "description": "Record the current emotional state into the emotion memory pool.",
         "input_schema": {
@@ -2155,13 +2155,13 @@ BRAIN_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "brain_emotion_state",
+        "name": "okmem_emotion_state",
         "category": "Memory",
         "description": "Get the latest emotional state for the current session.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
-        "name": "brain_detect_emotion",
+        "name": "okmem_detect_emotion",
         "category": "Memory",
         "description": "Detect emotion from free text using multi-signal rules.",
         "input_schema": {
@@ -2171,7 +2171,7 @@ BRAIN_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "brain_maintain_sessions",
+        "name": "okmem_maintain_sessions",
         "category": "Memory",
         "description": (
             "Archive expired session memories by TTL. Dry-run by default; "
@@ -2187,11 +2187,11 @@ BRAIN_TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
-BRAIN_TOOL_NAMES: tuple[str, ...] = tuple(schema["name"] for schema in BRAIN_TOOL_SCHEMAS)
+OKMEM_TOOL_NAMES: tuple[str, ...] = tuple(schema["name"] for schema in OKMEM_TOOL_SCHEMAS)
 
 
-async def dispatch_brain_tool(
-    provider: OpenKitsuneBrainProvider,
+async def dispatch_okmem_tool(
+    provider: OkmemProvider,
     tool_name: str,
     arguments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -2199,7 +2199,7 @@ async def dispatch_brain_tool(
     name = str(tool_name or "").strip()
     args = dict(arguments or {})
 
-    if name == "brain_recall":
+    if name == "okmem_recall":
         result = await provider.recall_pipeline(
             str(args.get("user_input", "") or ""),
             scene=str(args.get("scene", "mix") or "mix"),
@@ -2207,7 +2207,7 @@ async def dispatch_brain_tool(
         )
         return {"ok": True, "result": result}
 
-    if name == "brain_knowledge_search":
+    if name == "okmem_knowledge_search":
         records = await provider.knowledge_search(
             str(args.get("query", "") or ""),
             limit=int(args.get("limit", 10) or 10),
@@ -2218,29 +2218,29 @@ async def dispatch_brain_tool(
             "items": [record.to_dict() for record in records],
         }
 
-    if name == "brain_save_turn":
+    if name == "okmem_save_turn":
         result = await provider.save_turn(
             user_message=str(args.get("user_message", "") or ""),
             assistant_answer=args.get("assistant_answer"),
         )
         return {"ok": bool(result), "result": result}
 
-    if name == "brain_proactive_review":
+    if name == "okmem_proactive_review":
         return {
             "ok": True,
             "result": await provider.proactive_review(limit=int(args.get("limit", 30) or 30)),
         }
 
-    if name == "brain_health":
+    if name == "okmem_health":
         return {"ok": True, "result": await provider.health()}
 
-    if name == "brain_progress":
+    if name == "okmem_progress":
         return {
             "ok": True,
             "result": await provider.progress(session_id=str(args.get("session_id", "") or "")),
         }
 
-    if name == "brain_backfill":
+    if name == "okmem_backfill":
         result = await provider.backfill_knowledge(
             limit=int(args.get("limit", 200) or 200),
             dry_run=bool(args.get("dry_run", True)),
@@ -2250,7 +2250,7 @@ async def dispatch_brain_tool(
         )
         return {"ok": bool(result.get("ok")), "result": result}
 
-    if name == "brain_record_emotion":
+    if name == "okmem_record_emotion":
         result = await provider.record_emotion(
             str(args.get("label", "") or "unknown"),
             intensity=float(args.get("intensity", 0.5) or 0.5),
@@ -2260,16 +2260,16 @@ async def dispatch_brain_tool(
         )
         return {"ok": bool(result), "result": result}
 
-    if name == "brain_emotion_state":
+    if name == "okmem_emotion_state":
         return {"ok": True, "result": await provider.emotion_state()}
 
-    if name == "brain_detect_emotion":
+    if name == "okmem_detect_emotion":
         return {
             "ok": True,
             "result": provider.detect_emotion(str(args.get("text", "") or "")),
         }
 
-    if name == "brain_maintain_sessions":
+    if name == "okmem_maintain_sessions":
         result = await provider.maintain_sessions(
             ttl_days=float(args.get("ttl_days", 7) or 7),
             apply=bool(args.get("apply", False)),
@@ -2279,6 +2279,6 @@ async def dispatch_brain_tool(
     raise ValueError(f"Unknown openkitsune-brain tool: {name!r}")
 
 
-def create_openkitsune_brain_provider(**kwargs: Any) -> OpenKitsuneBrainProvider:
+def create_okmem_provider(**kwargs: Any) -> OkmemProvider:
     """创建 openkitsune-brain Provider（参数透传构造器）。"""
-    return OpenKitsuneBrainProvider(**kwargs)
+    return OkmemProvider(**kwargs)

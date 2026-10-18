@@ -59,6 +59,8 @@ dependencies = [
     "simplejson>=3.19.2",
     "packaging>=24.0",
     "cryptography>=42.0,<47.0",
+    # Windows 没有系统 tzdata，zoneinfo 需要该包才能解析 Asia/Shanghai 等时区
+    "tzdata>=2024.1; sys_platform == 'win32'",
     # C17: cross-process audit / scheduler / event_store locking.
     "filelock>=3.13.0",
 

@@ -13,36 +13,36 @@ from pathlib import Path
 
 import pytest
 
-from openkitsune.memory import brain_stack
-from openkitsune.memory.brain_stack import (
-    BrainStackConfig,
-    BrainStackSupervisor,
+from openkitsune.memory import okmem_stack
+from openkitsune.memory.okmem_stack import (
+    OkmemStackConfig,
+    OkmemStackSupervisor,
     build_bus_command,
     build_bus_env,
     build_fusion_command,
     fusion_binary,
-    resolve_brain_home,
+    resolve_okmem_home,
 )
 
 
-def _config(home: Path, **overrides) -> BrainStackConfig:
+def _config(home: Path, **overrides) -> OkmemStackConfig:
     values = {"home": home}
     values.update(overrides)
-    return BrainStackConfig(**values)
+    return OkmemStackConfig(**values)
 
 
 def test_env_overrides(tmp_path: Path) -> None:
     env = {
-        "OPENKITSUNE_BRAIN_HOME": str(tmp_path),
-        "OPENKITSUNE_BRAIN_AUTOSTART": "0",
-        "OPENKITSUNE_BRAIN_FUSION_AUTOSTART": "false",
-        "OPENKITSUNE_BRAIN_BUS_AUTOSTART": "off",
-        "OPENKITSUNE_BRAIN_FUSION_PORT": "5014",
-        "OPENKITSUNE_BRAIN_BUS_PORT": "9641",
-        "OPENKITSUNE_BRAIN_STOP_ON_EXIT": "no",
-        "OPENKITSUNE_BRAIN_HEALTH_TIMEOUT": "12.5",
+        "OPENKITSUNE_OKMEM_HOME": str(tmp_path),
+        "OPENKITSUNE_OKMEM_AUTOSTART": "0",
+        "OPENKITSUNE_OKMEM_FUSION_AUTOSTART": "false",
+        "OPENKITSUNE_OKMEM_BUS_AUTOSTART": "off",
+        "OPENKITSUNE_OKMEM_FUSION_PORT": "5014",
+        "OPENKITSUNE_OKMEM_BUS_PORT": "9641",
+        "OPENKITSUNE_OKMEM_STOP_ON_EXIT": "no",
+        "OPENKITSUNE_OKMEM_HEALTH_TIMEOUT": "12.5",
     }
-    config = BrainStackConfig.from_env(env)
+    config = OkmemStackConfig.from_env(env)
 
     assert config.home == tmp_path
     assert config.autostart is False
@@ -55,20 +55,20 @@ def test_env_overrides(tmp_path: Path) -> None:
 
 
 def test_invalid_port_falls_back_to_default() -> None:
-    config = BrainStackConfig.from_env(
+    config = OkmemStackConfig.from_env(
         {
-            "OPENKITSUNE_BRAIN_HOME": os.getcwd(),
-            "OPENKITSUNE_BRAIN_FUSION_PORT": "not-a-port",
-            "OPENKITSUNE_BRAIN_BUS_PORT": "70000",
+            "OPENKITSUNE_OKMEM_HOME": os.getcwd(),
+            "OPENKITSUNE_OKMEM_FUSION_PORT": "not-a-port",
+            "OPENKITSUNE_OKMEM_BUS_PORT": "70000",
         }
     )
 
-    assert config.fusion_port == brain_stack.DEFAULT_FUSION_PORT
-    assert config.bus_port == brain_stack.DEFAULT_BUS_PORT
+    assert config.fusion_port == okmem_stack.DEFAULT_FUSION_PORT
+    assert config.bus_port == okmem_stack.DEFAULT_BUS_PORT
 
 
 def test_resolve_home_prefers_env(tmp_path: Path) -> None:
-    assert resolve_brain_home({"OPENKITSUNE_BRAIN_HOME": str(tmp_path)}) == tmp_path
+    assert resolve_okmem_home({"OPENKITSUNE_OKMEM_HOME": str(tmp_path)}) == tmp_path
 
 
 def test_fusion_command_matches_stack_script(tmp_path: Path) -> None:
@@ -115,8 +115,8 @@ def test_autostart_disabled_never_spawns(monkeypatch: pytest.MonkeyPatch, tmp_pa
     def _fail(*_args, **_kwargs):
         raise AssertionError("Popen must not be called when autostart is disabled")
 
-    monkeypatch.setattr(brain_stack.subprocess, "Popen", _fail)
-    supervisor = BrainStackSupervisor(_config(tmp_path, autostart=False))
+    monkeypatch.setattr(okmem_stack.subprocess, "Popen", _fail)
+    supervisor = OkmemStackSupervisor(_config(tmp_path, autostart=False))
 
     status = supervisor.start()
 
@@ -127,13 +127,13 @@ def test_autostart_disabled_never_spawns(monkeypatch: pytest.MonkeyPatch, tmp_pa
 def test_missing_binaries_degrade_instead_of_raising(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(brain_stack, "_port_open", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(okmem_stack, "_port_open", lambda *_args, **_kwargs: False)
 
     def _fail(*_args, **_kwargs):
         raise AssertionError("Popen must not be called when files are missing")
 
-    monkeypatch.setattr(brain_stack.subprocess, "Popen", _fail)
-    supervisor = BrainStackSupervisor(_config(tmp_path))
+    monkeypatch.setattr(okmem_stack.subprocess, "Popen", _fail)
+    supervisor = OkmemStackSupervisor(_config(tmp_path))
 
     status = supervisor.start()
 
@@ -144,13 +144,13 @@ def test_missing_binaries_degrade_instead_of_raising(
 
 
 def test_existing_services_are_reused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(brain_stack, "_port_open", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(okmem_stack, "_port_open", lambda *_args, **_kwargs: True)
 
     def _fail(*_args, **_kwargs):
         raise AssertionError("Popen must not be called when ports are already served")
 
-    monkeypatch.setattr(brain_stack.subprocess, "Popen", _fail)
-    supervisor = BrainStackSupervisor(_config(tmp_path, health_timeout_s=0.1))
+    monkeypatch.setattr(okmem_stack.subprocess, "Popen", _fail)
+    supervisor = OkmemStackSupervisor(_config(tmp_path, health_timeout_s=0.1))
 
     status = supervisor.start()
 
