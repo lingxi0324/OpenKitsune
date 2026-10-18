@@ -821,7 +821,9 @@ def _strip_org_structure_marker(event: dict) -> dict:
     if not isinstance(result, str) or "[OPENKITSUNE_ORG]" not in result:
         return event
     next_event = dict(event)
-    lines = [line for line in result.splitlines() if not line.strip().startswith("[OPENKITSUNE_ORG]")]
+    lines = [
+        line for line in result.splitlines() if not line.strip().startswith("[OPENKITSUNE_ORG]")
+    ]
     next_event["result"] = "\n".join(lines).rstrip()
     return next_event
 
@@ -1551,8 +1553,33 @@ async def _stream_chat(
             actual_agent._current_session_id = conversation_id
             actual_agent._current_conversation_id = conversation_id
 
-        async def _agent_runner():
+        _spatial_client_ip: str | None = None
+        if http_request is not None:
             try:
+                from openkitsune.config import settings as _settings
+                from openkitsune.core.spatial_context import extract_public_ip
+
+                _remote_addr = http_request.client.host if http_request.client else ""
+                _extraction = extract_public_ip(
+                    _remote_addr,
+                    http_request.headers.get("x-forwarded-for", ""),
+                    _settings.spatial_trusted_proxies,
+                )
+                _spatial_client_ip = _extraction.ip
+            except Exception:
+                _spatial_client_ip = None
+
+        async def _agent_runner():
+            _spatial_token = None
+            try:
+                try:
+                    from openkitsune.core.spatial_context import bind_spatial_request
+
+                    _spatial_token = bind_spatial_request(
+                        _spatial_client_ip, allow_host_fallback=True
+                    )
+                except Exception:
+                    _spatial_token = None
                 async for ev in actual_agent.chat_with_session_stream(
                     message=chat_request.message or "",
                     session_messages=session_messages_history,
@@ -1591,6 +1618,13 @@ async def _stream_chat(
             except Exception as exc:
                 await _agent_queue.put({"type": "__agent_error__", "__exc_msg__": str(exc)[:500]})
             finally:
+                if _spatial_token is not None:
+                    try:
+                        from openkitsune.core.spatial_context import reset_spatial_request
+
+                        reset_spatial_request(_spatial_token)
+                    except Exception:
+                        pass
                 await _agent_queue.put(None)
                 _agent_done.set()
 
@@ -3496,20 +3530,45 @@ async def chat_sync(request: Request, body: ChatRequest):
         if body.plan_mode and effective_mode == "agent":
             effective_mode = "plan"
 
+        _spatial_token = None
         try:
-            reply = await actual_agent.chat_with_session(
-                message=body.message or "",
-                session_messages=session_messages_history,
-                session_id=conversation_id,
-                session=session,
-                gateway=None,
-                mode=effective_mode,
-                endpoint_override=body.endpoint,
-                endpoint_policy=body.endpoint_policy,
-                thinking_mode=body.thinking_mode,
-                thinking_depth=body.thinking_depth,
-                ask_user_reply=ask_reply_context,
-            )
+            try:
+                from openkitsune.config import settings as _settings
+                from openkitsune.core.spatial_context import (
+                    bind_spatial_request,
+                    extract_public_ip,
+                )
+
+                _extraction = extract_public_ip(
+                    request.client.host if request.client else "",
+                    request.headers.get("x-forwarded-for", ""),
+                    _settings.spatial_trusted_proxies,
+                )
+                _spatial_token = bind_spatial_request(_extraction.ip, allow_host_fallback=True)
+            except Exception:
+                _spatial_token = None
+            try:
+                reply = await actual_agent.chat_with_session(
+                    message=body.message or "",
+                    session_messages=session_messages_history,
+                    session_id=conversation_id,
+                    session=session,
+                    gateway=None,
+                    mode=effective_mode,
+                    endpoint_override=body.endpoint,
+                    endpoint_policy=body.endpoint_policy,
+                    thinking_mode=body.thinking_mode,
+                    thinking_depth=body.thinking_depth,
+                    ask_user_reply=ask_reply_context,
+                )
+            finally:
+                if _spatial_token is not None:
+                    try:
+                        from openkitsune.core.spatial_context import reset_spatial_request
+
+                        reset_spatial_request(_spatial_token)
+                    except Exception:
+                        pass
         except DeferredApprovalRequired as exc:
             # C14 / R4-6 / C12 §14.2: CONFIRM-class tool routed through
             # _handle_unattended → defer_to_inbox (or whatever the session

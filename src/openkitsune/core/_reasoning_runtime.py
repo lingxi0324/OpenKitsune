@@ -66,6 +66,8 @@ from .cancel_cleanup import (
     persisted_age_seconds,
     synthesize_tool_results_for_orphans,
 )
+from .gates import GATE_ORDER, GateRegistry
+from .gates import gate_context as _gate_context
 from .policy_v2.exceptions import DeferredApprovalRequired
 from .response_handler import (
     ResponseHandler,
@@ -124,6 +126,13 @@ from ._tool_runtime import ToolExecutor
 from .token_tracking import TokenTrackingContext, reset_tracking_context, set_tracking_context
 
 logger = logging.getLogger(__name__)
+
+# 12 门在 core.gates 导入时完成注册；推理循环的转换点依赖完整注册表。
+# 注册表不完整说明导入链路被破坏，启动期直接 fail-fast。
+_MISSING_GATES = [gate_id for gate_id in GATE_ORDER if GateRegistry.get(gate_id) is None]
+if _MISSING_GATES:  # pragma: no cover - 仅在注册表被破坏时触发
+    raise RuntimeError(f"Gate registry incomplete: missing {_MISSING_GATES}")
+
 
 _SSE_RESULT_PREVIEW_CHARS = 32000
 _TOOL_RESULT_ERROR_PREFIXES = (
@@ -2359,7 +2368,15 @@ class ReasoningEngine:
                 # write 仍保留。
                 if state.status != TaskStatus.REASONING:
                     try:
-                        state.ensure_ready_for_reasoning()
+                        state.ensure_ready_for_reasoning(
+                            _gate_context(
+                                goal_defined=bool(
+                                    task_description
+                                    or state.task_definition
+                                    or state.task_query
+                                )
+                            )
+                        )
                     except IllegalReasoningEntry as _illegal_entry:
                         logger.warning(
                             "[ReAct-Stream] IllegalReasoningEntry on iter %d (session=%r): %s",
@@ -3259,9 +3276,14 @@ class ReasoningEngine:
                             trace_result,
                             _trace_started_at,
                         )
+                        # 交付/失败终局门：G9 CONFORMANCE
+                        state.guard_gate("G9", {"conforms_spec": not is_verify_incomplete})
                         try:
                             state.transition(
-                                TaskStatus.FAILED if is_verify_incomplete else TaskStatus.COMPLETED
+                                TaskStatus.FAILED if is_verify_incomplete else TaskStatus.COMPLETED,
+                                gate_ctx=_gate_context(
+                                    conforms_spec=not is_verify_incomplete
+                                ),
                             )
                         except ValueError:  # s5b-allow-force-write
                             state.status = (
@@ -3351,8 +3373,15 @@ class ReasoningEngine:
                             yield {"type": "text_replace", "content": ""}
                         yield {"type": "chain_text", "content": "任务尚未完成，继续处理..."}
                         react_trace.append(_iter_trace)
+                        # 验证门：G6 EVIDENCE_AUDIT
+                        state.guard_gate("G6", {"audit_record_complete": bool(react_trace)})
                         try:
-                            state.transition(TaskStatus.VERIFYING)
+                            state.transition(
+                                TaskStatus.VERIFYING,
+                                gate_ctx=_gate_context(
+                                    audit_record_complete=bool(react_trace)
+                                ),
+                            )
                         except ValueError:  # s5b-allow-force-write
                             state.status = TaskStatus.VERIFYING
                         (
@@ -3368,8 +3397,15 @@ class ReasoningEngine:
                 elif decision.type == DecisionType.TOOL_CALLS and decision.tool_calls:
                     # A new tool round can invalidate an earlier report candidate.
                     task_final_candidates.clear()
+                    # 执行门：G4 DATA_CONSOLIDATION
+                    state.guard_gate("G4", {"data_consolidated": bool(decision.tool_calls)})
                     try:
-                        state.transition(TaskStatus.ACTING)
+                        state.transition(
+                            TaskStatus.ACTING,
+                            gate_ctx=_gate_context(
+                                data_consolidated=bool(decision.tool_calls)
+                            ),
+                        )
                     except ValueError:  # s5b-allow-force-write
                         state.status = TaskStatus.ACTING
 
@@ -3788,8 +3824,20 @@ class ReasoningEngine:
                             _trace_started_at,
                         )
                         self._last_exit_reason = "ask_user"
+                        # 用户确认门：G3 PROGRESS_MONITOR
+                        state.guard_gate(
+                            "G3",
+                            {"plan_executable": bool(parsed_questions or decision.tool_calls)},
+                        )
                         try:
-                            state.transition(TaskStatus.WAITING_USER)
+                            state.transition(
+                                TaskStatus.WAITING_USER,
+                                gate_ctx=_gate_context(
+                                    plan_executable=bool(
+                                        parsed_questions or decision.tool_calls
+                                    )
+                                ),
+                            )
                         except ValueError:  # s5b-allow-force-write
                             state.status = TaskStatus.WAITING_USER
                         yield {"type": "done"}
@@ -4673,8 +4721,26 @@ class ReasoningEngine:
                             _budget_decision.exit_reason
                         )
 
+                    # 观察门：G2 START_COMMITMENT
+                    state.guard_gate(
+                        "G2",
+                        {
+                            "spec_complete": bool(
+                                task_description or state.task_definition or state.task_query
+                            )
+                        },
+                    )
                     try:
-                        state.transition(TaskStatus.OBSERVING)
+                        state.transition(
+                            TaskStatus.OBSERVING,
+                            gate_ctx=_gate_context(
+                                spec_complete=bool(
+                                    task_description
+                                    or state.task_definition
+                                    or state.task_query
+                                )
+                            ),
+                        )
                     except ValueError:  # s5b-allow-force-write
                         state.status = TaskStatus.OBSERVING
 
@@ -5298,8 +5364,13 @@ class ReasoningEngine:
                                 "loop_terminated",
                                 _trace_started_at,
                             )
+                            # 失败终局门：G9 CONFORMANCE
+                            state.guard_gate("G9", {"conforms_spec": False})
                             try:
-                                state.transition(TaskStatus.FAILED)
+                                state.transition(
+                                    TaskStatus.FAILED,
+                                    gate_ctx=_gate_context(conforms_spec=False),
+                                )
                             except ValueError:  # s5b-allow-force-write
                                 state.status = TaskStatus.FAILED
                             self._run_failure_analysis(
@@ -5379,8 +5450,13 @@ class ReasoningEngine:
             self._save_react_trace(
                 react_trace, conversation_id, session_type, "max_iterations", _trace_started_at
             )
+            # 失败终局门：G9 CONFORMANCE
+            state.guard_gate("G9", {"conforms_spec": False})
             try:
-                state.transition(TaskStatus.FAILED)
+                state.transition(
+                    TaskStatus.FAILED,
+                    gate_ctx=_gate_context(conforms_spec=False),
+                )
             except ValueError:  # s5b-allow-force-write
                 state.status = TaskStatus.FAILED
             logger.info(f"[ReAct-Stream] === MAX_ITERATIONS reached ({max_iterations}) ===")
@@ -7949,6 +8025,7 @@ class ReasoningEngine:
         )
 
         try:
+            # MODEL_SWITCHING 无对应校验门（规范 5.2），仅走状态机。
             state.transition(TaskStatus.MODEL_SWITCHING)
         except ValueError:
             # Same race surface as the reason_stream main-loop reasoning-entry:

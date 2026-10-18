@@ -41,8 +41,11 @@ Provider 方法可以是同步函数，返回值是 awaitable 时会自动 await
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
 import inspect
+import json
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -133,6 +136,17 @@ class MemoryRecord:
     created_at: str = ""
     updated_at: str = ""
 
+    # 内容分页（不截断）：content 是 [content_offset, next_offset) 这一页，
+    # 全文长度由 content_total 给出，has_more=True 时用 next_offset 继续读取。
+    content_offset: int = 0
+    content_total: int = 0
+    has_more: bool = False
+    next_offset: int = 0
+    page_token: str = ""
+    next_page_token: str = ""
+    page_soft_limit: bool = False
+    snapshot_version: str = ""
+
     # 多来源合并时的附加信息
     score: float = 0.0
     provider: str = ""
@@ -156,6 +170,14 @@ class MemoryRecord:
             "workspace_id": self.workspace_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "content_offset": self.content_offset,
+            "content_total": self.content_total,
+            "has_more": self.has_more,
+            "next_offset": self.next_offset,
+            "page_token": self.page_token,
+            "next_page_token": self.next_page_token,
+            "page_soft_limit": self.page_soft_limit,
+            "snapshot_version": self.snapshot_version,
             "score": self.score,
             "provider": self.provider,
             "metadata": dict(self.metadata),
@@ -187,6 +209,14 @@ class MemoryRecord:
             workspace_id=str(data.get("workspace_id", "") or ""),
             created_at=str(data.get("created_at", "") or ""),
             updated_at=str(data.get("updated_at", "") or ""),
+            content_offset=int(data.get("content_offset", 0) or 0),
+            content_total=int(data.get("content_total", 0) or 0),
+            has_more=bool(data.get("has_more", False)),
+            next_offset=int(data.get("next_offset", 0) or 0),
+            page_token=str(data.get("page_token", "") or ""),
+            next_page_token=str(data.get("next_page_token", "") or ""),
+            page_soft_limit=bool(data.get("page_soft_limit", False)),
+            snapshot_version=str(data.get("snapshot_version", "") or ""),
             score=float(data.get("score", data.get("relevance", 0.0)) or 0.0),
             provider=str(data.get("provider", "") or ""),
             metadata=dict(data.get("metadata", {}) or {}),
@@ -205,9 +235,10 @@ class MemoryRecord:
         updated_at = getattr(memory, "updated_at", None)
         memory_type = getattr(memory, "type", MemoryType.FACT)
         priority = getattr(memory, "priority", MemoryPriority.SHORT_TERM)
+        content = str(getattr(memory, "content", "") or "")
         return cls(
             id=str(getattr(memory, "id", "") or ""),
-            content=str(getattr(memory, "content", "") or ""),
+            content=content,
             type=memory_type.value if hasattr(memory_type, "value") else str(memory_type),
             priority=priority.value if hasattr(priority, "value") else str(priority),
             importance=float(getattr(memory, "importance_score", 0.5) or 0.5),
@@ -221,6 +252,11 @@ class MemoryRecord:
             workspace_id=str(getattr(memory, "workspace_id", "") or ""),
             created_at=created_at.isoformat() if isinstance(created_at, datetime) else "",
             updated_at=updated_at.isoformat() if isinstance(updated_at, datetime) else "",
+            content_offset=0,
+            content_total=len(content),
+            has_more=False,
+            next_offset=len(content),
+            snapshot_version=content_hash(content)[:12],
             score=float(score or 0.0),
             provider=provider,
             metadata={
@@ -234,6 +270,29 @@ class MemoryRecord:
                 },
             },
         )
+
+    def apply_content_page(
+        self,
+        content: str,
+        *,
+        offset: int,
+        total: int,
+        page_token: str = "",
+        next_page_token: str = "",
+        page_soft_limit: bool = False,
+        snapshot_version: str = "",
+    ) -> MemoryRecord:
+        """把一页内容写回记录（不截断，只标注分页状态）。"""
+        self.content = content
+        self.content_offset = max(0, int(offset))
+        self.content_total = max(0, int(total))
+        self.next_offset = self.content_offset + len(content)
+        self.has_more = self.next_offset < self.content_total
+        self.page_token = page_token
+        self.next_page_token = next_page_token
+        self.page_soft_limit = page_soft_limit
+        self.snapshot_version = snapshot_version
+        return self
 
     def to_semantic_memory(self) -> SemanticMemory:
         """转换为内部 ``SemanticMemory``（写入内置存储时使用）。"""
@@ -318,6 +377,92 @@ def _coerce_record(item: Any, provider: str) -> MemoryRecord | None:
     if not record.provider:
         record.provider = provider
     return record
+
+
+def content_hash(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def build_page_token(
+    *,
+    memory_id: str,
+    provider: str,
+    offset: int,
+    limit: int,
+    content_hash_value: str,
+    snapshot_version: str = "",
+    boundary_hint: str = "paragraph",
+) -> str:
+    """生成可续读分页 token；内容变化时通过 content_hash 校验失效。"""
+    payload = {
+        "v": 1,
+        "memory_id": memory_id,
+        "provider": provider,
+        "offset": int(offset),
+        "limit": int(limit),
+        "content_hash": content_hash_value,
+        "snapshot_version": snapshot_version or content_hash_value[:12],
+        "boundary_hint": boundary_hint,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def parse_page_token(token: str) -> dict[str, Any] | None:
+    if not token:
+        return None
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return payload if payload.get("v") == 1 else None
+
+
+def _content_page(
+    content: str,
+    *,
+    offset: int = 0,
+    limit: int = 4000,
+    memory_id: str = "",
+    provider: str = "",
+    boundary_hint: str = "paragraph",
+) -> dict[str, Any]:
+    """按显式分页返回内容；页面之间可无损拼接。"""
+    total = len(content)
+    offset = max(0, min(int(offset), total))
+    limit = max(1, int(limit))
+    chunk = content[offset : offset + limit]
+    next_offset = offset + len(chunk)
+    full_hash = content_hash(content)
+    snapshot = full_hash[:12]
+
+    def token(at: int) -> str:
+        return build_page_token(
+            memory_id=memory_id,
+            provider=provider,
+            offset=at,
+            limit=limit,
+            content_hash_value=full_hash,
+            snapshot_version=snapshot,
+            boundary_hint=boundary_hint,
+        )
+
+    return {
+        "ok": True,
+        "memory_id": memory_id,
+        "provider": provider,
+        "content": chunk,
+        "offset": offset,
+        "total": total,
+        "has_more": next_offset < total,
+        "next_offset": next_offset,
+        "content_hash": full_hash,
+        "snapshot_version": snapshot,
+        "page_soft_limit": len(chunk) > limit,
+        "page_token": token(offset),
+        "next_page_token": token(next_offset) if next_offset < total else "",
+    }
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -412,6 +557,29 @@ class BuiltinMemoryProvider:
 
     async def get(self, memory_id: str) -> MemoryRecord | None:
         return await asyncio.to_thread(self._get_sync, memory_id)
+
+    async def read_content(
+        self, memory_id: str, *, offset: int = 0, limit: int = 4000
+    ) -> dict[str, Any]:
+        """分页读取内置记忆全文（不截断，返回 has_more/next_offset）。"""
+        record = await self.get(memory_id)
+        if record is None:
+            return {
+                "ok": False,
+                "memory_id": memory_id,
+                "content": "",
+                "offset": 0,
+                "total": 0,
+                "has_more": False,
+                "next_offset": 0,
+            }
+        return _content_page(
+            record.content,
+            offset=offset,
+            limit=limit,
+            memory_id=memory_id,
+            provider=self.name,
+        )
 
     def _get_sync(self, memory_id: str) -> MemoryRecord | None:
         memory = None
@@ -642,6 +810,128 @@ class MemorySystemAPI:
                 return record
         return None
 
+    async def get_content(
+        self,
+        memory_id: str = "",
+        *,
+        offset: int = 0,
+        limit: int = 4000,
+        page_token: str | None = None,
+    ) -> dict[str, Any]:
+        """分页读取全文；页面可无损拼接，不存在的 ID 返回 ok=False。
+
+        ``page_token`` 优先于 ``memory_id/offset/limit``。内容在分页期间发生
+        变化时返回 ``token_expired=True`` 和新的 ``next_page_token``。
+        """
+        token_payload = parse_page_token(page_token or "")
+        if token_payload:
+            memory_id = str(token_payload.get("memory_id") or memory_id)
+            offset = int(token_payload.get("offset") or offset)
+            limit = int(token_payload.get("limit") or limit)
+
+        candidates: list[Any] = []
+        builtin = self.registry.builtin
+        if isinstance(builtin, BuiltinMemoryProvider):
+            candidates.append(builtin)
+        candidates.extend(entry.provider for entry in self.registry.list())
+
+        for provider in candidates:
+            fn = getattr(provider, "read_content", None)
+            if not callable(fn):
+                continue
+            try:
+                result = await _maybe_await(fn(memory_id, offset=offset, limit=limit))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[MemoryAPI] provider %s.read_content failed: %s",
+                    getattr(provider, "name", "?"),
+                    exc,
+                )
+                continue
+            if not isinstance(result, dict) or not result.get("ok"):
+                continue
+            if token_payload:
+                expected = token_payload.get("content_hash")
+                actual = result.get("content_hash")
+                if expected and actual and expected != actual:
+                    return {
+                        "ok": False,
+                        "token_expired": True,
+                        "memory_id": memory_id,
+                        "provider": result.get("provider", ""),
+                        "content": "",
+                        "offset": 0,
+                        "total": int(result.get("total") or 0),
+                        "has_more": True,
+                        "next_offset": 0,
+                        "content_hash": actual,
+                        "next_page_token": result.get("page_token", ""),
+                    }
+            return result
+
+        record = await self.get(memory_id)
+        if record is None:
+            return {
+                "ok": False,
+                "memory_id": memory_id,
+                "content": "",
+                "offset": 0,
+                "total": 0,
+                "has_more": False,
+                "next_offset": 0,
+            }
+        return _content_page(
+            record.content,
+            offset=offset,
+            limit=limit,
+            memory_id=memory_id,
+            provider=record.provider,
+        )
+
+    async def add_deferred(self, memory: MemoryRecord | dict[str, Any]) -> dict[str, Any]:
+        """两阶段写入：立即返回 event_id，后台完成落盘与索引。"""
+        record = memory if isinstance(memory, MemoryRecord) else MemoryRecord.from_dict(memory)
+        for entry in self.registry.list():
+            fn = getattr(entry.provider, "add_deferred", None)
+            if not callable(fn):
+                continue
+            try:
+                result = await _maybe_await(fn(record))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[MemoryAPI] provider %s.add_deferred failed: %s",
+                    getattr(entry.provider, "name", "?"),
+                    exc,
+                )
+                continue
+            if isinstance(result, dict) and result.get("event_id"):
+                return result
+        memory_id = await self.add(record)
+        return {
+            "event_id": "",
+            "status": "indexed",
+            "index_pending": False,
+            "memory_id": memory_id,
+        }
+
+    async def event_status(self, event_id: str) -> dict[str, Any]:
+        for entry in self.registry.list():
+            fn = getattr(entry.provider, "event_status", None)
+            if not callable(fn):
+                continue
+            try:
+                result = await _maybe_await(fn(event_id))
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(result, dict) and result.get("status") != "unknown":
+                return result
+        return {
+            "event_id": event_id,
+            "status": "unknown",
+            "memory_id": "",
+            "index_pending": False,
+        }
+
     async def delete(self, memory_id: str) -> bool:
         """删除记忆；任一 Provider 成功即视为成功。"""
         deleted = False
@@ -667,6 +957,36 @@ class MemorySystemAPI:
                 entry.provider, "stats", default={}
             )
         return result
+
+    async def get_context_bundle(self, query: str = "", max_tokens: int = 700) -> dict[str, Any]:
+        """返回带 manifest 的上下文包；Provider 不支持时退化为纯文本。"""
+        candidates: list[Any] = []
+        builtin = self.registry.builtin
+        if isinstance(builtin, BuiltinMemoryProvider):
+            candidates.append(builtin)
+        candidates.extend(entry.provider for entry in self.registry.list())
+        for provider in candidates:
+            fn = getattr(provider, "build_context", None)
+            if not callable(fn):
+                continue
+            try:
+                result = await _maybe_await(fn(query, max_tokens))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[MemoryAPI] provider %s.build_context failed: %s",
+                    getattr(provider, "name", "?"),
+                    exc,
+                )
+                continue
+            if isinstance(result, dict):
+                return result
+        text = await self.get_injection_context(query, max_tokens)
+        return {
+            "text": text,
+            "manifest": [],
+            "tokens_used": len(text),
+            "budget": max(200, int(max_tokens) * 4),
+        }
 
     async def get_injection_context(self, query: str = "", max_tokens: int = 700) -> str:
         """获取用于提示词注入的记忆上下文。"""
@@ -732,7 +1052,8 @@ class MemorySystemAPI:
         provider_names: list[str],
     ) -> list[MemoryRecord]:
         merged: list[MemoryRecord] = []
-        seen: set[str] = set()
+        seen_ids: set[str] = set()
+        seen_content: set[str] = set()
         for index, batch in enumerate(batches):
             if isinstance(batch, (dict, str, MemoryRecord)):
                 batch = [batch]
@@ -743,10 +1064,14 @@ class MemorySystemAPI:
                 record = _coerce_record(item, provider_name)
                 if record is None or not record.content:
                     continue
-                key = record.id or record.content.strip().lower()
-                if key in seen:
+                # 多 Provider 场景下 okmem id 可能重复，用 provider 限定去重键
+                id_key = f"{record.provider}:{record.id}" if record.id else ""
+                content_key = record.content.strip().lower()
+                if (id_key and id_key in seen_ids) or content_key in seen_content:
                     continue
-                seen.add(key)
+                if id_key:
+                    seen_ids.add(id_key)
+                seen_content.add(content_key)
                 merged.append(record)
                 if len(merged) >= limit:
                     return merged
@@ -822,6 +1147,53 @@ MEMORY_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "memory_add_async",
+        "category": "Memory",
+        "description": (
+            "Two-phase write: enqueue a memory and return an event_id immediately. "
+            "The memory is readable before indexing completes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string"},
+                "type": {
+                    "type": "string",
+                    "enum": ["fact", "preference", "skill", "error", "rule", "experience"],
+                    "default": "fact",
+                },
+                "importance": {"type": "number", "default": 0.5},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "memory_event_status",
+        "category": "Memory",
+        "description": "Check the status of a two-phase write by event_id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"event_id": {"type": "string"}},
+            "required": ["event_id"],
+        },
+    },
+    {
+        "name": "memory_context_bundle",
+        "category": "Memory",
+        "description": (
+            "Build a context bundle: prompt-ready text plus a manifest of "
+            "not-yet-loaded records and their page tokens."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_tokens": {"type": "integer", "default": 700},
+            },
+        },
+    },
+    {
         "name": "memory_get",
         "category": "Memory",
         "description": "Read one memory by id from the unified memory interface.",
@@ -829,6 +1201,27 @@ MEMORY_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "memory_id": {"type": "string", "description": "记忆 ID"},
+            },
+            "required": ["memory_id"],
+        },
+    },
+    {
+        "name": "memory_read",
+        "category": "Memory",
+        "description": (
+            "Read a page of a memory's full content. Pages are resumable: "
+            "use next_offset from the previous response to continue."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "记忆 ID"},
+                "offset": {"type": "integer", "default": 0},
+                "limit": {"type": "integer", "default": 4000},
+                "page_token": {
+                    "type": "string",
+                    "description": "上一页返回的 next_page_token（优先于 offset）",
+                },
             },
             "required": ["memory_id"],
         },
@@ -915,6 +1308,37 @@ async def dispatch_memory_tool(
             "ok": record is not None,
             "memory": record.to_dict() if record is not None else None,
         }
+
+    if name == "memory_add_async":
+        result = await api.add_deferred(
+            MemoryRecord(
+                content=str(args.get("content", "") or ""),
+                type=str(args.get("type", "fact") or "fact"),
+                importance=float(args.get("importance", 0.5) or 0.5),
+                tags=normalize_tags(args.get("tags")),
+            )
+        )
+        return {
+            "ok": bool(result.get("event_id") or result.get("memory_id")),
+            **result,
+        }
+
+    if name == "memory_event_status":
+        return await api.event_status(str(args.get("event_id", "") or ""))
+
+    if name == "memory_context_bundle":
+        return await api.get_context_bundle(
+            str(args.get("query", "") or ""),
+            max_tokens=int(args.get("max_tokens", 700) or 700),
+        )
+
+    if name == "memory_read":
+        return await api.get_content(
+            str(args.get("memory_id", "") or ""),
+            offset=int(args.get("offset", 0) or 0),
+            limit=int(args.get("limit", 4000) or 4000),
+            page_token=str(args.get("page_token", "") or "") or None,
+        )
 
     if name == "memory_delete":
         deleted = await api.delete(str(args.get("memory_id", "") or ""))

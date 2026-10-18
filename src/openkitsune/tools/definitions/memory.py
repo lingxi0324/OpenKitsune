@@ -10,6 +10,8 @@ Memory 工具定义
 - trace_memory: 跨层导航（记忆↔情节↔对话）
 """
 
+from ...memory.openkitsune_brain import BRAIN_TOOL_SCHEMAS as _BRAIN_TOOL_SCHEMAS
+
 MEMORY_TOOLS = [
     {
         "name": "consolidate_memories",
@@ -351,3 +353,46 @@ MEMORY_TOOLS = [
         },
     },
 ]
+
+# ---------------------------------------------------------------------------
+# openkitsune-brain 长期记忆工具
+# ---------------------------------------------------------------------------
+# 定义来自 openkitsune.memory.openkitsune_brain.BRAIN_TOOL_SCHEMAS，
+# 这里补充 Agent 侧的使用说明，避免两处维护同一份 JSON Schema。
+_BRAIN_TOOL_DETAILS = {
+    "brain_recall": """运行 openkitsune-brain 六池主动回忆闭环，返回可直接注入提示词的记忆上下文。
+
+**适用场景**：需要回顾历史决策、偏好、任务进度、情绪状态或跨会话经历。
+**返回**：`memory_context`（六池召回 + 打分 + 场景注入）与阶段明细。
+**注意**：这是增强检索，不会替代当前会话上下文。""",
+    "brain_knowledge_search": """检索 fusion-memory 知识库（中医 / 玄学 / 长期笔记）。
+
+**适用场景**：用户询问知识性内容，且当前对话与内置记忆都没有答案。
+**返回**：`fusion:` / `fusion-fts:` 来源的条目，含 key、分类和相似度。""",
+    "brain_save_turn": """把一轮 user / assistant 对话写入 openkitsune-brain 长期记忆。
+
+**适用场景**：跨会话需要保留的偏好、决策、承诺或经验。
+**注意**：临时任务参数不要写入；优先使用 `add_memory` 表达明确的长记忆。""",
+    "brain_proactive_review": """获取主动复盘队列：冲突、弱记忆、开放假设、未校验结论、未建网记忆、未完成任务、到期复习。
+
+**适用场景**：空闲自省、开始新任务前检查遗留问题、定期维护。""",
+    "brain_health": """获取 openkitsune-brain 记忆健康报告（规模、完整性、回忆、图谱质量、冲突）。""",
+    "brain_progress": """读取 L1 进度快照：总目标、任务状态、最近决策、下一步动作。
+
+**适用场景**：跨会话恢复任务进度，或用户询问“我们做到哪了”。""",
+    "brain_backfill": """把 fusion-memory 知识库回填到 okmem。
+
+**默认演练**（`dry_run=True`），确认后再用 `dry_run=False` 真正导入；按 content_hash 去重。""",
+    "brain_record_emotion": """记录当前情绪状态（标签 / 强度 / 触发事件 / 诉求 / 共情边界）到情感记忆池。""",
+    "brain_emotion_state": """读取当前会话的最新情绪状态，用于调整回复语气与共情策略。""",
+    "brain_detect_emotion": """用多信号规则从自由文本中检测情绪标签与强度，不写入记忆。""",
+    "brain_maintain_sessions": """按 TTL 归档过期会话记忆。
+
+**默认演练**（`apply=False`），确认后用 `apply=True` 执行可逆归档。""",
+}
+
+MEMORY_TOOLS.extend(
+    {**schema, "detail": _BRAIN_TOOL_DETAILS.get(schema["name"], "")}
+    for schema in _BRAIN_TOOL_SCHEMAS
+)
+

@@ -196,47 +196,115 @@ class Settings(BaseSettings):
     # .env 中整体覆盖：SKILLS_INTENT_ALIASES=[["海报","poster"],...]
     skills_intent_aliases: list = Field(
         default_factory=lambda: [
-            ["海报", "poster posters banner"], ["横幅", "banner"], ["设计", "design designing"],
-            ["logo", "logo"], ["图标", "icon"],
-            ["邮件", "email emails gmail"], ["邮箱", "gmail"], ["发送", "send"],
-            ["日历", "calendar google calendar calendars"], ["日程", "calendar schedule scheduling"], ["会议", "meeting meetings"],
-            ["表格", "spreadsheet spreadsheets excel"], ["电子表格", "spreadsheet"], ["透视", "pivot"],
-            ["word", "word"], ["文档", "document documents"],
-            ["演示", "slide slides"], ["幻灯片", "slide slides"], ["ppt", "ppt"],
-            ["调试", "debug debugging"], ["报错", "error errors"], ["代码", "code"],
-            ["审查", "review"], ["评审", "review"],
-            ["测试", "test testing"], ["网页", "web"],
-            ["下载", "download downloading"], ["视频", "video videos"],
-            ["音乐", "music"], ["图片", "image images"], ["图像", "image images"], ["照片", "photo photos"],
-            ["论文", "paper papers"], ["文献", "literature"], ["学术", "scholar"],
-            ["小说", "novel"], ["写作", "write writing"],
-            ["搜索", "search searching"], ["新闻", "news"], ["百科", "encyclopedia"],
-            ["待办", "todo"], ["定时", "schedule scheduling"], ["提醒", "reminder"], ["定时任务", "cron"],
-            ["记忆", "memory memories"], ["记住", "remember"], ["检索", "search"],
-            ["地图", "map"], ["路线", "route"], ["打车", "ride"], ["出行", "travel"],
-            ["电商", "ecommerce"], ["商品", "product products"], ["营销", "marketing"],
-            ["公众号", "wechat"], ["微信", "wechat"], ["抖音", "douyin"],
-            ["小红书", "xiaohongshu"], ["b站", "bilibili"], ["哔哩哔哩", "bilibili"],
-            ["飞书", "feishu"], ["钉钉", "dingtalk"], ["企业微信", "wecom"],
-            ["技能", "skill"], ["安装", "install"],
-            ["头脑风暴", "brainstorm"], ["更新日志", "changelog"],
-            ["git", "git"], ["github", "github"], ["仓库", "repository repositories"],
-            ["绘画", "art"], ["封面", "cover"],
-            ["翻译", "translate"], ["总结", "summarize summarizing"], ["摘要", "summary"],
-            ["pdf", "pdf"], ["mermaid", "mermaid"], ["图表", "chart charts"],
-            ["架构图", "diagram diagrams"], ["研究", "research researching"], ["调研", "research"],
-            ["深度", "deep"], ["验证", "verify"],
-            ["复盘", "postmortem"], ["根因", "root cause"], ["风险", "risk"],
-            ["检查点", "checkpoint"], ["回滚", "rollback"], ["审计", "audit"],
-            ["健康", "health"], ["测试运行", "test"],
-            ["命令行", "shell"], ["终端", "shell"],
-            ["音频", "audio"], ["语音", "voice"],
-            ["资料", "profile"], ["画像", "profile"], ["更新", "update"],
-            ["文件夹", "folder directory folders"], ["文件", "file files"], ["整理", "organize organizing"],
-            ["个人资料", "profile"], ["偏好", "preference preferences"],
-            ["安排", "schedule scheduling"], ["会议日程", "calendar"],
-            ["代码审查", "code review"], ["测试用例", "test"],
-            ["促销", "promotion"], ["推广", "marketing"],
+            ["海报", "poster posters banner"],
+            ["横幅", "banner"],
+            ["设计", "design designing"],
+            ["logo", "logo"],
+            ["图标", "icon"],
+            ["邮件", "email emails gmail"],
+            ["邮箱", "gmail"],
+            ["发送", "send"],
+            ["日历", "calendar google calendar calendars"],
+            ["日程", "calendar schedule scheduling"],
+            ["会议", "meeting meetings"],
+            ["表格", "spreadsheet spreadsheets excel"],
+            ["电子表格", "spreadsheet"],
+            ["透视", "pivot"],
+            ["word", "word"],
+            ["文档", "document documents"],
+            ["演示", "slide slides"],
+            ["幻灯片", "slide slides"],
+            ["ppt", "ppt"],
+            ["调试", "debug debugging"],
+            ["报错", "error errors"],
+            ["代码", "code"],
+            ["审查", "review"],
+            ["评审", "review"],
+            ["测试", "test testing"],
+            ["网页", "web"],
+            ["下载", "download downloading"],
+            ["视频", "video videos"],
+            ["音乐", "music"],
+            ["图片", "image images"],
+            ["图像", "image images"],
+            ["照片", "photo photos"],
+            ["论文", "paper papers"],
+            ["文献", "literature"],
+            ["学术", "scholar"],
+            ["小说", "novel"],
+            ["写作", "write writing"],
+            ["搜索", "search searching"],
+            ["新闻", "news"],
+            ["百科", "encyclopedia"],
+            ["待办", "todo"],
+            ["定时", "schedule scheduling"],
+            ["提醒", "reminder"],
+            ["定时任务", "cron"],
+            ["记忆", "memory memories"],
+            ["记住", "remember"],
+            ["检索", "search"],
+            ["地图", "map"],
+            ["路线", "route"],
+            ["打车", "ride"],
+            ["出行", "travel"],
+            ["电商", "ecommerce"],
+            ["商品", "product products"],
+            ["营销", "marketing"],
+            ["公众号", "wechat"],
+            ["微信", "wechat"],
+            ["抖音", "douyin"],
+            ["小红书", "xiaohongshu"],
+            ["b站", "bilibili"],
+            ["哔哩哔哩", "bilibili"],
+            ["飞书", "feishu"],
+            ["钉钉", "dingtalk"],
+            ["企业微信", "wecom"],
+            ["技能", "skill"],
+            ["安装", "install"],
+            ["头脑风暴", "brainstorm"],
+            ["更新日志", "changelog"],
+            ["git", "git"],
+            ["github", "github"],
+            ["仓库", "repository repositories"],
+            ["绘画", "art"],
+            ["封面", "cover"],
+            ["翻译", "translate"],
+            ["总结", "summarize summarizing"],
+            ["摘要", "summary"],
+            ["pdf", "pdf"],
+            ["mermaid", "mermaid"],
+            ["图表", "chart charts"],
+            ["架构图", "diagram diagrams"],
+            ["研究", "research researching"],
+            ["调研", "research"],
+            ["深度", "deep"],
+            ["验证", "verify"],
+            ["复盘", "postmortem"],
+            ["根因", "root cause"],
+            ["风险", "risk"],
+            ["检查点", "checkpoint"],
+            ["回滚", "rollback"],
+            ["审计", "audit"],
+            ["健康", "health"],
+            ["测试运行", "test"],
+            ["命令行", "shell"],
+            ["终端", "shell"],
+            ["音频", "audio"],
+            ["语音", "voice"],
+            ["资料", "profile"],
+            ["画像", "profile"],
+            ["更新", "update"],
+            ["文件夹", "folder directory folders"],
+            ["文件", "file files"],
+            ["整理", "organize organizing"],
+            ["个人资料", "profile"],
+            ["偏好", "preference preferences"],
+            ["安排", "schedule scheduling"],
+            ["会议日程", "calendar"],
+            ["代码审查", "code review"],
+            ["测试用例", "test"],
+            ["促销", "promotion"],
+            ["推广", "marketing"],
         ],
         description="双语别名种子表（查询扩展用）：[中文主题词, 空格分隔的英文术语列表]。",
     )
@@ -767,6 +835,48 @@ class Settings(BaseSettings):
         description="单次自检自动修复的 token 预算，达到后跳过后续自动修复（0=不限制）",
     )
 
+    # === 空间感知配置 ===
+    spatial_awareness_enabled: bool = Field(
+        default=True,
+        description=(
+            "是否启用基于 IP 的空间感知。启用后，桌面/API 会话会把客户端 IP 的"
+            "城市级近似位置、时区和本地时间注入对话上下文；原始 IP 不落盘、不写日志。"
+        ),
+    )
+    spatial_manual_location: str = Field(
+        default="",
+        description=(
+            "手动设置当前城市/地区（如「四川泸州」）。设置后跳过 IP 城市推断，"
+            "直接作为可信位置注入；适合运营商跨省出口、CGNAT 或 VPN 导致 IP 定位不准的场景。"
+        ),
+    )
+    spatial_wifi_enabled: bool = Field(
+        default=False,
+        description=(
+            "是否启用 Wi-Fi BSSID 定位（需 Wi-Fi 网卡，当前支持 Windows）。"
+            "开启后会扫描附近 Wi-Fi 并将 BSSID 发送到免费服务 beaconDB 换取坐标，"
+            "再用 BigDataCloud 反查城市；精度通常优于 IP，但属于位置敏感数据，默认关闭。"
+        ),
+    )
+    spatial_wifi_timeout_seconds: float = Field(
+        default=2.5,
+        description="Wi-Fi 扫描 + beaconDB 定位的总超时（秒）",
+    )
+    spatial_trusted_proxies: str = Field(
+        default="",
+        description=(
+            "可信反向代理 CIDR 列表（逗号分隔）。只有当直连对端命中该列表（或为本机回环）时，"
+            "才会解析 X-Forwarded-For，避免伪造头导致位置误判。"
+        ),
+    )
+    spatial_lookup_timeout_seconds: float = Field(
+        default=1.5,
+        description=(
+            "在线 IP 归属地查询的总硬超时（秒）。多个数据源并行查询，超时后按已有结果"
+            "降级（仅单一数据源时只保留国家/时区，不声称城市）。"
+        ),
+    )
+
     # === 记忆整理配置 ===
     memory_consolidation_onboarding_days: int = Field(
         default=7,
@@ -1234,8 +1344,13 @@ class Settings(BaseSettings):
     )
     context_priority_weights: dict[str, float] = Field(
         default_factory=lambda: {
-            "alpha": 0.40, "beta": 0.20, "gamma": 0.10,
-            "delta": 0.10, "epsilon": 0.05, "eta": 0.10, "theta": 0.05,
+            "alpha": 0.40,
+            "beta": 0.20,
+            "gamma": 0.10,
+            "delta": 0.10,
+            "epsilon": 0.05,
+            "eta": 0.10,
+            "theta": 0.05,
         },
         description="动态评分权重：α层级 β关联 γ因果 δ不可恢复 ε时效 -η冗余 -θ成本",
     )

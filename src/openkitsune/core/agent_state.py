@@ -13,10 +13,11 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Any
 
 from .abort_scope import AbortScope
+from .gates import AuditRecord, FailureAction, GateRegistry, gate_context
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,72 @@ _VALID_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.COMPLETED: {TaskStatus.IDLE, TaskStatus.CANCELLED},
     TaskStatus.FAILED: {TaskStatus.IDLE, TaskStatus.CANCELLED},
     TaskStatus.CANCELLED: {TaskStatus.IDLE},
+}
+
+
+class Stage(IntEnum):
+    """任务级生命周期阶段 S0-S9（规范第 7 章）。
+
+    与 :class:`TaskStatus`（回合级执行状态）互补：
+    ``TaskStatus`` 描述当前在做什么，``Stage`` 描述任务走到哪一步。
+    """
+
+    S0_INTENT = 0
+    S1_SPEC = 1
+    S2_PLAN = 2
+    S3_DRAFT = 3
+    S4_EXECUTION = 4
+    S5_AUDIT = 5
+    S6_VERIFICATION = 6
+    S7_OPTIMIZE = 7
+    S8_DELIVERY = 8
+    S9_RETROSPECT = 9
+
+
+# TaskStatus → Stage（运行时可观察阶段）。
+#
+# 未列出的状态是「保持原位」状态（见 STAGE_HOLD_STATUSES）：
+#   MODEL_SWITCHING 只是切换模型，不改变任务所处阶段；
+#   FAILED / CANCELLED 是终态，保留失败/取消时已到达的阶段。
+#
+# 说明：S3_DRAFT（草稿生成）、S7_OPTIMIZE（定稿优化）、S9_RETROSPECT
+# （复盘沉淀）当前没有独立的 TaskStatus —— 它们分别发生在 REASONING 的
+# 流式输出、VERIFYING 的收敛循环、以及任务结束后的 memory/evolution
+# 流程中。STAGE_TO_GATES 仍为这 3 个阶段保留门映射，供后续把对应子流程
+# 提升为显式状态时直接使用。
+STATUS_TO_STAGE: dict[TaskStatus, Stage] = {
+    TaskStatus.IDLE: Stage.S0_INTENT,
+    TaskStatus.WAITING_USER: Stage.S0_INTENT,
+    TaskStatus.COMPILING: Stage.S1_SPEC,
+    TaskStatus.REASONING: Stage.S2_PLAN,
+    TaskStatus.ACTING: Stage.S4_EXECUTION,
+    TaskStatus.OBSERVING: Stage.S5_AUDIT,
+    TaskStatus.VERIFYING: Stage.S6_VERIFICATION,
+    TaskStatus.COMPLETED: Stage.S8_DELIVERY,
+}
+
+# 转换到这些状态时，stage_idx / gate_idx 保持原位。
+STAGE_HOLD_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.MODEL_SWITCHING,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
+)
+
+# 阶段 → 进入该阶段时应通过的门（对应 core/gates.py 的 bound_stage 语义）。
+# 进入 S(n) 审计 G(n)；S7 额外包含内部门 G8，S9 包含闭环门 G11。
+STAGE_TO_GATES: dict[Stage, tuple[str, ...]] = {
+    Stage.S0_INTENT: ("G0",),
+    Stage.S1_SPEC: ("G1",),
+    Stage.S2_PLAN: ("G2",),
+    Stage.S3_DRAFT: ("G3",),
+    Stage.S4_EXECUTION: ("G4",),
+    Stage.S5_AUDIT: ("G5",),
+    Stage.S6_VERIFICATION: ("G6",),
+    Stage.S7_OPTIMIZE: ("G7", "G8"),
+    Stage.S8_DELIVERY: ("G9",),
+    Stage.S9_RETROSPECT: ("G10", "G11"),
 }
 
 
@@ -243,19 +310,29 @@ class TaskState:
     # TaskState 新增 stage_idx + gate_idx 双维度，合法性由奇偶校验保证。
     # 与 lifecycle_constraints.Gate.parity_consistent 同义：
     #   is_valid() = (stage_idx % 2) == (gate_idx % 2)
-    # 合法态共 60 个（10×12=120，同奇偶），30 个失衡态被 is_valid 拦截。
+    # 合法态共 60 个（10×12=120，同奇偶），另外 60 个失衡态被 is_valid 拦截。
     # 注意：此处是 v1 core/agent_state.py 的 TaskState（对应 ReasoningEngine），
     #       v2 runtime/models.py 的 TaskLifecycleState 已有独立实现。
     # ──────────────────────────────────────────────────────────────────
     stage_idx: int = 0
     gate_idx: int = 0
 
+    # Gate 失败三态的运行时落点（由 ORCHESTRATOR / 调用方消费）：
+    #   pending_gate_failure 保留最近一次失败记录（含 rollback_target / action）；
+    #   suspended + suspend_reason 表示 SUSPEND 已生效，等待条件满足后重试。
+    pending_gate_failure: AuditRecord | None = None
+    suspended: bool = False
+    suspend_reason: str = ""
+
     def is_valid(self) -> bool:
         """复合状态合法性校验（规范第 7 章）。
 
-        推进序号与校验序号同奇偶 → 合法态；异奇偶 → 失衡态，
-        状态机在进入前拦截（见 begin_task / ensure_ready_for_reasoning）。
+        推进序号与校验序号同奇偶且在各自值域内（stage 0-9，gate 0-11）
+        → 合法态；越界或异奇偶 → 失衡态，状态机在进入前拦截
+        （见 advance / ensure_ready_for_reasoning）。
         """
+        if not (0 <= self.stage_idx <= 9 and 0 <= self.gate_idx <= 11):
+            return False
         return (self.stage_idx % 2) == (self.gate_idx % 2)
 
     def advance(self) -> tuple[int, int]:
@@ -265,10 +342,15 @@ class TaskState:
             (new_stage_idx, new_gate_idx)
 
         Raises:
-            ValueError: 推进后同奇偶校验失败（失衡态拦截）。
+            ValueError: 推进越界（stage > 9 / gate > 11）或同奇偶校验失败。
         """
         new_stage = self.stage_idx + 1
         new_gate = self.gate_idx + 1
+        if new_stage > 9 or new_gate > 11:
+            raise ValueError(
+                f"推进越界：stage={new_stage} (上限 9), gate={new_gate} (上限 11) – "
+                f"已到流程终点，不能继续 advance()。"
+            )
         if (new_stage % 2) != (new_gate % 2):
             raise ValueError(
                 f"推进后失衡：stage={new_stage} (奇), gate={new_gate} (偶) – "
@@ -288,11 +370,14 @@ class TaskState:
         self.gate_idx = new_gate
         return (new_stage, new_gate)
 
-    def transition(self, new_status: TaskStatus) -> None:
+    def transition(self, new_status: TaskStatus, gate_ctx: dict | None = None) -> None:
         """执行状态转换，带合法性验证。
 
         Args:
             new_status: 目标状态
+            gate_ctx: 可选。提供时进入严格模式：用该上下文执行新阶段绑定
+                的门，失败则按三态（回退/挂起/请求确认）落点处理；
+                默认 ``None`` 保持「放行优先」，仅记录审计。
 
         Raises:
             ValueError: 非法状态转换
@@ -323,10 +408,145 @@ class TaskState:
                 f"合法目标: {[s.value for s in valid_targets]}"
             )
         old_status = self.status
+        old_stage = self.stage_idx
         self.status = new_status
         logger.debug(f"[State] {old_status.value} -> {new_status.value} (task={self.task_id[:8]})")
+        # --- 复合状态同步（规范第 7 章） ---
+        # 用 STATUS_TO_STAGE 映射更新 (stage_idx, gate_idx)，而不是无条件
+        # advance()：ReAct 循环里 REASONING→ACTING→OBSERVING 会反复迁移，
+        # 逐次递增会在 10 次后越界；映射保证长循环内坐标始终有界且同奇偶。
+        self._sync_composite_state(old_stage)
+        if gate_ctx is not None:
+            self._enforce_stage_gates(gate_ctx)
 
-    def ensure_ready_for_reasoning(self) -> None:
+    def _sync_composite_state(self, old_stage: int) -> None:
+        """按当前 status 同步复合坐标，并在阶段跃迁时执行门审计。"""
+        stage = STATUS_TO_STAGE.get(self.status)
+        if stage is None:
+            return  # MODEL_SWITCHING / FAILED / CANCELLED：保持原位
+        self.stage_idx = int(stage)
+        self.gate_idx = int(stage)  # G<stage>，与 stage 同奇偶
+        if self.stage_idx != old_stage:
+            self._audit_stage_entry()
+
+    def _audit_stage_entry(self) -> None:
+        """进入新阶段时执行该阶段绑定的门（放行优先，仅记录审计）。"""
+        try:
+            stage = Stage(self.stage_idx)
+        except ValueError:
+            return
+        for gate_id in STAGE_TO_GATES.get(stage, ()):
+            gate = GateRegistry.get(gate_id)
+            if gate is not None:
+                gate.check(None)
+
+    def check_gate(self, gate_id: str, ctx: dict | None = None) -> AuditRecord:
+        """在任务上下文中执行指定门。
+
+        ``ctx is None`` 时沿用 core/gates.py 的「放行优先」语义；
+        需要严格判定时传入上下文（例如 ``{"spec_complete": True}``）。
+        """
+        gate = GateRegistry.get(gate_id)
+        if gate is None:
+            raise ValueError(f"Unknown gate: {gate_id}")
+        return gate.check(ctx)
+
+    def guard_gate(self, gate_id: str, ctx: dict | None = None) -> AuditRecord:
+        """在状态转换点执行指定门，并消费失败三态。
+
+        与 :meth:`transition` 的 ``gate_ctx`` 严格模式互补：本方法允许
+        调用点显式指定「逻辑上对应的门」，而不依赖阶段到门的映射。
+        失败不抛异常，结果写入 ``pending_gate_failure`` / ``suspended``，
+        由 ORCHESTRATOR 或后续循环消费。
+        """
+        record = self.check_gate(gate_id, ctx)
+        if not record.passed:
+            action = self.apply_gate_result(record)
+            logger.warning(
+                "[Gate] %s failed at %s transition: action=%s, reason=%s",
+                gate_id,
+                self.status.value,
+                action,
+                record.reason,
+            )
+        return record
+
+    # ── Gate 失败三态的运行时消费 ──────────────────────────────────
+
+    def can_transition(self, new_status: TaskStatus) -> bool:
+        """只读判定：目标状态是否在当前状态的合法迁移集合内。"""
+        return new_status in _VALID_TRANSITIONS.get(self.status, set())
+
+    def rollback_to(self, stage_idx: int) -> tuple[int, int]:
+        """回退复合坐标到指定阶段（gate 与 stage 同值，保持奇偶一致）。"""
+        target = max(0, min(stage_idx, 9))
+        self.stage_idx = target
+        self.gate_idx = target
+        return (target, target)
+
+    def apply_gate_result(self, record: AuditRecord) -> str:
+        """消费 Gate 判定结果并驱动任务状态（失败三态）。
+
+        - ``ROLLBACK``：复合坐标回退到 ``record.rollback_target``；
+        - ``SUSPEND``：置 ``suspended``，等待条件满足后由调用方重试；
+        - ``CONFIRM``：合法时转入 ``WAITING_USER``；非法时保留 pending，
+          交由编排层在合适时机处理。
+
+        Returns:
+            ``"pass"`` / ``"rollback"`` / ``"suspend"`` / ``"confirm"``
+        """
+        if record.passed:
+            return "pass"
+
+        raw_action = record.action
+        action = (
+            raw_action.value if isinstance(raw_action, FailureAction) else raw_action
+        ) or FailureAction.ROLLBACK.value
+        self.pending_gate_failure = record
+
+        if action == FailureAction.ROLLBACK.value:
+            if record.rollback_target is not None:
+                try:
+                    self.rollback_to(int(record.rollback_target))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "[Gate] invalid rollback target %r from %s",
+                        record.rollback_target,
+                        record.gate,
+                    )
+        elif action == FailureAction.SUSPEND.value:
+            self.suspended = True
+            self.suspend_reason = record.reason
+        elif action == FailureAction.CONFIRM.value and self.can_transition(TaskStatus.WAITING_USER):
+            self.transition(TaskStatus.WAITING_USER)
+        return action
+
+    def clear_suspension(self) -> None:
+        """清除 SUSPEND 落点（条件满足、准备重试时调用）。"""
+        self.suspended = False
+        self.suspend_reason = ""
+        self.pending_gate_failure = None
+
+    def _enforce_stage_gates(self, gate_ctx: dict) -> None:
+        """严格模式：用调用方上下文执行进入阶段绑定的门。
+
+        首个失败即按三态处理并停止后续门判定。默认 ``ctx is None``
+        的路径不进入本方法，保持既有「放行优先」行为。
+        """
+        try:
+            stage = Stage(self.stage_idx)
+        except ValueError:
+            return
+        # 与 DEFAULT_GATE_CONTEXT 合并：调用点只覆盖自己持有证据的键，
+        # 未提供的键保持放行，避免部分上下文把无关门误判为失败。
+        merged_ctx = gate_context(**gate_ctx)
+        for gate_id in STAGE_TO_GATES.get(stage, ()):
+            record = self.check_gate(gate_id, merged_ctx)
+            if not record.passed:
+                self.apply_gate_result(record)
+                return
+
+    def ensure_ready_for_reasoning(self, gate_ctx: dict | None = None) -> None:
         """v1.28.3 S5-A: idempotent entry guard for reasoning loops.
 
         Semantics:
@@ -341,6 +561,10 @@ class TaskState:
           illegal transition still raises ``ValueError`` (also fatal —
           see :meth:`transition` contract).
 
+        Args:
+            gate_ctx: 可选。提供时在进入 REASONING 前执行 G0
+                （GOAL_CONFIRMATION）；默认 ``None`` 仅依赖状态机校验。
+
         Use this whenever ``reason_stream`` or ``run`` re-enters the
         REASONING phase on the same TaskState (continuation, retry,
         post-tool-loop).  Don't use ``self.status = REASONING`` for the
@@ -349,13 +573,21 @@ class TaskState:
         """
         if self.status is TaskStatus.REASONING:
             return
+        if not self.is_valid():
+            raise ValueError(
+                f"复合状态失衡，拒绝进入 REASONING: "
+                f"stage_idx={self.stage_idx}, gate_idx={self.gate_idx} "
+                f"(task_id={self.task_id[:8]}); 奇偶校验失败"
+            )
         if self.is_terminal:
             raise IllegalReasoningEntry(
                 f"ensure_ready_for_reasoning on {self.status.value} state "
                 f"(task_id={self.task_id[:8]}); caller must call "
                 f"AgentState.begin_task() first to obtain a fresh TaskState"
             )
-        self.transition(TaskStatus.REASONING)
+        if gate_ctx is not None:
+            self.guard_gate("G0", gate_ctx)
+        self.transition(TaskStatus.REASONING, gate_ctx=gate_ctx)
 
     # v1.28 S3: ``cancel_event`` is now a thin alias for ``abort_root.event``.
     # All existing readers (``task.cancel_event.wait()``, ``.is_set()``) and

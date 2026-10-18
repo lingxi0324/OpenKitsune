@@ -38,6 +38,7 @@ class SystemHandler:
         "generate_image",
         "set_task_timeout",
         "get_workspace_map",
+        "get_spatial_context",
     ]
 
     # C7 explicit ApprovalClass
@@ -51,6 +52,8 @@ class SystemHandler:
         "generate_image": ApprovalClass.NETWORK_OUT,
         "set_task_timeout": ApprovalClass.CONTROL_PLANE,
         "get_workspace_map": ApprovalClass.READONLY_GLOBAL,
+        # IP 归属地查询需要出站网络请求
+        "get_spatial_context": ApprovalClass.NETWORK_OUT,
     }
 
     def __init__(self, agent: "Agent"):
@@ -78,8 +81,29 @@ class SystemHandler:
             return self._set_task_timeout(params)
         elif tool_name == "get_workspace_map":
             return self._get_workspace_map()
+        elif tool_name == "get_spatial_context":
+            return await self._get_spatial_context()
         else:
             return f"❌ Unknown system tool: {tool_name}"
+
+    async def _get_spatial_context(self) -> str:
+        """返回当前请求的近似空间上下文（城市级，带不确定性标记）。"""
+        import json
+
+        from ...core.spatial_context import resolve_current_spatial_context
+
+        context = await resolve_current_spatial_context()
+        if context is None:
+            return json.dumps(
+                {
+                    "status": "disabled",
+                    "degraded_reason": "spatial_awareness_disabled",
+                    "hint": "空间感知已关闭，请勿推断用户位置。",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        return json.dumps(context.to_dict(), ensure_ascii=False, indent=2)
 
     def _enable_thinking(self, params: dict) -> str:
         """控制深度思考模式"""

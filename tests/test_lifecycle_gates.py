@@ -23,6 +23,7 @@ from openkitsune.agent.lifecycle_constraints import (
     GATE_ORDER,
     GATE_TO_PHASE,
     PHASE_TO_GATE,
+    ROLE_ALIASES,
     STRATEGY_ROLES,
     STRATEGY_STAGES,
     AgentRole,
@@ -156,6 +157,23 @@ class TestRolesAndTopology:
             AgentRole.DELIVERY,
             AgentRole.MEMORY,
         }
+
+    def test_role_aliases_cover_spec_names(self) -> None:
+        """规范 9 角色名与域内角色一一对应（含 COLLECTOR/CONTEXT_POOL/PRESENTER）。"""
+        assert len(ROLE_ALIASES) == 9
+        assert set(ROLE_ALIASES) == {
+            "ORCHESTRATOR",
+            "EXECUTOR",
+            "COLLECTOR",
+            "CONTEXT_POOL",
+            "PRESENTER",
+            "MEMORY_STORE",
+            "GUARD",
+            "REASONER",
+            "VALIDATOR",
+        }
+        assert set(ROLE_ALIASES.values()) == set(ALL_ROLES)
+        assert len(set(ROLE_ALIASES.values())) == 9
 
     def test_four_counterbalance_pairs(self) -> None:
         """4 组对角制衡：每组两端角色互异、均属 9 角色集。"""

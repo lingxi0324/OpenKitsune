@@ -6,7 +6,7 @@ Gate interface + 12 校验门实例（规范第 5 章）
 
 Usage:
     from openkitsune.core.gates import GateRegistry, GATE_ORDER, GATE_DESCRIPTIONS, check_completeness
-    
+
     # In ORCHESTRATOR:
     #   GateRegistry.register(my_gate)
     #   result = GateRegistry.get("G0").check(ctx)
@@ -16,13 +16,14 @@ Usage:
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Callable, Protocol, runtime_checkable
 import time
-import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Protocol
 
 
+@dataclass
 class AuditRecord:
     """Gate 判定审计日志，判定依据可追溯。"""
 
@@ -32,6 +33,7 @@ class AuditRecord:
     passed: bool
     reason: str
     rollback_target: str | None = None
+    action: str | None = None
     context: dict = field(default_factory=dict)
 
     def __repr__(self) -> str:
@@ -41,12 +43,31 @@ class AuditRecord:
         )
 
 
-class Rollback:
-    """Gate 失败回退目标。"""
+class FailureAction(StrEnum):
+    """Gate 失败三态（规范第 5 章）。
 
-    def __init__(self, target_stage: int, reason: str = "") -> None:
+    - ROLLBACK: 回退到目标阶段重做；
+    - SUSPEND:  暂停等待外部条件满足后重试；
+    - CONFIRM:  挂起并向用户请求确认。
+    """
+
+    ROLLBACK = "rollback"
+    SUSPEND = "suspend"
+    CONFIRM = "confirm"
+
+
+class Rollback:
+    """Gate 失败处理结果：目标阶段 + 三态动作。"""
+
+    def __init__(
+        self,
+        target_stage: int,
+        reason: str = "",
+        action: FailureAction = FailureAction.ROLLBACK,
+    ) -> None:
         self.target_stage = target_stage
         self.reason = reason
+        self.action = action
 
 
 class GateCondition(Protocol):
@@ -63,6 +84,10 @@ class Gate:
     - on_fail: 回退回调 → 返回 Rollback
     - audit_log: 判定依据可追溯
     """
+
+    # 审计日志上限：Gate 会被接入状态转换热点路径，
+    # 必须有界，避免长任务中无限增长。
+    MAX_AUDIT_RECORDS = 256
 
     def __init__(
         self,
@@ -91,12 +116,15 @@ class Gate:
             reason=f"{'PASS' if passed else 'FAIL'}: {self.id} gate check",
         )
         self.audit_log.append(record)
+        if len(self.audit_log) > self.MAX_AUDIT_RECORDS:
+            del self.audit_log[: len(self.audit_log) - self.MAX_AUDIT_RECORDS]
         if passed:
             self.on_pass()
         else:
             rb = self.on_fail()
             record.rollback_target = str(rb.target_stage)
-            record.reason = f"{record.reason}, rollback to stage {rb.target_stage}"
+            record.action = rb.action.value
+            record.reason = f"{record.reason}, {rb.action.value} to stage {rb.target_stage}"
         return record
 
 
@@ -160,7 +188,11 @@ def _g0_pass() -> None:
 
 
 def _g0_fail() -> Rollback:
-    return Rollback(target_stage=0, reason="GOAL_CONFIRMATION: 目标未定义，挂起请求确认")
+    return Rollback(
+        target_stage=0,
+        reason="GOAL_CONFIRMATION: 目标未定义，挂起请求确认",
+        action=FailureAction.CONFIRM,
+    )
 
 
 g0 = make_gate(
@@ -185,7 +217,11 @@ def _g1_pass() -> None:
 
 
 def _g1_fail() -> Rollback:
-    return Rollback(target_stage=0, reason="INPUT_READINESS: 补齐资源后重试")
+    return Rollback(
+        target_stage=0,
+        reason="INPUT_READINESS: 补齐资源后重试",
+        action=FailureAction.SUSPEND,
+    )
 
 
 g1 = make_gate(
@@ -360,7 +396,11 @@ def _g8_pass() -> None:
 
 
 def _g8_fail() -> Rollback:
-    return Rollback(target_stage=7, reason="RIGOR_TRIAGE: 冗余未剔除，挂起人工确认")
+    return Rollback(
+        target_stage=7,
+        reason="RIGOR_TRIAGE: 冗余未剔除，挂起人工确认",
+        action=FailureAction.CONFIRM,
+    )
 
 
 g8 = make_gate(
@@ -410,7 +450,11 @@ def _g10_pass() -> None:
 
 
 def _g10_fail() -> Rollback:
-    return Rollback(target_stage=8, reason="FINALIZATION: 收束归档未完成，补归档后重试")
+    return Rollback(
+        target_stage=8,
+        reason="FINALIZATION: 收束归档未完成，补归档后重试",
+        action=FailureAction.SUSPEND,
+    )
 
 
 g10 = make_gate(
@@ -435,7 +479,11 @@ def _g11_pass() -> None:
 
 
 def _g11_fail() -> Rollback:
-    return Rollback(target_stage=9, reason="RETROSPECT_LOCK: 复盘未入库，挂起补复盘")
+    return Rollback(
+        target_stage=9,
+        reason="RETROSPECT_LOCK: 复盘未入库，挂起补复盘",
+        action=FailureAction.CONFIRM,
+    )
 
 
 g11 = make_gate(
@@ -446,6 +494,33 @@ g11 = make_gate(
     on_fail=_g11_fail,
 )
 GateRegistry.register(g11)
+
+
+# ─── 门上下文默认值 ───
+# 缺省一律放行（与 lifecycle_constraints「放行优先」一致）；调用点只需
+# 覆盖自己持有实际证据的键，未覆盖的键保持放行，避免部分上下文误杀。
+DEFAULT_GATE_CONTEXT: dict[str, bool] = {
+    "goal_defined": True,
+    "input_ready": True,
+    "tools_available": True,
+    "spec_complete": True,
+    "plan_executable": True,
+    "data_consolidated": True,
+    "synthesis_complete": True,
+    "audit_record_complete": True,
+    "gaps_filled": True,
+    "redundancy_trimmed": True,
+    "conforms_spec": True,
+    "all_archived": True,
+    "experience_logged": True,
+}
+
+
+def gate_context(**overrides: bool) -> dict[str, bool]:
+    """构造完整的门上下文（默认放行，按调用点证据覆盖）。"""
+    ctx = dict(DEFAULT_GATE_CONTEXT)
+    ctx.update(overrides)
+    return ctx
 
 
 # ─── 完整性四门共享策略（四库尽归土·信） ───
@@ -488,14 +563,27 @@ GATE_DESCRIPTIONS: dict[str, str] = {
 # 导出
 __all__ = [
     "AuditRecord",
+    "FailureAction",
     "Rollback",
     "Gate",
     "GateCondition",
     "GateRegistry",
+    "DEFAULT_GATE_CONTEXT",
+    "gate_context",
     "check_completeness",
     "COMPLETENESS_GATES",
     "GATE_ORDER",
     "GATE_DESCRIPTIONS",
-    "g0", "g1", "g2", "g3", "g4", "g5",
-    "g6", "g7", "g8", "g9", "g10", "g11",
+    "g0",
+    "g1",
+    "g2",
+    "g3",
+    "g4",
+    "g5",
+    "g6",
+    "g7",
+    "g8",
+    "g9",
+    "g10",
+    "g11",
 ]

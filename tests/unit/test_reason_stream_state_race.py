@@ -117,7 +117,8 @@ class TestReasonStreamRaceGuard:
         pattern = re.compile(
             r"if\s+state\.status\s*!=\s*TaskStatus\.REASONING\s*:\s*"
             r"\n\s*try\s*:\s*"
-            r"\n\s*state\.ensure_ready_for_reasoning\(\)\s*"
+            # v1.29: allow the optional gate_ctx argument (G0 goal check).
+            r"\n\s*state\.ensure_ready_for_reasoning\([\s\S]*?\)\s*"
             r"\n\s*except\s+IllegalReasoningEntry",
             re.MULTILINE,
         )

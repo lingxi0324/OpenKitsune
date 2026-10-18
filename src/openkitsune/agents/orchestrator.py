@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from openkitsune.agents.task_queue import TaskQueue
+from openkitsune.core.agent_state import TaskState
+from openkitsune.core.gates import GATE_ORDER, AuditRecord, GateRegistry
 
 if TYPE_CHECKING:
     from openkitsune.channels import MessageGateway
@@ -401,6 +403,10 @@ class AgentOrchestrator:
         # Priority task queue for future delegate-via-queue migration
         self._task_queue = TaskQueue(max_concurrent=self._DEFAULT_MAX_CONCURRENT_AGENTS)
 
+        # Lifecycle gates (G0-G11) are registered when core.gates is imported;
+        # keep an explicit handle for orchestrator-level routing.
+        self._gates = {gate_id: GateRegistry.get(gate_id) for gate_id in GATE_ORDER}
+
         # Lazy-initialised dependencies
         self._profile_store = None  # ProfileStore
         self._pool = None  # AgentInstancePool
@@ -425,6 +431,27 @@ class AgentOrchestrator:
     def set_gateway(self, gateway: MessageGateway | None) -> None:
         """Inject the MessageGateway reference (set after both are created)."""
         self._gateway = gateway
+
+    def consume_gate_failure(self, task: TaskState, record: AuditRecord) -> str:
+        """消费 Gate 失败三态并驱动任务状态。
+
+        - ``ROLLBACK``：复合坐标回退到 ``record.rollback_target``；
+        - ``SUSPEND``：置挂起标记，等待条件满足后重试；
+        - ``CONFIRM``：任务转入 ``WAITING_USER`` 等待用户确认。
+
+        Returns:
+            实际执行的动作（``pass`` / ``rollback`` / ``suspend`` / ``confirm``）。
+        """
+        outcome = task.apply_gate_result(record)
+        if outcome != "pass":
+            logger.warning(
+                "[Orchestrator] gate %s failed (action=%s, target=%s): %s",
+                record.gate,
+                outcome,
+                record.rollback_target,
+                record.reason,
+            )
+        return outcome
 
     @property
     def task_queue(self) -> TaskQueue:

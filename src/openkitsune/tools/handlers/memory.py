@@ -22,6 +22,7 @@
 import json
 import logging
 import math
+import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from ...core.policy_v2 import ApprovalClass, ToolPolicy
 from ...memory.json_utils import coerce_text, coerce_tool_names
+from ...memory.openkitsune_brain import BRAIN_TOOL_NAMES
 from ..tool_guidance import ToolGuidance
 from ..tool_result import (
     ToolResultPayload,
@@ -62,6 +64,18 @@ class MemoryHandler:
         "search_relational_memory",
         "get_session_context",
         "memory_delete_by_query",
+        # openkitsune-brain 长期记忆工具（显式列出，便于 AST 完备性检查）
+        "brain_recall",
+        "brain_knowledge_search",
+        "brain_save_turn",
+        "brain_proactive_review",
+        "brain_health",
+        "brain_progress",
+        "brain_backfill",
+        "brain_record_emotion",
+        "brain_emotion_state",
+        "brain_detect_emotion",
+        "brain_maintain_sessions",
     ]
 
     # C7 explicit ApprovalClass
@@ -76,6 +90,18 @@ class MemoryHandler:
         "search_relational_memory": ApprovalClass.READONLY_SEARCH,
         "get_session_context": ApprovalClass.READONLY_GLOBAL,
         "memory_delete_by_query": ApprovalClass.DESTRUCTIVE,
+        # openkitsune-brain 长期记忆工具
+        "brain_recall": ApprovalClass.READONLY_SEARCH,
+        "brain_knowledge_search": ApprovalClass.READONLY_SEARCH,
+        "brain_save_turn": ApprovalClass.EXEC_LOW_RISK,
+        "brain_proactive_review": ApprovalClass.READONLY_GLOBAL,
+        "brain_health": ApprovalClass.READONLY_GLOBAL,
+        "brain_progress": ApprovalClass.READONLY_GLOBAL,
+        "brain_backfill": ApprovalClass.EXEC_LOW_RISK,
+        "brain_record_emotion": ApprovalClass.EXEC_LOW_RISK,
+        "brain_emotion_state": ApprovalClass.READONLY_GLOBAL,
+        "brain_detect_emotion": ApprovalClass.READONLY_GLOBAL,
+        "brain_maintain_sessions": ApprovalClass.EXEC_LOW_RISK,
     }
 
     TOOL_POLICIES = {
@@ -515,6 +541,8 @@ class MemoryHandler:
             return self._get_session_context(params)
         elif tool_name == "memory_delete_by_query":
             return self._delete_by_query_structured(params)
+        elif tool_name in BRAIN_TOOL_NAMES:
+            return await self._handle_brain_tool(tool_name, params)
         else:
             return f"❌ Unknown memory tool: {tool_name}"
 
@@ -523,6 +551,65 @@ class MemoryHandler:
             self._persist_guide_marker()
             return self._NAVIGATION_GUIDE + self._visible_text(result)
         return result
+
+    # ------------------------------------------------------------------
+    # openkitsune-brain 长期记忆工具
+    # ------------------------------------------------------------------
+
+    def _brain_provider(self):
+        """复用 Agent 启动时创建的外部记忆 Provider；未启用时返回 None。"""
+        provider = getattr(self.agent, "_openkitsune_brain_provider", None)
+        if provider is not None:
+            return provider
+        flag = os.environ.get("OPENKITSUNE_BRAIN_MEMORY", "1").strip().lower()
+        if flag in ("0", "false", "off", "no"):
+            return None
+        try:
+            from ...memory.openkitsune_brain import create_openkitsune_brain_provider
+
+            provider = create_openkitsune_brain_provider()
+            self.agent._openkitsune_brain_provider = provider  # type: ignore[attr-defined]
+            return provider
+        except Exception as e:  # noqa: BLE001 —— 外部记忆不可用不能阻断内置工具
+            logger.warning("[BrainMemory] provider init failed: %s", e)
+            return None
+
+    def _brain_session_id(self) -> str:
+        for owner in (self.agent, getattr(self.agent, "memory_manager", None)):
+            session_id = getattr(owner, "_current_session_id", "") if owner else ""
+            if session_id:
+                return str(session_id)
+        return ""
+
+    async def _handle_brain_tool(self, tool_name: str, params: dict) -> str:
+        provider = self._brain_provider()
+        if provider is None:
+            return (
+                "❌ openkitsune-brain 记忆源未启用（OPENKITSUNE_BRAIN_MEMORY=0 "
+                "或依赖不可用），本次调用已跳过。"
+            )
+
+        session_id = self._brain_session_id()
+        if session_id:
+            provider.session_id = session_id
+            # recall_pipeline / save_turn 走 MemorySystem 实例内部 session，
+            # 同步更新，保证写入与主动回忆落在当前会话。
+            ms = getattr(provider, "_ms", None)
+            if ms is not None:
+                ms.session_id = session_id
+                try:
+                    ms.progress.session_id = session_id
+                except Exception:
+                    pass
+
+        from ...memory.openkitsune_brain import dispatch_brain_tool
+
+        try:
+            result = await dispatch_brain_tool(provider, tool_name, params)
+        except Exception as e:  # noqa: BLE001 —— 工具失败返回可读错误
+            logger.warning("[BrainMemory] %s failed: %s", tool_name, e)
+            return f"❌ {tool_name} 执行失败: {e}"
+        return json.dumps(result, ensure_ascii=False, default=str)
 
     async def _consolidate_memories(self, params: dict) -> str:
         """手动触发记忆整理"""

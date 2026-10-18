@@ -58,6 +58,7 @@ __all__ = [
     "assert_gate",
     "AgentRole",
     "ALL_ROLES",
+    "ROLE_ALIASES",
     "COUNTERBALANCE",
     "TopologyViolation",
     "assert_star_topology",
@@ -399,6 +400,22 @@ class AgentRole(StrEnum):
 
 
 ALL_ROLES: frozenset[AgentRole] = frozenset(AgentRole)
+
+# 规范角色名 → 本域角色名（同义映射，不新增第二套角色）。
+# 规范里的 COLLECTOR / CONTEXT_POOL / PRESENTER / MEMORY_STORE / GUARD /
+# EXECUTOR 在本域分别由 PERCEPTION / CONTEXT / DELIVERY / MEMORY /
+# SECURITY / EXECUTION 承载；保留映射是为了让规范术语可机器检索。
+ROLE_ALIASES: dict[str, AgentRole] = {
+    "ORCHESTRATOR": AgentRole.ORCHESTRATOR,
+    "EXECUTOR": AgentRole.EXECUTION,
+    "COLLECTOR": AgentRole.PERCEPTION,
+    "CONTEXT_POOL": AgentRole.CONTEXT,
+    "PRESENTER": AgentRole.DELIVERY,
+    "MEMORY_STORE": AgentRole.MEMORY,
+    "GUARD": AgentRole.SECURITY,
+    "REASONER": AgentRole.REASONING,
+    "VALIDATOR": AgentRole.VALIDATION,
+}
 
 # 四组对角对位制衡（互为张力、禁止同源）
 COUNTERBALANCE: tuple[tuple[AgentRole, AgentRole, str], ...] = (

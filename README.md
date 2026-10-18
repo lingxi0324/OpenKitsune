@@ -26,7 +26,7 @@
 </p>
 
 <p align="center">
-  Multi-Agent Collaboration · Organization Orchestration · Plugin System · Sandbox Security · 30+ LLMs · 6 IM Platforms · 117 Tools · Desktop / Web / Mobile
+  Multi-Agent Collaboration · Organization Orchestration · Plugin System · Sandbox Security · 30+ LLMs · 6 IM Platforms · 138 Tools · Temporal & Spatial Awareness · Desktop / Web / Mobile
 </p>
 
 <p align="center">
@@ -48,7 +48,7 @@
 
 **Other AIs just chat. OpenKitsune gets things done.**
 
-OpenKitsune is an open-source, all-in-one AI assistant — multiple AI Agents work together, build an **AI company** that runs autonomously, search the web, operate your computer, manage files, run scheduled tasks, and respond instantly across Telegram / Feishu / WeCom / DingTalk / QQ. **Scan a QR code to bind your chat app in 30 seconds.** It remembers your preferences, teaches itself new skills, and never gives up on a task. Extend anything through the **plugin system**, protected by **6-layer sandbox security**.
+OpenKitsune is an open-source, all-in-one AI assistant — multiple AI Agents work together, build an **AI company** that runs autonomously, search the web, operate your computer, manage files, run scheduled tasks, and respond instantly across Telegram / Feishu / WeCom / DingTalk / QQ. **Scan a QR code to bind your chat app in 30 seconds.** It remembers your preferences, teaches itself new skills, and never gives up on a task. It also carries a **temporal and spatial sense** — current season, solar term, time of day, and a deliberately coarse city-level location — so its wording fits *when* and *where* you are. Extend anything through the **plugin system**, protected by **6-layer sandbox security**.
 
 **Fully GUI-based setup. Ready in 5 minutes. Zero command line required.**
 
@@ -187,6 +187,18 @@ Five-emotion interplay, time-of-day rhythm, and a 3D relationship model (affinit
 A presence heartbeat wakes after every turn; three rotating "eyes" (logic / empathy / he-luo) see the world; insights and diaries accumulate over time.
 
 </td></tr>
+
+<tr><td>
+
+### 🧠 Brain Memory (openkitsune-brain)
+Six-pool active recall + an external knowledge base. 11 dedicated `brain_*` tools with lossless content paging — long memories are continued, never silently cut.
+
+</td><td>
+
+### 🌗 Temporal & Spatial Awareness
+Knows the season, solar term, Chinese double-hour and local time of day — plus a city-level location with explicit accuracy, degradation and privacy guarantees.
+
+</td></tr>
 </table>
 
 ---
@@ -200,7 +212,7 @@ A presence heartbeat wakes after every turn; three rotating "eyes" (logic / empa
 | 📋 | **Plan Mode** | Auto task decomposition, per-step tracking, floating progress bar in UI |
 | 🧠 | **ReAct Reasoning** | Explicit 3-phase loop, checkpoint/rollback, loop detection, strategy switching |
 | 🚀 | **Zero-Barrier Setup** | Full GUI config, onboarding wizard, 5 minutes from install to chat, zero CLI |
-| 🔧 | **117 Built-in Tools** | 30+ categories: Files / Browser / Desktop / Search / Scheduler / MCP / Code Execution … |
+| 🔧 | **138 Built-in Tools** | 30+ categories: Files / Browser / Desktop / Search / Scheduler / MCP / Code Execution … |
 | 🗜️ | **Context Management** | Zero-LLM turn-skeleton compression · tiered water-level strategy · 90% proactive handoff with one-shot cross-session recovery |
 | 🔌 | **Plugin System** | 8 types (tool/channel/RAG/memory/LLM/hook/skill/MCP), 3-tier permissions, 10 lifecycle hooks, fault isolation |
 | 🛡️ | **6-Layer Security** | Path zoning, confirmation gates, command blocklist, file snapshots, self-protection, OS sandbox (Linux bwrap / macOS seatbelt / Windows MIC) |
@@ -210,6 +222,10 @@ A presence heartbeat wakes after every turn; three rotating "eyes" (logic / empa
 | 💬 | **6 IM Platforms** | Telegram / Feishu / WeCom / DingTalk / QQ / OneBot, voice recognition, smart group chat |
 | 🔗 | **MCP Integration** | Standard MCP client, stdio / HTTP / SSE transports, multi-directory scan, dynamic server management |
 | 💾 | **Dual-Mode Memory** | Mode 1 fragments (3 layers + 7 types + multi-path recall) + Mode 2 MDRM relational graph (5 dimensions + multi-hop traversal + 3D visualization), auto smart switching |
+| 🧠 | **Brain Memory** | openkitsune-brain integration: okmem six-pool recall + external knowledge base, 11 `brain_*` tools, lossless content paging |
+| 🌗 | **Temporal Awareness** | Season, 24 solar terms, 十二时辰, day-period guidance, lunar date & festivals (optional `lunar_python`) |
+| 📍 | **Spatial Awareness** | City-level location from IP with explicit accuracy radius, ok/degraded/unknown states, trusted-proxy allow-list, no raw IP persisted or logged |
+| 🧭 | **Lifecycle Gates** | 10-stage task lifecycle × 12 quality gates, rollback / suspend / confirm failure outcomes, bounded audit trail |
 | 🎭 | **9 Personas** | Lingxi · Default / Tech Expert / Boyfriend / Girlfriend / Jarvis / Butler / Business / Family, switch in one sentence |
 | 💗 | **Emotion Engine** | Five-emotion interplay (以情胜情) · twelve time-period rhythm · emotion perception · 3D relationship (affinity / intimacy / trust) · heart notes |
 | 🌸 | **Lingxi Soul** | Presence heartbeat · three-lives rotating eyes · mood drift · soul age · auto diary & insights |
@@ -217,7 +233,7 @@ A presence heartbeat wakes after every turn; three rotating "eyes" (logic / empa
 | 🧬 | **Self-Evolution** | Daily self-check & repair, failure root cause analysis, auto skill generation |
 | 🔍 | **Deep Thinking** | Controllable thinking mode, real-time chain-of-thought display, IM streaming |
 | 🖥️ | **Multi-Platform** | Desktop (Win/Mac/Linux) · Web (PC & mobile browser) · Mobile App (Android/iOS), 11 panels, dark theme |
-| 📊 | **Observability** | 12 trace span types, full-chain token statistics panel |
+| 📊 | **Observability** | 12 trace span types, full-chain token statistics panel, gate audit trail |
 | 😄 | **Stickers** | 5700+ stickers, mood-aware, persona-matched |
 
 ---
@@ -620,6 +636,20 @@ On top of fragment memory, builds **causal chains, timelines, and entity relatio
 - **3-layer encoding**: Fast rule-based encoding → summary backfill → session-end batch LLM encoding
 - **3D visualization**: Frontend supports 3D visualization of the memory graph
 
+### Mode 3: openkitsune-brain External Memory (New)
+
+An optional external memory brain that registers through the same provider interface as the built-in modes:
+
+| Layer | What it adds |
+|-------|--------------|
+| **okmem** | Nine memory formats, six active-recall pools, a four-dimensional graph, and an L1 progress layer (goal / task state / recent decisions / next action) |
+| **fusion-memory knowledge base** | Read-only retrieval over real knowledge data — memories, entities, relations, formulas, acupoints (TCM / traditional-culture domains) |
+
+- **11 dedicated tools**: `brain_recall`, `brain_knowledge_search`, `brain_save_turn`, `brain_proactive_review`, `brain_health`, `brain_progress`, `brain_backfill`, `brain_record_emotion`, `brain_emotion_state`, `brain_detect_emotion`, `brain_maintain_sessions`
+- **Lossless content paging**: every record reports `content_total` / `has_more` / `next_offset` / `next_page_token`; long memories are continued, not truncated mid-sentence
+- **Write safety**: all okmem SQLite writes go through a single-thread async FIFO queue — no concurrent writers
+- **Enable / disable**: enabled by default when the brain runtime and data are available; set `OPENKITSUNE_BRAIN_MEMORY=0` to turn it off
+
 ### Smart Mode Switching
 
 Set `memory_mode` to `auto` (default) and the system auto-routes based on query characteristics: causal/timeline/cross-session questions use **Mode 2 graph traversal**, preference/fact queries use **Mode 1 semantic retrieval**.
@@ -658,6 +688,22 @@ The primary compaction path is **deterministic — zero LLM calls**:
 ### Proactive Handoff at 90%
 
 Instead of re-summarizing until the history turns blurry, at the handoff watermark OpenKitsune **ends the round cleanly** and writes a structured handoff snapshot (task goal · completed summary · next steps · key paths · recent conversation tail). A new session auto-loads the snapshot into its context and **consumes it in one shot** (deleted immediately, 7-day TTL, never written into long-term memory) — long tasks resume naturally across sessions with a clean context.
+
+### Temporal Awareness
+
+Prompt assembly injects a compact `## 时间感知` block: local date/time in the configured timezone, weekday vs weekend, day period (dawn / morning / work hours / evening / late night), Chinese double-hour (时辰), season phase, current and next solar term with pentad progress — plus lunar date and traditional festivals when `lunar_python` is installed. Solar terms are computed with the standard library, so prompt assembly never depends on an optional third-party package.
+
+### Spatial Awareness
+
+When enabled (default), desktop and API sessions resolve a deliberately bounded spatial context:
+
+- **City-level only** — latitude/longitude is an approximate centre point, and `accuracy_radius_km` states the uncertainty explicitly
+- **Three quality states** — `ok` / `degraded` / `unknown`; a proxy or VPN signal invalidates the geographic fields instead of reporting the exit node's city
+- **Trusted-proxy allow-list** — `X-Forwarded-For` is honoured only when the peer itself is trusted
+- **Privacy first** — raw IPs are never persisted or logged; cache keys are salted hashes held in process memory only
+- **Tool + prompt** — `get_spatial_context` returns the same context on demand, and a short location hint is added to the runtime prompt only when `status == "ok"`
+
+Config: `SPATIAL_AWARENESS_ENABLED`, `SPATIAL_TRUSTED_PROXIES`, `SPATIAL_LOOKUP_TIMEOUT_SECONDS`.
 
 ---
 
@@ -731,6 +777,7 @@ Identity ─── SOUL.md · AGENT.md · POLICIES.yaml · 9 Persona Presets (in
     │
 Core     ─── ReasoningEngine(ReAct) · Brain(LLM) · ContextManager
     │        PromptAssembler · RuntimeSupervisor · ResourceBudget
+    │        GateRegistry(12 Gates) · TaskState(S0-S9 × G0-G11)
     │
 Agents   ─── AgentOrchestrator(Coordination) · AgentInstancePool(Pooling)
     │        AgentFactory · FallbackResolver(Failover)
@@ -744,10 +791,12 @@ Plugins  ─── PluginManager(Discovery/Loading) · PluginAPI(Host Interface)
     │
 Memory   ─── Mode1: UnifiedStore(SQLite+Vector) · RetrievalEngine(Multi-path)
     │        Mode2: RelationalStore(MDRM Graph) · GraphEngine(Multi-hop)
+    │        Mode3: BrainProvider(okmem · fusion KB)
     │        MemoryModeRouter(Auto Switch) · MemoryEncoder(3-Layer)
     │
 Context  ─── TurnSkeletonCompressor(Zero-LLM) · MicroCompact · HandoffSnapshot
     │        CompactionGuard · CompressionLineage · WaterLevelStrategy
+    │        TemporalContext(节气/时辰) · SpatialContext(IP city-level)
     │
 Emotion  ─── EmotionEngine(五志/时辰/以情胜情) · EmotionPerceiver
     │        RelationshipModel(3D) · HeartNoteWriter · LingxiSpirit(神识/日记)
@@ -765,6 +814,20 @@ Channels ─── CLI · Telegram · Feishu · WeCom · WeChat · DingTalk · Q
     │
 Tracing  ─── AgentTracer(12 SpanTypes) · DecisionTrace · TokenStats
 ```
+
+---
+
+## Task Lifecycle & Quality Gates
+
+Every task moves through a 10-stage lifecycle (intent → spec → plan → draft → execution → audit → verification → optimize → delivery → retrospect) guarded by 12 gates:
+
+| Property | Behavior |
+|----------|----------|
+| **Composite state** | `(stage_idx, gate_idx)` must stay parity-consistent; invalid combinations are rejected before entering reasoning |
+| **Gate contract** | Each gate declares a bound stage, a checkable condition, pass/fail callbacks, and an audit record |
+| **Three failure outcomes** | `rollback` (redo an earlier stage), `suspend` (wait for an external condition), `confirm` (ask the user) |
+| **Bounded audit** | Gate verdicts are kept in a capped audit log (256 records per gate), so long tasks cannot grow memory without bound |
+| **Allow-by-default** | Gate context is merged with permissive defaults; only call sites holding real evidence can fail a gate, so existing paths are not broken |
 
 ---
 

@@ -381,24 +381,18 @@ class Identity:
         Args:
             include_active_task: 是否包含活跃任务（IM Session 应设为 False）
         """
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime
 
-        try:
-            from zoneinfo import ZoneInfo
+        from ..core.temporal_context import build_temporal_context, resolve_timezone
 
-            tz = ZoneInfo(self._get_configured_timezone())
-        except Exception:
-            tz = timezone(timedelta(hours=8))
-        now = datetime.now(tz)
-        weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-        current_time = now.strftime("%Y-%m-%d %H:%M:%S")
-        current_weekday = weekday_names[now.weekday()]
+        timezone_name = self._get_configured_timezone()
+        now = datetime.now(resolve_timezone(timezone_name))
 
         return f"""# Agent System
 
 {self.get_soul_summary(agent_voice=agent_voice)}
 
-**当前时间: {current_time} {current_weekday}**
+{build_temporal_context(now, timezone_name)}
 
 ## 运行平台说明
 

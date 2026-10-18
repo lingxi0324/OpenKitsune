@@ -260,7 +260,10 @@ SYSTEM_TOOLS = [
                     "type": "string",
                     "description": "输出分辨率，支持 宽*高 或 宽x高；不填使用端点默认值",
                 },
-                "quality": {"type": "string", "description": "生成质量（可选，如 low/medium/high/hd）"},
+                "quality": {
+                    "type": "string",
+                    "description": "生成质量（可选，如 low/medium/high/hd）",
+                },
                 "style": {"type": "string", "description": "生成风格（可选，如 vivid/natural）"},
                 "prompt_extend": {
                     "type": "boolean",
@@ -327,6 +330,46 @@ SYSTEM_TOOLS = [
 **建议**：
 - 涉及文件系统操作前先调用此工具，避免盲目搜索
 - 返回结果会根据实际存在的目录动态生成""",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "get_spatial_context",
+        "category": "System",
+        "description": (
+            "获取当前用户的近似空间上下文：城市级位置、时区、当地时间和网络环境。"
+            "位置精度通常为城市级，其误差由 accuracy_radius_km 给出；lat/lng 只是"
+            "近似中心点。status='ok' 时才可使用位置；status='degraded' 或 'unknown' "
+            "时不要猜测用户位置。time_of_day='late_night' 表示用户可能正在休息。"
+        ),
+        "detail": """获取当前用户的近似空间上下文。
+
+**返回字段**：
+- 位置：city / region / country / latitude / longitude / accuracy_radius_km
+- 时间：timezone / local_time_iso / local_hour / time_of_day
+- 网络：isp / org / is_mobile / is_proxy_or_vpn
+- 质量：status（ok / degraded / unknown）/ degraded_reason / is_stale
+- 来源：source（manual / request_ip / host_egress / wifi_bssid）/ accuracy_source
+
+**使用规则（重要）**：
+1. 先看 `source`：`manual` 可直接使用；`wifi_bssid` 是 Wi-Fi 指纹定位，精度通常几十米，
+   比 IP 可靠；`request_ip` / `host_egress` 是 IP 推断，只能使用“大概/附近”措辞。
+2. `status != "ok"` 时，位置不可用：不要编造城市，也不要根据语言/时区反推。
+3. `is_proxy_or_vpn=true` 时，位置与当地时间均不可靠，不要使用。
+4. `time_of_day="late_night"` 时，回复宜轻短，可适当关心用户休息。
+5. 用户自述的位置优先于本工具的推断结果。
+
+**适用场景**：
+- 需要判断用户所在时区、当地作息（深夜/工作时间）时
+- 回复中适合自然带一句本地化关心时
+- 用户询问“现在几点”“我这边天气”等需要本地时空基准的问题
+
+**不适用场景**：
+- 用户明确告知了自己的位置
+- 位置与当前任务无关时，不必主动查询（避免无谓的网络请求）""",
         "input_schema": {
             "type": "object",
             "properties": {},

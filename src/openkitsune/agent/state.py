@@ -166,6 +166,21 @@ def derive_lifecycle_for_phase(phase: ReasoningPhase) -> TaskLifecycleState | No
     return _LIFECYCLE_FOR_PHASE.get(phase)
 
 
+# 推理阶段 → 复合坐标 stage_idx（与 core/agent_state.STATUS_TO_STAGE 同口径）。
+# 入口/中断阶段保持现值；S3_DRAFT / S7_OPTIMIZE / S9_RETROSPECT 没有独立
+# phase（分别发生在 THINK 的流式输出、VERIFY 的收敛循环、DONE 后的收尾）。
+_STAGE_FOR_PHASE: dict[ReasoningPhase, int | None] = {
+    ReasoningPhase.COMPILING: 1,
+    ReasoningPhase.THINK: 2,
+    ReasoningPhase.ACT: 4,
+    ReasoningPhase.OBSERVE: 5,
+    ReasoningPhase.VERIFY: 6,
+    ReasoningPhase.DONE: 8,
+    ReasoningPhase.IDLE: None,
+    ReasoningPhase.AWAITING_USER: None,
+}
+
+
 @dataclass
 class TaskState:
     """Per-task state held inside a single agent.
@@ -222,6 +237,19 @@ class TaskState:
         derived = derive_lifecycle_for_phase(target)
         if derived is not None:
             self.lifecycle = derived
+        self._sync_composite_state()
+
+    def _sync_composite_state(self) -> None:
+        """按当前 phase 同步 (stage_idx, gate_idx)。
+
+        入口（IDLE）与中断（AWAITING_USER）阶段不移动坐标。``gate_idx``
+        取与 ``stage_idx`` 相同的值，保证 ``is_valid()`` 的奇偶校验恒成立。
+        """
+        stage = _STAGE_FOR_PHASE.get(self.phase)
+        if stage is None:
+            return
+        self.stage_idx = stage
+        self.gate_idx = stage
 
     # ------------------------------------------------------------------
     # Cooperative cancel adapter
@@ -286,7 +314,7 @@ class TaskState:
     # TaskState 新增 stage_idx + gate_idx 双维度，合法性由奇偶校验保证。
     # 与 lifecycle_constraints.Gate.parity_consistent 同义：
     #   is_valid() = (stage_idx % 2) == (gate_idx % 2)
-    # 合法态共 60 个（10×12=120，同奇偶恰 60），30 个失衡态被 is_valid 拦截。
+    # 合法态共 60 个（10×12=120，同奇偶恰 60），另外 60 个失衡态被 is_valid 拦截。
     # ------------------------------------------------------------------
 
     stage_idx: int = 0
@@ -295,9 +323,11 @@ class TaskState:
     def is_valid(self) -> bool:
         """复合状态合法性校验（规范第 7 章）。
 
-        推进序号与校验序号同奇偶 → 合法态；异奇偶 → 30 个失衡态，
-        状态机在进入前拦截（见 begin_task / ensure_ready_for_reasoning）。
+        推进序号与校验序号同奇偶且在各自值域内（stage 0-9，gate 0-11）
+        → 合法态；越界或异奇偶 → 失衡态，由 :meth:`advance` 拦截。
         """
+        if not (0 <= self.stage_idx <= 9 and 0 <= self.gate_idx <= 11):
+            return False
         return (self.stage_idx % 2) == (self.gate_idx % 2)
 
     def advance(self) -> tuple[int, int]:
@@ -307,14 +337,19 @@ class TaskState:
             (new_stage_idx, new_gate_idx)
 
         Raises:
-            ValueError: 推进后同奇偶校验失败（失衡态拦截）。
+            ValueError: 推进越界（stage > 9 / gate > 11）或同奇偶校验失败。
         """
         new_stage = self.stage_idx + 1
         new_gate = self.gate_idx + 1
+        if new_stage > 9 or new_gate > 11:
+            raise ValueError(
+                f"推进越界：stage={new_stage} (上限 9), gate={new_gate} (上限 11) – "
+                f"已到流程终点，不能继续 advance()。"
+            )
         if (new_stage % 2) != (new_gate % 2):
             raise ValueError(
                 f"推进后失衡：stage={new_stage} (奇), gate={new_gate} (偶) – "
-                f"同频推进必须同奇偶。这是 30 个失衡态之一。"
+                f"同频推进必须同奇偶。这是失衡态之一。"
             )
         self.stage_idx = new_stage
         self.gate_idx = new_gate

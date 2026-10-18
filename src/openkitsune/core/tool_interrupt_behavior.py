@@ -113,6 +113,8 @@ _INTERRUPT_BEHAVIOR_MAP: dict[str, InterruptBehavior] = {
     "get_session_logs": "cancel",
     "get_tool_info": "cancel",
     "get_workspace_map": "cancel",
+    # Read-only IP geolocation query; cancellation has no side effects.
+    "get_spatial_context": "cancel",
     "set_task_timeout": "cancel",
     "system_config": "block",
     # ── Desktop automation ────────────────────────────────────────

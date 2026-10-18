@@ -491,7 +491,10 @@ def build_system_prompt(
     system_parts.append(_SAFETY_SECTION)
     system_parts.append(_INFO_SOURCE_HONESTY_SECTION)
     # 注入当前日期：本地模型训练知识时间截断，时间敏感问题必须以此为准
-    _now_dt = datetime.now()
+    from ..config import settings as _settings
+    from ..core.temporal_context import resolve_timezone
+
+    _now_dt = datetime.now(resolve_timezone(_settings.scheduler_timezone))
     _weekday_names = ("一", "二", "三", "四", "五", "六", "日")
     system_parts.append(
         "## Current time\n\n"
@@ -583,6 +586,15 @@ def build_system_prompt(
         runtime_section = _build_runtime_section(working_directory)
     runtime_parts.append(runtime_section)
     from ..config import settings
+    from ..core.temporal_context import build_temporal_context
+
+    runtime_parts.append(build_temporal_context(timezone_name=settings.scheduler_timezone))
+    if isinstance(session_context, dict) and session_context.get("spatial_context"):
+        from ..core.spatial_context import format_spatial_hint
+
+        spatial_hint = format_spatial_hint(session_context["spatial_context"])
+        if spatial_hint:
+            runtime_parts.append(spatial_hint)
 
     sampled_time = f"当前时间: {_get_current_time(settings.scheduler_timezone)} ({settings.scheduler_timezone})"
 
@@ -2006,7 +2018,10 @@ def _join_memory_layers(layers: list[tuple[int, str]]) -> str:
         if total_tokens + t > _MEMORY_SECTION_MAX_TOKENS:
             logger.debug(
                 "[Memory] layer dropped by cap (priority=%d, tokens=%d, total=%d/%d)",
-                priority, t, total_tokens, _MEMORY_SECTION_MAX_TOKENS,
+                priority,
+                t,
+                total_tokens,
+                _MEMORY_SECTION_MAX_TOKENS,
             )
             continue
         joined_parts.append(text)

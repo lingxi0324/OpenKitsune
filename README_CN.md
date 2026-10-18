@@ -16,7 +16,7 @@
 
 **别人的 AI 只能聊天，OpenKitsune 帮你做事。**
 
-OpenKitsune 是一款开源全能 AI 助手 —— 多个 AI Agent 协作分工、组建 AI 公司自主运营、自动上网搜索、操作你的电脑、管理文件、定时执行任务，还能接入飞书 / 钉钉 / 企微 / Telegram/QQ，**扫码即绑定，随时响应**。它会记住你的偏好，会自己学新技能，遇到问题永不放弃。通过**插件系统**可以无限扩展能力，**六层沙箱安全**保护你的系统安全。
+OpenKitsune 是一款开源全能 AI 助手 —— 多个 AI Agent 协作分工、组建 AI 公司自主运营、自动上网搜索、操作你的电脑、管理文件、定时执行任务，还能接入飞书 / 钉钉 / 企微 / Telegram/QQ，**扫码即绑定，随时响应**。它会记住你的偏好，会自己学新技能，遇到问题永不放弃。它还具备**时间与空间感知** —— 知道当前的季节、节气、时段，以及一个刻意保持粗粒度的城市级位置，让表达更贴合你所处的「何时、何地」。通过**插件系统**可以无限扩展能力，**六层沙箱安全**保护你的系统安全。
 
 **全图形化配置，5 分钟上手，全程不用敲一行命令。**
 
@@ -80,6 +80,14 @@ OpenKitsune 由 **OpenAkita**（一个早期开源的自进化 AI Agent 项目�
 
 每轮对话后神识苏醒一次；三世之眼（逻辑 / 共情 / 河洛）轮转看世界；感悟与日记随时间沉淀。
 
+### 🧠 外部记忆脑（openkitsune-brain）
+
+六池主动回忆 + 外部知识库，提供 11 个专用 `brain_*` 工具；内容分页不截断，长记忆可无损续读。
+
+### 🌗 时间与空间感知
+
+知道季节、节气、十二时辰与当地时段；位置只取城市级，并明确标注精度、降级状态与隐私边界。
+
 
 
 ***
@@ -95,7 +103,7 @@ OpenKitsune 由 **OpenAkita**（一个早期开源的自进化 AI Agent 项目�
 | 📋  | **计划模式**        | 复杂任务自动拆步骤，每步独立追踪，前端进度条实时展示                                                    |
 | 🧠  | **ReAct 推理**    | 显式三阶段推理循环，检查点 / 回滚，循环检测，失败换策略                                                 |
 | 🚀  | **零门槛上手**       | 全图形化配置，Onboarding 引导向导，5 分钟安装到对话，零命令行                                         |
-| 🔧  | **117 个内置工具**   | 30+ 大类：文件 / 浏览器 / 桌面自动化 / 搜索 / 定时任务 / MCP / 代码执行 ……                           |
+| 🔧  | **138 个内置工具**   | 30+ 大类：文件 / 浏览器 / 桌面自动化 / 搜索 / 定时任务 / MCP / 代码执行 ……                           |
 | 🗜️ | **上下文管理**       | 零 LLM 轮次骨架压缩・分级水位策略・90% 主动交接一次性跨会话恢复                                          |
 | 🔌  | **插件系统**        | 8 种类型（工具 / 通道 / RAG / 记忆 / LLM / 钩子 / 技能 / MCP）、三级权限、10 个生命周期钩子、故障自动隔离        |
 | 🛡️ | **六层安全**        | 路径四区分级、高危确认门、命令黑名单、文件快照、自保护、OS 级沙箱（Linux bwrap /macOS seatbelt / Windows MIC） |
@@ -105,6 +113,10 @@ OpenKitsune 由 **OpenAkita**（一个早期开源的自进化 AI Agent 项目�
 | 💬  | **6 大 IM 平台**   | Telegram / 飞书 / 企微 / 钉钉 / QQ / OneBot，语音识别，群聊智能策略                             |
 | 🔗  | **MCP 集成**      | 标准 MCP 客户端，stdio / HTTP / SSE 三种传输，多目录扫描，动态增删服务器                              |
 | 💾  | **双模式记忆**       | 模式 1 碎片化（三层 + 7 类型 + 多路召回）+ 模式 2 MDRM 关系图谱（5 维度 + 多跳遍历 + 3D 可视化），auto 智能切换    |
+| 🧠  | **外部记忆脑**       | 接入 openkitsune-brain：okmem 六池召回 + 外部知识库，11 个 `brain_*` 工具，内容无损分页                     |
+| 🌗  | **时间感知**        | 季节、二十四节气、十二时辰、时段指引、农历与传统节日（可选 `lunar_python`）                                |
+| 📍  | **空间感知**        | 基于 IP 的城市级位置，显式给出精度半径，ok / degraded / unknown 三态，可信代理白名单，原始 IP 不落盘不写日志          |
+| 🧭  | **生命周期质量门**     | 10 阶段任务生命周期 × 12 道质量门，回退 / 挂起 / 请求确认三态，审计日志有界                                  |
 | 🎭  | **9 种人格**       | 灵汐・默认 / 技术专家 / 男友 / 女友 / Jarvis / 管家 / 商务 / 家庭，一句话切换                          |
 | 💗  | **情感引擎**        | 五志生克（以情胜情）・十二时辰节律・情绪感知・关系三维模型（好感 / 亲密 / 信任）・心笺                                |
 | 🌸  | **灵汐灵魂**        | 神识心跳・三世回响轮转・心境漂移・灵魂年龄・日记与感悟自动沉淀                                               |
@@ -112,7 +124,7 @@ OpenKitsune 由 **OpenAkita**（一个早期开源的自进化 AI Agent 项目�
 | 🧬  | **自我进化**        | 每日自检修复、失败根因分析、技能自动生成、依赖自修复                                                    |
 | 🔍  | **深度思考**        | 可控 thinking 模式，思维链实时展示，IM 推送                                                  |
 | 🖥️ | **多端访问**        | 桌面端 (Win/Mac/Linux)・Web 端 (PC / 手机浏览器)・移动端 (安卓 /iOS)，11 个功能面板，深色主题            |
-| 📊  | **可观测性**        | 12 种追踪 Span，Token 全链路统计面板                                                     |
+| 📊  | **可观测性**        | 12 种追踪 Span，Token 全链路统计面板，质量门审计轨迹                                            |
 | 😄  | **表情包**         | 5700+ 表情包，看心情发，按人格选                                                           |
 
 
@@ -539,7 +551,7 @@ L6  OS 级沙箱       Linux bwrap / macOS seatbelt / Windows MIC
 
 ## 记忆系统
 
-不是普通的 "上下文窗口"，而是真正的长期记忆。支持**双模式**，按需自动切换：
+不是普通的 "上下文窗口"，而是真正的长期记忆。内置**双模式**，按需自动切换；在此基础上还可接入**外部记忆脑**（模式 3）：
 
 ### 模式 1：碎片化记忆（经典）
 
@@ -576,6 +588,24 @@ L6  OS 级沙箱       Linux bwrap / macOS seatbelt / Windows MIC
 * **三层编码**：快速规则编码 → 摘要补全 → 会话结束批量 LLM 编码
 
 * **3D 可视化**：前端支持记忆图谱的 3D 可视化展示
+
+### 模式 3：openkitsune-brain 外部记忆脑（新）
+
+可选的第三层记忆，通过同一套 Provider 接口注册，不替代内置模式：
+
+
+| 组成 | 它带来什么 |
+| --- | --- |
+| **okmem** | 九种记忆格式、六个记忆池、四维图谱，以及 L1 进度层（总目标 / 任务状态 / 最近决策 / 下一步动作） |
+| **fusion-memory 知识库** | 只读检索真实知识数据 —— 记忆、实体、关系、方剂、穴位（中医 / 传统文化领域） |
+
+* **11 个专用工具**：`brain_recall`、`brain_knowledge_search`、`brain_save_turn`、`brain_proactive_review`、`brain_health`、`brain_progress`、`brain_backfill`、`brain_record_emotion`、`brain_emotion_state`、`brain_detect_emotion`、`brain_maintain_sessions`
+
+* **无损内容分页**：每条记录返回 `content_total` / `has_more` / `next_offset` / `next_page_token`，长记忆可续读，不会在句子中间被截断
+
+* **写入安全**：所有 okmem SQLite 写入走单线程异步 FIFO 队列，避免并发写
+
+* **开关**：记忆运行时与数据可用时默认启用；设置 `OPENKITSUNE_BRAIN_MEMORY=0` 可关闭
 
 ### 智能模式切换
 
@@ -627,6 +657,28 @@ L6  OS 级沙箱       Linux bwrap / macOS seatbelt / Windows MIC
 ### 90% 水位主动交接
 
 不在 "边漏边补" 中把历史压糊，而是在交接水位**干净地结束本轮**，写入结构化交接快照（任务目标・完成摘要・下一步・关键路径・最近对话尾）。新会话自动加载快照注入上下文并**一次性消费**（读后即删、7 天 TTL、不进长期记忆）—— 长任务跨会话自然续作，上下文始终干净。
+
+### 时间感知
+
+提示词组装会注入一段紧凑的 `## 时间感知` 区块：配置时区下的本地日期时间、工作日 / 周末、时段（清晨 / 上午 / 工作时段 / 傍晚 / 深夜）、十二时辰、季节阶段、当前与下一个节气及其候序进度；安装 `lunar_python` 时还会补充农历与传统节日。节气计算使用标准库实现，提示词组装不依赖可选第三方包。
+
+### 空间感知
+
+启用后（默认开启），桌面端与 API 会话会解析一份**刻意保持克制**的空间上下文：
+
+* **仅城市级** —— 经纬度只是近似中心点，不确定性由 `accuracy_radius_km` 显式给出
+
+* **三种质量状态** —— `ok` / `degraded` / `unknown`；检测到代理或 VPN 时会直接作废地理字段，而不是返回出口节点城市
+
+* **可信代理白名单** —— 只有当直连对端可信时，才会解析 `X-Forwarded-For`
+
+* **隐私优先** —— 原始 IP 不落盘、不写日志；缓存键是加盐哈希，只存在于进程内存
+
+* **工具 + 提示词** —— `get_spatial_context` 可按需返回同一份上下文；仅当 `status == "ok"` 时，才向运行时提示词加入简短位置提示
+
+配置项：`SPATIAL_AWARENESS_ENABLED`、`SPATIAL_TRUSTED_PROXIES`、`SPATIAL_LOOKUP_TIMEOUT_SECONDS`。
+
+***
 
 ## 情感智能与灵汐灵魂
 
@@ -720,6 +772,7 @@ OpenKitsune 会自己变强：
     │
 核心层 ─── ReasoningEngine(ReAct) · Brain(LLM) · ContextManager
     │      PromptAssembler · RuntimeSupervisor · ResourceBudget
+    │      GateRegistry(12 道门) · TaskState(S0-S9 × G0-G11)
     │
 Agent 层── AgentOrchestrator(协调) · AgentInstancePool(池化)
     │      AgentFactory · FallbackResolver(故障切换)
@@ -733,10 +786,12 @@ Agent 层── AgentOrchestrator(协调) · AgentInstancePool(池化)
     │
 记忆层 ─── 模式1: UnifiedStore(SQLite+向量) · RetrievalEngine(多路召回)
     │      模式2: RelationalStore(MDRM图) · GraphEngine(多跳遍历)
+    │      模式3: BrainProvider(okmem · fusion知识库)
     │      MemoryModeRouter(auto切换) · MemoryEncoder(三层编码)
     │
 上下文层 ─ TurnSkeletonCompressor(零LLM) · MicroCompact · HandoffSnapshot
     │      CompactionGuard · CompressionLineage · WaterLevelStrategy
+    │      TemporalContext(节气/时辰) · SpatialContext(IP 城市级)
     │
 情感层 ─── EmotionEngine(五志/时辰/以情胜情) · EmotionPerceiver
     │      RelationshipModel(三维) · HeartNoteWriter · LingxiSpirit(神识/日记)
@@ -754,6 +809,23 @@ Agent 层── AgentOrchestrator(协调) · AgentInstancePool(池化)
     │
 追踪层 ─── AgentTracer(12种Span) · DecisionTrace · TokenStats
 ```
+
+
+
+***
+
+## 任务生命周期与质量门
+
+每个任务都会经过 10 阶段生命周期（意图 → 规格 → 计划 → 草稿 → 执行 → 审计 → 验证 → 优化 → 交付 → 复盘），并由 12 道质量门守护：
+
+
+| 机制 | 行为 |
+| --- | --- |
+| **复合状态** | `(stage_idx, gate_idx)` 必须保持奇偶一致；非法组合在进入推理前被拒绝 |
+| **门契约** | 每道门声明绑定阶段、可判定条件、通过 / 失败回调与审计记录 |
+| **失败三态** | `rollback`（回退重做）、`suspend`（等待外部条件）、`confirm`（请求用户确认） |
+| **有界审计** | 每道门最多保留 256 条判定记录，长任务不会无限增长内存 |
+| **默认放行** | 门上下文与宽松默认值合并；只有持有真实证据的调用点才可能判定失败，不破坏既有路径 |
 
 
 

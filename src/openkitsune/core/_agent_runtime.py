@@ -784,6 +784,30 @@ class Agent:
             )
         except Exception as e:
             logger.debug("[Knowledge] cloud retrieval providers unavailable: %s", e)
+
+        # openkitsune-brain 外部记忆源（okmem + 知识库 + 案例库，只读/增强模式）
+        self._openkitsune_brain_source = None
+        self._openkitsune_brain_provider = None
+        try:
+            from ..memory.openkitsune_brain import (
+                OpenKitsuneBrainRetrievalSource,
+                create_openkitsune_brain_provider,
+            )
+
+            flag = os.environ.get("OPENKITSUNE_BRAIN_MEMORY", "1").strip().lower()
+            if flag not in ("0", "false", "off", "no"):
+                provider = create_openkitsune_brain_provider()
+                source = OpenKitsuneBrainRetrievalSource(provider)
+                self._openkitsune_brain_provider = provider
+                self._openkitsune_brain_source = source
+                self.memory_manager.retrieval_engine._external_sources.append(source)
+                logger.info(
+                    "[BrainMemory] external retrieval source registered (home=%s, okmem=%s)",
+                    provider.home,
+                    provider.okmem_available,
+                )
+        except Exception as e:
+            logger.debug("[BrainMemory] external retrieval source unavailable: %s", e)
         self._active_agent_lifecycle_runs: dict[str, dict[str, Any]] = {}
 
         # 用户档案管理器
@@ -1392,6 +1416,16 @@ class Agent:
 
         # 初始化 token 用量追踪
         init_token_tracking(str(settings.db_full_path))
+
+        # 伴随拉起 openkitsune-brain 记忆栈（fusion-memory + brain-bus）。
+        # 子进程启动失败只记录日志，绝不阻断 Agent 初始化；sub-agent 不重复拉起。
+        if not lightweight:
+            try:
+                from ..memory.brain_stack import start_brain_stack
+
+                logger.info("[BrainStack] autostart: %s", start_brain_stack())
+            except Exception as e:  # noqa: BLE001 -- 外部记忆栈不可用不能阻断宿主
+                logger.debug("[BrainStack] autostart failed: %s", e)
 
         # 自动生成/加载设备 ID（用于平台认证）
         if not settings.hub_device_id:
@@ -3244,6 +3278,19 @@ class Agent:
                     logger.debug("[F1Guard] contradiction detection skipped: %s", e)
             except Exception:
                 pass
+
+        # 空间感知：仅在本轮请求绑定了客户端 IP（或允许本机出口回退）时解析。
+        # 原始 IP 只存在于请求上下文与进程内存缓存中，不落盘、不写日志。
+        try:
+            from .spatial_context import resolve_current_spatial_context
+
+            _spatial = await resolve_current_spatial_context()
+            if _spatial is not None:
+                if session_context is None:
+                    session_context = {}
+                session_context["spatial_context"] = _spatial.to_dict()
+        except Exception as exc:
+            logger.debug("[Spatial] context resolution skipped: %s", exc)
 
         if ask_user_reply is not None:
             try:
@@ -5995,7 +6042,9 @@ class Agent:
                 if _persist_q:
                     _persist_sess.set_metadata("active_task_query", _persist_q[:2000])
             except Exception:
-                logger.debug("[SessionCleanup] persist active_task_definition failed", exc_info=True)
+                logger.debug(
+                    "[SessionCleanup] persist active_task_definition failed", exc_info=True
+                )
         self._current_session = None
         self.agent_state.current_session = None
         self._current_task_monitor = None
@@ -6356,22 +6405,16 @@ class Agent:
             # === 视角切换审查点（IM/CLI 对话通道 · 交付前终审，配置门控 + 全程兜底）===
             # response_text 已就绪、exit_reason 与 react_trace 完整，位于共享收尾前；
             # 覆盖 orchestrator → chat_with_session（IM 委派）与 CLI 交互对话等全部同步通道。
-            if (
-                response_text
-                and getattr(settings, "view_switch_review_enabled", False)
-            ):
+            if response_text and getattr(settings, "view_switch_review_enabled", False):
                 try:
                     response_text = await self._view_switch_exit_review(
                         response_text,
-                        getattr(self.reasoning_engine, "_last_exit_reason", "normal")
-                        or "normal",
+                        getattr(self.reasoning_engine, "_last_exit_reason", "normal") or "normal",
                         task=None,
                         task_description=message,
                     )
                 except Exception as _vs_exc:  # 兜底：任何异常不阻断原流程
-                    logger.warning(
-                        "[view_switch][sync] 出口钩子异常，维持原响应: %s", _vs_exc
-                    )
+                    logger.warning("[view_switch][sync] 出口钩子异常，维持原响应: %s", _vs_exc)
 
             # === 共享收尾 ===
             await self._finalize_session(
@@ -6430,9 +6473,7 @@ class Agent:
             events.put_nowait(
                 {
                     "type": "intent_ready",
-                    "intent": getattr(
-                        _rule.intent, "value", str(getattr(_rule, "intent", ""))
-                    ),
+                    "intent": getattr(_rule.intent, "value", str(getattr(_rule, "intent", ""))),
                     "task_type": getattr(_rule, "task_type", "") or "",
                     "confidence": 0.0,
                     "summary": (getattr(_rule, "task_definition", "") or message)[:240],
@@ -6454,9 +6495,7 @@ class Agent:
             )
             return
         except Exception as e:
-            logger.warning(
-                "[Session:%s] Background intent analysis failed: %s", session_id, e
-            )
+            logger.warning("[Session:%s] Background intent analysis failed: %s", session_id, e)
             return
 
         # 仅当仍是同一轮会话时应用（避免跨会话/跨轮串扰）
@@ -6885,15 +6924,13 @@ class Agent:
                     consume_pending_handoff,
                     render_handoff_block,
                 )
+
                 _pending_handoff = consume_pending_handoff(
                     data_dir=str(getattr(settings, "data_dir", "data") or "data"),
                     handoff_dir=str(
-                        getattr(settings, "context_handoff_dir", "data/handoff")
-                        or "data/handoff"
+                        getattr(settings, "context_handoff_dir", "data/handoff") or "data/handoff"
                     ),
-                    ttl_hours=float(
-                        getattr(settings, "context_handoff_ttl_hours", 168.0) or 168.0
-                    ),
+                    ttl_hours=float(getattr(settings, "context_handoff_ttl_hours", 168.0) or 168.0),
                 )
                 if _pending_handoff is not None:
                     system_prompt += (
@@ -8109,15 +8146,13 @@ class Agent:
                 consume_pending_handoff,
                 render_handoff_block,
             )
+
             _pending_handoff = consume_pending_handoff(
                 data_dir=str(getattr(settings, "data_dir", "data") or "data"),
                 handoff_dir=str(
-                    getattr(settings, "context_handoff_dir", "data/handoff")
-                    or "data/handoff"
+                    getattr(settings, "context_handoff_dir", "data/handoff") or "data/handoff"
                 ),
-                ttl_hours=float(
-                    getattr(settings, "context_handoff_ttl_hours", 168.0) or 168.0
-                ),
+                ttl_hours=float(getattr(settings, "context_handoff_ttl_hours", 168.0) or 168.0),
             )
             if _pending_handoff is not None:
                 system_prompt += (
@@ -8905,13 +8940,9 @@ class Agent:
                 # —— 视角切换审查点：交付前终审（配置门控 + 全程兜底；未触发/异常 → 原响应不变）——
                 if getattr(settings, "view_switch_review_enabled", False):
                     try:
-                        response = await self._view_switch_exit_review(
-                            response, exit_reason, task
-                        )
+                        response = await self._view_switch_exit_review(response, exit_reason, task)
                     except Exception as _vs_exc:  # 兜底：任何异常不阻断原流程
-                        logger.warning(
-                            "[view_switch] 出口钩子异常，维持原响应: %s", _vs_exc
-                        )
+                        logger.warning("[view_switch] 出口钩子异常，维持原响应: %s", _vs_exc)
                 task.mark_completed(response)
                 metrics = task_monitor.complete(success=True, response=response)
                 if metrics.retrospect_needed:
@@ -9197,6 +9228,20 @@ class Agent:
         except Exception as e:
             logger.warning(f"Failed to await memory pending tasks: {e}")
 
+        # 关闭 openkitsune-brain 外部记忆源（释放 okmem 连接与线程池）
+        brain_source = getattr(self, "_openkitsune_brain_source", None)
+        if brain_source is not None:
+            try:
+                sources = getattr(self.memory_manager.retrieval_engine, "_external_sources", None)
+                if sources is not None:
+                    with contextlib.suppress(ValueError):
+                        sources.remove(brain_source)
+                brain_source.close()
+            except Exception as e:
+                logger.debug(f"[BrainMemory] close failed: {e}")
+            self._openkitsune_brain_source = None
+            self._openkitsune_brain_provider = None
+
         # Flush TodoStore 并停止防抖循环
         try:
             todo_save_task = getattr(self, "_todo_save_task", None)
@@ -9216,6 +9261,13 @@ class Agent:
         # 如果当前 Agent 是进程主 Agent，则清理引用，防止后续 sub-agent
         # 拿到已经 shutdown 的 parent。
         if get_primary_agent() is self:
+            # 回收随宿主拉起的 openkitsune-brain 记忆栈（外部实例不受影响）
+            try:
+                from ..memory.brain_stack import stop_brain_stack
+
+                await asyncio.to_thread(stop_brain_stack)
+            except Exception as e:  # noqa: BLE001 -- 收尾失败不能阻断 shutdown
+                logger.debug(f"[BrainStack] stop failed: {e}")
             set_primary_agent(None)
 
         self._running = False
