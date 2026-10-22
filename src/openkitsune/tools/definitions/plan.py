@@ -43,7 +43,9 @@ PLAN_TOOLS = [
 
 **步骤字段说明**：
 - `id` + `description`: 必填
+- `expected` + `done_when`: 代码门禁要求的预期结果与完成判定（enforce 模式必填）
 - `tool`: 可选，预计使用的工具名
+- `allow_tools`: 可选，该步允许的额外工具
 - `skills`: 可选，关联的技能名称列表（用于追踪）
 - `depends_on`: 可选，前置依赖步骤
 
@@ -61,6 +63,25 @@ PLAN_TOOLS = [
                         "properties": {
                             "id": {"type": "string", "description": "步骤ID，如 step_1, step_2"},
                             "description": {"type": "string", "description": "步骤描述"},
+                            "expected": {
+                                "type": "string",
+                                "description": (
+                                    "该步的预期结果（enforce 模式下必填）；"
+                                    "用于代码层偏离检测与自检对照"
+                                ),
+                            },
+                            "done_when": {
+                                "type": "string",
+                                "description": (
+                                    "可验证的完成判定标准（enforce 模式下必填），"
+                                    "例如 '命令退出码为 0' / '页面包含目标标题'"
+                                ),
+                            },
+                            "allow_tools": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "该步允许的额外工具（可选）",
+                            },
                             "tool": {"type": "string", "description": "预计使用的工具（可选）"},
                             "skills": {
                                 "type": "array",
@@ -105,9 +126,15 @@ PLAN_TOOLS = [
 - failed: 执行失败
 - skipped: 已跳过
 
+**完成证据（代码强制）**：
+标记 completed/failed 时 result 必须包含自检口径：
+`actual=<结果/命令输出摘要 ≤120字> | verdict=PASS|FAIL|DEVIATE`
+缺少证据会被 plan_guard 拒绝，步骤状态不会推进。
+
 **示例**：
 执行完 browser_navigate 后：
-→ update_todo_step(step_id="step_1", status="completed", result="已打开百度首页")""",
+→ update_todo_step(step_id="step_1", status="completed",
+   result="actual=页面标题为『百度一下』 | verdict=PASS")""",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -117,7 +144,13 @@ PLAN_TOOLS = [
                     "enum": ["pending", "in_progress", "completed", "failed", "skipped"],
                     "description": "步骤状态",
                 },
-                "result": {"type": "string", "description": "执行结果或错误信息"},
+                "result": {
+                    "type": "string",
+                    "description": (
+                        "执行结果或错误信息。标记 completed/failed 时必须提供证据："
+                        "actual=<结果/命令输出摘要> | verdict=PASS|FAIL|DEVIATE"
+                    ),
+                },
             },
             "required": ["step_id", "status"],
         },

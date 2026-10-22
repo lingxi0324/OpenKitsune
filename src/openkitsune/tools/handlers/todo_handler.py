@@ -210,6 +210,32 @@ class PlanHandler:
         else:
             return f"❌ Unknown plan tool: {tool_name}"
 
+    async def _guard_plan_created(self, plan: dict, *, require_expected: bool = True) -> str | None:
+        """R8：通过 Hook 层校验计划结构；返回阻断提示或 None（fail-open）。"""
+        try:
+            from ...process_rules import plan_guard
+
+            return await plan_guard.run_plan_created_hook(
+                plan, require_expected=require_expected
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[PlanGuard] plan created hook degraded: {e}")
+            return None
+
+    async def _guard_step_update(
+        self, plan: dict, step_id: str, status: str, result: str
+    ) -> str | None:
+        """R8：完成/失败步骤必须携带显式自检证据；返回阻断提示或 None。"""
+        try:
+            from ...process_rules import plan_guard
+
+            return await plan_guard.run_step_update_hook(
+                plan, step_id=step_id, status=status, result=result
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[PlanGuard] step update hook degraded: {e}")
+            return None
+
     async def _create_todo(self, params: dict) -> str:
         """创建任务计划（支持多计划共存）"""
         if "task_summary" not in params and "goal" in params:
@@ -292,6 +318,9 @@ class PlanHandler:
             "completed_at": None,
             "logs": [],
         }
+        guard_block = await self._guard_plan_created(_new_plan, require_expected=True)
+        if guard_block:
+            return guard_block
         self._set_current_todo(_new_plan)
 
         self._save_plan_markdown()
@@ -353,6 +382,10 @@ class PlanHandler:
             return "❌ 请指定要更新的步骤"
         if not status:
             return "❌ 请指定步骤的目标状态（如 in_progress、completed、failed、skipped）"
+
+        guard_block = await self._guard_step_update(_plan, step_id, status, str(result or ""))
+        if guard_block:
+            return guard_block
 
         _VALID_TRANSITIONS: dict[str, set[str]] = {
             "pending": {"in_progress", "completed", "skipped", "cancelled"},
@@ -611,6 +644,25 @@ class PlanHandler:
             )
         if not str(body or overview).strip():
             body = self._render_plan_body_from_todos(name, overview, todos)
+
+        # R8：plan_file 的结构约束只看 id/description/步骤上限（详细内容在 body）
+        preview_plan = {
+            "id": "planfile_preview",
+            "plan_type": "plan_file",
+            "task_summary": name,
+            "status": "in_progress",
+            "steps": [
+                {
+                    "id": todo.get("id", f"step_{idx}"),
+                    "description": todo.get("content", ""),
+                    "status": todo.get("status", "pending"),
+                }
+                for idx, todo in enumerate(todos, start=1)
+            ],
+        }
+        guard_block = await self._guard_plan_created(preview_plan, require_expected=False)
+        if guard_block:
+            return guard_block
 
         import hashlib as _hashlib
 

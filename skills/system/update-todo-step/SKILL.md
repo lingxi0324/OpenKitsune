@@ -17,16 +17,16 @@ category: Plan
 |-----|------|-----|------|
 | step_id | string | 是 | 步骤 ID |
 | status | string | 是 | pending / in_progress / completed / failed / skipped |
-| result | string | 否 | 执行结果或错误信息 |
+| result | string | 完成/失败时必填 | 证据，格式：`actual=<摘要> \| verdict=PASS\|FAIL\|DEVIATE` |
 
 ## Examples
 
-**步骤完成**:
+**步骤完成（带自检证据）**:
 ```json
 {
   "step_id": "step_1",
   "status": "completed",
-  "result": "已打开百度首页"
+  "result": "actual=百度首页标题为『百度一下』 | verdict=PASS"
 }
 ```
 
@@ -35,9 +35,12 @@ category: Plan
 {
   "step_id": "step_2",
   "status": "failed",
-  "result": "找不到搜索框元素"
+  "result": "actual=未找到搜索框元素（selector 超时 10s） | verdict=FAIL"
 }
 ```
+
+> 标记 completed/failed 但 `result` 缺少 `actual=` 或 `verdict=` 时，
+> `plan_guard` 会拒绝更新，步骤状态不会推进。
 
 ## Related Skills
 

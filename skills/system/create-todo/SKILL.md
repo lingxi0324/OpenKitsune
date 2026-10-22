@@ -34,9 +34,15 @@ category: Plan
 |-----|------|-----|------|
 | id | string | 是 | 步骤 ID（如 step_1） |
 | description | string | 是 | 步骤描述 |
+| expected | string | 是* | 该步预期结果（代码门禁要求） |
+| done_when | string | 是* | 可验证的完成判定标准（代码门禁要求） |
 | tool | string | 否 | 预计使用的工具 |
+| allow_tools | array | 否 | 该步允许的额外工具 |
 | skills | array | 否 | 关联的 skill 名称列表（可选，用于追踪） |
 | depends_on | array | 否 | 依赖的步骤 ID |
+
+\* `process_rules_plan_guard_mode=enforce`（默认）时为必填；缺失会被
+`plan_guard` 拒绝创建。
 
 ## Examples
 
@@ -45,10 +51,17 @@ category: Plan
 {
   "task_summary": "打开百度搜索天气并截图发送",
   "steps": [
-    {"id": "step_1", "description": "打开百度", "tool": "browser_navigate", "skills": ["browser-navigate"]},
-    {"id": "step_2", "description": "输入搜索关键词", "tool": "browser_type", "skills": ["browser-type"], "depends_on": ["step_1"]},
-    {"id": "step_3", "description": "截图", "tool": "browser_screenshot", "skills": ["browser-screenshot"], "depends_on": ["step_2"]},
-    {"id": "step_4", "description": "发送截图", "tool": "deliver_artifacts", "skills": ["deliver-artifacts"], "depends_on": ["step_3"]}
+    {"id": "step_1", "description": "打开百度", "tool": "browser_navigate",
+     "expected": "百度首页可交互", "done_when": "页面标题包含『百度』"},
+    {"id": "step_2", "description": "输入搜索关键词", "tool": "browser_type",
+     "expected": "搜索框出现天气关键词", "done_when": "输入框 value 为『天气』",
+     "depends_on": ["step_1"]},
+    {"id": "step_3", "description": "截图", "tool": "browser_screenshot",
+     "expected": "得到结果页截图", "done_when": "返回非空图片路径",
+     "depends_on": ["step_2"]},
+    {"id": "step_4", "description": "发送截图", "tool": "deliver_artifacts",
+     "expected": "用户收到图片", "done_when": "发送工具返回成功",
+     "depends_on": ["step_3"]}
   ]
 }
 ```

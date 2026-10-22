@@ -6024,6 +6024,25 @@ class Agent:
             except Exception as e:
                 logger.debug(f"[Todo] auto_close_todo failed: {e}")
 
+            # R8：轮末确定性进度汇报（代码从计划状态机生成，不依赖 LLM 自述）
+            try:
+                from ..process_rules import plan_guard
+
+                plan = plan_guard.resolve_active_plan(conversation_id)
+                report = await plan_guard.run_turn_end_report(plan, response_text or "")
+                if report:
+                    session_obj = getattr(self, "_current_session", None)
+                    gateway = (
+                        session_obj.get_metadata("_gateway")
+                        if session_obj is not None and hasattr(session_obj, "get_metadata")
+                        else None
+                    )
+                    if gateway is not None and hasattr(gateway, "emit_progress_event"):
+                        await gateway.emit_progress_event(session_obj, report)
+                    logger.info(f"[PlanGuard] progress report:\n{report}")
+            except Exception as e:
+                logger.debug(f"[PlanGuard] turn-end report skipped: {e}")
+
             # 及时结束 memory session，触发记忆提取
             try:
                 task_desc = (getattr(self, "_current_task_query", "") or "").strip()[:200]

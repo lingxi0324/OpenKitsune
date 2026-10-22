@@ -54,6 +54,12 @@ class HookEvent(StrEnum):
     TASK_CREATED = "task_created"
     TASK_COMPLETED = "task_completed"
 
+    # Plan compliance (plan_guard hook layer)
+    PLAN_CREATED = "plan_created"
+    PLAN_STEP_TOOL = "plan_step_tool"
+    PLAN_STEP_UPDATE = "plan_step_update"
+    PLAN_TURN_END = "plan_turn_end"
+
     # Configuration
     CONFIG_CHANGE = "config_change"
 
@@ -71,7 +77,12 @@ class HookEvent(StrEnum):
 
 @dataclass
 class HookResult:
-    """Hook 执行结果"""
+    """Hook 执行结果。
+
+    ``decision`` 为 Hook 的裁决（allow / warn / block），供
+    :meth:`HookExecutor.execute_first_blocking` 聚合；``feedback`` 是
+    需要回注给模型/调用方的提示文本。两者默认值保证旧 Hook 行为不变。
+    """
 
     hook_id: str
     event: str
@@ -79,6 +90,8 @@ class HookResult:
     output: str = ""
     error: str = ""
     duration_ms: float = 0
+    decision: str = "allow"
+    feedback: str = ""
 
 
 class HookHandler:
@@ -113,6 +126,19 @@ class CallbackHook(HookHandler):
             if asyncio.iscoroutine(result):
                 result = await result
             duration = (time.monotonic() - start) * 1000
+            if isinstance(result, HookResult):
+                result.duration_ms = result.duration_ms or duration
+                return result
+            if isinstance(result, dict):
+                return HookResult(
+                    hook_id=self.hook_id,
+                    event=event.value,
+                    success=True,
+                    output=str(result.get("output", "")),
+                    decision=str(result.get("decision", "allow")),
+                    feedback=str(result.get("feedback", "")),
+                    duration_ms=duration,
+                )
             return HookResult(
                 hook_id=self.hook_id,
                 event=event.value,
@@ -207,6 +233,10 @@ class HookExecutor:
         """取消注册。"""
         self._handlers = [h for h in self._handlers if h.hook_id != hook_id]
 
+    def has_handler(self, hook_id: str) -> bool:
+        """是否已注册指定 hook_id（幂等注册用）。"""
+        return any(h.hook_id == hook_id for h in self._handlers)
+
     def register_callback(
         self,
         hook_id: str,
@@ -271,6 +301,36 @@ class HookExecutor:
     @property
     def handler_count(self) -> int:
         return len(self._handlers)
+
+    async def execute_first_blocking(
+        self,
+        event: HookEvent,
+        context: dict | None = None,
+    ) -> HookResult | None:
+        """执行事件的所有 Hooks，返回第一个 ``decision == "block"`` 的结果。
+
+        语义：阻断优先。一旦某个 Hook 明确阻断，后续 Hook 仍会执行（审计
+        完整性），但调用方只需要拿到第一份阻断理由。没有阻断时返回 None。
+        所有异常都被吞掉——Hook 层永远不能因为自身故障阻断主流程。
+        """
+        results = await self.execute(event, context)
+        for result in results:
+            if result.success and result.decision == "block":
+                return result
+        return None
+
+    async def execute_collect_feedback(
+        self,
+        event: HookEvent,
+        context: dict | None = None,
+    ) -> list[str]:
+        """执行事件的所有 Hooks，收集 warn/block 的 feedback 文本。"""
+        results = await self.execute(event, context)
+        return [
+            r.feedback
+            for r in results
+            if r.success and r.decision in ("warn", "block") and r.feedback
+        ]
 
 
 # Global hook executor instance

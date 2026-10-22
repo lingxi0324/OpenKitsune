@@ -19,6 +19,16 @@ process_rules —— 流程规则引擎（整改版 v2.0 代码落地 + 自主�
   LLM 调用有预算上限与缓存，成本受控。
 """
 
+from . import plan_guard
+from .arbiter import AgentResult, arbitrate, deterministic_arbiter_decision
+from .autonomy import decide, decide_async_or_sync, get_tracker as get_autonomy_tracker
+from .checkpoints import (
+    CheckpointTracker,
+    detect_deviation,
+    deterministic_checkpoint_decision,
+    note_todo_completed,
+    trigger_checkpoint,
+)
 from .config import ProcessRulesConfig, get_process_rules_config
 from .engine import (
     RuleAudit,
@@ -27,27 +37,6 @@ from .engine import (
     get_rule_engine,
     is_enabled,
 )
-from .todo_policy import (
-    detect_risk_signal,
-    deterministic_todo_decision,
-    estimate_step_count,
-    todo_policy_check,
-)
-from .checkpoints import (
-    CheckpointTracker,
-    detect_deviation,
-    deterministic_checkpoint_decision,
-    note_todo_completed,
-    trigger_checkpoint,
-)
-from .preflight import (
-    PreflightTracker,
-    classify_preflight,
-    deterministic_preflight_decision,
-    get_tracker as get_preflight_tracker,
-    preflight_check,
-)
-from .arbiter import AgentResult, arbitrate, deterministic_arbiter_decision
 from .exception_tree import (
     ErrorClass,
     classify_error_class,
@@ -61,7 +50,37 @@ from .memory_events import (
     end_of_turn_scan,
     memory_event,
 )
-from .autonomy import decide, decide_async_or_sync, get_tracker as get_autonomy_tracker
+from .plan_guard import (
+    GuardDecision,
+    build_progress_report,
+    build_selfcheck_prompt,
+    detect_premature_completion,
+    detect_stale_steps,
+    effective_mode,
+    gate_tool_call,
+    install_plan_guard,
+    is_structured,
+    resolve_active_plan,
+    run_plan_created_hook,
+    run_step_update_hook,
+    run_tool_gate_hook,
+    run_turn_end_report,
+    validate_plan_structure,
+    validate_step_update,
+)
+from .preflight import (
+    PreflightTracker,
+    classify_preflight,
+    deterministic_preflight_decision,
+    get_tracker as get_preflight_tracker,
+    preflight_check,
+)
+from .todo_policy import (
+    detect_risk_signal,
+    deterministic_todo_decision,
+    estimate_step_count,
+    todo_policy_check,
+)
 
 __all__ = [
     # config
@@ -109,4 +128,22 @@ __all__ = [
     "decide",
     "decide_async_or_sync",
     "get_autonomy_tracker",
+    # R8 plan guard
+    "plan_guard",
+    "GuardDecision",
+    "build_progress_report",
+    "build_selfcheck_prompt",
+    "detect_premature_completion",
+    "detect_stale_steps",
+    "effective_mode",
+    "gate_tool_call",
+    "install_plan_guard",
+    "is_structured",
+    "resolve_active_plan",
+    "run_plan_created_hook",
+    "run_step_update_hook",
+    "run_tool_gate_hook",
+    "run_turn_end_report",
+    "validate_plan_structure",
+    "validate_step_update",
 ]

@@ -96,6 +96,17 @@ class ProcessRulesConfig:
         "conflict",       # 与已存偏好冲突 → update 而非新增
     )
 
+    # ── R8 Plan 合规门禁（代码 Hook 层）─────────────────────
+    plan_guard_enabled: bool = True
+    # off: 完全关闭；observe: 只审计+提示；enforce: 硬阻断
+    plan_guard_mode: str = "enforce"
+    # 创建 todo 时要求每步提供 expected / done_when（plan_file 豁免）
+    plan_guard_require_expected: bool = True
+    # 结构化计划完成步骤时要求 actual= / verdict= 自检证据
+    plan_guard_require_evidence: bool = True
+    # in_progress 步骤停滞多久后提醒（秒）
+    plan_guard_stale_seconds: int = 900
+
     @classmethod
     def from_settings(cls, settings: object) -> "ProcessRulesConfig":
         """从 openkitsune.config.settings 读取覆盖项；字段缺失时用默认值。
@@ -167,6 +178,20 @@ class ProcessRulesConfig:
         cfg.autonomy_max_tokens = int(_get("autonomy_max_tokens", cfg.autonomy_max_tokens))
         cfg.autonomy_budget_per_rule = int(
             _get("autonomy_budget_per_rule", cfg.autonomy_budget_per_rule)
+        )
+
+        cfg.plan_guard_enabled = bool(_get("plan_guard_enabled", cfg.plan_guard_enabled))
+        guard_mode = _get("plan_guard_mode", cfg.plan_guard_mode)
+        if str(guard_mode) in ("off", "observe", "enforce"):
+            cfg.plan_guard_mode = str(guard_mode)
+        cfg.plan_guard_require_expected = bool(
+            _get("plan_guard_require_expected", cfg.plan_guard_require_expected)
+        )
+        cfg.plan_guard_require_evidence = bool(
+            _get("plan_guard_require_evidence", cfg.plan_guard_require_evidence)
+        )
+        cfg.plan_guard_stale_seconds = int(
+            _get("plan_guard_stale_seconds", cfg.plan_guard_stale_seconds)
         )
 
         return cfg

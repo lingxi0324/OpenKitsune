@@ -1255,6 +1255,12 @@ class ToolExecutor:
         if todo_block:
             return todo_block, None
 
+        # R8 Plan 合规门禁（代码 Hook 层）：有活跃计划时必须绑定到
+        # in_progress 步骤，且工具与步骤声明一致（enforce 模式下硬阻断）。
+        plan_block = await self._check_plan_gate(tool_name, tool_input, session_id)
+        if plan_block:
+            return plan_block, None
+
         grounding_block = self._check_current_turn_grounding(tool_name, tool_input)
         if grounding_block:
             return grounding_block, None
@@ -1297,12 +1303,13 @@ class ToolExecutor:
                 sandbox_output += f"stderr:\n{sb_result.stderr}\n"
             return self._guard_truncate(tool_name, sandbox_output), None
 
-        return await self._execute_tool_impl(
+        text, hint = await self._execute_tool_impl(
             tool_name,
             tool_input,
             session_id=session_id,
             execution_context=execution_context,
         )
+        return self._inject_plan_selfcheck(tool_name, text, session_id), hint
 
     async def execute_batch(
         self,
@@ -1965,6 +1972,62 @@ class ToolExecutor:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[ProcessRules] autonomous todo gate degraded, allow: {e}")
             return None
+
+    def _plan_session_key(self, session_id: str | None) -> str | None:
+        """Plan 状态以 conversation_id 为键；优先取 agent 当前会话。"""
+        agent = self._agent_ref
+        cid = getattr(agent, "_current_conversation_id", None) if agent is not None else None
+        return str(cid or session_id or "") or None
+
+    async def _check_plan_gate(
+        self, tool_name: str, tool_input: dict, session_id: str | None
+    ) -> str | None:
+        """R8 Plan 合规门禁（Hook 层）：返回阻断提示或 None。
+
+        fail-open：门禁自身异常一律放行，绝不阻碍主流程。
+        """
+        try:
+            from openkitsune.process_rules import plan_guard
+
+            key = self._plan_session_key(session_id)
+            plan = plan_guard.resolve_active_plan(key)
+            if plan is None:
+                return None
+            return await plan_guard.run_tool_gate_hook(
+                plan,
+                session_id=key,
+                tool_name=tool_name,
+                tool_input=tool_input or {},
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[PlanGuard] tool gate degraded, allow: {e}")
+            return None
+
+    def _inject_plan_selfcheck(
+        self, tool_name: str, text: str, session_id: str | None
+    ) -> str:
+        """把"显式自检契约"回注到工具结果，供模型在推进步骤前复述。"""
+        try:
+            from openkitsune.process_rules import plan_guard
+
+            if tool_name in plan_guard.PLAN_TOOL_NAMES:
+                return text
+            key = self._plan_session_key(session_id)
+            plan = plan_guard.resolve_active_plan(key)
+            if plan is None:
+                return text
+            prompt = plan_guard.build_selfcheck_prompt(
+                plan,
+                tool_name=tool_name,
+                success=not str(text or "").startswith("❌"),
+                result_text=text or "",
+            )
+            if not prompt:
+                return text
+            return f"{text}\n\n{prompt}" if text else prompt
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[PlanGuard] selfcheck inject degraded: {e}")
+            return text
 
     def _run_preflight(
         self, tool_name: str, tool_input: dict, session_id: str | None
