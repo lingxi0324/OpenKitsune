@@ -221,6 +221,11 @@ class SkillMetadata:
     model: str | None = None
     fallback_for_toolsets: list[str] = field(default_factory=list)
 
+    # 模型可见性级别（"core" | "recommended" | "optional"；空则按
+    # system/trust 推断）。core 技能在 system prompt 技能目录中排最前，
+    # 不会被 metadata 预算截断剔除。
+    exposure_level: str = ""
+
     # 国际化（由 agents/openai.yaml i18n 字段注入，兼容旧的 .openkitsune-i18n.json）
     # key 为语言代码 (如 "zh")，value 为该语言的显示名/描述
     name_i18n: dict[str, str] = field(default_factory=dict)
@@ -676,6 +681,7 @@ class SkillParser:
             model=model if isinstance(model, str) else None,
             fallback_for_toolsets=fallback_for_toolsets,
             approval_class=approval_class,
+            exposure_level=str(data.get("exposure_level") or data.get("exposure-level") or ""),
         )
 
     @staticmethod

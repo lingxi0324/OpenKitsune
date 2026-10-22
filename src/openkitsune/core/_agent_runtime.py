@@ -777,11 +777,10 @@ class Agent:
         runtime_state.load()
 
         # 系统工具目录（渐进式披露）
+        # 桌面工具已并入 BASE_TOOLS（tools/definitions/desktop.py，Windows 平台
+        # 条件导入）；handler 按 _ensure_desktop() 在下方注册，与 POWERSHELL_TOOLS
+        # 同一模式（定义无条件进目录，处理器仅实际可用平台注册）。
         _all_tools = list(BASE_TOOLS)
-        if _ensure_desktop():
-            from ..tools.desktop import DESKTOP_TOOLS as _DT
-
-            _all_tools.extend(_DT)
         from ..tools.definitions.agent import AGENT_TOOLS
         from ..tools.definitions.org_setup import ORG_SETUP_TOOLS
 

@@ -53,6 +53,7 @@ from .code_quality import CODE_QUALITY_TOOLS
 
 # 工具定义
 from .config import CONFIG_TOOLS
+from .desktop import DESKTOP_TOOLS
 from .filesystem import FILESYSTEM_TOOLS
 from .im_channel import IM_CHANNEL_TOOLS
 from .kanban import KANBAN_TOOLS
@@ -116,6 +117,7 @@ BASE_TOOLS = (
     + KNOWLEDGE_TOOLS
     + KANBAN_TOOLS
     + VOICE_TOOLS
+    + DESKTOP_TOOLS
 )
 
 # 平台连接工具（Agent Hub + Skill Store），仅在 hub_enabled=True 时注册
@@ -156,6 +158,7 @@ __all__ = [
     "BASE_TOOLS",
     "HUB_TOOLS",
     "AGENT_TOOLS",
+    "DESKTOP_TOOLS",
     "ORG_SETUP_TOOLS",
     "AGENT_HUB_TOOLS",
     "AGENT_PACKAGE_TOOLS",
