@@ -4757,5 +4757,24 @@
     "viewParams": "查看工具参数",
     "notePlaceholder": "可选：添加审批备注...",
     "expired": "已过期"
+  },
+  "desktop": {
+    "toggle": "AI 桌面可视化",
+    "title": "AI 桌面可视化",
+    "live": "实时",
+    "refresh": "刷新",
+    "autoRefresh": "自动刷新",
+    "close": "关闭",
+    "screen": "屏幕",
+    "pointer": "指针",
+    "windows": "窗口",
+    "activeWindow": "活动窗口",
+    "visibleWindows": "可见窗口",
+    "noWindows": "无可见窗口",
+    "capabilities": "能力探测",
+    "noScreenshot": "暂无截图，点击刷新",
+    "imgFailed": "截图加载失败，点击刷新重试",
+    "fetchError": "桌面状态获取失败",
+    "hint": "坐标操作前先观察 · 操作后用新截图验证"
   }
 }

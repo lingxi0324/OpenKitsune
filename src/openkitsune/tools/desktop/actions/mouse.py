@@ -4,9 +4,11 @@ Windows 桌面自动化 - 鼠标操作模块
 基于 PyAutoGUI 封装鼠标操作
 """
 
+import ctypes
 import logging
 import sys
 import time
+from contextlib import contextmanager
 
 from ..config import get_config
 from ..types import ActionResult, BoundingBox, MouseButton, UIElement
@@ -25,6 +27,39 @@ except ImportError:
     raise ImportError(import_or_hint("pyautogui"))
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _modifiers_held(modifiers: list[str] | tuple[str, ...] | None):
+    """按住修饰键执行鼠标操作（ctrl/shift/alt/win）。
+
+    典型用途：Ctrl+点击多选、Shift+点击范围选择、Ctrl+拖拽复制文件、
+    Alt+拖拽创建快捷方式、Ctrl+滚轮缩放。
+    """
+    keys: list[str] = []
+    try:
+        from .keyboard import get_keyboard
+
+        keyboard = get_keyboard()
+        for mod in modifiers or []:
+            key = str(mod).strip().lower()
+            if key:
+                keyboard.key_down(key)
+                keys.append(key)
+    except Exception as e:  # pragma: no cover - 非关键路径
+        logger.debug(f"Modifier key-down failed: {e}")
+
+    try:
+        yield
+    finally:
+        try:
+            from .keyboard import get_keyboard
+
+            keyboard = get_keyboard()
+            for key in reversed(keys):
+                keyboard.key_up(key)
+        except Exception:
+            pass
 
 
 class MouseController:
@@ -142,6 +177,7 @@ class MouseController:
         dx: int,
         dy: int,
         duration: float | None = None,
+        raw: bool = False,
     ) -> ActionResult:
         """
         相对移动鼠标
@@ -149,6 +185,8 @@ class MouseController:
         Args:
             dx, dy: 相对偏移量
             duration: 移动持续时间
+            raw: True 时用 mouse_event 发送相对位移（游戏/全屏程序更兼容；
+                 False 时移动系统光标到新位置）
 
         Returns:
             ActionResult
@@ -158,6 +196,17 @@ class MouseController:
 
         start_time = time.time()
         try:
+            if raw:
+                # MOUSEEVENTF_MOVE = 0x0001，相对位移，不依赖 SetCursorPos
+                ctypes.windll.user32.mouse_event(0x0001, int(dx), int(dy), 0, 0)
+                return ActionResult(
+                    success=True,
+                    action="move_relative",
+                    target=f"{dx},{dy}",
+                    message=f"Moved mouse by ({dx}, {dy}) [raw]",
+                    duration_ms=(time.time() - start_time) * 1000,
+                )
+
             pyautogui.move(dx, dy, duration=dur)
             return ActionResult(
                 success=True,
@@ -183,6 +232,7 @@ class MouseController:
         button: str | MouseButton = MouseButton.LEFT,
         clicks: int = 1,
         interval: float = 0.1,
+        modifiers: list[str] | tuple[str, ...] | None = None,
     ) -> ActionResult:
         """
         点击鼠标
@@ -192,6 +242,7 @@ class MouseController:
             button: 鼠标按钮
             clicks: 点击次数
             interval: 多次点击之间的间隔
+            modifiers: 同时按住的修饰键（ctrl/shift/alt/win），用于组合点击
 
         Returns:
             ActionResult
@@ -205,20 +256,25 @@ class MouseController:
             if config.click_delay > 0:
                 time.sleep(config.click_delay)
 
-            if x is not None and y is not None:
-                pyautogui.click(x, y, clicks=clicks, interval=interval, button=btn)
-                target = f"{x},{y}"
-            else:
-                pyautogui.click(clicks=clicks, interval=interval, button=btn)
-                pos = self.get_position()
-                target = f"{pos[0]},{pos[1]}"
+            with _modifiers_held(modifiers):
+                if x is not None and y is not None:
+                    pyautogui.click(x, y, clicks=clicks, interval=interval, button=btn)
+                    target = f"{x},{y}"
+                else:
+                    pyautogui.click(clicks=clicks, interval=interval, button=btn)
+                    pos = self.get_position()
+                    target = f"{pos[0]},{pos[1]}"
 
             action_name = "double_click" if clicks == 2 else "click"
+            mods = "+".join(str(m).lower() for m in (modifiers or []))
+            message = f"Clicked {btn} button at ({target}), {clicks} time(s)"
+            if mods:
+                message += f" with {mods} held"
             return ActionResult(
                 success=True,
                 action=action_name,
                 target=target,
-                message=f"Clicked {btn} button at ({target}), {clicks} time(s)",
+                message=message,
                 duration_ms=(time.time() - start_time) * 1000,
             )
         except Exception as e:
@@ -230,6 +286,16 @@ class MouseController:
                 error=str(e),
                 duration_ms=(time.time() - start_time) * 1000,
             )
+
+    def hover(self, x: int, y: int, pause: float = 0.3) -> ActionResult:
+        """移动鼠标悬停到目标位置并停留，用于触发 hover 菜单/提示。"""
+        start_time = time.time()
+        result = self.move_to(x, y)
+        if result.success and pause > 0:
+            time.sleep(pause)
+            result.message = f"Hovered at ({x}, {y}) for {pause:.2f}s"
+            result.duration_ms = (time.time() - start_time) * 1000
+        return result
 
     def click_target(
         self,
@@ -315,6 +381,7 @@ class MouseController:
         end_y: int,
         duration: float = 0.5,
         button: str | MouseButton = MouseButton.LEFT,
+        modifiers: list[str] | tuple[str, ...] | None = None,
     ) -> ActionResult:
         """
         拖拽
@@ -324,6 +391,7 @@ class MouseController:
             end_x, end_y: 结束位置
             duration: 拖拽持续时间
             button: 鼠标按钮
+            modifiers: 拖拽期间按住的修饰键（ctrl=复制，shift=移动约束，alt=快捷方式）
 
         Returns:
             ActionResult
@@ -332,21 +400,26 @@ class MouseController:
 
         start_time = time.time()
         try:
-            # 先移动到起始位置
-            pyautogui.moveTo(start_x, start_y)
-            # 拖拽到目标位置
-            pyautogui.drag(
-                end_x - start_x,
-                end_y - start_y,
-                duration=duration,
-                button=btn,
-            )
+            with _modifiers_held(modifiers):
+                # 先移动到起始位置
+                pyautogui.moveTo(start_x, start_y)
+                # 拖拽到目标位置
+                pyautogui.drag(
+                    end_x - start_x,
+                    end_y - start_y,
+                    duration=duration,
+                    button=btn,
+                )
 
+            mods = "+".join(str(m).lower() for m in (modifiers or []))
+            message = f"Dragged from ({start_x},{start_y}) to ({end_x},{end_y})"
+            if mods:
+                message += f" with {mods} held"
             return ActionResult(
                 success=True,
                 action="drag",
                 target=f"({start_x},{start_y}) -> ({end_x},{end_y})",
-                message=f"Dragged from ({start_x},{start_y}) to ({end_x},{end_y})",
+                message=message,
                 duration_ms=(time.time() - start_time) * 1000,
             )
         except Exception as e:
@@ -365,6 +438,7 @@ class MouseController:
         end_y: int,
         duration: float = 0.5,
         button: str | MouseButton = MouseButton.LEFT,
+        modifiers: list[str] | tuple[str, ...] | None = None,
     ) -> ActionResult:
         """
         从当前位置拖拽到目标位置
@@ -373,18 +447,20 @@ class MouseController:
             end_x, end_y: 目标位置
             duration: 拖拽持续时间
             button: 鼠标按钮
+            modifiers: 拖拽期间按住的修饰键
 
         Returns:
             ActionResult
         """
         start_x, start_y = self.get_position()
-        return self.drag(start_x, start_y, end_x, end_y, duration, button)
+        return self.drag(start_x, start_y, end_x, end_y, duration, button, modifiers)
 
     def scroll(
         self,
         clicks: int,
         x: int | None = None,
         y: int | None = None,
+        modifiers: list[str] | tuple[str, ...] | None = None,
     ) -> ActionResult:
         """
         滚动鼠标滚轮
@@ -392,25 +468,31 @@ class MouseController:
         Args:
             clicks: 滚动格数，正数向上，负数向下
             x, y: 滚动位置，None 表示当前位置
+            modifiers: 按住修饰键滚动（ctrl=缩放）
 
         Returns:
             ActionResult
         """
         start_time = time.time()
         try:
-            if x is not None and y is not None:
-                pyautogui.scroll(clicks, x, y)
-                target = f"{x},{y}"
-            else:
-                pyautogui.scroll(clicks)
-                target = "current"
+            with _modifiers_held(modifiers):
+                if x is not None and y is not None:
+                    pyautogui.scroll(clicks, x, y)
+                    target = f"{x},{y}"
+                else:
+                    pyautogui.scroll(clicks)
+                    target = "current"
 
             direction = "up" if clicks > 0 else "down"
+            mods = "+".join(str(m).lower() for m in (modifiers or []))
+            message = f"Scrolled {direction} {abs(clicks)} clicks"
+            if mods:
+                message += f" with {mods} held"
             return ActionResult(
                 success=True,
                 action="scroll",
                 target=target,
-                message=f"Scrolled {direction} {abs(clicks)} clicks",
+                message=message,
                 duration_ms=(time.time() - start_time) * 1000,
             )
         except Exception as e:

@@ -127,6 +127,12 @@ _INTERRUPT_BEHAVIOR_MAP: dict[str, InterruptBehavior] = {
     "desktop_type": "block",
     "desktop_wait": "cancel",
     "desktop_window": "block",
+    # 组合/批量输入类：改动真实桌面状态，中断会让按键/鼠标停在半路，必须 block
+    "desktop_batch": "block",
+    "desktop_key": "block",
+    "desktop_macro": "block",
+    "desktop_mouse": "block",
+    "desktop_press": "block",
     # ── Filesystem ────────────────────────────────────────────────
     # Reads are cancel; any write/mutate is block (half-written file
     # is worse than the user re-running the operation).

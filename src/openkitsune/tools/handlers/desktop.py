@@ -34,12 +34,17 @@ DESKTOP_TOOLS = [
     "desktop_screenshot",
     "desktop_find_element",
     "desktop_click",
+    "desktop_mouse",
     "desktop_type",
+    "desktop_press",
+    "desktop_key",
     "desktop_hotkey",
     "desktop_scroll",
     "desktop_window",
     "desktop_wait",
     "desktop_inspect",
+    "desktop_batch",
+    "desktop_macro",
 ]
 
 
@@ -53,12 +58,17 @@ class DesktopHandler:
         "desktop_screenshot": ApprovalClass.READONLY_GLOBAL,
         "desktop_find_element": ApprovalClass.READONLY_GLOBAL,
         "desktop_click": ApprovalClass.EXEC_CAPABLE,
+        "desktop_mouse": ApprovalClass.EXEC_CAPABLE,
         "desktop_type": ApprovalClass.EXEC_CAPABLE,
+        "desktop_press": ApprovalClass.EXEC_CAPABLE,
+        "desktop_key": ApprovalClass.EXEC_CAPABLE,
         "desktop_hotkey": ApprovalClass.EXEC_CAPABLE,
         "desktop_scroll": ApprovalClass.EXEC_LOW_RISK,
         "desktop_window": ApprovalClass.EXEC_CAPABLE,
         "desktop_wait": ApprovalClass.EXEC_LOW_RISK,
         "desktop_inspect": ApprovalClass.READONLY_GLOBAL,
+        "desktop_batch": ApprovalClass.EXEC_CAPABLE,
+        "desktop_macro": ApprovalClass.EXEC_CAPABLE,
     }
 
     def __init__(self, agent):
@@ -113,44 +123,126 @@ class DesktopHandler:
             return f"桌面工具错误: {str(e)}"
 
     def _format_result(self, tool_name: str, result: Any) -> str:
-        """格式化工具执行结果"""
-        if isinstance(result, dict):
-            if result.get("success"):
-                # 截图结果
-                if result.get("file_path"):
-                    output = f"截图已保存: {result.get('file_path')} ({result.get('width')}x{result.get('height')})"
-                    if result.get("analysis"):
-                        output += f"\n\n分析结果:\n{result['analysis'].get('answer', '')}"
-                    return output
+        """格式化工具执行结果
 
-                # 元素查找结果
-                if result.get("found") is not None:
-                    if result.get("found"):
-                        elem = result.get("element", {})
-                        return f"找到元素: {elem.get('name', 'unknown')} @ {elem.get('center', 'unknown')}"
-                    else:
-                        return f"未找到元素: {result.get('message', '')}"
-
-                # 窗口列表
-                if result.get("windows"):
-                    windows = result["windows"]
-                    output = f"找到 {len(windows)} 个窗口:\n"
-                    for i, w in enumerate(windows[:10], 1):
-                        output += f"  {i}. {w.get('title', 'unknown')}\n"
-                    if len(windows) > 10:
-                        output += f"  ... 还有 {len(windows) - 10} 个\n"
-                    return output
-
-                # 元素树
-                if result.get("tree"):
-                    return f"元素树:\n```\n{result.get('text', '')}\n```"
-
-                # 通用成功
-                return f"{result.get('message', '操作成功')}"
-            else:
-                return f"错误: {result.get('error', '操作失败')}"
-        else:
+        注意：LLM 只能看到这里返回的文本。截图工具产出的 OCR 文本、画面理解、
+        坐标空间必须在文本里显式呈现，否则模型等于「没看见」这张图。
+        """
+        if not isinstance(result, dict):
             return str(result)
+
+        if not result.get("success"):
+            return f"错误: {result.get('error', '操作失败')}"
+
+        # 截图结果（含 OCR / 视觉理解 / 坐标空间）
+        if result.get("file_path"):
+            return self._format_screenshot(result)
+
+        # 元素查找结果
+        if result.get("found") is not None:
+            if result.get("found"):
+                elem = result.get("element") or {}
+                source = elem.get("source", "unknown")
+                return (
+                    f"找到元素: {elem.get('name', 'unknown')} "
+                    f"@{elem.get('center', 'unknown')} "
+                    f"(bbox={elem.get('bbox')}, type={elem.get('control_type')}, "
+                    f"source={source}, confidence={elem.get('confidence')})"
+                )
+            return f"未找到元素: {result.get('message', '')}"
+
+        # 窗口列表
+        if result.get("windows"):
+            windows = result["windows"]
+            output = f"找到 {len(windows)} 个窗口:\n"
+            for i, w in enumerate(windows[:10], 1):
+                output += f"  {i}. {w.get('title', 'unknown')}\n"
+            if len(windows) > 10:
+                output += f"  ... 还有 {len(windows) - 10} 个\n"
+            return output
+
+        # 元素树
+        if result.get("tree"):
+            return f"元素树:\n```\n{result.get('text', '')}\n```"
+
+        # 批量执行
+        if result.get("results") is not None and tool_name == "desktop_batch":
+            lines = [f"批量执行: {result.get('steps_completed', 0)} 步, "
+                     f"success={result.get('success')}"]
+            for item in result.get("results", []):
+                step = item.get("step")
+                inner = item.get("result") or {}
+                if item.get("error"):
+                    lines.append(f"  [{step}] 错误: {item['error']}")
+                else:
+                    lines.append(f"  [{step}] {inner.get('message') or inner}")
+            return "\n".join(lines)
+
+        # 宏序列
+        if tool_name == "desktop_macro" and result.get("results") is not None:
+            lines = [
+                f"宏执行: {result.get('steps_completed', 0)} 步, "
+                f"rounds={result.get('rounds', 1)}, success={result.get('success')}"
+            ]
+            for item in result.get("results", [])[:30]:
+                status = "ok" if item.get("success") else "fail"
+                detail = item.get("message") or item.get("error") or ""
+                lines.append(
+                    f"  [r{item.get('round', 0)}/s{item.get('step', 0)}] "
+                    f"{item.get('tool', '?')} {status}: {detail}"
+                )
+            return "\n".join(lines)
+
+        # 通用成功
+        return f"{result.get('message', '操作成功')}"
+
+    def _format_screenshot(self, result: dict) -> str:
+        """把截图结果渲染成模型可消费的文本（文字 + 画面 + 坐标空间）"""
+        lines = [
+            f"截图已保存: {result.get('file_path')} "
+            f"({result.get('width')}x{result.get('height')})"
+        ]
+
+        screen_size = result.get("screen_size")
+        if result.get("coordinate_space") == "window" and result.get("window_bbox"):
+            origin = result.get("window_origin") or result["window_bbox"][:2]
+            lines.append(
+                f"坐标空间: 窗口截图（窗口 '{result.get('window_title')}'，"
+                f"bbox={result.get('window_bbox')}，origin={origin}）"
+                f"；屏幕绝对坐标 = 截图像素坐标 + origin"
+            )
+        else:
+            lines.append("坐标空间: 全屏截图，截图像素坐标即屏幕绝对坐标")
+
+        if screen_size:
+            lines.append(f"屏幕尺寸: {screen_size[0]}x{screen_size[1]}")
+
+        ocr_text = result.get("ocr_text")
+        if ocr_text:
+            indented = "\n".join(f"  {ln}" for ln in str(ocr_text).splitlines() if ln.strip())
+            lines.append("识别文字(OCR):\n" + indented)
+        elif result.get("extracted_text_success") is False:
+            lines.append("识别文字(OCR): 未提取到文字（视觉模型不可用或无文本）")
+
+        vision_analysis = result.get("vision_analysis")
+        if vision_analysis:
+            lines.append("画面理解:\n" + "\n".join(
+                f"  {ln}" for ln in str(vision_analysis).splitlines() if ln.strip()
+            ))
+
+        analysis = result.get("analysis")
+        if isinstance(analysis, dict) and analysis.get("answer"):
+            lines.append("定向分析:\n" + "\n".join(
+                f"  {ln}" for ln in str(analysis["answer"]).splitlines() if ln.strip()
+            ))
+
+        if ocr_text or vision_analysis:
+            lines.append(
+                "提示: OCR 文本可直接引用；需要点击时请用 desktop_find_element "
+                "获取 UIA 精确屏幕坐标（vision 坐标仅作参考，可能不精确）"
+            )
+
+        return "\n".join(lines)
 
 
 def create_handler(agent) -> callable:

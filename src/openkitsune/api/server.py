@@ -46,6 +46,7 @@ from .routes import (
     chat,
     chat_models,
     config,
+    desktop,
     diagnostics,
     feishu_onboard,
     files,
@@ -1148,6 +1149,7 @@ def create_app(
     app.include_router(chat.router, tags=["对话"])
     app.include_router(chat_models.router, tags=["模型"])
     app.include_router(config.router, tags=["配置"])
+    app.include_router(desktop.router, tags=["桌面"])
     app.include_router(diagnostics.router, tags=["诊断"])
     app.include_router(feishu_onboard.router, tags=["飞书扫码"])
     app.include_router(qqbot_onboard.router, tags=["QQ扫码"])

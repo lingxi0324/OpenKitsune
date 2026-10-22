@@ -8,6 +8,7 @@ import { LoginView } from "./views/LoginView";
 import { SetupView } from "./views/SetupView";
 import { ServerManagerView } from "./views/ServerManagerView";
 import { ChatView } from "./views/ChatView";
+import { DesktopPanel } from "./views/DesktopPanel";
 import type { LinkDiagnostic } from "./components/LinkDiagnosticsPanel";
 
 // Lazy-loaded views — keeps first-screen bundle small (4.7 Code Splitting)
@@ -5572,6 +5573,9 @@ function MainApp() {
         serviceRunning={serviceStatus?.running ?? false}
         currentWorkspaceId={currentWorkspaceId}
       />
+
+      {/* AI 桌面可视化（浮动开关 + 滑出面板） */}
+      <DesktopPanel apiBaseUrl={apiBaseUrl} />
     </div>
     </EnvFieldContext.Provider>
   );

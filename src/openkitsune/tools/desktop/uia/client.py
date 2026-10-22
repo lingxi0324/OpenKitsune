@@ -153,12 +153,28 @@ class UIAClient:
             logger.debug(f"Window not found: {criteria} - {e}")
             return None
         except ElementAmbiguousError:
-            # 如果找到多个，返回第一个
+            # 找到多个：优先选「可见且未最小化」的窗口（跳过已最小化/隐藏的陈旧窗口），
+            # 枚举顺序作为平手裁决（一般接近 Z-order 顶部）。
             logger.warning(f"Multiple windows match criteria: {criteria}")
             try:
                 wins = self.desktop.windows(**criteria)
-                if wins:
-                    return UIAElementWrapper(wins[0])
+                if not wins:
+                    return None
+
+                def _prefer(win) -> tuple:
+                    try:
+                        visible = bool(win.is_visible())
+                    except Exception:
+                        visible = False
+                    try:
+                        minimized = bool(win.is_minimized())
+                    except Exception:
+                        minimized = False
+                    # 可见且未最小化 → 0（优先）；否则 1
+                    return (0 if (visible and not minimized) else 1,)
+
+                best = sorted(wins, key=_prefer)[0]
+                return UIAElementWrapper(best)
             except Exception:
                 pass
             return None
@@ -372,10 +388,125 @@ class UIAClient:
             return UIAElementWrapper(elem)
         except (ElementNotFoundError, PywinautoTimeoutError):
             logger.debug(f"Element not found: {criteria}")
+            return self._find_descendant_fuzzy(
+                root,
+                name=name,
+                name_re=name_re,
+                control_type=control_type,
+                automation_id=automation_id,
+            )
+        except ElementAmbiguousError:
+            # 只给了控件类型（如"按钮"）时可能命中多个，取第一个可见的候选
+            logger.debug(f"Multiple elements match: {criteria}; taking first")
+            try:
+                items = (
+                    search_root.descendants(**criteria)
+                    if root
+                    else search_root.windows(**criteria)
+                )
+                for item in items:
+                    wrapper = UIAElementWrapper(item)
+                    if wrapper.is_visible:
+                        return wrapper
+            except Exception:
+                pass
             return None
         except Exception as e:
             logger.error(f"Error finding element: {e}")
             return None
+
+    def _find_descendant_fuzzy(
+        self,
+        root: UIAElementWrapper | None,
+        *,
+        name: str | None = None,
+        name_re: str | None = None,
+        control_type: str | None = None,
+        automation_id: str | None = None,
+    ) -> UIAElementWrapper | None:
+        """精确匹配失败后的模糊兜底：在子树中做大小写不敏感的子串匹配。
+
+        场景：自然语言描述（"PING 按钮" → "PING"）不等于控件 UIA Name 的完整值，
+        pywinauto 的 title/title_re 精确/正则匹配可能找不到，但子树里确实存在。
+        """
+        if not (name or name_re or control_type):
+            return None
+
+        pattern = name or name_re or ""
+        use_regex = False
+        matcher = None
+        if pattern:
+            try:
+                matcher = re.compile(pattern, re.IGNORECASE)
+                use_regex = True
+            except re.error:
+                matcher = re.compile(re.escape(pattern), re.IGNORECASE)
+                use_regex = False
+
+        # root 为空时扫描所有可见顶层窗口的子树：desktop_click("PING") 这类
+        # 不指定窗口的调用也能命中控件，而不是只在顶层窗口里找。
+        roots: list[UIAElementWrapper] = []
+        if root is not None:
+            roots = [root]
+        else:
+            active = None
+            try:
+                active = self.get_active_window()
+            except Exception:
+                active = None
+            if active is not None:
+                roots.append(active)
+            try:
+                for win in self.desktop.windows():
+                    try:
+                        wrapper = UIAElementWrapper(win)
+                        if not wrapper.is_visible or not wrapper.name:
+                            continue
+                        if active is not None and wrapper.name == active.name:
+                            continue
+                        roots.append(wrapper)
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.debug(f"Enumerate windows for fuzzy search failed: {e}")
+                if not roots:
+                    return None
+
+        scanned = 0
+        for search_root in roots:
+            try:
+                children = search_root.control.descendants()
+            except Exception:
+                continue
+            for child in children:
+                scanned += 1
+                if scanned > 4000:
+                    return None
+                try:
+                    wrapper = UIAElementWrapper(child)
+                    label = wrapper.name or ""
+                    if pattern:
+                        if not label:
+                            continue
+                        if use_regex:
+                            matched = bool(matcher.search(label))
+                        else:
+                            matched = pattern.casefold() in label.casefold()
+                        if not matched:
+                            continue
+                    if control_type and control_type.lower() not in (
+                        wrapper.control_type or ""
+                    ).lower():
+                        continue
+                    if automation_id and (wrapper.automation_id or "") != automation_id:
+                        continue
+                    if not wrapper.is_visible:
+                        continue
+                    return wrapper
+                except Exception:
+                    continue
+
+        return None
 
     def find_all_elements(
         self,

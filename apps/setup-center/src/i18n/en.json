@@ -4742,5 +4742,24 @@
     "viewParams": "View tool parameters",
     "notePlaceholder": "Optional: add a note...",
     "expired": "Expired"
+  },
+  "desktop": {
+    "toggle": "AI Desktop View",
+    "title": "AI Desktop View",
+    "live": "Live",
+    "refresh": "Refresh",
+    "autoRefresh": "Auto refresh",
+    "close": "Close",
+    "screen": "Screen",
+    "pointer": "Pointer",
+    "windows": "Windows",
+    "activeWindow": "Active window",
+    "visibleWindows": "Visible windows",
+    "noWindows": "No visible windows",
+    "capabilities": "Capabilities",
+    "noScreenshot": "No screenshot yet — refresh",
+    "imgFailed": "Screenshot failed to load — refresh to retry",
+    "fetchError": "Failed to fetch desktop state",
+    "hint": "Observe before coordinate actions · verify with a fresh screenshot"
   }
 }

@@ -4,6 +4,7 @@ Windows 桌面自动化 - Agent 工具定义
 定义供 OpenKitsune Agent 使用的工具
 """
 
+import asyncio
 import logging
 import sys
 from typing import Any
@@ -198,6 +199,11 @@ DESKTOP_TOOLS = [
                     "default": True,
                     "description": "是否自动用视觉模型从截图中提取文字（OCR），默认开启",
                 },
+                "auto_vision": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否自动用视觉模型理解截图画面（图片内容/布局），默认开启",
+                },
             },
             "required": [],
         },
@@ -283,8 +289,100 @@ DESKTOP_TOOLS = [
                     "default": "auto",
                     "description": "元素查找方法",
                 },
+                "window_title": {
+                    "type": "string",
+                    "description": "可选，限定在某个窗口内查找要点击的元素（推荐：避免命中其它窗口）",
+                },
+                "modifiers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "同时按住的修饰键，如 ['ctrl']（多选）、['shift']（范围选择）、['ctrl','shift']",
+                },
             },
             "required": ["target"],
+        },
+    },
+    {
+        "name": "desktop_mouse",
+        "category": "Desktop",
+        "description": (
+            "Fine-grained mouse control for web, file managers and games. "
+            "Actions: move, move_relative, hover, drag, click, double_click, right_click, "
+            "middle_click, down, up, position, scroll. Supports modifier keys "
+            "(ctrl/shift/alt) for combined clicks and drags, e.g. ctrl+click multi-select, "
+            "ctrl+drag copy, shift+click range select."
+        ),
+        "detail": """精细鼠标控制（网页 / 文件管理器 / 游戏）。
+
+**action 说明**：
+- move: 移动到 (x, y)，可带 duration
+- move_relative: 相对移动 (dx, dy)（游戏视角常用）
+- hover: 移动到 (x, y) 并停留 pause 秒（触发悬浮菜单）
+- drag: 从 (x, y) 拖到 (to_x, to_y)；可带 modifiers（ctrl=复制 / alt=快捷方式）
+- click / double_click / right_click / middle_click: 点击 (x, y)
+- down / up: 按下/释放鼠标键（长按、拖拽、游戏）
+- position: 返回当前鼠标坐标与屏幕尺寸
+- scroll: 在 (x, y) 滚动，direction=up/down/left/right，modifiers=['ctrl'] 可缩放
+
+**常用组合**：
+- Ctrl+点击多选：{"action":"click","x":..,"y":..,"modifiers":["ctrl"]}
+- Shift+点击范围选择：{"action":"click",...,"modifiers":["shift"]}
+- Ctrl+拖拽复制文件：{"action":"drag",...,"modifiers":["ctrl"]}
+- 框选：down → move → up
+- 游戏视角：move_relative(dx, dy)""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "move",
+                        "move_relative",
+                        "hover",
+                        "drag",
+                        "click",
+                        "double_click",
+                        "right_click",
+                        "middle_click",
+                        "down",
+                        "up",
+                        "position",
+                        "scroll",
+                    ],
+                    "description": "鼠标动作",
+                },
+                "x": {"type": "integer", "description": "屏幕绝对 X 坐标"},
+                "y": {"type": "integer", "description": "屏幕绝对 Y 坐标"},
+                "dx": {"type": "integer", "description": "相对移动 X 偏移"},
+                "dy": {"type": "integer", "description": "相对移动 Y 偏移"},
+                "raw": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "move_relative 时发送原始相对位移（游戏/全屏程序更兼容）",
+                },
+                "to_x": {"type": "integer", "description": "拖拽终点 X 坐标"},
+                "to_y": {"type": "integer", "description": "拖拽终点 Y 坐标"},
+                "duration": {"type": "number", "default": 0.3, "description": "移动/拖拽时长（秒）"},
+                "pause": {"type": "number", "default": 0.3, "description": "hover 停留秒数"},
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "middle"],
+                    "default": "left",
+                    "description": "鼠标按钮",
+                },
+                "modifiers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "按住的修饰键，如 ['ctrl'] / ['shift'] / ['alt']",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["up", "down", "left", "right"],
+                    "description": "滚动方向（scroll 使用）",
+                },
+                "amount": {"type": "integer", "default": 3, "description": "滚动格数"},
+            },
+            "required": ["action"],
         },
     },
     {
@@ -315,8 +413,109 @@ DESKTOP_TOOLS = [
                     "default": False,
                     "description": "是否先清空现有内容（Ctrl+A 后输入）",
                 },
+                "method": {
+                    "type": "string",
+                    "enum": ["auto", "paste", "type"],
+                    "default": "auto",
+                    "description": (
+                        "输入方式：auto=优先剪贴板粘贴（避开中文输入法干扰，推荐）；"
+                        "paste=只用剪贴板；type=逐字符按键输入"
+                    ),
+                },
             },
             "required": ["text"],
+        },
+    },
+    {
+        "name": "desktop_press",
+        "category": "Desktop",
+        "description": (
+            "Press a single keyboard key (Enter, Space, Tab, Escape, Backspace, arrows, F1-F12). "
+            "Use when you need to: (1) Submit a form or confirm a dialog with Enter, "
+            "(2) Insert a space or navigate with Tab/arrows, (3) Clear a field with Backspace. "
+            "For key combinations (Ctrl+C, Alt+F4) use desktop_hotkey instead."
+        ),
+        "detail": """按下单个按键（可重复）。
+
+**常用按键**：
+- enter: 回车/确认
+- space: 空格
+- tab: 切换焦点
+- escape / esc: 取消
+- backspace / delete: 删除
+- up / down / left / right: 方向键
+- home / end / pageup / pagedown
+- f1 ~ f12
+
+**参数说明**：
+- key: 按键名（不区分大小写）
+- times: 按下次数，默认 1
+
+**使用建议**：
+- 先点击/聚焦目标控件，再调用此工具
+- 组合键请用 desktop_hotkey（如 ['ctrl','c']）""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "按键名，如 enter、space、tab、escape、backspace、up",
+                },
+                "times": {
+                    "type": "integer",
+                    "default": 1,
+                    "description": "按下次数",
+                },
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "desktop_key",
+        "category": "Desktop",
+        "description": (
+            "Fine-grained keyboard control: press, down, up, release_all, type, hotkey. "
+            "Use down/up to hold keys (games, walk/aim, modifier drag), press with times "
+            "for repeated taps, and hotkey for combinations like ['ctrl','shift','esc']."
+        ),
+        "detail": """精细键盘控制。
+
+**action 说明**：
+- press: 按下并释放 key（可 times 重复）
+- down: 按住 key 不释放（游戏移动/加速/瞄准）
+- up: 释放 key
+- release_all: 释放所有仍按住的键（异常恢复）
+- type: 输入文本 text（支持中文）
+- hotkey: 组合键 keys=['ctrl','shift','esc']
+
+**场景示例**：
+- 游戏持续前进：down('w') → 等待 → up('w')
+- 连续射击：press('space', times=10, interval=0.05)
+- 文件批量重命名：hotkey(['f2']) → type('new name') → press('enter')
+- 浏览器无痕窗口：hotkey(['ctrl','shift','n'])""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["press", "down", "up", "release_all", "type", "hotkey"],
+                    "description": "键盘动作",
+                },
+                "key": {"type": "string", "description": "单个按键，如 enter/space/tab/w/a/f2"},
+                "keys": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "组合键列表（hotkey 使用），如 ['ctrl','c']",
+                },
+                "text": {"type": "string", "description": "要输入的文本（type 使用）"},
+                "times": {"type": "integer", "default": 1, "description": "重复次数（press）"},
+                "interval": {
+                    "type": "number",
+                    "default": 0.1,
+                    "description": "重复间隔秒数（press）",
+                },
+            },
+            "required": ["action"],
         },
     },
     {
@@ -511,7 +710,10 @@ keys 是按键数组，如 ['ctrl', 'c']""",
                                 "type": "string",
                                 "enum": [
                                     "desktop_click",
+                                    "desktop_mouse",
                                     "desktop_type",
+                                    "desktop_press",
+                                    "desktop_key",
                                     "desktop_hotkey",
                                     "desktop_scroll",
                                     "desktop_wait",
@@ -529,6 +731,116 @@ keys 是按键数组，如 ['ctrl', 'c']""",
                 },
             },
             "required": ["actions"],
+        },
+    },
+    {
+        "name": "desktop_macro",
+        "category": "Desktop",
+        "description": (
+            "Run a coordinated mouse+keyboard macro: an ordered list of desktop steps with "
+            "per-step delay, optional repeat. Use for multi-step workflows that must not be "
+            "interleaved with screenshots, e.g. ctrl+click multi-select then F2 rename, "
+            "game combos (hold key + move mouse + click), drag-and-drop with ctrl held, "
+            "or opening a file and typing into it."
+        ),
+        "detail": """鼠标 + 键盘协同宏（原子序列）。
+
+**steps 每项**：
+- tool: desktop_mouse / desktop_key / desktop_click / desktop_type /
+        desktop_press / desktop_hotkey / desktop_scroll / desktop_wait
+- params: 对应工具参数
+- delay_ms: 该步执行后等待毫秒（0~5000）
+
+**顶层参数**：
+- repeat: 重复次数（1~20）
+- interval_ms: 每轮之间等待毫秒
+- stop_on_error: 出错是否中止（默认 true）
+- release_at_end: 结束时释放所有按键/鼠标键（默认 true，防卡键）
+- focus_window: 执行前先激活的目标窗口标题（模糊匹配）。**强烈建议填写**：
+  组合开始时若目标窗口尚未获得焦点，type/hotkey 可能落空；核心引擎会先
+  激活该窗口并等待焦点沉降再执行序列。
+- focus_delay_ms: 激活窗口后的焦点沉降等待毫秒（默认 250）
+
+**示例：Ctrl+点击多选后重命名**
+```json
+{"steps":[
+  {"tool":"desktop_mouse","params":{"action":"click","x":100,"y":200,"modifiers":["ctrl"]}},
+  {"tool":"desktop_key","params":{"action":"hotkey","keys":["f2"]},"delay_ms":200},
+  {"tool":"desktop_key","params":{"action":"type","text":"renamed"},"delay_ms":100},
+  {"tool":"desktop_key","params":{"action":"press","key":"enter"}}
+]}
+```
+
+**示例：游戏连招（按住 W + 鼠标移动 + 连点）**
+```json
+{"steps":[
+  {"tool":"desktop_key","params":{"action":"down","key":"w"}},
+  {"tool":"desktop_mouse","params":{"action":"move_relative","dx":120,"dy":0}},
+  {"tool":"desktop_mouse","params":{"action":"click","modifiers":[]},"delay_ms":50}
+],"repeat":3,"interval_ms":100}
+```""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string", "description": "要执行的桌面工具名"},
+                            "params": {"type": "object", "description": "工具参数"},
+                            "delay_ms": {
+                                "type": "integer",
+                                "default": 0,
+                                "minimum": 0,
+                                "maximum": 5000,
+                                "description": "该步之后等待毫秒",
+                            },
+                        },
+                        "required": ["tool"],
+                    },
+                    "description": "按顺序执行的步骤列表（最多 50 步）",
+                },
+                "repeat": {
+                    "type": "integer",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "重复轮数",
+                },
+                "interval_ms": {
+                    "type": "integer",
+                    "default": 0,
+                    "minimum": 0,
+                    "maximum": 5000,
+                    "description": "每轮之间的等待毫秒",
+                },
+                "stop_on_error": {"type": "boolean", "default": True},
+                "release_at_end": {"type": "boolean", "default": True},
+                "focus_window": {
+                    "type": "string",
+                    "description": "执行前先激活的目标窗口标题（模糊匹配），避免 type/hotkey 因焦点未就绪而落空",
+                },
+                "focus_delay_ms": {
+                    "type": "integer",
+                    "default": 400,
+                    "minimum": 0,
+                    "maximum": 5000,
+                    "description": "激活窗口后的焦点沉降等待毫秒（新启动窗口可调大）",
+                },
+                "default_step_delay_ms": {
+                    "type": "integer",
+                    "default": 120,
+                    "minimum": 0,
+                    "maximum": 5000,
+                    "description": (
+                        "未显式给 delay_ms 的步骤的默认步间延迟毫秒；Windows 下紧随注入键"
+                        "后的 WM_CHAR 突发可能被窗口丢弃，默认延迟可显著提高组合可靠性，"
+                        "显式 delay_ms=0 表示立即执行"
+                    ),
+                },
+            },
+            "required": ["steps"],
         },
     },
 ]
@@ -574,8 +886,14 @@ class DesktopToolHandler:
                 return await self._handle_find_element(params)
             elif tool_name == "desktop_click":
                 return await self._handle_click(params)
+            elif tool_name == "desktop_mouse":
+                return self._handle_mouse(params)
             elif tool_name == "desktop_type":
                 return self._handle_type(params)
+            elif tool_name == "desktop_press":
+                return self._handle_press(params)
+            elif tool_name == "desktop_key":
+                return self._handle_key(params)
             elif tool_name == "desktop_hotkey":
                 return self._handle_hotkey(params)
             elif tool_name == "desktop_scroll":
@@ -588,6 +906,8 @@ class DesktopToolHandler:
                 return self._handle_inspect(params)
             elif tool_name == "desktop_batch":
                 return await self._handle_batch(params)
+            elif tool_name == "desktop_macro":
+                return await self._handle_macro(params)
             # Tab-Agent 视觉工具
             elif tool_name == "segment_object":
                 return await self._handle_segment_object(params)
@@ -630,7 +950,28 @@ class DesktopToolHandler:
                 path = filename
 
         # 保存截图（总是保存，便于后续分析）
-        self.controller.capture.save(img, path)
+        try:
+            from pathlib import Path
+
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            self.controller.capture.save(img, path)
+        except OSError as e:
+            # 桌面目录可能被 OneDrive 重定向 / 受控文件夹访问保护，写入会被拒。
+            # 回退到项目 data 目录，避免整个截图工具因保存失败而不可用。
+            logger.warning(f"Save screenshot to '{path}' failed ({e}); using fallback dir")
+            from pathlib import Path
+
+            try:
+                from ...config import settings
+
+                fallback_dir = Path(settings.project_root) / "data" / "desktop" / "screenshots" / "adhoc"
+            except Exception:
+                import tempfile
+
+                fallback_dir = Path(tempfile.gettempdir()) / "openkitsune_screenshots"
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            path = str(fallback_dir / Path(path).name)
+            self.controller.capture.save(img, path)
         abs_path = os.path.abspath(path)
 
         # 获取文件 URL（本地 HTTP 服务）
@@ -648,6 +989,29 @@ class DesktopToolHandler:
             "height": img.height,
         }
 
+        # 坐标空间说明：窗口截图的像素坐标需要加上窗口原点才是屏幕绝对坐标，
+        # 否则模型会拿窗口内坐标去点击，落到窗口外。
+        window_bbox = None
+        if window_title:
+            try:
+                window = self.controller.uia.find_window_fuzzy(window_title, timeout=2.0)
+                if window and window.bbox:
+                    window_bbox = window.bbox.to_tuple()
+            except Exception as e:
+                logger.debug(f"Window bbox lookup failed: {e}")
+
+        try:
+            screen_size = list(self.controller.capture.get_screen_size(0))
+        except Exception:
+            screen_size = [img.width, img.height]
+
+        result["window_title"] = window_title
+        result["window_bbox"] = window_bbox
+        result["screen_size"] = screen_size
+        result["coordinate_space"] = "window" if window_bbox else "screen"
+        if window_bbox:
+            result["window_origin"] = [window_bbox[0], window_bbox[1]]
+
         # 视觉分析（如果启用）
         if analyze:
             analysis = await self.controller.analyze_screen(
@@ -656,40 +1020,47 @@ class DesktopToolHandler:
             )
             result["analysis"] = analysis
 
-        # 自动 OCR 提取文字
-        if auto_ocr:
-            try:
-                from .vision.analyzer import get_vision_analyzer
-                analyzer = get_vision_analyzer()
-                ocr_result = await analyzer.extract_text(img)
-                if ocr_result and ocr_result.success:
+        # 自动 OCR + 视觉语义分析：并行调用，避免串行等待（本地视觉模型较慢）
+        if auto_ocr or auto_vision:
+            from .vision.analyzer import get_vision_analyzer
+
+            analyzer = get_vision_analyzer()
+            tasks = []
+            if auto_ocr:
+                tasks.append(analyzer.extract_text(img))
+            if auto_vision:
+                tasks.append(analyzer.analyze_page(img))
+
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
+            idx = 0
+
+            if auto_ocr:
+                ocr_result = gathered[idx]
+                idx += 1
+                if isinstance(ocr_result, Exception):
+                    logger.debug(f"OCR failed: {ocr_result}")
+                    result["ocr_text"] = None
+                    result["extracted_text_success"] = False
+                elif ocr_result and ocr_result.success:
                     result["ocr_text"] = ocr_result.answer
                     result["ocr_elements"] = ocr_result.elements
                     result["extracted_text_success"] = True
                 else:
                     result["ocr_text"] = None
                     result["extracted_text_success"] = False
-            except Exception as e:
-                logger.debug(f"OCR failed: {e}")
-                result["ocr_text"] = None
-                result["extracted_text_success"] = False
 
-        # 自动视觉语义分析（调用 _call_vision_model）
-        if auto_vision:
-            try:
-                from .vision.analyzer import get_vision_analyzer
-                analyzer = get_vision_analyzer()
-                vision_result = await analyzer.analyze_page(img)
-                if vision_result and vision_result.success:
+            if auto_vision:
+                vision_result = gathered[idx]
+                if isinstance(vision_result, Exception):
+                    logger.debug(f"Vision analysis failed: {vision_result}")
+                    result["vision_analysis"] = None
+                    result["vision_success"] = False
+                elif vision_result and vision_result.success:
                     result["vision_analysis"] = vision_result.answer
                     result["vision_success"] = True
                 else:
                     result["vision_analysis"] = None
                     result["vision_success"] = False
-            except Exception as e:
-                logger.debug(f"Vision analysis failed: {e}")
-                result["vision_analysis"] = None
-                result["vision_success"] = False
 
         return result
 
@@ -724,23 +1095,208 @@ class DesktopToolHandler:
         button = params.get("button", "left")
         double = params.get("double", False)
         method = params.get("method", "auto")
+        window_title = params.get("window_title")
 
         result = await self.controller.click(
             target=target,
             button=button,
             double=double,
             method=method,
+            window_title=window_title,
+            modifiers=params.get("modifiers") or None,
         )
 
         return result.to_dict()
+
+    def _handle_mouse(self, params: dict) -> dict:
+        """精细鼠标控制（移动/拖拽/组合点击/按下释放/滚动/位置）"""
+        action = str(params.get("action") or "").lower()
+        button = params.get("button", "left")
+        modifiers = params.get("modifiers") or None
+        x = params.get("x")
+        y = params.get("y")
+
+        def _int(value: Any) -> int:
+            return int(value)
+
+        try:
+            if action == "position":
+                pos = self.controller.mouse_position()
+                size = self.controller.mouse.get_screen_size()
+                return {
+                    "success": True,
+                    "action": "position",
+                    "position": [int(pos[0]), int(pos[1])],
+                    "screen_size": [int(size[0]), int(size[1])],
+                    "message": f"Mouse at ({pos[0]}, {pos[1]}), screen {size[0]}x{size[1]}",
+                }
+
+            if action == "move":
+                if x is None or y is None:
+                    return {"error": "move requires x and y"}
+                return self.controller.mouse.move_to(
+                    _int(x), _int(y), duration=params.get("duration")
+                ).to_dict()
+
+            if action == "move_relative":
+                dx = params.get("dx", 0)
+                dy = params.get("dy", 0)
+                return self.controller.mouse.move_relative(
+                    _int(dx),
+                    _int(dy),
+                    duration=params.get("duration"),
+                    raw=bool(params.get("raw", False)),
+                ).to_dict()
+
+            if action == "hover":
+                if x is None or y is None:
+                    return {"error": "hover requires x and y"}
+                return self.controller.mouse.hover(
+                    _int(x), _int(y), pause=float(params.get("pause", 0.3))
+                ).to_dict()
+
+            if action == "drag":
+                to_x, to_y = params.get("to_x"), params.get("to_y")
+                if None in (x, y, to_x, to_y):
+                    return {"error": "drag requires x, y, to_x, to_y"}
+                return self.controller.drag(
+                    _int(x),
+                    _int(y),
+                    _int(to_x),
+                    _int(to_y),
+                    duration=float(params.get("duration", 0.5)),
+                    button=button,
+                    modifiers=modifiers,
+                ).to_dict()
+
+            if action in ("click", "double_click", "right_click", "middle_click"):
+                if x is not None and y is not None:
+                    pos: tuple[int, int] | None = (_int(x), _int(y))
+                elif action in ("click", "double_click") and params.get("target"):
+                    resolved = self.controller.mouse._resolve_target(params["target"])
+                    pos = (int(resolved[0]), int(resolved[1]))
+                else:
+                    pos = None
+
+                if action == "right_click":
+                    button = "right"
+                elif action == "middle_click":
+                    button = "middle"
+                clicks = 2 if action == "double_click" else 1
+
+                return self.controller.mouse.click(
+                    pos[0] if pos else None,
+                    pos[1] if pos else None,
+                    button=button,
+                    clicks=clicks,
+                    modifiers=modifiers,
+                ).to_dict()
+
+            if action in ("down", "up"):
+                if action == "down":
+                    return self.controller.mouse_down(
+                        button=button,
+                        x=_int(x) if x is not None else None,
+                        y=_int(y) if y is not None else None,
+                    ).to_dict()
+                return self.controller.mouse_up(
+                    button=button,
+                    x=_int(x) if x is not None else None,
+                    y=_int(y) if y is not None else None,
+                ).to_dict()
+
+            if action == "scroll":
+                return self.controller.scroll(
+                    direction=params.get("direction", "down"),
+                    amount=int(params.get("amount", 3)),
+                    x=_int(x) if x is not None else None,
+                    y=_int(y) if y is not None else None,
+                    modifiers=modifiers,
+                ).to_dict()
+
+            return {"error": f"Unknown mouse action: {action}"}
+        except Exception as e:
+            return {"error": str(e)}
 
     def _handle_type(self, params: dict) -> dict:
         """处理输入请求"""
         text = params.get("text", "")
         clear_first = params.get("clear_first", False)
+        method = params.get("method", "auto")
 
-        result = self.controller.type_text(text, clear_first=clear_first)
+        result = self.controller.type_text(text, clear_first=clear_first, method=method)
         return result.to_dict()
+
+    def _handle_press(self, params: dict) -> dict:
+        """处理单键按下请求（enter / space / tab / esc / arrows ...）"""
+        key = params.get("key", "")
+        times = params.get("times", 1)
+
+        if not key:
+            return {"error": "No key provided"}
+
+        try:
+            times = int(times or 1)
+        except (TypeError, ValueError):
+            times = 1
+
+        result = self.controller.press(key, times=times)
+        return result.to_dict()
+
+    def _handle_key(self, params: dict) -> dict:
+        """精细键盘控制（press/down/up/release_all/type/hotkey）"""
+        action = str(params.get("action") or "").lower()
+        key = str(params.get("key") or "").strip()
+        text = params.get("text", "")
+        keys = params.get("keys") or []
+        times = int(params.get("times", 1) or 1)
+        interval = float(params.get("interval", 0.1) or 0.1)
+
+        try:
+            if action == "press":
+                if not key:
+                    return {"error": "press requires key"}
+                if times > 1:
+                    results = []
+                    for _ in range(min(times, 100)):
+                        results.append(self.controller.press(key).to_dict())
+                        if interval > 0:
+                            import time as _time
+
+                            _time.sleep(interval)
+                    return {
+                        "success": all(r.get("success") for r in results),
+                        "action": "press",
+                        "target": key,
+                        "message": f"Pressed {key} {len(results)} times",
+                        "results": results,
+                    }
+                return self.controller.press(key).to_dict()
+
+            if action == "down":
+                if not key:
+                    return {"error": "down requires key"}
+                return self.controller.key_down(key).to_dict()
+
+            if action == "up":
+                if not key:
+                    return {"error": "up requires key"}
+                return self.controller.key_up(key).to_dict()
+
+            if action == "release_all":
+                return self.controller.release_all_keys().to_dict()
+
+            if action == "type":
+                return self.controller.type_text(str(text)).to_dict()
+
+            if action == "hotkey":
+                if not keys:
+                    return {"error": "hotkey requires keys"}
+                return self.controller.hotkey(*[str(k) for k in keys]).to_dict()
+
+            return {"error": f"Unknown key action: {action}"}
+        except Exception as e:
+            return {"error": str(e)}
 
     def _handle_hotkey(self, params: dict) -> dict:
         """处理快捷键请求"""
@@ -832,7 +1388,10 @@ class DesktopToolHandler:
 
         allowed = {
             "desktop_click",
+            "desktop_mouse",
             "desktop_type",
+            "desktop_press",
+            "desktop_key",
             "desktop_hotkey",
             "desktop_scroll",
             "desktop_wait",
@@ -856,6 +1415,54 @@ class DesktopToolHandler:
             "steps_completed": len(results),
             "results": results,
         }
+
+    async def _handle_macro(self, params: dict) -> dict:
+        """鼠标 + 键盘协同宏：委派 DesktopController.macro 核心执行引擎。
+
+        编排/白名单/重复/中止/兜底释放全部由核心方法负责（controller.py），
+        此处只做参数透传与校验快路径。
+        """
+        steps = params.get("steps") or []
+        if not isinstance(steps, list) or not steps:
+            return {"error": "desktop_macro requires a non-empty 'steps' array."}
+        if len(steps) > 50:
+            return {"error": "desktop_macro supports at most 50 steps per call."}
+
+        try:
+            repeat = max(1, min(int(params.get("repeat", 1) or 1), 20))
+        except (TypeError, ValueError):
+            repeat = 1
+        try:
+            interval_ms = max(0, min(int(params.get("interval_ms", 0) or 0), 5000))
+        except (TypeError, ValueError):
+            interval_ms = 0
+        try:
+            focus_delay_ms = max(0, min(int(params.get("focus_delay_ms", 400) or 400), 5000))
+        except (TypeError, ValueError):
+            focus_delay_ms = 400
+        try:
+            default_step_delay_ms = max(
+                0, min(int(params.get("default_step_delay_ms", 120) or 120), 5000)
+            )
+        except (TypeError, ValueError):
+            default_step_delay_ms = 120
+
+        stop_on_error = bool(params.get("stop_on_error", True))
+        release_at_end = bool(params.get("release_at_end", True))
+        focus_window = params.get("focus_window") or None
+
+        result = await asyncio.to_thread(
+            self.controller.macro,
+            steps,
+            repeat=repeat,
+            interval_ms=interval_ms,
+            stop_on_error=stop_on_error,
+            release_at_end=release_at_end,
+            focus_window=focus_window,
+            focus_delay_ms=focus_delay_ms,
+            default_step_delay_ms=default_step_delay_ms,
+        )
+        return result
 
     # ========== Tab-Agent 视觉工具处理器 ==========
 

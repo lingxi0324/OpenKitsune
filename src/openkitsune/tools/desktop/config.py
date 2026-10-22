@@ -53,6 +53,8 @@ class VisionConfig:
     enabled: bool = True
     max_retries: int = 2
     timeout: float = 30.0
+    # 指定桌面截图分析使用的 LLM 端点（留空 = 按端点优先级自动选择）
+    endpoint: str = ""
 
     @classmethod
     def from_env(cls) -> "VisionConfig":
@@ -60,6 +62,7 @@ class VisionConfig:
             enabled=os.getenv("DESKTOP_VISION_ENABLED", "true").lower() == "true",
             max_retries=int(os.getenv("DESKTOP_VISION_MAX_RETRIES", "2")),
             timeout=float(os.getenv("DESKTOP_VISION_TIMEOUT", "30.0")),
+            endpoint=os.getenv("DESKTOP_VISION_ENDPOINT", "").strip(),
         )
 
 

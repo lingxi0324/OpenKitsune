@@ -10,6 +10,7 @@ from . import (
     chat,
     chat_models,
     config,
+    desktop,
     diagnostics,
     feedback_store,
     feishu_onboard,

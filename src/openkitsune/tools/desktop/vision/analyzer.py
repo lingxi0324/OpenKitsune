@@ -106,6 +106,7 @@ class VisionAnalyzer:
             messages=messages,
             max_tokens=4096,
             temperature=1.0,
+            **self._endpoint_kwargs(),
         )
 
         if response.content:
@@ -114,6 +115,23 @@ class VisionAnalyzer:
                     return block.text
 
         return ""
+
+    @staticmethod
+    def _endpoint_kwargs() -> dict[str, Any]:
+        """可选的视觉端点偏好（DESKTOP_VISION_ENDPOINT）。
+
+        默认按端点优先级自动选择；配置后优先使用指定的轻量视觉端点，
+        避免桌面截图分析把主对话模型挤下显存或触发冷启动。
+        """
+        try:
+            from ..config import get_config
+
+            endpoint = (get_config().vision.endpoint or "").strip()
+        except Exception:
+            endpoint = ""
+        if not endpoint:
+            return {}
+        return {"endpoint_name": endpoint, "endpoint_policy": "prefer"}
 
     def _parse_json_response(self, text: str) -> Any:
         """
@@ -162,7 +180,49 @@ class VisionAnalyzer:
             recovered = self._recover_json(json_str)
             if recovered is not None:
                 return recovered
+            # 模型常在 JSON 前后/中间夹杂解释文字（Extra data），
+            # 逐个尝试文本中第一个完整且可解析的 JSON 结构。
+            for span in self._balanced_json_spans(text):
+                try:
+                    return json.loads(span)
+                except json.JSONDecodeError:
+                    recovered = self._recover_json(span)
+                    if recovered is not None:
+                        return recovered
             return None
+
+    @staticmethod
+    def _balanced_json_spans(text: str, limit: int = 10) -> list[str]:
+        """提取文本中以 { 或 [ 开头、括号配平的 JSON 片段（跳过字符串内的括号）。"""
+        spans: list[str] = []
+        for start, ch in enumerate(text):
+            if ch not in "{[":
+                continue
+            depth = 0
+            in_string = False
+            escaped = False
+            for idx in range(start, len(text)):
+                cur = text[idx]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif cur == "\\":
+                        escaped = True
+                    elif cur == '"':
+                        in_string = False
+                    continue
+                if cur == '"':
+                    in_string = True
+                elif cur in "{[":
+                    depth += 1
+                elif cur in "}]":
+                    depth -= 1
+                    if depth == 0:
+                        spans.append(text[start:idx + 1])
+                        break
+            if len(spans) >= limit:
+                break
+        return spans
 
     @staticmethod
     def _normalize_quotes(text: str) -> str:
@@ -482,7 +542,12 @@ class VisionAnalyzer:
 
             # 提取区域作为元素
             elements = []
-            for region in result.get("regions", []):
+            regions = result.get("regions", []) if isinstance(result, dict) else result
+            if not isinstance(regions, list):
+                regions = []
+            for region in regions:
+                if not isinstance(region, dict):
+                    continue
                 bbox_data = region.get("bbox")
                 if bbox_data and len(bbox_data) == 4:
                     elements.append(
@@ -497,10 +562,17 @@ class VisionAnalyzer:
                         )
                     )
 
+            if isinstance(result, dict):
+                answer = result.get("summary", "") or response.strip()
+            else:
+                # 模型直接返回区域列表：用区域名拼出概要
+                names = [str(e.description) for e in elements if e.description]
+                answer = "；".join(names) if names else response.strip()
+
             return VisionResult(
                 success=True,
                 query="analyze_page",
-                answer=result.get("summary", "") or response.strip(),
+                answer=answer,
                 elements=elements,
                 raw_response=response,
             )
@@ -853,7 +925,10 @@ class VisionAnalyzer:
             response = await self._call_vision_model(prompt, combined)
             result = self._parse_json_response(response)
 
-            if not result:
+            if isinstance(result, list):
+                result = next((r for r in result if isinstance(r, dict)), None)
+
+            if not isinstance(result, dict):
                 # 宽松回退：解析失败时保留原文，由调用方判断
                 logger.debug("verify_action: JSON parse failed, falling back to raw response")
                 return VisionResult(

@@ -596,6 +596,14 @@ def build_system_prompt(
         if spatial_hint:
             runtime_parts.append(spatial_hint)
 
+    # 6.4 桌面状态感知（Windows 专属，参照 agent-zero _desktop 提示词注入）
+    # 有界注入：仅非 MINIMAL 模式（工具型会话）+ win32 + 启用时采集；
+    # 渲染块带 TTL 缓存保证连续构建逐字稳定，失败静默降级为空。
+    if prompt_mode != PromptMode.MINIMAL:
+        desktop_state_section = _build_desktop_state_section()
+        if desktop_state_section:
+            runtime_parts.append(desktop_state_section)
+
     sampled_time = f"当前时间: {_get_current_time(settings.scheduler_timezone)} ({settings.scheduler_timezone})"
 
     # 6.5 会话元数据（session_context 和 model_display_name）
@@ -1160,6 +1168,26 @@ def _build_runtime_section_compact(working_directory: str | None = None) -> str:
         cwd = str(current_working_directory())
     shell_type = "PowerShell" if platform.system() == "Windows" else "bash"
     return f"## 运行环境\n\n- 平台: {platform.system()} ({shell_type})\n- 当前工作目录: {cwd}"
+
+
+def _build_desktop_state_section() -> str:
+    """构建 ``[DESKTOP STATE]`` 感知块（参照 agent-zero _desktop 提示词注入）。
+
+    - 仅 win32 且 DESKTOP_STATE_ENABLED 时采集，内部带 TTL 缓存（默认 5s）
+    - 任何失败静默降级为空字符串，绝不破坏提示词构建
+    - 文本有界（约 200-400 token），由外层 apply_budget 统一预算约束
+    """
+    import sys as _sys
+
+    if _sys.platform != "win32":
+        return ""
+    try:
+        from ..tools.desktop.state import cached_prompt_context
+
+        return cached_prompt_context()
+    except Exception as exc:  # noqa: BLE001 -- 感知层失败不阻塞主流程
+        logger.debug("[Prompt] desktop state section unavailable: %s", exc)
+        return ""
 
 
 def _build_runtime_section_uncached(working_directory: str | None = None) -> str:
