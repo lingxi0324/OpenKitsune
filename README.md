@@ -190,8 +190,8 @@ A presence heartbeat wakes after every turn; three rotating "eyes" (logic / empa
 
 <tr><td>
 
-### 🧠 Brain Memory (openkitsune-brain)
-Six-pool active recall + an external knowledge base. 11 dedicated `brain_*` tools with lossless content paging — long memories are continued, never silently cut.
+### 🧠 okmem Memory
+Six-pool active recall + an external knowledge base. 11 dedicated `okmem_*` tools with lossless content paging — long memories are continued, never silently cut.
 
 </td><td>
 
@@ -222,7 +222,7 @@ Knows the season, solar term, Chinese double-hour and local time of day — plus
 | 💬 | **6 IM Platforms** | Telegram / Feishu / WeCom / DingTalk / QQ / OneBot, voice recognition, smart group chat |
 | 🔗 | **MCP Integration** | Standard MCP client, stdio / HTTP / SSE transports, multi-directory scan, dynamic server management |
 | 💾 | **Dual-Mode Memory** | Mode 1 fragments (3 layers + 7 types + multi-path recall) + Mode 2 MDRM relational graph (5 dimensions + multi-hop traversal + 3D visualization), auto smart switching |
-| 🧠 | **Brain Memory** | openkitsune-brain integration: okmem six-pool recall + external knowledge base, 11 `brain_*` tools, lossless content paging |
+| 🧠 | **okmem Memory** | okmem integration: six-pool recall + knowledge base, 11 `okmem_*` tools, lossless content paging |
 | 🌗 | **Temporal Awareness** | Season, 24 solar terms, 十二时辰, day-period guidance, lunar date & festivals (optional `lunar_python`) |
 | 📍 | **Spatial Awareness** | City-level location from IP with explicit accuracy radius, ok/degraded/unknown states, trusted-proxy allow-list, no raw IP persisted or logged |
 | 🧭 | **Lifecycle Gates** | 10-stage task lifecycle × 12 quality gates, rollback / suspend / confirm failure outcomes, bounded audit trail |
@@ -636,7 +636,7 @@ On top of fragment memory, builds **causal chains, timelines, and entity relatio
 - **3-layer encoding**: Fast rule-based encoding → summary backfill → session-end batch LLM encoding
 - **3D visualization**: Frontend supports 3D visualization of the memory graph
 
-### Mode 3: openkitsune-brain External Memory (New)
+### Mode 3: okmem Long-Term Memory (New)
 
 An optional external memory brain that registers through the same provider interface as the built-in modes:
 
@@ -645,10 +645,10 @@ An optional external memory brain that registers through the same provider inter
 | **okmem** | Nine memory formats, six active-recall pools, a four-dimensional graph, and an L1 progress layer (goal / task state / recent decisions / next action) |
 | **fusion-memory knowledge base** | Read-only retrieval over real knowledge data — memories, entities, relations, formulas, acupoints (TCM / traditional-culture domains) |
 
-- **11 dedicated tools**: `brain_recall`, `brain_knowledge_search`, `brain_save_turn`, `brain_proactive_review`, `brain_health`, `brain_progress`, `brain_backfill`, `brain_record_emotion`, `brain_emotion_state`, `brain_detect_emotion`, `brain_maintain_sessions`
+- **11 dedicated tools**: `okmem_recall`, `okmem_knowledge_search`, `okmem_save_turn`, `okmem_proactive_review`, `okmem_health`, `okmem_progress`, `okmem_backfill`, `okmem_record_emotion`, `okmem_emotion_state`, `okmem_detect_emotion`, `okmem_maintain_sessions`
 - **Lossless content paging**: every record reports `content_total` / `has_more` / `next_offset` / `next_page_token`; long memories are continued, not truncated mid-sentence
 - **Write safety**: all okmem SQLite writes go through a single-thread async FIFO queue — no concurrent writers
-- **Enable / disable**: enabled by default when the brain runtime and data are available; set `OPENKITSUNE_BRAIN_MEMORY=0` to turn it off
+- **Enable / disable**: enabled by default when the brain runtime and data are available; set `OPENKITSUNE_OKMEM_ENABLED=0` to turn it off
 
 ### Smart Mode Switching
 
@@ -791,7 +791,7 @@ Plugins  ─── PluginManager(Discovery/Loading) · PluginAPI(Host Interface)
     │
 Memory   ─── Mode1: UnifiedStore(SQLite+Vector) · RetrievalEngine(Multi-path)
     │        Mode2: RelationalStore(MDRM Graph) · GraphEngine(Multi-hop)
-    │        Mode3: BrainProvider(okmem · fusion KB)
+    │        Mode3: OkmemProvider(okmem · okmem KB)
     │        MemoryModeRouter(Auto Switch) · MemoryEncoder(3-Layer)
     │
 Context  ─── TurnSkeletonCompressor(Zero-LLM) · MicroCompact · HandoffSnapshot

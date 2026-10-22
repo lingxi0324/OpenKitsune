@@ -155,9 +155,36 @@ ffmpeg 需在 PATH（转码/合并/语音气泡必需）。
 ### 已知限制
 - **edge 引擎语言适配**：默认英文语音读中文会抛 `NoAudioReceived`，已实现按文本语言自动选
   zh-CN/ja-JP/ko-KR 语音；如需固定请配置 `tts.edge.voice`。
-- **NeuTTS** 依赖 `neutts_synth.py` 脚本（hermes 侧未随迁移带入，需按 hermes
-  `tools/neutts_synth.py` 另行补充，或用 `piper`/`kittentts`）。
+- **edge 端点 403**：微软经典端点自 2026 年起 403，已内置 `edge_tts_compat.py` 补丁
+  （自动切换 api.msedgeservices.com），无需人工干预。
 - **录音/VAD** 需物理麦克风与 `sounddevice` 依赖（未在本机实测录音，已通过逻辑验证与导入验证）。
+
+### v2.1 完善记录（2026-10-22，对照 hermes-agent 语音栈）
+
+| 项 | 说明 |
+|---|---|
+| 运行时依赖 | `.venv` 已装 `edge-tts 7.3.1 / sounddevice 0.5.6 / faster-whisper 1.2.1 / pilk 0.2.4 / soundfile 0.14.0`（此前代码已迁移但依赖缺失，语音能力实际不可用） |
+| `edge_tts_compat.py` | 新增：edge-tts 端点 403 补丁（api.msedgeservices.com），`generate_edge_tts` 自动应用 |
+| `neutts_synth.py` | 新增：NeuTTS 独立合成脚本（hermes 移植），`tts_local._generate_neutts` 增加 ref_audio/ref_text 前置校验与清晰报错 |
+| `tts_streaming.py` | 新增：流式 TTS —— `SentenceChunker`（增量句子切分，剔除推理块，兼容中英文句读）+ PCM 流式引擎（openai/gemini/elevenlabs/xai）+ `stream_tts_to_speaker` 高层入口（edge 等无分块 API 引擎按句同步合成逐句播放）+ 抢话闩锁 |
+| `tts_command.py` | 新增：命令型 TTS provider（`tts.providers.<name>.command`，占位符引号感知转义、空闲超时+进程树清理）；`tts.py` 的 `_is_command_provider` 由 stub 改为真实解析，非内置 provider 名可解析到命令引擎 |
+| `stt.py` hf 镜像 | `stt.hf_endpoint`（如 https://hf-mirror.com）驱动 HF 模型下载；自动禁用 XetData（`HF_HUB_DISABLE_XET`，其 CAS 端点不认镜像且匿名 401），并建议 `huggingface-hub<2`（2.x 新版下载流不兼容镜像） |
+| 实测 | edge TTS 中文合成 ✅（29KB mp3）；TTS→STT 闭环 ✅（faster-whisper base 经镜像下载后转写 mp3 成功）；离线测试子集 9 passed |
+
+### v2.1 使用示例（新增能力）
+
+```python
+from openkitsune.voice.tts_streaming import stream_tts_to_speaker, SentenceChunker
+
+# 流式朗读（edge 默认按句合成播放；openai/gemini 等配置后走 PCM 流式）
+stream_tts_to_speaker("你好，这是一段流式朗读测试。", on_sentence=print)
+
+# 命令型 TTS（data/voice_config.json）
+# {"tts": {"providers": {"piper-local": {"type": "command",
+#    "command": "piper -f {output_path} < {input_path}", "voice": "zh_CN-huayan-medium"}}}}
+from openkitsune.voice import synthesize_text
+print(synthesize_text("测试", provider="piper-local")["paths"])
+```
 
 ---
 
@@ -171,9 +198,52 @@ ffmpeg 需在 PATH（转码/合并/语音气泡必需）。
 | `src/openkitsune/tools/handlers/voice.py` | 新增：语音处理器 |
 | `src/openkitsune/core/_agent_runtime.py` | 修改：注册 `voice` handler |
 | `pyproject.toml` | 修改：新增 `voice-tts-cloud` / `voice-tts-local`，扩充 `voice` extra |
-| `.venv` | 修改：已安装 `edge-tts 7.2.8` |
+| `.venv` | 修改：已安装 `edge-tts 7.3.1 / sounddevice / faster-whisper / pilk / soundfile`；`huggingface-hub<2`（镜像兼容）；openkitsune 可编辑安装已重指向 D:\ai\OpenKitsune-main\src |
+| `src/openkitsune/voice/edge_tts_compat.py` | 新增（v2.1）：edge 端点 403 补丁 |
+| `src/openkitsune/voice/neutts_synth.py` | 新增（v2.1）：NeuTTS 独立合成脚本 |
+| `src/openkitsune/voice/tts_streaming.py` | 新增（v2.1）：流式 TTS（句子切分 + PCM 流式引擎 + 播放） |
+| `src/openkitsune/voice/tts_command.py` | 新增（v2.1）：命令型 TTS provider |
+| `src/openkitsune/voice/tts.py` / `tts_local.py` / `tts_providers.py` / `stt.py` | 修改（v2.1）：命令 provider 接入、neutts 校验、edge 补丁、hf 镜像 |
 | `tests/unit/test_voice_integration.py` | 新增：语音能力集成测试（20 用例） |
+| `src/openkitsune/api/routes/chat.py` | 修改（v2.2）：回复完成前自动 TTS 合成并注入 `artifact_type="voice"` 事件（见第 8 节） |
+| `data/voice_config.json` | 修改（v2.2）：新增 `tts.reply_voice`（对话语音回复开关） |
 | `VOICE_INTEGRATION.md` | 新增：本说明文档 |
+
+---
+
+## 8. 对话语音回复（v2.2，Web 用户端自动发声）
+
+Web 聊天（POST /api/chat SSE 流）在每轮回复完成后，若配置开启 `tts.reply_voice`，
+后端自动把回复文本交给 openkitsune.voice 合成 mp3，并以 `artifact` 事件
+（`artifact_type="voice"`）注入流尾（done 之前）。前端 `Artifacts.tsx` 对
+`voice` 类型渲染 `<audio controls>` 播放器——**零前端改动**，每条 assistant
+消息自动出现"语音回复 · 点击播放"音频条；会话持久化时随 artifacts 一起保存，
+历史重放同样可见。
+
+配置（`data/voice_config.json`）：
+
+```json
+{
+  "tts": {
+    "provider": "edge",
+    "reply_voice": {
+      "enabled": true,
+      "max_chars": 500,
+      "caption": "语音回复 · 点击播放"
+    }
+  }
+}
+```
+
+- `enabled: false` 可关闭；`max_chars` 超长回复不自动合成（避免拖慢）；
+  合成失败/超时（20s）静默跳过，绝不阻塞文本回复。
+- 产出目录：会话工作区 `voice_replies/`（受 /api/files 作用域约束）。
+- 实测（2026-10-22）：短对话 SSE 流自动出现 `artifact(voice)`，114KB mp3，
+  `/api/files` 返回 200 audio/mpeg ✅。
+
+### 可选升级（未做，需前端改动 + `npm run build:web`）
+- 回复到达后**自动播放**（浏览器需一次用户交互授权，建议默认关、设置里开关）；
+- 浏览器端 `speechSynthesis` 即时朗读（音色为系统语音，非神经语音）。
 
 ---
 

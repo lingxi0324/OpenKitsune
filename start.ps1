@@ -11,7 +11,7 @@
 #   powershell -ExecutionPolicy Bypass -File start.ps1
 #   powershell -ExecutionPolicy Bypass -File start.ps1 -Port 18900 -ShowLog
 # ============================================================
-param([int]$Port = 0, [switch]$ShowLog)
+param([int]$Port = 0, [switch]$ShowLog, [switch]$NoBrowser)
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -108,18 +108,47 @@ if ($listener) {
     }
 }
 
+# ---------- 4.5 解析启动工作区（与桌面端一致：读取 state.json 的 currentWorkspaceId） ----------
+# 后端以 cwd 作为 project_root，因此启动目录决定打开哪个工作区。
+# 约定：
+#   - currentWorkspaceId 非 default 且工作区目录存在 → 以该工作区为启动目录（生产模式）
+#   - 缺失 / default / 解析失败 → 保持仓库目录（开发模式），不影响原有用法
+$OkRoot = $env:OPENKITSUNE_ROOT
+if (-not $OkRoot) { $OkRoot = Join-Path $env:USERPROFILE ".openkitsune" }
+$StateFile = Join-Path $OkRoot "state.json"
+$BackendWorkDir = $ProjectRoot
+$WorkspaceLabel = "仓库工作区"
+if (Test-Path $StateFile) {
+    try {
+        $StateJson = Get-Content $StateFile -Encoding UTF8 -Raw | ConvertFrom-Json
+        $CurrentWsId = [string]$StateJson.currentWorkspaceId
+        if ($CurrentWsId -and $CurrentWsId -ne "default") {
+            $WsDir = Join-Path (Join-Path $OkRoot "workspaces") $CurrentWsId
+            if (Test-Path $WsDir) {
+                $BackendWorkDir = $WsDir
+                $WsMeta = @($StateJson.workspaces) | Where-Object { $_.id -eq $CurrentWsId } | Select-Object -First 1
+                $WorkspaceLabel = if ($WsMeta -and $WsMeta.name) { [string]$WsMeta.name } else { $CurrentWsId }
+            } else {
+                Write-Host "  [WARN] state.json 指向的工作区不存在：$WsDir，回退到仓库目录" -ForegroundColor Yellow
+            }
+        }
+    } catch {
+        Write-Host "  [WARN] 读取 state.json 失败，回退到仓库目录：$($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 # ---------- 5. 启动 Windows 原生服务 ----------
 if (-not $already) {
-    Write-Host "  [..] 启动 openkitsune serve（Windows，端口 $Port）..." -ForegroundColor Cyan
+    Write-Host "  [..] 启动 openkitsune serve（Windows，端口 $Port，工作区：$WorkspaceLabel）..." -ForegroundColor Cyan
     if (Test-Path $ServeLog) { Remove-Item $ServeLog -Force -ErrorAction SilentlyContinue }
     if (Test-Path $ServeErr) { Remove-Item $ServeErr -Force -ErrorAction SilentlyContinue }
 
     Start-Process -FilePath $ServePy `
         -ArgumentList @("-m", "openkitsune", "serve") `
-        -WorkingDirectory $ProjectRoot `
+        -WorkingDirectory $BackendWorkDir `
         -RedirectStandardOutput $ServeLog `
         -RedirectStandardError $ServeErr `
-        -WindowStyle Minimized | Out-Null
+        -WindowStyle Hidden | Out-Null
 
     $ready = $false
     for ($i = 0; $i -lt 90; $i++) {
@@ -138,7 +167,8 @@ if (-not $already) {
         Write-Host "    $ServeLog" -ForegroundColor DarkGray
         Write-Host "    $ServeErr" -ForegroundColor DarkGray
         if (Test-Path $ServeErr) {
-            Get-Content $ServeErr -Tail 20 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+            # 显式 -Encoding UTF8：PS 5.1 默认按 ANSI(GBK) 解码无 BOM 的 UTF-8 日志，会导致中文乱码
+            Get-Content $ServeErr -Encoding UTF8 -Tail 20 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
         }
         if ($ShowLog) { Read-Host "  按回车退出" }
         exit 1
@@ -147,7 +177,7 @@ if (-not $already) {
 }
 
 # ---------- 6. 打开 Web 对话页 ----------
-Start-Process $WebUrl
+if (-not $NoBrowser) { Start-Process $WebUrl }
 Write-Host ""
 Write-Host "  对话入口：$WebUrl" -ForegroundColor Green
 Write-Host "  服务日志：$ServeLog" -ForegroundColor DarkGray
@@ -155,7 +185,14 @@ Write-Host "  提示：首次访问如需密码，请看服务日志中的 OPENK
 Write-Host ""
 
 # ---------- 7. 可选：在当前窗口实时跟随日志 ----------
-if ($ShowLog -and (Test-Path $ServeLog)) {
+# 优先 tail file handler 的 openkitsune.log（不受 stdout 重定向影响，
+# 无论服务由 start.ps1 / launcher / 手动启动，file handler 都在写它，
+# 永远跟着对话滚动）；若该文件不存在（极端情况），回退到 stdout 文件。
+if ($ShowLog) {
+    $FileLog = Join-Path $BackendWorkDir "logs\openkitsune.log"
+    $TailTarget = if (Test-Path $FileLog) { $FileLog } else { $ServeLog }
     Write-Host "  实时日志（Ctrl+C 退出，不会停止服务）..." -ForegroundColor DarkGray
-    Get-Content $ServeLog -Tail 20 -Wait
+    Write-Host "  跟随文件：$TailTarget" -ForegroundColor DarkGray
+    # 显式 -Encoding UTF8：PS 5.1 默认按 ANSI(GBK) 解码无 BOM 的 UTF-8 日志，会导致中文乱码
+    Get-Content $TailTarget -Encoding UTF8 -Tail 20 -Wait
 }

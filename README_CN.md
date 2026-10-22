@@ -80,9 +80,9 @@ OpenKitsune 由 **OpenAkita**（一个早期开源的自进化 AI Agent 项目�
 
 每轮对话后神识苏醒一次；三世之眼（逻辑 / 共情 / 河洛）轮转看世界；感悟与日记随时间沉淀。
 
-### 🧠 外部记忆脑（openkitsune-brain）
+### 🧠 okmem 长期记忆
 
-六池主动回忆 + 外部知识库，提供 11 个专用 `brain_*` 工具；内容分页不截断，长记忆可无损续读。
+六池主动回忆 + 外部知识库，提供 11 个专用 `okmem_*` 工具；内容分页不截断，长记忆可无损续读。
 
 ### 🌗 时间与空间感知
 
@@ -113,7 +113,7 @@ OpenKitsune 由 **OpenAkita**（一个早期开源的自进化 AI Agent 项目�
 | 💬  | **6 大 IM 平台**   | Telegram / 飞书 / 企微 / 钉钉 / QQ / OneBot，语音识别，群聊智能策略                             |
 | 🔗  | **MCP 集成**      | 标准 MCP 客户端，stdio / HTTP / SSE 三种传输，多目录扫描，动态增删服务器                              |
 | 💾  | **双模式记忆**       | 模式 1 碎片化（三层 + 7 类型 + 多路召回）+ 模式 2 MDRM 关系图谱（5 维度 + 多跳遍历 + 3D 可视化），auto 智能切换    |
-| 🧠  | **外部记忆脑**       | 接入 openkitsune-brain：okmem 六池召回 + 外部知识库，11 个 `brain_*` 工具，内容无损分页                     |
+| 🧠  | **okmem 长期记忆**   | okmem 六池召回 + 外部知识库，11 个 `okmem_*` 工具，内容无损分页                              |
 | 🌗  | **时间感知**        | 季节、二十四节气、十二时辰、时段指引、农历与传统节日（可选 `lunar_python`）                                |
 | 📍  | **空间感知**        | 基于 IP 的城市级位置，显式给出精度半径，ok / degraded / unknown 三态，可信代理白名单，原始 IP 不落盘不写日志          |
 | 🧭  | **生命周期质量门**     | 10 阶段任务生命周期 × 12 道质量门，回退 / 挂起 / 请求确认三态，审计日志有界                                  |
@@ -551,7 +551,7 @@ L6  OS 级沙箱       Linux bwrap / macOS seatbelt / Windows MIC
 
 ## 记忆系统
 
-不是普通的 "上下文窗口"，而是真正的长期记忆。内置**双模式**，按需自动切换；在此基础上还可接入**外部记忆脑**（模式 3）：
+不是普通的 "上下文窗口"，而是真正的长期记忆。内置**双模式**，按需自动切换；在此基础上还可接入 **okmem 长期记忆**（模式 3）：
 
 ### 模式 1：碎片化记忆（经典）
 
@@ -589,7 +589,7 @@ L6  OS 级沙箱       Linux bwrap / macOS seatbelt / Windows MIC
 
 * **3D 可视化**：前端支持记忆图谱的 3D 可视化展示
 
-### 模式 3：openkitsune-brain 外部记忆脑（新）
+### 模式 3：okmem 长期记忆（新）
 
 可选的第三层记忆，通过同一套 Provider 接口注册，不替代内置模式：
 
@@ -599,13 +599,13 @@ L6  OS 级沙箱       Linux bwrap / macOS seatbelt / Windows MIC
 | **okmem** | 九种记忆格式、六个记忆池、四维图谱，以及 L1 进度层（总目标 / 任务状态 / 最近决策 / 下一步动作） |
 | **fusion-memory 知识库** | 只读检索真实知识数据 —— 记忆、实体、关系、方剂、穴位（中医 / 传统文化领域） |
 
-* **11 个专用工具**：`brain_recall`、`brain_knowledge_search`、`brain_save_turn`、`brain_proactive_review`、`brain_health`、`brain_progress`、`brain_backfill`、`brain_record_emotion`、`brain_emotion_state`、`brain_detect_emotion`、`brain_maintain_sessions`
+* **11 个专用工具**：`okmem_recall`、`okmem_knowledge_search`、`okmem_save_turn`、`okmem_proactive_review`、`okmem_health`、`okmem_progress`、`okmem_backfill`、`okmem_record_emotion`、`okmem_emotion_state`、`okmem_detect_emotion`、`okmem_maintain_sessions`
 
 * **无损内容分页**：每条记录返回 `content_total` / `has_more` / `next_offset` / `next_page_token`，长记忆可续读，不会在句子中间被截断
 
 * **写入安全**：所有 okmem SQLite 写入走单线程异步 FIFO 队列，避免并发写
 
-* **开关**：记忆运行时与数据可用时默认启用；设置 `OPENKITSUNE_BRAIN_MEMORY=0` 可关闭
+* **开关**：记忆运行时与数据可用时默认启用；设置 `OPENKITSUNE_OKMEM_ENABLED=0` 可关闭
 
 ### 智能模式切换
 
@@ -786,7 +786,7 @@ Agent 层── AgentOrchestrator(协调) · AgentInstancePool(池化)
     │
 记忆层 ─── 模式1: UnifiedStore(SQLite+向量) · RetrievalEngine(多路召回)
     │      模式2: RelationalStore(MDRM图) · GraphEngine(多跳遍历)
-    │      模式3: BrainProvider(okmem · fusion知识库)
+    │      模式3: OkmemProvider(okmem · okmem知识库)
     │      MemoryModeRouter(auto切换) · MemoryEncoder(三层编码)
     │
 上下文层 ─ TurnSkeletonCompressor(零LLM) · MicroCompact · HandoffSnapshot

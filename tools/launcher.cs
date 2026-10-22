@@ -5,7 +5,7 @@ using System.Threading;
 
 public static class OpenKitsuneLauncher
 {
-    private static readonly string ProjectRoot = @"E:\agents\OpenKitsune-main";
+    private static readonly string ProjectRoot = @"D:\ai\OpenKitsune-main";
     private static readonly string StartPs1 = Path.Combine(ProjectRoot, "start.ps1");
     private static readonly string LogRoot = Path.Combine(ProjectRoot, "data", "logs");
     private static readonly string ServeLog = Path.Combine(LogRoot, "serve_win.log");
@@ -62,7 +62,9 @@ public static class OpenKitsuneLauncher
 
                     // 实时滚动 Windows 服务日志，直到用户关闭窗口 / 按键中断
                     ProcessStartInfo tail = new ProcessStartInfo("powershell.exe");
-                    tail.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command \"Get-Content -LiteralPath '" + ServeLog + "' -Tail 20 -Wait\"";
+                    // PowerShell 5.1 的 Get-Content 默认按 ANSI(GBK) 解码无 BOM 的 UTF-8
+                    // 日志，必须显式 -Encoding UTF8，否则中文全部显示为乱码。
+                    tail.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command \"Get-Content -LiteralPath '" + ServeLog + "' -Encoding UTF8 -Tail 20 -Wait\"";
                     tail.UseShellExecute = false;
                     tail.CreateNoWindow = false;
                     Process t = Process.Start(tail);

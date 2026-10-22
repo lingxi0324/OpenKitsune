@@ -1,96 +1,52 @@
+// OpenKitsune Windows 启动器（双击 exe → 弹独立 PowerShell 窗口显示启动检查 + 实时日志）
+// 行为：
+//   1) exe 编译为 GUI 子系统（WindowsApplication），双击不弹黑色控制台窗口
+//   2) 拉起 powershell.exe 打开一个独立的 PowerShell 窗口，运行 manage.ps1 start -ShowLog：
+//      彩色启动检查（[OK]/[WARN]/[FAIL]）→ 实时日志跟随（窗口常驻，Ctrl+C 或关闭窗口不影响后台 serve）
+//   3) exe 自身立即退出；PowerShell 窗口由 manage.ps1 持有
+// 编译（在 PowerShell 5.1 中，UTF-8 读取源码避免中文乱码）：
+//   $winCs = [IO.File]::ReadAllText("D:\ai\OpenKitsune-main\tools\launcher_win.cs", [Text.Encoding]::UTF8)
+//   Add-Type -TypeDefinition $winCs -OutputAssembly "D:\ai\OpenKitsune-main\OpenKitsunewinLauncher.exe" -OutputType WindowsApplication
 using System;
 using System.Diagnostics;
 using System.IO;
-using System.Threading;
+using System.Windows.Forms;
 
 public static class OpenKitsuneWinLauncher
 {
-    private static readonly string ProjectRoot = @"E:\agents\OpenKitsune-main";
-    private static readonly string StartPs1 = Path.Combine(ProjectRoot, "start.ps1");
-    private static readonly string LogRoot = Path.Combine(ProjectRoot, "data", "logs");
-    private static readonly string ServeLog = Path.Combine(LogRoot, "serve_win.log");
-    private static readonly string ServeErr = Path.Combine(LogRoot, "serve_win.err");
+    // 硬编码常量：仓库迁移后必须同步修改并重新编译，否则启动器会去旧路径找 manage.ps1
+    private static readonly string ProjectRoot = @"D:\ai\OpenKitsune-main";
+    private static readonly string ManagePs1 = Path.Combine(ProjectRoot, "manage.ps1");
 
     [STAThread]
     public static void Main()
     {
-        try { Console.Title = "OpenKitsune Windows 启动器"; } catch { }
-
-        bool createdNew;
-        using (Mutex instance = new Mutex(true, "OpenKitsuneWinLauncherInstance", out createdNew))
+        if (!File.Exists(ManagePs1))
         {
-            if (!createdNew)
-            {
-                Console.WriteLine("OpenKitsune Windows 启动器已在运行（现有窗口仍打开）。");
-                Pause();
-                return;
-            }
-
-            Console.WriteLine("OpenKitsune Windows 版启动中……（使用 .venv 原生 Python）");
-            Console.WriteLine();
-            if (!File.Exists(StartPs1))
-            {
-                Console.WriteLine("错误：未找到启动脚本 " + StartPs1);
-                Pause();
-                return;
-            }
-            try
-            {
-                ProcessStartInfo psi = new ProcessStartInfo("powershell.exe");
-                psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + StartPs1 + "\"";
-                psi.WorkingDirectory = ProjectRoot;
-                psi.UseShellExecute = false;
-                psi.CreateNoWindow = false;
-                Process p = Process.Start(psi);
-                p.WaitForExit();
-                int code = p.ExitCode;
-                Console.WriteLine();
-                if (code == 0)
-                {
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine("启动成功：浏览器已打开（http://127.0.0.1:18900/web/），服务已就绪。");
-                    Console.ResetColor();
-                    Console.WriteLine("服务日志: " + ServeLog);
-                    Console.WriteLine();
-                    Console.WriteLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                    Console.WriteLine("以下为 Windows 服务实时日志（窗口常驻；关闭此窗口不影响服务运行）");
-                    Console.WriteLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                    try { Console.Title = "OpenKitsune Windows · 运行中"; } catch { }
-
-                    ProcessStartInfo tail = new ProcessStartInfo("powershell.exe");
-                    tail.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command \"Get-Content -LiteralPath '" + ServeLog + "' -Tail 20 -Wait\"";
-                    tail.UseShellExecute = false;
-                    tail.CreateNoWindow = false;
-                    Process t = Process.Start(tail);
-                    t.WaitForExit();
-                    Console.WriteLine();
-                    Console.WriteLine("实时日志已结束（退出码 " + t.ExitCode + "）。关闭窗口即可。");
-                    Pause();
-                }
-                else
-                {
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine("启动失败（退出码 " + code + "）。");
-                    Console.ResetColor();
-                    Console.WriteLine("排查日志：");
-                    Console.WriteLine("  服务日志: " + ServeLog);
-                    Console.WriteLine("  错误日志: " + ServeErr);
-                    Console.WriteLine("  手工启动试跑: powershell -ExecutionPolicy Bypass -File \"" + StartPs1 + "\"");
-                    Pause();
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine();
-                Console.WriteLine("启动器异常: " + ex.Message);
-                Pause();
-            }
+            MessageBox.Show(
+                "未找到管理脚本：\n" + ManagePs1 +
+                "\n\n请检查 ProjectRoot 常量是否指向当前仓库，然后重新编译。",
+                "OpenKitsune 启动器", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
         }
-    }
-
-    private static void Pause()
-    {
-        try { Console.WriteLine(); Console.WriteLine("按任意键退出……"); Console.ReadKey(true); }
-        catch { }
+        try
+        {
+            // GUI 子系统进程没有父控制台，启动 powershell.exe（控制台程序）时
+            // Windows 会自动为它分配一个新的控制台窗口 → 即用户看到的 PowerShell 窗口。
+            // -NoExit 保证脚本（含 -ShowLog 日志跟随）结束后窗口仍保持常驻。
+            var psi = new ProcessStartInfo("powershell.exe")
+            {
+                Arguments = "-NoExit -NoProfile -ExecutionPolicy Bypass -File \"" + ManagePs1 + "\" start -ShowLog",
+                WorkingDirectory = ProjectRoot,
+                UseShellExecute = false,
+                CreateNoWindow = false
+            };
+            Process.Start(psi);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("启动失败: " + ex.Message,
+                "OpenKitsune 启动器", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 }
