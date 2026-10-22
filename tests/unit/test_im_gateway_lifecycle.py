@@ -18,6 +18,9 @@ class _FakeGateway:
     def set_channel_install_errors(self, errors):
         self.install_errors = errors
 
+    def configure_dm_access(self, **_kwargs):
+        return None
+
     async def register_adapter(self, adapter):
         self.adapters.append(adapter)
         if self._running:

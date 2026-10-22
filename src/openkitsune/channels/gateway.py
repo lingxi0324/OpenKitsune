@@ -31,7 +31,9 @@ from typing import TYPE_CHECKING, Any, Optional
 from ..sessions import Session, SessionManager
 from ..utils.errors import format_user_friendly_error as format_user_friendly_error  # re-export
 from .base import ChannelAdapter, ChannelDeliveryUnavailable
+from .dead_targets import DeadTargetRegistry, classify_dead_error
 from .group_response import GroupResponseMode, SmartModeThrottle
+from .inbound_guard import InboundGuard
 from .types import MediaStatus, MessageContent, OutgoingMessage, UnifiedMessage
 
 if TYPE_CHECKING:
@@ -1016,6 +1018,19 @@ class MessageGateway:
 
         # ==================== DM Pairing 配对授权 ====================
         self._dm_pairing: DMPairingManager | None = None
+        # DM 访问策略：open / pairing / allowlist（由 configure_dm_access 设置）
+        self._dm_policy: str = "open"
+        self._dm_allowlist: set[str] = set()
+        # 未授权提示去抖：{channel:user_id: last_notice_at}
+        self._dm_reject_notices: collections.OrderedDict[str, float] = collections.OrderedDict()
+
+        # ==================== 入站幂等 / 陈旧消息 ====================
+        self._inbound_guard = InboundGuard(
+            stale_threshold_seconds=ChannelAdapter.STALE_MESSAGE_THRESHOLD_S
+        )
+
+        # ==================== 死目标登记（永久失败短路） ====================
+        self._dead_targets = DeadTargetRegistry()
 
         # ==================== 群聊响应策略 ====================
         self._smart_throttle = SmartModeThrottle()
@@ -1089,12 +1104,141 @@ class MessageGateway:
         from .dm_pairing import DMPairingManager
 
         self._dm_pairing = DMPairingManager(data_dir)
+        self._dm_policy = "pairing"
         logger.info("DM Pairing enabled")
+
+    def configure_dm_access(
+        self,
+        *,
+        policy: str = "open",
+        allowlist: list[str] | tuple[str, ...] | set[str] = (),
+        data_dir: "Path | None" = None,
+    ) -> None:
+        """Configure DM access policy from application settings.
+
+        Policies:
+        - ``open``: 任何人都可以私聊（默认，保持向后兼容）
+        - ``pairing``: 未授权用户必须先发送配对码
+        - ``allowlist``: 仅白名单用户/会话可用
+
+        Allowlist entries accept ``user_id``, ``channel:user_id`` or
+        ``channel:chat_id``.
+        """
+        normalized = (policy or "open").strip().lower()
+        if normalized not in {"open", "pairing", "allowlist"}:
+            logger.warning("[DM] Unknown policy %r, falling back to 'open'", policy)
+            normalized = "open"
+
+        self._dm_policy = normalized
+        self._dm_allowlist = {
+            str(item).strip() for item in (allowlist or ()) if str(item).strip()
+        }
+
+        if normalized == "pairing" and self._dm_pairing is None:
+            from .dm_pairing import DMPairingManager
+
+            self._dm_pairing = DMPairingManager(Path(data_dir or "data/sessions"))
+        logger.info(
+            "[DM] Access policy=%s allowlist=%d pairing=%s",
+            self._dm_policy,
+            len(self._dm_allowlist),
+            "on" if self._dm_pairing else "off",
+        )
+
+    def _is_owner_user(self, message: UnifiedMessage) -> bool:
+        """Whether the sender is an owner for this channel.
+
+        ``_get_owner_user_ids`` returns ``None`` when no owner allowlist is
+        configured, which keeps the historical single-user assumption.
+        """
+        owner_ids = self._get_owner_user_ids(message.channel)
+        return True if owner_ids is None else str(message.user_id) in owner_ids
+
+    def _dm_allowlist_matches(self, message: UnifiedMessage) -> bool:
+        """Match ``user_id`` / ``channel:user_id`` / ``channel:chat_id`` entries."""
+        candidates = {
+            str(message.user_id or ""),
+            str(message.chat_id or ""),
+            f"{message.channel}:{message.user_id}",
+            f"{message.channel}:{message.chat_id}",
+        }
+        return bool(candidates & self._dm_allowlist)
+
+    def _should_notify_dm_rejection(self, message: UnifiedMessage) -> bool:
+        """未授权提示按 ``channel:user_id`` 十分钟去抖，避免刷屏。"""
+        key = f"{message.channel}:{message.user_id}"
+        now = _time.monotonic()
+        last = self._dm_reject_notices.get(key)
+        if last is not None and now - last < 600:
+            return False
+        self._dm_reject_notices[key] = now
+        self._dm_reject_notices.move_to_end(key)
+        while len(self._dm_reject_notices) > 500:
+            self._dm_reject_notices.popitem(last=False)
+        return True
+
+    async def _check_dm_access(self, message: UnifiedMessage, raw_text: str) -> bool:
+        """Enforce DM access policy before any fast-path/queue handling.
+
+        Returns ``True`` when the message may continue, ``False`` when it was
+        rejected (a hint may already have been sent to the user).
+        """
+        if message.chat_type == "group":
+            return True
+
+        policy = self._dm_policy
+        if policy == "open":
+            return True
+
+        if policy == "allowlist":
+            if self._dm_allowlist_matches(message):
+                return True
+            if self._should_notify_dm_rejection(message):
+                await self._send_feedback(message, "🔒 您暂无权限使用此机器人，请联系管理员。")
+            return False
+
+        if policy != "pairing":
+            logger.warning("[DM] Unknown policy %r, failing closed", policy)
+            return False
+
+        if self._dm_pairing is None:
+            logger.warning("[DM] policy=pairing but pairing manager is not configured")
+            return False
+
+        # 白名单优先级高于配对：已明确授权的用户不需要再走配对码。
+        if self._dm_allowlist_matches(message):
+            return True
+        if self._dm_pairing.is_authorized(message.channel, message.chat_id):
+            return True
+
+        # /pair 本身必须放行，否则管理员无法生成首个配对码。
+        # 具体子命令的 Owner 校验在 _handle_pair_command 内完成。
+        if raw_text.strip().lower().startswith("/pair"):
+            return True
+
+        # 只有“看起来像配对码”的输入才计入失败次数，避免普通闲聊触发
+        # 5 次失败后的 15 分钟锁定。
+        candidate = raw_text.strip()
+        if not re.fullmatch(r"[A-Za-z0-9]{8}", candidate):
+            if self._should_notify_dm_rejection(message):
+                await self._send_feedback(message, "🔒 未授权。请输入配对码或联系管理员获取。")
+            return False
+
+        ok, hint = self._dm_pairing.verify_code(candidate, message.channel, message.chat_id)
+        if ok:
+            await self._send_feedback(message, f"✅ {hint}")
+        elif self._should_notify_dm_rejection(message):
+            await self._send_feedback(
+                message, f"🔒 未授权。请输入配对码或联系管理员获取。({hint})"
+            )
+        return False
 
     async def _handle_pair_command(self, cmd: str, message: "UnifiedMessage") -> str | None:
         """Handle /pair command for DM Pairing."""
         if not self._dm_pairing:
             return "DM Pairing is not enabled."
+        if not self._is_owner_user(message):
+            return "只有 Owner 可以管理配对授权。"
 
         parts = cmd.strip().split()
         sub = parts[1] if len(parts) > 1 else "generate"
@@ -2582,6 +2726,31 @@ class MessageGateway:
         session_key = self._get_session_key(message)
         _raw_text = (message.plain_text or "").strip()
 
+        # ==================== 入站幂等 / 陈旧消息 / DM 访问策略 ====================
+        # 平台重连或 webhook 重试可能把同一条消息二次投递；统一在网关层
+        # 兜底，避免重复调用 Agent、重复回复。
+        if self._inbound_guard.is_duplicate(
+            message.channel, message.chat_id, message.channel_message_id
+        ):
+            logger.info(
+                "[IM] Duplicate inbound dropped: channel=%s chat=%s msg=%s",
+                message.channel,
+                message.chat_id,
+                message.channel_message_id,
+            )
+            return
+        if self._inbound_guard.is_stale(message.timestamp):
+            logger.warning(
+                "[IM] Stale inbound dropped: channel=%s chat=%s ts=%s",
+                message.channel,
+                message.chat_id,
+                message.timestamp,
+            )
+            return
+        # 访问控制必须早于所有 fast-path：未授权用户不能触发 /restart、/org 等。
+        if not await self._check_dm_access(message, _raw_text):
+            return
+
         # ==================== 终极重启指令拦截 ====================
         # 在所有逻辑之前拦截，确保即使系统卡死也能响应。
         # 不经过消息队列、不进入 Agent、不污染会话上下文。
@@ -2594,6 +2763,9 @@ class MessageGateway:
                 return
 
         if self._restart_cmd_handler.is_restart_command(_raw_text):
+            if not self._is_owner_user(message):
+                await self._send_feedback(message, "只有 Owner 可以重启服务。")
+                return
             await self._restart_cmd_handler.handle_restart_command(session_key, message)
             return
         # ==================== /终极重启指令拦截 ====================
@@ -2852,25 +3024,6 @@ class MessageGateway:
                         f"[Interrupt] No agent_handler, queued as interrupt for {session_key}: {user_text[:50]}"
                     )
                 return
-
-        # ==================== DM Pairing 配对授权检查 ====================
-        if self._dm_pairing:
-            channel = message.channel
-            chat_id = message.chat_id
-            if not self._dm_pairing.is_authorized(channel, chat_id):
-                stripped = _raw_text.strip()
-                is_pair_cmd = stripped.lower().startswith("/pair")
-                if is_pair_cmd:
-                    pass
-                else:
-                    result = self._dm_pairing.verify_code(_raw_text, channel, chat_id)
-                    if result[0]:
-                        await self._send_feedback(message, f"✅ {result[1]}")
-                    else:
-                        await self._send_feedback(
-                            message, f"🔒 未授权。请输入配对码或联系管理员获取。({result[1]})"
-                        )
-                    return
 
         # 正常入队
         await self._message_queue.put(message)
@@ -5894,6 +6047,16 @@ class MessageGateway:
                 logger.error(f"No adapter for channel: {original.channel}")
             return False
 
+        # 永久失败的目标（被踢群/被拉黑/chat 失效）在 TTL 内直接短路，
+        # 避免每条回复都重试一遍并刷错误日志；成功投递一次后自动清除。
+        if self._dead_targets.is_dead(original.channel, original.chat_id):
+            logger.warning(
+                "[SendResponse] Skip delivery to dead target: channel=%s chat=%s",
+                original.channel,
+                original.chat_id,
+            )
+            return False
+
         # 解析文本中的媒体引用
         media_result = parse_media_from_text(response)
         text_to_send = media_result.cleaned_text
@@ -5961,7 +6124,7 @@ class MessageGateway:
                     )
                     failed_at = i
                     break
-            except ChannelDeliveryUnavailable:
+            except ChannelDeliveryUnavailable as exc:
                 logger.warning(
                     "Channel unavailable while sending response part %s/%s "
                     "(channel=%s, chat_id=%s)",
@@ -5970,15 +6133,18 @@ class MessageGateway:
                     original.channel,
                     original.chat_id,
                 )
+                self._record_delivery_failure(original, exc)
                 raise
             except Exception as e:
                 logger.error(
                     f"Failed to send response part {i + 1}/{len(messages)} after retries: {e}"
                 )
+                self._record_delivery_failure(original, e)
                 failed_at = i
                 break
 
         if failed_at < 0:
+            self._dead_targets.clear(original.channel, original.chat_id)
             await self._send_extracted_media(adapter, original, media_result, outgoing_meta)
             return True
 
@@ -6003,10 +6169,12 @@ class MessageGateway:
                 plain_result = await adapter.send_message(plain_out)
                 if not self._is_im_send_delivered(plain_result):
                     raise RuntimeError("adapter did not confirm immediate delivery")
-            except ChannelDeliveryUnavailable:
+            except ChannelDeliveryUnavailable as exc:
+                self._record_delivery_failure(original, exc)
                 raise
             except Exception as e2:
                 logger.error(f"Plain-text fallback also failed for part {failed_at + j + 1}: {e2}")
+                self._record_delivery_failure(original, e2)
                 _sent_count = failed_at + j
                 _fail_hint = (
                     f"消息发送失败（已送达 {_sent_count}/{len(messages)} 段），请稍后重试。"
@@ -6025,6 +6193,55 @@ class MessageGateway:
 
         await self._send_extracted_media(adapter, original, media_result, outgoing_meta)
         return True
+
+    _REMOTE_MEDIA_LIMITS = {
+        "image": 20 * 1024 * 1024,
+        "audio": 20 * 1024 * 1024,
+        "video": 50 * 1024 * 1024,
+        "file": 50 * 1024 * 1024,
+    }
+
+    async def _resolve_extracted_media_path(
+        self,
+        item: Any,
+        media_type: str,
+        adapter: "ChannelAdapter",
+        original: UnifiedMessage,
+        reply_to: str | None,
+        outgoing_meta: dict,
+    ) -> str | None:
+        """把解析出的媒体项解析成本地路径。
+
+        本地路径原样返回；远程 URL 先下载到缓存目录。下载失败时把 URL
+        以文本形式回显，避免用户既拿不到附件也看不到原始链接。
+        """
+        if not item.is_url:
+            return item.path
+
+        from .media_fetch import fetch_remote_media
+
+        try:
+            path = await fetch_remote_media(
+                item.path,
+                media_type=media_type,
+                max_bytes=self._REMOTE_MEDIA_LIMITS.get(media_type, 50 * 1024 * 1024),
+            )
+            return str(path)
+        except Exception as exc:  # noqa: BLE001 -- 失败降级为文本链接
+            logger.warning(
+                "[SendResponse] remote %s fetch failed (%s): %s",
+                media_type,
+                item.path[:120],
+                exc,
+            )
+            with contextlib.suppress(Exception):
+                await adapter.send_text(
+                    original.chat_id,
+                    f"🔗 {item.path}",
+                    reply_to=reply_to,
+                    metadata=outgoing_meta,
+                )
+            return None
 
     async def _send_extracted_media(
         self,
@@ -6053,18 +6270,21 @@ class MessageGateway:
 
         if adapter.has_capability("send_image"):
             for img in media_result.images:
-                if img.is_url:
+                image_path = await self._resolve_extracted_media_path(
+                    img, "image", adapter, original, reply_to, outgoing_meta
+                )
+                if not image_path:
                     continue
                 try:
                     await adapter.send_image(
                         original.chat_id,
-                        img.path,
+                        image_path,
                         reply_to=reply_to,
                     )
                 except Exception as e:
                     logger.warning(f"[SendResponse] send extracted image failed: {e}")
                     with contextlib.suppress(Exception):
-                        fname = Path(img.path).name if img.path else "image"
+                        fname = Path(image_path).name or "image"
                         await adapter.send_text(
                             original.chat_id,
                             f"📎 {fname}",
@@ -6072,21 +6292,27 @@ class MessageGateway:
                             metadata=outgoing_meta,
                         )
 
-        all_files = list(media_result.files) + list(media_result.videos)
+        all_files: list[tuple[Any, str]] = [
+            *((item, "file") for item in media_result.files),
+            *((item, "video") for item in media_result.videos),
+        ]
         if adapter.has_capability("send_file"):
-            for file in all_files:
-                if file.is_url:
+            for file, media_type in all_files:
+                file_path = await self._resolve_extracted_media_path(
+                    file, media_type, adapter, original, reply_to, outgoing_meta
+                )
+                if not file_path:
                     continue
                 try:
                     await adapter.send_file(
                         original.chat_id,
-                        file.path,
+                        file_path,
                         **reply_kwargs(adapter.send_file),
                     )
                 except Exception as e:
                     logger.warning(f"[SendResponse] send extracted file failed: {e}")
                     with contextlib.suppress(Exception):
-                        fname = Path(file.path).name if file.path else "file"
+                        fname = Path(file_path).name or "file"
                         await adapter.send_text(
                             original.chat_id,
                             f"📎 {fname}",
@@ -6094,7 +6320,7 @@ class MessageGateway:
                             metadata=outgoing_meta,
                         )
         elif all_files:
-            names = [Path(file.path).name or "file" for file in all_files if not file.is_url]
+            names = [Path(file.path).name or "file" for file, _ in all_files if not file.is_url]
             if names:
                 with contextlib.suppress(Exception):
                     await adapter.send_text(
@@ -6106,18 +6332,21 @@ class MessageGateway:
 
         if adapter.has_capability("send_voice"):
             for audio in media_result.audios:
-                if audio.is_url:
+                audio_path = await self._resolve_extracted_media_path(
+                    audio, "audio", adapter, original, reply_to, outgoing_meta
+                )
+                if not audio_path:
                     continue
                 try:
                     await adapter.send_voice(
                         original.chat_id,
-                        audio.path,
+                        audio_path,
                         **reply_kwargs(adapter.send_voice),
                     )
                 except Exception as e:
                     logger.warning(f"[SendResponse] send extracted audio failed: {e}")
                     with contextlib.suppress(Exception):
-                        fname = Path(audio.path).name if audio.path else "audio"
+                        fname = Path(audio_path).name or "audio"
                         await adapter.send_text(
                             original.chat_id,
                             f"📎 {fname}",
@@ -6265,6 +6494,18 @@ class MessageGateway:
         if isinstance(result, str):
             return bool(result)
         return result is not None
+
+    def _record_delivery_failure(
+        self,
+        original: UnifiedMessage,
+        error: BaseException,
+    ) -> None:
+        """把明确的永久性投递失败登记为死目标（瞬时错误忽略）。"""
+        if isinstance(error, ChannelDeliveryUnavailable) and error.retryable:
+            return
+        reason = classify_dead_error(getattr(error, "reason", "") or error)
+        if reason:
+            self._dead_targets.mark_dead(original.channel, original.chat_id, reason)
 
     async def send_text_reliably(
         self,

@@ -529,6 +529,15 @@ async def start_im_channels(agent_or_master):
         stt_client=stt_client,  # 在线 STT 客户端
     )
 
+    # DM 访问策略（open / pairing / allowlist）——未配置时保持 open，向后兼容。
+    from pathlib import Path as _Path
+
+    _message_gateway.configure_dm_access(
+        policy=settings.im_dm_policy,
+        allowlist=settings.im_dm_allowlist,
+        data_dir=_Path(settings.session_storage_path) / "im_pairing",
+    )
+
     # 把"逐包 pip 错误"快照挂到 Gateway 上：适配器启动失败时若 reason 只是
     # "缺少依赖: pip install xxx"，Gateway 会用这个表回退查具体原因
     # （超时 / 版本冲突 / 网络错误），让前端 IM 行 tooltip 真正可读。
