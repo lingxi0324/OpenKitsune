@@ -8,6 +8,7 @@ Piper 与 KittenTTS 以小型 LRU 缓存（每进程至多 3 个已加载模型�
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -84,12 +85,22 @@ def _generate_neutts(text: str, output_path: str, tts_config: dict[str, Any]) ->
     neutts_config = _section(tts_config, "neutts")
     wav_path = _wav_sidecar_path(output_path)
     script = _import_neutts_synth_script()
+    ref_audio = str(neutts_config.get("ref_audio") or "").strip()
+    ref_text = str(neutts_config.get("ref_text") or "").strip()
+    if not ref_audio or not os.path.isfile(ref_audio):
+        raise RuntimeError(
+            "NeuTTS needs tts.neutts.ref_audio in data/voice_config.json "
+            "(a short recording of the voice to clone)")
+    if not ref_text or not os.path.isfile(ref_text):
+        raise RuntimeError(
+            "NeuTTS needs tts.neutts.ref_text in data/voice_config.json "
+            "(transcript of ref_audio)")
     cmd = [
         sys.executable, script,
         "--text", text,
         "--out", wav_path,
-        "--ref-audio", str(neutts_config.get("ref_audio") or ""),
-        "--ref-text", str(neutts_config.get("ref_text") or ""),
+        "--ref-audio", ref_audio,
+        "--ref-text", ref_text,
         "--model", str(neutts_config.get("model") or DEFAULT_NEUTTS_MODEL),
         "--device", str(neutts_config.get("device") or "cpu")]
     result = _run_helper(cmd, 120)

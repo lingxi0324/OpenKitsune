@@ -6,6 +6,7 @@
 - :mod:`.vad`     语音检测：RMS 能量检测、静音自动停止、预卷、抢话检测、全双工监听
 - :mod:`.stt`     语音识别：本地 faster-whisper + 在线 STTClient（llm_endpoints.json stt_endpoints）
 - :mod:`.tts`     语音合成：edge/openai/deepinfra/elevenlabs/minimax/xai/mistral/gemini/piper/kittentts/neutts
+- :mod:`.tts_streaming`  流式语音播报：句子增量切分、PCM 流式引擎、逐句播放、抢话闩锁
 - :mod:`.audio`   音频工具：WAV 包装、ffmpeg 转码、容器嗅探、长文本分块、交付打包
 - :mod:`.config`  语音配置（data/voice_config.json + 环境变量）
 - :mod:`.text_normalize`  朗读文本清理（Markdown/符号归一化）
@@ -32,6 +33,12 @@ from .tts import (
     list_available_providers,
     resolve_max_text_length,
     synthesize_text,
+)
+from .tts_streaming import (
+    SentenceChunker,
+    mark_speech_interrupted,
+    stream_tts_to_speaker,
+    take_speech_interrupted,
 )
 from .vad import (
     AudioRecorder,
@@ -62,6 +69,11 @@ __all__ = [
     "list_available_providers",
     "resolve_max_text_length",
     "synthesize_text",
+    # tts_streaming
+    "SentenceChunker",
+    "mark_speech_interrupted",
+    "stream_tts_to_speaker",
+    "take_speech_interrupted",
     # vad
     "AudioRecorder",
     "create_audio_recorder",

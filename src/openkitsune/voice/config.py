@@ -77,7 +77,7 @@ PROVIDER_MAX_TEXT_LENGTH: dict[str, int] = {
 }
 FALLBACK_MAX_TEXT_LENGTH = 4000
 
-# 内置 TTS provider 名（与 hermes 保持一致；插件/命令 provider 暂不迁移）
+# 内置 TTS provider 名（与 hermes 保持一致）；非内置名可经 tts.providers.<name> 声明命令型引擎
 BUILTIN_TTS_PROVIDERS = frozenset({
     "edge", "elevenlabs", "openai", "deepinfra", "minimax", "xai", "mistral", "gemini",
     "piper", "kittentts", "neutts",

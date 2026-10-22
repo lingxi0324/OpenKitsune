@@ -128,6 +128,15 @@ class LocalSTT:
             device, compute = self._resolve_device()
             cache_dir = str(_model_cache_dir())
             Path(cache_dir).mkdir(parents=True, exist_ok=True)
+            # HF 下载端点：stt.hf_endpoint（如 https://hf-mirror.com）覆盖默认 huggingface.co，
+            # 供受限网络下载 Whisper 模型；仅当环境变量未设置时写入，避免覆盖用户显式配置。
+            # 同步禁用 XetData（hf_xet）：其 CAS 端点 cas-server.xethub.hf.co 不认 HF_ENDPOINT
+            # 且匿名重建 401，镜像场景必须回退经典 LFS HTTP 下载流。
+            hf_endpoint = str(get_stt_config().get("hf_endpoint") or "").strip()
+            if hf_endpoint and not os.environ.get("HF_ENDPOINT"):
+                os.environ["HF_ENDPOINT"] = hf_endpoint.rstrip("/")
+            if hf_endpoint and not os.environ.get("HF_HUB_DISABLE_XET"):
+                os.environ["HF_HUB_DISABLE_XET"] = "1"
             logger.info("Loading local Whisper model '%s' (device=%s, compute=%s)...",
                         self._model_name, device, compute)
             started = time.monotonic()

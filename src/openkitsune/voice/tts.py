@@ -60,7 +60,10 @@ def _positive_int(value: Any) -> int | None:
 
 
 def resolve_max_text_length(provider: str | None, tts_config: dict[str, Any] | None = None) -> int:
-    """provider 输入字符上限：``tts.<provider>.max_text_length`` > 内置表 > 兜底。"""
+    """provider 输入字符上限：``tts.<provider>.max_text_length`` > 内置表 > 兜底。
+
+    命令型 provider 使用其默认上限（5000，可经 ``tts.providers.<name>.max_text_length`` 覆盖）。
+    """
     if not provider:
         return FALLBACK_MAX_TEXT_LENGTH
     key = provider.lower().strip()
@@ -69,6 +72,12 @@ def resolve_max_text_length(provider: str | None, tts_config: dict[str, Any] | N
     override = _positive_int(prov_cfg.get("max_text_length"))
     if override:
         return override
+    try:
+        from .tts_command import DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH, resolve_command_provider_config
+        if resolve_command_provider_config(key, cfg) is not None:
+            return DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH
+    except Exception:
+        pass
     if key == "elevenlabs":
         model_id = prov_cfg.get("model_id")
         mapped = audio_elevenlabs_model_cap(str(model_id).strip()) if model_id else None
@@ -88,12 +97,19 @@ def audio_elevenlabs_model_cap(model_id: str) -> int | None:
 
 
 def _is_command_provider(provider: str, tts_config: dict[str, Any]) -> bool:
-    """命令 provider（本地可执行文件合成）暂不迁移；返回 False。"""
-    return False
+    """命令型 provider（用户自定义 shell 命令合成，见 :mod:`.tts_command`）。"""
+    try:
+        from .tts_command import resolve_command_provider_config
+        return resolve_command_provider_config(provider, tts_config) is not None
+    except Exception:
+        return False
 
 
-def _resolve_engine(provider: str) -> Callable | None:
-    """返回 provider 对应的同步/异步生成函数；未知返回 None。"""
+def _resolve_engine(provider: str, tts_config: dict[str, Any] | None = None) -> Callable | None:
+    """返回 provider 对应的同步/异步生成函数；未知返回 None。
+
+    ``tts_config`` 供命令型 provider 解析（``tts.providers.<name>``）。
+    """
     engines: dict[str, Callable] = {
         "edge": generate_edge_tts,          # async
         "openai": generate_openai_tts,
@@ -107,7 +123,17 @@ def _resolve_engine(provider: str) -> Callable | None:
     local_engine = _resolve_local_engine(provider)
     if local_engine is not None:
         return local_engine
-    return engines.get(provider.lower().strip())
+    key = provider.lower().strip()
+    cfg = tts_config if tts_config is not None else {}
+    if key not in engines and _is_command_provider(key, cfg):
+        def _command_bound(text: str, output_path: str, cfg_: dict[str, Any]) -> str:
+            from .tts_command import generate_command_tts, resolve_command_provider_config
+            command_cfg = resolve_command_provider_config(key, cfg_)
+            if command_cfg is None:
+                raise RuntimeError(f"TTS command provider '{key}' not configured")
+            return generate_command_tts(text, output_path, key, command_cfg, cfg_)
+        return _command_bound
+    return engines.get(key)
 
 
 def _resolve_local_engine(provider: str) -> Callable | None:
@@ -243,10 +269,11 @@ def synthesize_text(
     """
     cfg = tts_config if tts_config is not None else get_tts_config()
     provider = (provider or get_tts_provider(cfg)).lower().strip()
-    if provider not in BUILTIN_TTS_PROVIDERS:
+    if provider not in BUILTIN_TTS_PROVIDERS and not _is_command_provider(provider, cfg):
         raise ValueError(
-            f"Unknown TTS provider '{provider}'. Built-in: {sorted(BUILTIN_TTS_PROVIDERS)}")
-    engine = _resolve_engine(provider)
+            f"Unknown TTS provider '{provider}'. Built-in: {sorted(BUILTIN_TTS_PROVIDERS)}"
+            " (plus command providers in tts.providers)")
+    engine = _resolve_engine(provider, cfg)
     if engine is None:
         raise RuntimeError(f"TTS engine '{provider}' unavailable (missing dependency)")
 
@@ -319,7 +346,7 @@ def get_output_dir_path(tts_config: dict[str, Any]) -> str:
 
 
 def list_available_providers() -> list[str]:
-    """列出可用引擎（本地引擎按依赖可用性过滤）。"""
+    """列出可用引擎（本地引擎按依赖可用性过滤；命令型 provider 一并列出）。"""
     available = []
     for provider in sorted(BUILTIN_TTS_PROVIDERS):
         try:
@@ -327,4 +354,11 @@ def list_available_providers() -> list[str]:
                 available.append(provider)
         except Exception:
             continue
+    try:
+        from .tts_command import iter_command_providers
+        for name, _ in iter_command_providers(get_tts_config()):
+            if name not in available:
+                available.append(name)
+    except Exception:
+        pass
     return available

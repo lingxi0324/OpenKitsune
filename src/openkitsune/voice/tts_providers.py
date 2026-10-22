@@ -139,8 +139,13 @@ async def generate_edge_tts(text: str, output_path: str, tts_config: dict[str, A
     语音未显式配置时按文本语言自动适配（中文 -> zh-CN-XiaoxiaoNeural，
     日文 -> ja-JP-NanamiNeural，其余英文默认），避免英文语音读中文抛
     ``NoAudioReceived``。可经 ``tts.edge.voice`` 显式固定。
+
+    首次调用前应用 :func:`openkitsune.voice.edge_tts_compat.patch_edge_tts`
+    端点补丁：微软旧端点自 2026 年起 403，需切换到 api.msedgeservices.com。
     """
     edge_tts = _import_edge_tts()
+    from .edge_tts_compat import patch_edge_tts
+    patch_edge_tts(edge_tts)
     edge_config = tts_config.get("edge") if isinstance(tts_config, dict) and isinstance(
         tts_config.get("edge"), dict) else {}
     voice = edge_config.get("voice") or DEFAULT_EDGE_VOICE
