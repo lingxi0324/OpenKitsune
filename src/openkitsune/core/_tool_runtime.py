@@ -945,6 +945,12 @@ class ToolExecutor:
                 span.set_attribute("config_hint_scope", e.hint.scope)
                 span.set_attribute("config_hint_code", e.hint.error_code)
                 error_text = e.to_llm_text()
+                await self._record_process_rule_failure_autonomous(
+                    tool_name,
+                    error_type="config:" + str(getattr(e.hint, "error_code", "")),
+                    message=str(e),
+                    session_id=session_id,
+                )
                 await self._dispatch_hook(
                     "on_after_tool_use",
                     tool_name=tool_name,
@@ -967,6 +973,12 @@ class ToolExecutor:
                 span.set_attribute("error_type", e.error_type.value)
                 span.set_attribute("error_message", e.message)
                 error_result = e.to_tool_result()
+                await self._record_process_rule_failure_autonomous(
+                    tool_name,
+                    error_type=e.error_type.value,
+                    message=e.message,
+                    session_id=session_id,
+                )
                 await self._dispatch_hook(
                     "on_after_tool_use",
                     tool_name=tool_name,
@@ -993,6 +1005,12 @@ class ToolExecutor:
                 span.set_attribute("error_type", tool_error.error_type.value)
                 span.set_attribute("error_message", str(e))
                 error_result = tool_error.to_tool_result()
+                await self._record_process_rule_failure_autonomous(
+                    tool_name,
+                    error_type=tool_error.error_type.value,
+                    message=str(e),
+                    session_id=session_id,
+                )
                 await self._dispatch_hook(
                     "on_after_tool_use",
                     tool_name=tool_name,
@@ -1009,6 +1027,89 @@ class ToolExecutor:
                     error_type=tool_error.error_type.value,
                 )
                 return error_result, None
+
+    def _record_process_rule_failure(
+        self,
+        tool_name: str,
+        *,
+        error_type: str,
+        message: str,
+        session_id: str | None = None,
+    ) -> None:
+        """R5 异常决策树插桩：记录失败并生成重试/换通道决策（fail-open）。
+
+        仅记录审计与决策提示，绝不改变原有返回路径。
+        """
+        try:
+            from openkitsune.process_rules.exception_tree import handle_failure
+
+            decision = handle_failure(
+                session_id=session_id,
+                tool_name=tool_name,
+                error_type=error_type,
+                message=message,
+            )
+            if decision and decision.get("action") == "check_common_cause":
+                logger.warning(
+                    "[ProcessRules] R5 共性成因：%s 同类错误已超阈值，停止重试查共同成因",
+                    tool_name,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[ProcessRules] failure record degraded: {e}")
+
+    async def _record_process_rule_failure_autonomous(
+        self,
+        tool_name: str,
+        *,
+        error_type: str,
+        message: str,
+        session_id: str | None = None,
+    ) -> dict | None:
+        """R5 + 自主决策：错误分类模糊时交 AI 判断重试/换通道/报告。
+
+        返回决策 dict（仅观测记录用），不改变原有返回路径。
+        """
+        try:
+            from openkitsune.process_rules.autonomy import decide as _autonomy_decide
+            from openkitsune.process_rules.exception_tree import (
+                deterministic_retry_decision,
+                handle_failure,
+            )
+
+            det = deterministic_retry_decision(
+                session_id=session_id,
+                tool_name=tool_name,
+                error_type=error_type,
+                message=message,
+            )
+            decision = det
+            if det.get("confidence", 1.0) < 0.75:
+                ai = await _autonomy_decide(
+                    "r5_retry",
+                    session_id=session_id,
+                    deterministic=lambda: det,
+                    context={
+                        "tool_name": tool_name,
+                        "error_type": error_type,
+                        "message": message,
+                        "user_request": getattr(self, "_last_user_request", "") or "",
+                    },
+                )
+                if ai.get("decided_by") == "llm" and ai.get("decision"):
+                    decision = dict(det)
+                    decision["decision"] = ai.get("decision")
+                    decision["decided_by"] = "llm"
+                    decision["reason"] = ai.get("reason", "")
+
+            if decision.get("action") == "check_common_cause":
+                logger.warning(
+                    "[ProcessRules] R5 共性成因：%s 同类错误已超阈值，停止重试查共同成因",
+                    tool_name,
+                )
+            return decision
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[ProcessRules] autonomous failure record degraded: {e}")
+            return None
 
     def _record_experience(
         self,
@@ -1141,13 +1242,27 @@ class ToolExecutor:
         tool_name = self._canonicalize_tool_name(tool_name)
         tool_input = normalize_tool_input(tool_name, tool_input)
 
-        todo_block = self._check_todo_required(tool_name, session_id)
+        # R1/R3 插桩：为 todo gate 与 preflight 提供输入上下文（fail-open）
+        try:
+            self._last_tool_input = tool_input
+            self._turn_tool_count = getattr(self, "_turn_tool_count", 0) + 1
+        except Exception:
+            pass
+
+        todo_block = await self._check_todo_required_autonomous(
+            tool_name, session_id, tool_input
+        )
         if todo_block:
             return todo_block, None
 
         grounding_block = self._check_current_turn_grounding(tool_name, tool_input)
         if grounding_block:
             return grounding_block, None
+
+        # R3 工具预检分层（observe：快检直接过，详检记录审计；enforce 模式可阻断）
+        preflight_block = await self._run_preflight_autonomous(tool_name, tool_input, session_id)
+        if preflight_block:
+            return preflight_block, None
 
         if getattr(policy_result, "metadata", {}).get("needs_checkpoint"):
             try:
@@ -1744,20 +1859,236 @@ class ToolExecutor:
         except Exception as exc:
             logger.debug("[CurrentTurn] result observation skipped: %s", exc)
 
-    def _check_todo_required(self, tool_name: str, session_id: str | None) -> str | None:
+    def _check_todo_required(
+        self, tool_name: str, session_id: str | None, tool_input: dict | None = None
+    ) -> str | None:
         """
         检查是否需要先创建 Todo（仅 Agent 模式下的 todo 跟踪）。
 
-        Todo 是任务管理提示，不应成为工具执行的硬门槛。旧逻辑会在复合任务未
-        创建 Todo 时拒绝 read_file/run_shell/browser 等工具，导致模型反复收到
-        “请先创建 Todo”的长提示，反而阻碍用户任务推进。
+        历史教训：todo 不应成为工具执行的硬门槛——旧逻辑会在复合任务未
+        创建 Todo 时拒绝工具，导致模型反复收到“请先创建 Todo”的长提示，
+        反而阻碍任务推进。因此这里默认软引导（suggest），统一放行。
 
-        现在统一放行，由 prompt 和 Todo 工具自身引导模型在合适时主动建计划。
+        整改版 v2.0（process_rules R1）：
+        - 默认 ``suggest``：估算步骤 + 风险信号，仅审计记录，不阻断。
+        - 配置 ``process_rules_todo_mode=enforce`` 时：命中 Plan 风险信号
+          （irreversible/external/permission/user_requested/first_time）
+          或步骤数 ≥ todo_min_steps 时返回提示文本（可阻断）。
+        规则引擎自身异常一律放行（fail-open），绝不阻碍主流程。
 
         Returns:
-            始终返回 None（允许执行）。
+            默认 None（允许执行）；enforce 模式下命中规则时返回提示文本。
         """
-        return None
+        try:
+            from openkitsune.process_rules.todo_policy import todo_policy_check
+            from openkitsune.config import settings as _settings
+
+            mode = str(getattr(_settings, "process_rules_todo_mode", "suggest") or "suggest")
+            return todo_policy_check(
+                session_id=session_id,
+                tool_name=tool_name,
+                tool_input=tool_input or {},
+                user_request=getattr(self, "_last_user_request", "") or "",
+                tool_call_count=getattr(self, "_turn_tool_count", 0),
+                mode=mode,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[ProcessRules] todo gate degraded, allow: {e}")
+            return None
+
+    async def _check_todo_required_autonomous(
+        self, tool_name: str, session_id: str | None, tool_input: dict | None = None
+    ) -> str | None:
+        """R1 + 自主决策：todo/Plan 判定在灰色地带交 AI 自主决定。
+
+        L0 确定性置信 → 低置信问 LLM（r1_todo / r1_plan）→ LLM 决定是否
+        需要 todo/plan；LLM 失败回退确定性。fail-open：任何异常放行。
+        """
+        try:
+            from openkitsune.config import settings as _settings
+            from openkitsune.process_rules.autonomy import decide as _autonomy_decide
+            from openkitsune.process_rules.todo_policy import (
+                deterministic_todo_decision,
+                todo_policy_check,
+            )
+
+            mode = str(getattr(_settings, "process_rules_todo_mode", "suggest") or "suggest")
+            det = deterministic_todo_decision(
+                tool_name=tool_name,
+                tool_input=tool_input or {},
+                user_request=getattr(self, "_last_user_request", "") or "",
+                tool_call_count=getattr(self, "_turn_tool_count", 0),
+            )
+            decision = det.get("decision", "none")
+            if det.get("confidence", 1.0) < getattr(
+                _settings, "process_rules_autonomy_confidence_threshold", 0.75
+            ):
+                ai = await _autonomy_decide(
+                    "r1_todo",
+                    session_id=session_id,
+                    deterministic=lambda: det,
+                    context={
+                        "tool_name": tool_name,
+                        "user_request": getattr(self, "_last_user_request", "") or "",
+                    },
+                )
+                if ai.get("decided_by") == "llm":
+                    llm_todo = ai.get("decision")
+                    if llm_todo is True:
+                        decision = "todo"
+                    elif llm_todo is False:
+                        decision = "none"
+
+            # enforce 模式：命中风险信号才硬阻断；否则软提示
+            if decision == "none":
+                return None
+            if mode == "enforce" and decision == "plan":
+                from openkitsune.process_rules.todo_policy import detect_risk_signal
+
+                risk = detect_risk_signal(
+                    tool_name,
+                    tool_input or {},
+                    getattr(self, "_last_user_request", "") or "",
+                )
+                return (
+                    f"⚠️ 该操作命中 Plan 风险信号（{risk}）："
+                    "请先创建 Plan（create_plan_file + exit_plan_mode）获得批准后执行。"
+                )
+            return todo_policy_check(
+                session_id=session_id,
+                tool_name=tool_name,
+                tool_input=tool_input or {},
+                user_request=getattr(self, "_last_user_request", "") or "",
+                tool_call_count=getattr(self, "_turn_tool_count", 0),
+                mode="suggest",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[ProcessRules] autonomous todo gate degraded, allow: {e}")
+            return None
+
+    def _run_preflight(
+        self, tool_name: str, tool_input: dict, session_id: str | None
+    ) -> str | None:
+        """R3 工具预检分层（同步兜底路径；async 入口优先走自主决策）。
+
+        - ``process_rules_preflight_mode=observe``（默认）：详检记录审计，不阻断；
+          仅当预检发现硬性问题（如工具不在已知目录 + enforce 模式）才返回提示。
+        - ``process_rules_preflight_mode=enforce``：issues 非空时返回阻断提示。
+        """
+        try:
+            from openkitsune.process_rules.preflight import preflight_check
+            from openkitsune.config import settings as _settings
+
+            mode = str(
+                getattr(_settings, "process_rules_preflight_mode", "observe") or "observe"
+            )
+            known = False
+            try:
+                known = self._handler_registry.has_tool(tool_name) is True
+            except Exception:
+                known = False
+            result = preflight_check(
+                session_id=session_id,
+                tool_name=tool_name,
+                params=tool_input or {},
+                known_tool=known,
+                permission_ok=None,
+                mode=mode,
+            )
+            if not result:
+                return None
+            issues = result.get("issues") or []
+            if not issues:
+                return None
+            if mode == "enforce":
+                return (
+                    f"⚠️ 工具预检未通过（{tool_name}）："
+                    + "; ".join(issues)
+                    + "。请先解决前置条件（确认 schema/权限/依赖/数据）后重试。"
+                )
+            # observe：不阻断，仅记录（preflight_check 已写审计）
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[ProcessRules] preflight degraded, allow: {e}")
+            return None
+
+    async def _run_preflight_autonomous(
+        self, tool_name: str, tool_input: dict, session_id: str | None
+    ) -> str | None:
+        """R3 + 自主决策：灰色地带（参数形态变化/无历史/成功次数不足）交 AI 判断。
+
+        流程：L0 确定性置信 → 低置信问 LLM（r3_preflight）→ LLM 决定 fast/detail；
+        失败回退确定性。fail-open：任何异常放行。
+        """
+        try:
+            from openkitsune.config import settings as _settings
+            from openkitsune.process_rules.autonomy import decide as _autonomy_decide
+            from openkitsune.process_rules.preflight import (
+                deterministic_preflight_decision,
+                preflight_check,
+            )
+
+            mode = str(
+                getattr(_settings, "process_rules_preflight_mode", "observe") or "observe"
+            )
+            known = False
+            try:
+                known = self._handler_registry.has_tool(tool_name) is True
+            except Exception:
+                known = False
+
+            # L0 确定性判定 + 置信度
+            det = deterministic_preflight_decision(
+                session_id=session_id,
+                tool_name=tool_name,
+                params=tool_input or {},
+                known_tool=known,
+            )
+            decision = det.get("decision", "fast")
+            if det.get("confidence", 1.0) < getattr(
+                _settings, "process_rules_autonomy_confidence_threshold", 0.75
+            ):
+                # L1 灰色地带：交 AI 自主决定快检还是详检
+                ai = await _autonomy_decide(
+                    "r3_preflight",
+                    session_id=session_id,
+                    deterministic=lambda: det,
+                    context={
+                        "tool_name": tool_name,
+                        "params": str(tool_input)[:200],
+                        "user_request": getattr(self, "_last_user_request", "") or "",
+                    },
+                )
+                if ai.get("decided_by") == "llm":
+                    decision = ai.get("decision", decision)
+
+            if decision == "fast":
+                return None
+
+            # 详检：跑预检清单（observe 记录 / enforce 阻断）
+            result = preflight_check(
+                session_id=session_id,
+                tool_name=tool_name,
+                params=tool_input or {},
+                known_tool=known,
+                permission_ok=None,
+                mode=mode,
+            )
+            if not result:
+                return None
+            issues = result.get("issues") or []
+            if not issues:
+                return None
+            if mode == "enforce":
+                return (
+                    f"⚠️ 工具预检未通过（{tool_name}）："
+                    + "; ".join(issues)
+                    + "。请先解决前置条件（确认 schema/权限/依赖/数据）后重试。"
+                )
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[ProcessRules] autonomous preflight degraded, allow: {e}")
+            return None
 
     def check_permission(self, tool_name: str, tool_input: dict) -> "PermissionDecision":
         """Unified permission check — mode rules + PolicyEngine + fail-closed.

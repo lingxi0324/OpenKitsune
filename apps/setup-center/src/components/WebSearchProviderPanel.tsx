@@ -90,6 +90,12 @@ function getEnvFieldLabel(envKey: string, t: (key: string, defaultValue: string)
 }
 
 const PROVIDER_UI: Record<string, ProviderUIConfig> = {
+  hands: {
+    envKey: "OPENKITSUNE_HANDS_URL",
+    envType: "text",
+    envPlaceholder: "http://127.0.0.1:8320",
+    envHelp: "本机 openkitsune-hands 网络爪牙服务地址（宿主启动时自动拉起）",
+  },
   bocha: {
     envKey: "BOCHA_API_KEY",
     envType: "password",

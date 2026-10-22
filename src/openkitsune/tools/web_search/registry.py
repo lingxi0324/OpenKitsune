@@ -42,7 +42,15 @@ def _ensure_loaded() -> None:
         return
     _LOADED = True
     # Import provider modules — each calls ``register(...)`` at module scope
-    from .providers import bing, bocha, duckduckgo, jina, searxng, tavily  # noqa: F401
+    from .providers import (  # noqa: F401
+        bing,
+        bocha,
+        duckduckgo,
+        hands,
+        jina,
+        searxng,
+        tavily,
+    )
 
 
 def iter_providers() -> list[WebSearchProvider]:

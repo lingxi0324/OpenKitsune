@@ -2,6 +2,7 @@
 
 Each module in this package registers itself on import:
 
+    hands       — 本机 openkitsune-hands 九尾网络爪牙（无 Key，优先）
     bocha       — 博查（国内推荐，需要 BOCHA_API_KEY）
     tavily      — Tavily（海外推荐，需要 TAVILY_API_KEY）
     searxng     — 自部署 SearXNG（需要 SEARXNG_BASE_URL）

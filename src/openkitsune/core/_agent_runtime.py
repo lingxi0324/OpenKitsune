@@ -412,6 +412,55 @@ MEDIUM_CTX_EXTRA_TOOLS = {
     "delegate_parallel",
 }
 
+# 桌面操作请求直接暴露的桌面工具集合（AI 桌面可视化）。
+# 不放进全局 core set：只在用户请求命中桌面意图时按需提升，避免每轮多带 ~1k tokens。
+DESKTOP_TOOL_BUNDLE = frozenset(
+    {
+        "desktop_screenshot",
+        "desktop_find_element",
+        "desktop_click",
+        "desktop_mouse",
+        "desktop_type",
+        "desktop_press",
+        "desktop_key",
+        "desktop_hotkey",
+        "desktop_scroll",
+        "desktop_window",
+        "desktop_wait",
+        "desktop_inspect",
+        "desktop_batch",
+        "desktop_macro",
+    }
+)
+_DESKTOP_INTENT_MARKERS: tuple[str, ...] = (
+    "桌面",
+    "截图",
+    "屏幕",
+    "鼠标",
+    "点击",
+    "双击",
+    "输入框",
+    "键盘",
+    "按键",
+    "回车",
+    "空格",
+    "desktop",
+    "screenshot",
+    "screen",
+    "mouse",
+    "click",
+    "keyboard",
+    "keystroke",
+)
+
+
+def _is_desktop_intent_message(message: str) -> bool:
+    """用户消息是否命中桌面操作意图（用于按需提升桌面工具 schema）。"""
+    text = str(message or "").casefold()
+    if not text:
+        return False
+    return any(marker in text for marker in _DESKTOP_INTENT_MARKERS)
+
 
 @dataclass(frozen=True)
 class PromptStrategy:
@@ -1284,6 +1333,8 @@ class Agent:
         The ordinary direct-schema surface is the explicit 14-tool core.
         User-pinned and previously discovered tools can extend it. A structured
         IntentAnalyzer hint may add at most one request-scoped primary tool.
+        Desktop requests additionally promote the desktop action bundle so the
+        model does not fall back to ad-hoc shell screenshot scripts.
         Every other registered tool remains in the effective list with
         ``_deferred=True`` so the Brain omits its API schema while the catalog
         and ``tool_search`` can still expose and promote it.
@@ -1294,6 +1345,9 @@ class Agent:
         user_always_cats = frozenset(settings.always_load_categories)
         discovered = getattr(self, "_discovered_tools", set())
         intent_promoted = getattr(self, "_intent_promoted_tools", set())
+        desktop_intent = _is_desktop_intent_message(
+            getattr(self, "_current_user_message", "")
+        )
 
         out: list[dict] = []
         for registered_tool in tools:
@@ -1313,6 +1367,7 @@ class Agent:
                 or name in intent_promoted
                 or name in user_always_tools
                 or (cat and cat in user_always_cats)
+                or (desktop_intent and name in DESKTOP_TOOL_BUNDLE)
             ):
                 tool["_promoted"] = True
             else:
@@ -1321,6 +1376,10 @@ class Agent:
             out.append(tool)
 
         return out
+
+    def _is_desktop_intent(self) -> bool:
+        """当前用户请求是否明确在操作桌面（用于直接暴露桌面工具 schema）。"""
+        return _is_desktop_intent_message(getattr(self, "_current_user_message", ""))
 
     @staticmethod
     def _dedupe_tools_by_name(tools: list[dict], *, source: str) -> list[dict]:
@@ -1417,7 +1476,7 @@ class Agent:
         # 初始化 token 用量追踪
         init_token_tracking(str(settings.db_full_path))
 
-        # 伴随拉起 openkitsune-brain 记忆栈（fusion-memory + brain-bus）。
+        # 伴随拉起外部能力服务（记忆栈 + 网络爪牙）。
         # 子进程启动失败只记录日志，绝不阻断 Agent 初始化；sub-agent 不重复拉起。
         if not lightweight:
             try:
@@ -1426,6 +1485,12 @@ class Agent:
                 logger.info("[OkmemStack] autostart: %s", start_okmem_stack())
             except Exception as e:  # noqa: BLE001 -- 外部记忆栈不可用不能阻断宿主
                 logger.debug("[OkmemStack] autostart failed: %s", e)
+            try:
+                from ..tools.web_search.hands_stack import start_hands_stack
+
+                logger.info("[HandsStack] autostart: %s", start_hands_stack())
+            except Exception as e:  # noqa: BLE001 -- 网络爪牙不可用不能阻断宿主
+                logger.debug("[HandsStack] autostart failed: %s", e)
 
         # 自动生成/加载设备 ID（用于平台认证）
         if not settings.hub_device_id:
@@ -9261,13 +9326,19 @@ class Agent:
         # 如果当前 Agent 是进程主 Agent，则清理引用，防止后续 sub-agent
         # 拿到已经 shutdown 的 parent。
         if get_primary_agent() is self:
-            # 回收随宿主拉起的 openkitsune-brain 记忆栈（外部实例不受影响）
+            # 回收随宿主拉起的外部能力服务（外部实例不受影响）
             try:
                 from ..memory.okmem_stack import stop_okmem_stack
 
                 await asyncio.to_thread(stop_okmem_stack)
             except Exception as e:  # noqa: BLE001 -- 收尾失败不能阻断 shutdown
                 logger.debug(f"[OkmemStack] stop failed: {e}")
+            try:
+                from ..tools.web_search.hands_stack import stop_hands_stack
+
+                await asyncio.to_thread(stop_hands_stack)
+            except Exception as e:  # noqa: BLE001 -- 收尾失败不能阻断 shutdown
+                logger.debug(f"[HandsStack] stop failed: {e}")
             set_primary_agent(None)
 
         self._running = False
