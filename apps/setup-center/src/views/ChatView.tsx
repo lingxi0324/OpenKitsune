@@ -3413,7 +3413,7 @@ export function ChatView({
     }},
     { id: "memory", label: t("chat.memoryCmd", "记忆管理"), description: t("chat.memoryCmdDesc", "查看/管理 AI 记忆条目"), action: (args) => {
       if (args === "list" || !args) {
-        safeFetch(`${apiBase}/api/memory/entries?limit=20`).then(r => r.json()).then(data => {
+        safeFetch(`${apiBase}/api/memories?limit=20`).then(r => r.json()).then(data => {
           const entries = data?.entries || data?.memories || [];
           if (!entries.length) {
             setMessages(prev => [...prev, { id: genId(), role: "system", content: t("chat.memoryEmpty", "暂无记忆条目。AI 会在对话中自动学习和记忆。"), timestamp: Date.now() }]);

@@ -5,6 +5,7 @@ import { stripLegacySummary } from "../utils/chatHelpers";
 import { resolveMessageParts, hasRenderableBody } from "../utils/messageParts";
 import { formatTime } from "../../../utils";
 import { AttachmentPreview } from "./AttachmentPreview";
+import { ChatAvatar } from "./ChatAvatar";
 import { SpinnerTipDisplay } from "./SpinnerTipDisplay";
 import { MarkdownContent } from "./MarkdownContent";
 import { MessageParts } from "./MessageParts";
@@ -85,18 +86,43 @@ export const MessageBubble = memo(function MessageBubble({
   const canRevealChain =
     !!msg.thinkingChain && msg.thinkingChain.length > 0 && parts.some((p) => p.kind === "reasoning");
   const showRevealHandle = isAssistant && !msg.streaming && !hasBody && canRevealChain;
+  // Avatars render beside user and assistant messages; system/system-like rows
+  // keep the legacy column layout without an avatar.
+  const showAvatar = isUser || isAssistant;
+
+  const avatarSize = 32;
 
   return (
-    <div className="msgBubbleWrap" style={{ display: "flex", flexDirection: "column", alignItems: isUser ? "flex-end" : "flex-start", marginBottom: 16, position: "relative" }}>
-      {!isUser && msg.agentName && (
-        <div style={{ fontSize: 11, fontWeight: 700, opacity: 0.5, marginBottom: 2, paddingLeft: 2 }}>
-          {msg.agentName}
-        </div>
-      )}
+    <div
+      className="msgBubbleWrap"
+      style={{
+        display: "flex",
+        flexDirection: isUser ? "row-reverse" : "row",
+        alignItems: "flex-start",
+        gap: 8,
+        marginBottom: 16,
+        position: "relative",
+      }}
+    >
+      {showAvatar && <ChatAvatar variant={isUser ? "user" : "ai"} size={avatarSize} />}
       <div
         style={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: isUser ? "flex-end" : "flex-start",
           maxWidth: "85%",
-          padding: isUser ? "10px 16px" : "12px 16px",
+          minWidth: 0,
+        }}
+      >
+        {!isUser && msg.agentName && (
+          <div style={{ fontSize: 11, fontWeight: 700, opacity: 0.5, marginBottom: 2, paddingLeft: 2 }}>
+            {msg.agentName}
+          </div>
+        )}
+        <div
+          style={{
+            maxWidth: "100%",
+            padding: isUser ? "10px 16px" : "12px 16px",
           borderRadius: isUser ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
           background: isUser ? "var(--brand)" : "var(--panel2)",
           color: isUser ? "#fff" : "var(--text)",
@@ -218,6 +244,7 @@ export const MessageBubble = memo(function MessageBubble({
         {!isLast && !msg.streaming && onRewind && (
           <button className="msgActionBtn" onClick={() => onRewind(msg.id)} title={t("chat.rewind", "回到这里")}><IconRewind size={12} /></button>
         )}
+      </div>
       </div>
     </div>
   );
