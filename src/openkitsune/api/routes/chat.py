@@ -1924,6 +1924,84 @@ async def _stream_chat(
                 except (json.JSONDecodeError, TypeError, KeyError):
                     pass
 
+        # ── 语音回复：自动合成并注入 voice artifact ──
+        # 回复完成后，若 voice_config 开启 ``tts.reply_voice`` 且回复文本适中，
+        # 用 openkitsune.voice 引擎合成 mp3，作为 ``artifact_type="voice"`` 事件
+        # 下发（前端 Artifacts 渲染 <audio> 播放器，零前端改动）；同时并入
+        # ``_collected_artifacts``，随 assistant 消息持久化，历史重放同样可见。
+        # 合成失败 / 超时一律静默跳过，绝不阻塞文本回复。
+        if not _agent_errored and not _client_disconnected and _full_reply.strip():
+            try:
+                from openkitsune.voice.config import get_tts_config
+
+                _tts_cfg = get_tts_config()
+                _rv = _tts_cfg.get("reply_voice")
+                _rv = _rv if isinstance(_rv, dict) else {}
+                _has_voice_art = any(
+                    (isinstance(a, dict) and a.get("artifact_type") == "voice")
+                    for a in _collected_artifacts
+                )
+                if _rv.get("enabled") and not _has_voice_art:
+                    from openkitsune.voice.text_normalize import prepare_spoken_text
+
+                    _spoken = prepare_spoken_text(_full_reply, max_chars=None)
+                    _max_chars = int(_rv.get("max_chars") or 500)
+                    if _spoken and len(_spoken) <= _max_chars:
+                        try:
+                            from pathlib import Path as _Path
+
+                            from openkitsune.core.working_directory import (
+                                session_working_directory,
+                            )
+
+                            _ws = session_working_directory(session, require_available=True)
+                            _voice_dir = _Path(_ws) / "voice_replies"
+                            _voice_dir.mkdir(parents=True, exist_ok=True)
+                            _voice_path = _voice_dir / f"reply_{turn_id.replace(':', '_')}.mp3"
+                            from openkitsune.voice.tts import synthesize_text
+
+                            _res = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    synthesize_text,
+                                    _spoken,
+                                    provider=str(_rv.get("provider") or "").strip() or None,
+                                    output_path=str(_voice_path),
+                                    tts_config=_tts_cfg,
+                                ),
+                                timeout=20.0,
+                            )
+                            _voice_file = _res.get("paths")[0] if _res.get("paths") else ""
+                            if _voice_file:
+                                from urllib.parse import quote
+
+                                _vp = _Path(_voice_file).resolve()
+                                if _vp.is_file() and _vp.stat().st_size > 0:
+                                    _voice_art = {
+                                        "artifact_type": "voice",
+                                        "file_url": (
+                                            f"/api/files?path={quote(str(_vp))}"
+                                            f"&conversation_id={quote(conversation_id)}"
+                                        ),
+                                        "path": str(_vp),
+                                        "name": _vp.name,
+                                        "caption": _rv.get("caption") or "语音回复（点击播放）",
+                                        "size": _vp.stat().st_size,
+                                    }
+                                    _collected_artifacts.append(_voice_art)
+                                    yield _sse("artifact", _voice_art)
+                                    _last_emit_ts = time.time()
+                                    logger.info(
+                                        "[Chat API] Reply voice injected: %s (%d bytes)",
+                                        _vp.name,
+                                        _vp.stat().st_size,
+                                    )
+                        except Exception as _voice_err:
+                            logger.warning(
+                                "[Chat API] Reply voice synthesis skipped: %s", _voice_err
+                            )
+            except Exception:
+                pass
+
         # --- Save assistant response to session ---
         _save_done = True
 

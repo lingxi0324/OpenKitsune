@@ -317,6 +317,91 @@ class AgentToolHandler:
         _art_marker = "\n\n__ARTIFACT_RECEIPTS__\n"
         all_receipt_blocks: list[str] = []
         parts = []
+
+        # R4 多 Agent 冲突裁决插桩（fail-open：只标注，不改返回结构）
+        arbiter_note = ""
+        try:
+            from openkitsune.process_rules.arbiter import AgentResult, arbitrate
+            from openkitsune.config import settings as _arb_settings
+
+            _arb_mode = str(getattr(_arb_settings, "process_rules_arbiter_mode", "observe") or "observe")
+            if _arb_mode != "off":
+                _arb_results: list[AgentResult] = []
+                for i, res in enumerate(raw_results):
+                    if isinstance(res, BaseException):
+                        continue
+                    _disp, _res_text = res
+                    if not _res_text or "❌" in str(_res_text)[:40]:
+                        continue
+                    # 启发式评分：成功结果视为中等证据/一致性/置信（实测=1.0 需结构化回执）
+                    _arb_results.append(
+                        AgentResult(
+                            agent_id=str(_disp),
+                            text=str(_res_text),
+                            evidence=0.7,
+                            goal_alignment=0.6,
+                            confidence=0.5,
+                        )
+                    )
+                if len(_arb_results) >= 2:
+                    _arb = arbitrate(
+                        _arb_results,
+                        session_id=getattr(session, "id", None),
+                        mode=_arb_mode,
+                    )
+                    # R4 + 自主决策：分差接近/核心结论时交 AI 判断采纳谁（fail-open）
+                    try:
+                        from openkitsune.process_rules.autonomy import (
+                            decide as _arb_autonomy_decide,
+                        )
+                        from openkitsune.process_rules.arbiter import (
+                            deterministic_arbiter_decision,
+                        )
+
+                        _arb_det = deterministic_arbiter_decision(
+                            _arb_results,
+                            session_id=getattr(session, "id", None),
+                            core_conclusion=False,
+                        )
+                        _arb_conf = float(_arb_det.get("confidence", 1.0))
+                        _arb_auto_cfg = getattr(_arb_settings, "process_rules_autonomy_enabled", True)
+                        if (
+                            _arb_auto_cfg
+                            and _arb.get("disputes", 0) > 0
+                            and _arb_conf < 0.75
+                        ):
+                            _ai = await _arb_autonomy_decide(
+                                "r4_arbiter",
+                                session_id=getattr(session, "id", None),
+                                deterministic=lambda: _arb_det,
+                                context={
+                                    "agent_results": _arb_results,
+                                    "user_request": "",
+                                },
+                            )
+                            if _ai.get("decided_by") == "llm":
+                                _llm_winner = _ai.get("decision")
+                                if _llm_winner in ("winner", "consensus") and _arb.get("winner"):
+                                    _arb["winner"] = _arb.get("winner")
+                                    _arb["action"] = "arbitrated"
+                                elif _llm_winner == "human":
+                                    _arb["action"] = "consensus"
+                    except Exception as _arb_ai_exc:  # noqa: BLE001
+                        logger.debug(
+                            f"[AgentToolHandler] R4 autonomy degraded (ignored): {_arb_ai_exc}"
+                        )
+                    if _arb.get("action") in ("arbitrated", "consensus") and _arb.get("winner"):
+                        _winner_id = _arb["winner"].agent_id
+                        _disputes = _arb.get("disputes", 0)
+                        if _disputes > 0:
+                            arbiter_note = (
+                                f"\n\n🎯 [裁决] 子 Agent 结果存在 {_disputes} 处分歧，"
+                                f"按证据/目标一致性/置信度排序，采纳 **{_winner_id}**；"
+                                "其余结论仅作参考。"
+                            )
+        except Exception as _arb_exc:  # noqa: BLE001
+            logger.debug(f"[AgentToolHandler] R4 arbiter degraded (ignored): {_arb_exc}")
+
         for i, res in enumerate(raw_results):
             if isinstance(res, BaseException):
                 display = resolved_tasks[i]["display_id"]
@@ -335,6 +420,8 @@ class AgentToolHandler:
                 wrapped = wrap_external_content(result, source=f"parallel_sub_agent:{display_id}")
                 parts.append(f"## Agent: {display_id}\n{wrapped}")
         combined = "\n\n---\n\n".join(parts)
+        if arbiter_note:
+            combined += arbiter_note
         # Re-append all receipt blocks as a single merged JSON array at the end
         if all_receipt_blocks:
             import json as _json

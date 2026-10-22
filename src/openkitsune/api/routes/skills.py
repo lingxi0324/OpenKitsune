@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 
 import httpx
@@ -54,14 +55,55 @@ _skills_list_task_revision = 0
 _skills_reload_task: asyncio.Task[dict] | None = None
 _skills_cache_revision = 0
 
+# 进程级共享的"技能内容查找" loader：GET /api/skills 列表构建和
+# GET /api/skills/content/{name} 内容查找都复用同一个全量扫描结果，
+# 避免每个请求各自新建 SkillLoader 重复扫描工作区技能目录。
+# 技能变更（install/uninstall/reload/content-update/allowlist-change）时由
+# _invalidate_skills_cache 统一失效，下次请求惰性重建一次。
+_tmp_content_loader: "SkillLoader | None" = None
+_tmp_content_loader_path: Path | None = None
+_tmp_content_loader_lock = threading.Lock()
+
 
 def _invalidate_skills_cache() -> None:
     """Clear the cached skill list so the next GET /api/skills re-scans disk."""
     global _skills_cache, _organize_cache, _organize_cache_hash, _skills_cache_revision
+    global _tmp_content_loader, _tmp_content_loader_path
     _skills_cache = None
     _organize_cache = None
     _organize_cache_hash = None
     _skills_cache_revision += 1
+    _tmp_content_loader = None
+    _tmp_content_loader_path = None
+
+
+def _get_content_loader(base_path: Path):
+    """Return the process-shared skill loader, rebuilding it on first use.
+
+    The first caller after a (re)build performs one full ``load_all`` scan and
+    caches the loader; later callers reuse it without touching disk. Callers
+    from the event loop may block briefly on that first scan — the same cost as
+    the previous per-request ``SkillLoader().load_all()``, paid only once.
+    """
+    global _tmp_content_loader, _tmp_content_loader_path
+    loader = _tmp_content_loader
+    if loader is not None and _tmp_content_loader_path == base_path:
+        return loader
+    with _tmp_content_loader_lock:
+        loader = _tmp_content_loader
+        if loader is not None and _tmp_content_loader_path == base_path:
+            return loader
+        try:
+            from openkitsune.skills.loader import SkillLoader
+
+            new_loader = SkillLoader()
+            new_loader.load_all(base_path=base_path)
+        except Exception as e:
+            logger.warning("Shared skill content loader rebuild failed: %s", e)
+            return None
+        _tmp_content_loader = new_loader
+        _tmp_content_loader_path = base_path
+        return new_loader
 
 
 def _resolve_agent(request: Request):
@@ -240,10 +282,9 @@ async def _build_skills_list_response(request: Request) -> dict:
         base_path = skills_json_path.parent.parent
 
     try:
-        from openkitsune.skills.loader import SkillLoader
-
-        loader = SkillLoader()
-        await asyncio.to_thread(loader.load_all, base_path)
+        loader = _get_content_loader(base_path)
+        if loader is None:
+            raise RuntimeError("shared skill content loader unavailable")
         all_skills = loader.registry.list_all()
         effective_allowlist = loader.compute_effective_allowlist(external_allowlist)
     except Exception:
@@ -1103,8 +1144,6 @@ async def get_skill_content(skill_name: str, request: Request):
     返回 { content, path, system } 供前端展示和编辑。
     系统内置技能标记 system=true，前端可据此决定是否允许编辑。
     """
-    from openkitsune.skills.loader import SkillLoader
-
     try:
         from openkitsune.config import settings
 
@@ -1121,12 +1160,12 @@ async def get_skill_content(skill_name: str, request: Request):
             skill = loader.get_skill(skill_name)
 
     if not skill:
-        try:
-            tmp_loader = SkillLoader()
-            tmp_loader.load_all(base_path=base_path)
-            skill = tmp_loader.get_skill(skill_name)
-        except Exception:
-            pass
+        loader = _get_content_loader(base_path)
+        if loader is not None:
+            try:
+                skill = loader.get_skill(skill_name)
+            except Exception:
+                pass
 
     if not skill:
         raise HTTPException(404, f"Skill '{skill_name}' not found")

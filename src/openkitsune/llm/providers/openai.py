@@ -164,6 +164,56 @@ def _extract_reasoning_delta(value: object) -> str:
     return ""
 
 
+# 思考通道退化抑制：本地模型偶发在 reasoning 通道连续输出同一字符
+# （实测 Qwen3.6 在一次任务复盘请求中连续输出 "/" 直到耗尽思考预算）。
+# 思考内容不是最终答案，检测到退化后整段丢弃，避免污染前端展示。
+_THINK_PROBE_CHARS = 64
+_DEGENERATE_MIN_CHARS = 16
+_DEGENERATE_DOMINANCE = 0.95
+
+
+def _is_degenerate_text(text: str) -> bool:
+    """判断文本是否退化为单一字符重复（忽略空白），如连续输出 "//////"。"""
+    compact = "".join(text.split())
+    if len(compact) < _DEGENERATE_MIN_CHARS:
+        return False
+    counts: dict[str, int] = {}
+    for ch in compact:
+        counts[ch] = counts.get(ch, 0) + 1
+    _, count = max(counts.items(), key=lambda item: item[1])
+    return count / len(compact) >= _DEGENERATE_DOMINANCE
+
+
+def _is_thinking_delta(event: object) -> bool:
+    """是否为思考通道的流式增量事件。"""
+    if not isinstance(event, dict) or event.get("type") != "content_block_delta":
+        return False
+    delta = event.get("delta")
+    return isinstance(delta, dict) and delta.get("type") == "thinking"
+
+
+def _is_text_delta(event: object) -> bool:
+    """是否为正文通道的流式增量事件。"""
+    if not isinstance(event, dict) or event.get("type") != "content_block_delta":
+        return False
+    delta = event.get("delta")
+    return isinstance(delta, dict) and delta.get("type") == "text"
+
+
+def _looks_like_repetition_start(text: str) -> bool:
+    """首个正文增量是否为单一字符重复（退化输出的典型开场）。"""
+    compact = "".join(text.split())
+    return bool(compact) and len(set(compact)) == 1
+
+
+def _degenerate_output_error(provider_name: str, text: str) -> LLMError:
+    preview = text[:32]
+    return LLMError(
+        f"Degenerate model output from '{provider_name}': "
+        f"{len(text)} chars dominated by a single character (preview={preview!r})"
+    )
+
+
 def _is_stream_only_error(error: str) -> bool:
     """检测错误是否表明端点仅支持流式请求（stream-only relay/中转站）。"""
     err_lower = error.lower()
@@ -840,6 +890,13 @@ class OpenAIProvider(LLMProvider):
         _conn_closed_retries = 0
         _MAX_CONN_CLOSED_RETRIES = 1
         while True:
+            # 每次流式尝试独立判定思考/正文通道是否退化（重试时重新开始）
+            _think_mode = "buffering"  # buffering → ok | suppressed
+            _think_buf: list[dict] = []
+            _think_probe = ""
+            _text_mode = "idle"  # idle → probing | ok
+            _text_buf: list[dict] = []
+            _text_probe = ""
             try:
                 async with client.stream(
                     "POST",
@@ -918,11 +975,107 @@ class OpenAIProvider(LLMProvider):
                                     has_content = True
                                     received_chunks += 1
                                     converted = self._convert_stream_event(event)
-                                    if isinstance(converted, list):
-                                        for ev in converted:
+                                    events = converted if isinstance(converted, list) else [converted]
+                                    for ev in events:
+                                        # 思考增量先缓冲探测：退化（连续同一字符）则整段丢弃，
+                                        # 避免把模型卡死时的无效思考推给前端。
+                                        if _is_thinking_delta(ev):
+                                            text = ev["delta"].get("text") or ""
+                                            if not text or _think_mode == "suppressed":
+                                                continue
+                                            if _think_mode == "buffering":
+                                                _think_buf.append(ev)
+                                                _think_probe += text
+                                                if _is_degenerate_text(_think_probe):
+                                                    _think_mode = "suppressed"
+                                                    logger.warning(
+                                                        "[OpenAI] '%s': suppressing degenerate "
+                                                        "reasoning stream (%d chars, preview=%r)",
+                                                        self.name,
+                                                        len(_think_probe),
+                                                        _think_probe[:32],
+                                                    )
+                                                    _think_buf.clear()
+                                                    _think_probe = ""
+                                                    continue
+                                                if len(_think_probe) >= _THINK_PROBE_CHARS:
+                                                    _think_mode = "ok"
+                                                    for buffered in _think_buf:
+                                                        yield buffered
+                                                    _think_buf.clear()
+                                                    _think_probe = ""
+                                                continue
                                             yield ev
-                                    else:
-                                        yield converted
+                                            continue
+                                        # 正文退化探测：首块若为单一字符重复则先缓冲，
+                                        # 确认退化直接抛错交给上层重试/切换端点，
+                                        # 避免把满屏 "/" 当成回答展示给用户。
+                                        if _is_text_delta(ev):
+                                            text = ev["delta"].get("text") or ""
+                                            if not text or _text_mode == "ok":
+                                                yield ev
+                                                continue
+                                            if _text_mode == "idle":
+                                                if not _looks_like_repetition_start(text):
+                                                    _text_mode = "ok"
+                                                    yield ev
+                                                    continue
+                                                _text_mode = "probing"
+                                                _text_buf.append(ev)
+                                                _text_probe = text
+                                                if _is_degenerate_text(_text_probe):
+                                                    raise _degenerate_output_error(
+                                                        self.name, _text_probe
+                                                    )
+                                                continue
+                                            # probing：出现正常字符才放行
+                                            _text_buf.append(ev)
+                                            _text_probe += text
+                                            if _is_degenerate_text(_text_probe):
+                                                raise _degenerate_output_error(
+                                                    self.name, _text_probe
+                                                )
+                                            if len(set("".join(_text_probe.split()))) > 1:
+                                                _text_mode = "ok"
+                                                for buffered in _text_buf:
+                                                    yield buffered
+                                                _text_buf.clear()
+                                                _text_probe = ""
+                                            continue
+                                        # 非正文事件：先判定/冲刷正文探测缓冲。
+                                        # ping / usage（message_delta）是心跳类事件，
+                                        # 不能用来结算探测窗口，否则首个思考增量后紧跟
+                                        # 一个 ping 就会提前放行后续退化内容。
+                                        if ev.get("type") in ("ping", "message_delta"):
+                                            yield ev
+                                            continue
+                                        if _text_mode == "probing":
+                                            if _is_degenerate_text(_text_probe):
+                                                raise _degenerate_output_error(
+                                                    self.name, _text_probe
+                                                )
+                                            _text_mode = "ok"
+                                            for buffered in _text_buf:
+                                                yield buffered
+                                            _text_buf.clear()
+                                            _text_probe = ""
+                                        if _think_mode == "buffering":
+                                            if _is_degenerate_text(_think_probe):
+                                                _think_mode = "suppressed"
+                                                logger.warning(
+                                                    "[OpenAI] '%s': suppressing degenerate "
+                                                    "reasoning stream (%d chars, preview=%r)",
+                                                    self.name,
+                                                    len(_think_probe),
+                                                    _think_probe[:32],
+                                                )
+                                            else:
+                                                _think_mode = "ok"
+                                                for buffered in _think_buf:
+                                                    yield buffered
+                                            _think_buf.clear()
+                                            _think_probe = ""
+                                        yield ev
                                 except json.JSONDecodeError:
                                     continue
                         elif not has_content and not line.startswith(":"):
@@ -939,6 +1092,33 @@ class OpenAIProvider(LLMProvider):
                             except json.JSONDecodeError:
                                 if "error" in line.lower():
                                     raise LLMError(f"Stream error from '{self.name}': {line[:500]}")
+
+                    # 流结束：判定/冲刷正文探测缓冲
+                    if _text_mode == "probing":
+                        if _is_degenerate_text(_text_probe):
+                            raise _degenerate_output_error(self.name, _text_probe)
+                        for buffered in _text_buf:
+                            yield buffered
+                        _text_buf.clear()
+                        _text_probe = ""
+                        _text_mode = "ok"
+
+                    # 流结束：冲刷仍处于缓冲态的思考增量（不足探测窗口）
+                    if _think_mode == "buffering":
+                        if _is_degenerate_text(_think_probe):
+                            logger.warning(
+                                "[OpenAI] '%s': suppressing degenerate reasoning stream "
+                                "(%d chars, preview=%r)",
+                                self.name,
+                                len(_think_probe),
+                                _think_probe[:32],
+                            )
+                        else:
+                            for buffered in _think_buf:
+                                yield buffered
+                        _think_buf.clear()
+                        _think_probe = ""
+                        _think_mode = "ok"
 
                     if has_content:
                         self.mark_healthy()
@@ -1072,6 +1252,8 @@ class OpenAIProvider(LLMProvider):
 
         content_blocks: list = []
         text = "".join(text_parts)
+        if text and _is_degenerate_text(text):
+            raise _degenerate_output_error(self.name, text)
         if text:
             content_blocks.append(TextBlock(text=text))
 
@@ -1094,6 +1276,12 @@ class OpenAIProvider(LLMProvider):
 
         _reasoning_text = "".join(reasoning_parts)
         has_any_tool_calls = bool(tool_calls)
+
+        # 退化思考：有正文时直接丢弃；没有正文时无法作为可见文本兜底，交给重试
+        if _reasoning_text and _is_degenerate_text(_reasoning_text):
+            if not content_blocks and not has_any_tool_calls:
+                raise _degenerate_output_error(self.name, _reasoning_text)
+            _reasoning_text = ""
 
         # 防御层：与 _parse_response 对齐 — reasoning 作为可见文本 fallback
         if not content_blocks and not has_any_tool_calls and _reasoning_text:
@@ -1747,6 +1935,8 @@ class OpenAIProvider(LLMProvider):
         # 当 reasoning 模型被 max_tokens 截断时，所有输出可能都在 reasoning 字段，
         # content 为空。此时尝试从 reasoning 中提取结构化内容作为兜底。
         if not text_content and not has_tool_calls and reasoning_content:
+            if _is_degenerate_text(reasoning_content):
+                raise _degenerate_output_error(self.name, reasoning_content)
             import re
 
             yaml_match = re.search(
@@ -1855,6 +2045,11 @@ class OpenAIProvider(LLMProvider):
             isinstance(b, TextBlock) and b.text == text_content for b in content_blocks
         ):
             content_blocks.insert(0, TextBlock(text=text_content))
+
+        # 退化输出防御：整段正文由同一字符重复构成（实测 Qwen3.6 输出 1024 个 "/"），
+        # 抛错交给客户端重试/切换端点，避免把垃圾当答案返回。
+        if text_content and _is_degenerate_text(text_content):
+            raise _degenerate_output_error(self.name, text_content)
 
         # 仍然为空 → 记录详细诊断信息（帮助定位代理格式变化）
         # [fix 2026-10-17] reasoning-only 响应（content 空但 reasoning 有值）是

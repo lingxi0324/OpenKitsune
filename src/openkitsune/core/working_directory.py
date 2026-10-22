@@ -70,6 +70,14 @@ def normalize_working_directory(
         rest = raw[2:].lstrip("\\/").replace("\\", "/")
         raw = f"/mnt/{drive}/{rest}"
 
+    # Windows / WSL 双栈兼容：同一数据目录在 WSL 下创建会话后回到 Windows
+    # 原生服务运行时，历史会话的 /mnt/<drive>/... 在 Windows 上不是绝对
+    # 路径，会把 sessions/{id}/history 打成 500。此处映射为 <drive>:\...
+    if os.name == "nt" and len(raw) >= 6 and raw[:5].lower() == "/mnt/" and raw[5].isalpha():
+        drive = raw[5].upper()
+        rest = raw[6:].lstrip("/\\").replace("/", "\\")
+        raw = f"{drive}:\\{rest}" if rest else f"{drive}:\\"
+
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
         raise WorkingDirectoryError("working_directory must be an absolute path")

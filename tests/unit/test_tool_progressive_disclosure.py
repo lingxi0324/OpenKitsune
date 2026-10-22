@@ -171,3 +171,52 @@ async def test_discovered_list_skills_schema_reaches_next_stream_request(
     assert schemas["list_skills"] == tools[1]["input_schema"]
     if restrict_after_discovery:
         assert requests[2] is None
+
+
+_DESKTOP_TOOLS = [
+    {
+        "name": "desktop_screenshot",
+        "category": "Desktop",
+        "description": "Capture desktop screenshot",
+        "input_schema": {"type": "object"},
+    },
+    {
+        "name": "desktop_click",
+        "category": "Desktop",
+        "description": "Click a desktop element",
+        "input_schema": {"type": "object"},
+    },
+    {
+        "name": "web_search",
+        "category": "Web Search",
+        "description": "Search the web",
+        "input_schema": {"type": "object"},
+    },
+]
+
+
+def test_desktop_intent_promotes_desktop_action_bundle():
+    agent = SimpleNamespace(
+        _tools=_DESKTOP_TOOLS,
+        _discovered_tools=set(),
+        _current_user_message="帮我点击桌面上的 PING 按钮，然后截图确认",
+    )
+
+    result = {t["name"]: t for t in Agent._stable_main_chat_tool_set(agent, _DESKTOP_TOOLS)}
+
+    assert result["desktop_screenshot"]["_promoted"] is True
+    assert result["desktop_click"]["_promoted"] is True
+    assert result["web_search"]["_deferred"] is True
+
+
+def test_non_desktop_message_keeps_desktop_tools_deferred():
+    agent = SimpleNamespace(
+        _tools=_DESKTOP_TOOLS,
+        _discovered_tools=set(),
+        _current_user_message="帮我写一个 Python 函数",
+    )
+
+    result = {t["name"]: t for t in Agent._stable_main_chat_tool_set(agent, _DESKTOP_TOOLS)}
+
+    assert result["desktop_screenshot"]["_deferred"] is True
+    assert result["desktop_click"]["_deferred"] is True

@@ -1,9 +1,18 @@
+import json
+
 import httpx
 import pytest
 
 from openkitsune.llm.providers.base import LLMProvider
 from openkitsune.llm.providers.openai import OpenAIProvider
-from openkitsune.llm.types import EndpointConfig, LLMRequest, LLMResponse, StopReason, Usage
+from openkitsune.llm.types import (
+    EndpointConfig,
+    LLMError,
+    LLMRequest,
+    LLMResponse,
+    StopReason,
+    Usage,
+)
 
 
 def _provider() -> OpenAIProvider:
@@ -132,3 +141,169 @@ async def test_openai_redirect_request_hook_restores_authorization_header():
         assert redirected_request.headers["Authorization"] == "Bearer sk-test"
     finally:
         await provider.close()
+
+
+class _FakeStreamResponse:
+    status_code = 200
+    headers: dict = {}
+
+    def __init__(self, lines: list[str]):
+        self._lines = lines
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
+class _FakeStreamClient:
+    def __init__(self, lines: list[str]):
+        self._lines = lines
+
+    def stream(self, *args, **kwargs):
+        return _FakeStreamResponse(self._lines)
+
+
+def _sse(payload: dict) -> str:
+    return "data: " + json.dumps(payload, ensure_ascii=False)
+
+
+def _stream_events_by_type(events: list[dict], delta_type: str) -> str:
+    return "".join(
+        ev["delta"].get("text") or ""
+        for ev in events
+        if ev.get("type") == "content_block_delta"
+        and isinstance(ev.get("delta"), dict)
+        and ev["delta"].get("type") == delta_type
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_suppresses_degenerate_reasoning_output():
+    provider = _provider()
+    lines = [
+        _sse({"choices": [{"delta": {"reasoning_content": "/"}}]}) for _ in range(40)
+    ]
+    lines.append(
+        _sse(
+            {
+                "choices": [
+                    {"delta": {"content": "正常回复"}, "finish_reason": "stop"}
+                ]
+            }
+        )
+    )
+
+    async def _get_client():
+        return _FakeStreamClient(lines)
+
+    provider._get_client = _get_client
+    events = [ev async for ev in provider._iter_sse_events({"stream": True, "messages": []})]
+
+    assert _stream_events_by_type(events, "thinking") == ""
+    assert _stream_events_by_type(events, "text") == "正常回复"
+
+
+@pytest.mark.asyncio
+async def test_stream_keeps_normal_reasoning_output():
+    provider = _provider()
+    lines = [
+        _sse({"choices": [{"delta": {"reasoning_content": "先分析任务的耗时"}}]}),
+        _sse({"choices": [{"delta": {"reasoning_content": "根因，再给出建议。"}}]}),
+        _sse({"choices": [{"delta": {"content": "分析完成"}, "finish_reason": "stop"}]}),
+    ]
+
+    async def _get_client():
+        return _FakeStreamClient(lines)
+
+    provider._get_client = _get_client
+    events = [ev async for ev in provider._iter_sse_events({"stream": True, "messages": []})]
+
+    assert _stream_events_by_type(events, "thinking") == "先分析任务的耗时根因，再给出建议。"
+    assert _stream_events_by_type(events, "text") == "分析完成"
+
+
+@pytest.mark.asyncio
+async def test_stream_suppresses_degenerate_reasoning_with_interleaved_pings():
+    provider = _provider()
+    lines = []
+    for _ in range(40):
+        lines.append(_sse({"choices": [{"delta": {"reasoning_content": "/"}}]}))
+        lines.append(_sse({"choices": []}))
+    lines.append(
+        _sse(
+            {
+                "choices": [
+                    {"delta": {"content": "正常回复"}, "finish_reason": "stop"}
+                ]
+            }
+        )
+    )
+
+    async def _get_client():
+        return _FakeStreamClient(lines)
+
+    provider._get_client = _get_client
+    events = [ev async for ev in provider._iter_sse_events({"stream": True, "messages": []})]
+
+    assert _stream_events_by_type(events, "thinking") == ""
+    assert _stream_events_by_type(events, "text") == "正常回复"
+
+
+@pytest.mark.asyncio
+async def test_stream_rejects_degenerate_text_output_with_interleaved_pings():
+    provider = _provider()
+    lines = []
+    for _ in range(40):
+        lines.append(_sse({"choices": [{"delta": {"content": "/"}}]}))
+        lines.append(_sse({"choices": []}))
+
+    async def _get_client():
+        return _FakeStreamClient(lines)
+
+    provider._get_client = _get_client
+    with pytest.raises(LLMError, match="Degenerate model output"):
+        _ = [ev async for ev in provider._iter_sse_events({"stream": True, "messages": []})]
+
+
+@pytest.mark.asyncio
+async def test_stream_passes_single_char_first_chunk_followed_by_normal_text():
+    provider = _provider()
+    lines = [
+        _sse({"choices": [{"delta": {"content": "好"}}]}),
+        _sse({"choices": [{"delta": {"content": "的呀"}}]}),
+        _sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+    ]
+
+    async def _get_client():
+        return _FakeStreamClient(lines)
+
+    provider._get_client = _get_client
+    events = [ev async for ev in provider._iter_sse_events({"stream": True, "messages": []})]
+
+    assert _stream_events_by_type(events, "text") == "好的呀"
+
+
+def test_parse_response_rejects_degenerate_text_output():
+    provider = _provider()
+
+    with pytest.raises(LLMError, match="Degenerate model output"):
+        provider._parse_response(
+            {
+                "id": "chatcmpl-test",
+                "model": "gpt-test",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "/" * 1024},
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 512, "total_tokens": 515},
+            }
+        )
