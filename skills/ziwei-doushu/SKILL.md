@@ -1,7 +1,39 @@
 ---
 name: ziwei-doushu
-description: 紫微斗数命盘推演系统 — 十二宫/十四主星/辅星/四化/庙旺利陷/特殊格局
+description: 紫微斗数命盘推演系统 — 十二宫/十四主星/辅星/四化/庙旺利陷/特殊格局/大限/流年，含可执行排盘引擎
 category: 中医玄学
+exposure_level: core
+when-to-use: 需要排紫微命盘、看十二宫星曜四化、判格局大限流年时使用。
+keywords: [紫微斗数, 命盘, 十二宫, 十四主星, 四化, 大限, 流年, 庙旺, 格局]
+argument-hint: "--date 1990-05-15 --hour 14 --minute 30 --gender male"
+arguments:
+  - name: --date
+    type: string
+    required: false
+    description: 公历出生日期 YYYY-MM-DD
+  - name: --hour
+    type: int
+    required: false
+    description: 出生小时 0-23
+  - name: --minute
+    type: int
+    required: false
+    description: 分钟
+  - name: --gender
+    type: string
+    required: false
+    description: male/female 或 男/女
+  - name: --json
+    type: bool
+    required: false
+    description: JSON 输出
+metadata:
+  author: OpenKitsune
+  version: "2.1.0"
+  openkitsune:
+    python:
+      dependencies:
+        - lunar-python
 ---
 
 # 紫微斗数命盘推演系统 (Ziwei Doushu)
@@ -302,7 +334,60 @@ life_palace_branch = rotated_branches[0]
 
 ---
 
-## 九、参考资源
+## 九、可执行排盘引擎（v2.1.0 新增）
+
+`scripts/ziwei_engine.py` 已实现完整排盘，不再只是文档示意。
+
+### 直接调用（无需写代码）
+
+```text
+run_skill_script(
+  skill_name="ziwei-doushu",
+  script_name="scripts/ziwei_engine.py",
+  args=["--date", "1990-05-15", "--hour", "14",
+        "--minute", "30", "--gender", "male"]
+)
+```
+
+### 命令行 / API
+
+```bash
+# 公历出生时间排盘
+python scripts/ziwei_engine.py --date 1990-05-15 --hour 14 --minute 30 --gender male
+
+# JSON 输出
+python scripts/ziwei_engine.py --date 2021-03-19 --hour 22 --gender female --json
+```
+
+```python
+from ziwei_engine import ZiweiChart
+
+chart = ZiweiChart(1990, 5, 15, 14, "male", 30)
+data = chart.to_dict()
+print(data["life_palace"]["ju_name"])   # 土五局
+print(data["palaces"][0]["main_stars"]) # 命宫主星
+```
+
+引擎覆盖：
+
+| 模块 | 实现 |
+|:----|:-----|
+| 命宫/身宫 | 寅起正月顺数生月，命宫逆数生时、身宫顺数生时 |
+| 五行局 | 命宫干支纳音 → 水二/木三/金四/土五/火六局 |
+| 紫微/天府 | 起紫微星诀（补数整除、奇逆偶顺），天府按寅申轴对称 |
+| 十四主星 | 紫微系逆布、天府系顺布 |
+| 辅星煞星 | 左辅右弼、文昌文曲、地空地劫、天魁天钺、禄存擎羊陀罗、火星铃星、天马、红鸾天喜 |
+| 四化 | 十天干禄权科忌 |
+| 庙旺 | 十四主星常用庙旺利陷表 |
+| 大限 | 阳男阴女顺行、阴男阳女逆行，起限岁数=五行局数 |
+| 流年 | 流年命宫、流年十二宫、流年四化、所属大限 |
+| 格局 | 紫府同宫、君臣庆会、火贪、铃贪、日月反背、日照雷门、月朗天门、杀破狼、机月同梁、府相朝垣、刑囚夹印、命无正曜 |
+
+> 自检基准：2021-03-19 亥时女命 → 命宫壬辰、水二局、紫微在辰、天府在子。
+
+---
+
+## 十、参考资源
 
 - 本skill参考知识库文档: `reference/紫微斗数命盘矩阵系统.md`
 - 包含完整的Python类定义：ZiweiPalace、ZiweiStar、FourTransforms、SpecialPatterns、ZiweiChart

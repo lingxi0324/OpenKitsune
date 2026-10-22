@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 八字命理完整推演工具 v2.1 — 含从格增强 + 置信度评分 + 内嵌自测
@@ -59,10 +59,10 @@ DI_ZHI_CANG_GAN = {
     "申":["庚","壬","戊"],"酉":["辛"],"戌":["戊","辛","丁"],"亥":["壬","甲"]
 }
 REN_YUAN_SI_LING = {
-    "寅":[("戊",7),("丙",7),("甲",16.5)],"卯":[("乙",30)],"辰":[("乙",9),("癸",3),("戊",18)],
-    "巳":[("戊",5),("庚",9),("丙",16)],"午":[("丁",19),("己",11)],"未":[("丁",9),("乙",3),("己",18)],
-    "申":[("己",7),("戊",3),("庚",17),("壬",3)],"酉":[("辛",30)],"戌":[("辛",9),("丁",3),("戊",18)],
-    "亥":[("戊",7),("甲",5),("壬",18)],"子":[("癸",30)],"丑":[("癸",9),("辛",3),("己",18)]
+    "寅":[("戊",7),("丙",7),("甲",16)],"卯":[("甲",10),("乙",20)],"辰":[("乙",9),("癸",3),("戊",18)],
+    "巳":[("戊",5),("庚",9),("丙",16)],"午":[("丙",10),("己",9),("丁",11)],"未":[("丁",9),("乙",3),("己",18)],
+    "申":[("戊",5),("己",5),("壬",3),("庚",17)],"酉":[("庚",10),("辛",20)],"戌":[("辛",9),("丁",3),("戊",18)],
+    "亥":[("戊",7),("甲",5),("壬",18)],"子":[("壬",10),("癸",20)],"丑":[("癸",9),("辛",3),("己",18)]
 }
 
 def get_shi_shen_name(gan, ri_gan):
@@ -284,18 +284,14 @@ class BaZiEngine:
                 wx_score[WU_XING[g]] = wx_score.get(WU_XING[g], 0) + 0.5
         sorted_wx = sorted(wx_score.items(), key=lambda x:-x[1])
         avg = sum(wx_score.values()) / max(1, len(wx_score))
-        fu_yi = ""
-        if ri_score > avg * 1.2: fu_yi = f"身强，宜克泄耗（{self._ke_wx(ri_wx)}、{self._sheng_wx(ri_wx)}、{ri_wx}）"
-        elif ri_score < avg * 0.8: fu_yi = f"身弱，宜生扶（{self._sheng_wo_wx(ri_wx)}、{ri_wx}）"
-        else: fu_yi = "中和，视大运流年调候"
-        yong = self._sheng_wo_wx(ri_wx) if ri_score < avg else (self._ke_wx(ri_wx) if ri_score > avg * 1.2 else ri_wx)
+        qr = self.result.get("steps", {}).get("5_量化强弱", {}).get("强弱判断", "")
         tiao_hou_table = {
             "寅": {"甲":"丙","丙":"甲庚","丁":"甲庚","戊":"丙甲","己":"丙甲","庚":"甲","辛":"甲"},
             "卯": {"甲":"庚丙","丙":"甲庚","丁":"甲庚","戊":"丙甲","己":"丙甲","庚":"甲","辛":"甲"},
             "辰": {"甲":"庚丙","丙":"癸甲","丁":"甲庚","戊":"甲丙","己":"甲丙","庚":"甲","辛":"甲"},
             "月": {"甲":"壬庚","丙":"壬庚","丁":"壬庚","戊":"壬","己":"癸丙","庚":"丁甲","辛":"壬甲"},
             "巳": {"丙":"壬庚","丁":"甲庚","庚":"壬癸","辛":"壬癸","壬":"癸","癸":"丙"},
-            "午": {"丙":"壬庚","丁":"甲庚","庚":"壬癸","辛":"壬癸","壬":"癸","癸":"丙"},
+            "午": {"丙":"壬庚","丁":"甲庚","戊":"壬甲","己":"癸丙","庚":"壬癸","辛":"壬癸","壬":"癸","癸":"丙"},
             "未": {"甲":"庚丙","丙":"壬庚","丁":"甲庚","戊":"甲丙","己":"甲丙","庚":"甲","辛":"甲"},
             "申": {"甲":"庚丙","丙":"戊庚","丁":"甲庚","戊":"甲丙","己":"甲丙","庚":"甲","辛":"甲"},
             "酉": {"甲":"庚丙","丙":"甲庚","丁":"甲庚","戊":"甲丙","己":"甲丙","庚":"甲","辛":"甲"},
@@ -305,9 +301,24 @@ class BaZiEngine:
         }
         tiao_hou = tiao_hou_table.get(month_zhi, {}).get(ri, "")
         if not tiao_hou: tiao_hou = "月令中和"
+
+        sheng_wo = self._sheng_wo_wx(ri_wx)
+        ke_wo = self._ke_wx(ri_wx)
+        wo_sheng = self._sheng_wx(ri_wx)
+        if "强" in qr:
+            fu_yi = f"身强，宜克泄耗（{ke_wo}、{wo_sheng}、{ri_wx}）"
+            yong, ji = ke_wo, sheng_wo
+        elif "弱" in qr:
+            fu_yi = f"身弱，宜生扶（{sheng_wo}、{ri_wx}）"
+            yong, ji = sheng_wo, ke_wo
+        else:
+            fu_yi = "中和，视大运流年调候"
+            yong = (tiao_hou[0] if tiao_hou and tiao_hou != "月令中和" else ri_wx)
+            ji = ""
+
         r = {"五行分布": " > ".join(f"{wx}:{round(n,1)}" for wx,n in sorted_wx),
              "法一·扶抑": fu_yi, "法二·调候": f"{month_zhi}月{ri}{ri_wx}日用神：{tiao_hou}",
-             "建议用神": yong, "建议忌神": self._ke_wx(ri_wx) if ri_score > avg * 1.2 else (ri_wx if ri_score < avg * 0.8 else "")}
+             "建议用神": yong, "建议忌神": ji}
         self.result["steps"]["9_取用神"] = r; return r
 
     def step10_shi_shen_pei_zhi(self):
@@ -407,6 +418,9 @@ class BaZiEngine:
             current_year = solar.getYear()
         except: current_year = 2026
         ri = self.bazi.ri_gan
+        ri_zhi = self.bazi.ri_zhi
+        da_yun = self.result.get("steps", {}).get("13_排大运", {}).get("大运", "")
+        da_yun_list = [item for item in da_yun.split("、") if item]
         liu_nian = {}
         for y in range(current_year, min(current_year+5, 2031)):
             g_idx = (y - 4) % 10; z_idx = (y - 4) % 12
@@ -414,8 +428,15 @@ class BaZiEngine:
             ss = get_shi_shen_name(lg, ri)
             warning = ""
             if lg == ri: warning = "⚠️ 值太岁（伏吟），宜静不宜动"
-            if DI_ZHI_LIU_CHONG.get(lz+self.bazi.day_zhi) or DI_ZHI_LIU_CHONG.get(self.bazi.day_zhi+lz):
+            if DI_ZHI_LIU_CHONG.get(lz+ri_zhi) or DI_ZHI_LIU_CHONG.get(ri_zhi+lz):
                 warning = "⚠️ 日柱逢冲（反吟岁），变动较大"
+            if f"{lg}{lz}" in da_yun_list:
+                warning = (warning + "；" if warning else "") + "⚠️ 岁运并临，吉凶倍之"
+            # 流年干克日干（天克）
+            if (WU_XING.get(lg) and WU_XING.get(ri)
+                    and WU_XING[lg] == {"木": "土", "土": "水", "水": "火",
+                                        "火": "金", "金": "木"}.get(WU_XING[ri])):
+                warning = (warning + "；" if warning else "") + "⚠️ 流年干克日干，压力较大"
             liu_nian[str(y)] = f"{lg}{lz}({ss}) {warning}" if warning else f"{lg}{lz}({ss})"
         r = {"流年": "\n".join(f"{y}: {v}" for y,v in liu_nian.items())}
         self.result["steps"]["14_论流年"] = r; return r

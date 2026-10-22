@@ -122,6 +122,33 @@ SHEN_TO_QINGZHI = {
 # 九宫洛书数字
 LO_SHU_NUMS = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8, 9: 9}
 
+# 三奇六仪布宫顺序
+QIYI_ORDER = ["戊", "己", "庚", "辛", "壬", "癸", "丁", "丙", "乙"]
+# 九星本位（用于天盘干随星转动）
+STAR_ORIGINAL_PALACE = {
+    "天蓬": 1, "天芮": 2, "天冲": 3, "天辅": 4, "天禽": 5,
+    "天心": 6, "天柱": 7, "天任": 8, "天英": 9,
+}
+
+try:  # 同目录脚本既可独立运行，也可被当作模块导入
+    from qimen_patterns import (
+        detect_geju,
+        detect_fuyin_fanyin,
+        gate_wangshuai,
+        star_wangshuai,
+        men_po,
+        tianrui_shen_combo,
+        ganzhi_role_analysis,
+    )
+except ImportError:  # pragma: no cover
+    detect_geju = detect_fuyin_fanyin = gate_wangshuai = None
+    star_wangshuai = men_po = tianrui_shen_combo = ganzhi_role_analysis = None
+
+try:  # 真实时家奇门排盘（拆补转盘）
+    from qimen_paipan import compute_qimen
+except ImportError:  # pragma: no cover
+    compute_qimen = None
+
 # 八维路径（洛书核心——每行/列/对角线之和=15）
 BA_WEI_PATHS = [
     # 三行
@@ -327,7 +354,44 @@ def _qimen_get_term_and_ju(year: int, month: int, day: int, hour: int):
     return is_yang, ju, current_term, days_in_term, yuan_names[yuan_idx]
 
 
+def _attach_pattern_analysis(pan: dict) -> dict:
+    """为排盘结果附加格局、旺衰、门迫、反吟伏吟与四柱角色。"""
+    tianpan = pan.get("tianpan_gan", {})
+    dipan = pan.get("dipan_gan", {})
+    star_layout = {p["gong"]: p["star"] for p in pan.get("palaces", [])}
+    gate_layout = {p["gong"]: p["men"] for p in pan.get("palaces", [])}
+    four = pan.get("four_pillars", "")
+    month_zhi = four.split()[1][1] if len(four.split()) == 4 else ""
+
+    pan["geju"] = detect_geju(tianpan, dipan) if detect_geju else []
+    pan["fuyin_fanyin"] = (detect_fuyin_fanyin(star_layout, gate_layout)
+                           if detect_fuyin_fanyin else {})
+    pan["gate_wangshuai"] = (gate_wangshuai(pan.get("term", ""), gate_layout)
+                             if gate_wangshuai else {})
+    pan["star_wangshuai"] = (star_wangshuai(month_zhi, star_layout)
+                             if star_wangshuai else {})
+    pan["men_po"] = men_po(gate_layout) if men_po else []
+    pan["ganzhi_roles"] = (ganzhi_role_analysis(four, tianpan, dipan)
+                           if ganzhi_role_analysis else {})
+    return pan
+
+
 def _full_ju(year: int, month: int, day: int, hour: int, use_lunar_time: bool = False) -> dict:
+    """
+    完整奇门排盘（优先使用 qimen_paipan 的真实时家拆补转盘；
+    若依赖缺失则回退到内置简化排盘）。
+    """
+    if compute_qimen is not None:
+        try:
+            report = compute_qimen(year, month, day, hour)
+            return _attach_pattern_analysis(report.to_dict())
+        except Exception:
+            pass
+    return _full_ju_simple(year, month, day, hour, use_lunar_time)
+
+
+def _full_ju_simple(year: int, month: int, day: int, hour: int,
+                    use_lunar_time: bool = False) -> dict:
     """
     完整奇门排盘（独立实现，不依赖系统qimen_pail工具）
 
@@ -414,6 +478,20 @@ def _full_ju(year: int, month: int, day: int, hour: int, use_lunar_time: bool = 
     # 值符定位
     zhi_fu_star = star_mapping.get(1, "天蓬")  # 坎1为值符
 
+    # 地盘三奇六仪：阳遁顺布、阴遁逆布
+    dipan_gan = {}
+    for i, gong in enumerate(LO_SHU_ORDER):
+        idx = (ju - 1 + i) % 9 if is_yang_dun else (ju - 1 - i) % 9
+        dipan_gan[gong] = QIYI_ORDER[idx]
+
+    # 天盘干随九星转动：星落宫的天盘干 = 该星本宫的地盘干
+    tianpan_gan = {}
+    for gong, star in star_mapping.items():
+        original = STAR_ORIGINAL_PALACE.get(star, gong)
+        tianpan_gan[gong] = dipan_gan.get(original, "")
+
+    # 格局 / 旺相 / 门迫 / 反吟伏吟 / 四柱角色由 _attach_pattern_analysis 统一附加
+
     # 构建九宫数据
     palaces = []
     for gong in LO_SHU_ORDER:
@@ -438,7 +516,7 @@ def _full_ju(year: int, month: int, day: int, hour: int, use_lunar_time: bool = 
             palace["level"] = "平"
         palaces.append(palace)
 
-    return {
+    return _attach_pattern_analysis({
         "four_pillars": four_pillars,
         "yin_yang": yin_yang,
         "ju": ju,
@@ -447,8 +525,10 @@ def _full_ju(year: int, month: int, day: int, hour: int, use_lunar_time: bool = 
         "days_in_term": days_in_term,
         "palaces": palaces,
         "zhi_fu_star": zhi_fu_star,
-        "yong_shen_gong": yong_shen_gong
-    }
+        "yong_shen_gong": yong_shen_gong,
+        "tianpan_gan": tianpan_gan,
+        "dipan_gan": dipan_gan,
+    })
 
 
 # =============================================================
@@ -519,6 +599,9 @@ def _tianrui_analysis(pan: dict, symptoms: str) -> dict:
         "men": men,
         "shen": shen,
         "level": "凶",
+        "tianpan_gan": pan.get("tianpan_gan", {}).get(gong, ""),
+        "dipan_gan": pan.get("dipan_gan", {}).get(gong, ""),
+        "shen_combo": tianrui_shen_combo(shen) if tianrui_shen_combo else "",
         "meaning": "".join(meaning_parts)
     }
 
@@ -606,14 +689,24 @@ def _six_step_analysis(pan: dict, symptoms: str, department: str,
 # =============================================================
 
 def _load_knowledge_files() -> dict:
-    """加载知识库参考文件"""
+    """加载知识库参考文件（优先技能内置 reference/knowledge）。"""
+    result = {}
+
+    # 技能内置知识库（随仓库分发，不依赖外部路径）
+    local_dir = Path(__file__).resolve().parent.parent / "reference" / "knowledge"
+    if local_dir.exists():
+        for path in sorted(local_dir.glob("*.md")):
+            try:
+                result[path.name] = path.read_text(encoding="utf-8")[:5000]
+            except Exception:
+                pass
+
     if not KNOWLEDGE_BASE:
-        return {}
+        return result
     knowledge_path = Path(KNOWLEDGE_BASE)
     if not knowledge_path.exists():
-        return {}
+        return result
 
-    result = {}
     related_files = [
         "01-理论基础/六经三才论·先天八卦化生推演.md",
         "01-理论基础/五脏九宫矩阵·洛书数理与脏腑升降体系.md",
@@ -910,6 +1003,14 @@ def diagnose(symptoms: str, year: int = None, month: int = None,
         "tianrui": tianrui,
         "step_by_step": six_steps,
         "nine_layers": deep_analysis if "error" not in deep_analysis else {"note": "LLM不可用，使用基础分析", **deep_analysis},
+        "pattern_analysis": {
+            "geju": pan.get("geju", []),
+            "fuyin_fanyin": pan.get("fuyin_fanyin", {}),
+            "men_po": pan.get("men_po", []),
+            "gate_wangshuai": pan.get("gate_wangshuai", {}),
+            "star_wangshuai": pan.get("star_wangshuai", {}),
+            "ganzhi_roles": pan.get("ganzhi_roles", {}),
+        },
         "plan": plan
     }
 
@@ -935,6 +1036,28 @@ def _pretty_print(result: dict):
     print("【六步推演】")
     for k, v in result['step_by_step'].items():
         print(f"  {k}: {v}")
+    print("-" * 55)
+    pa = result.get("pattern_analysis", {})
+    print("【格局与旺衰】")
+    ff = pa.get("fuyin_fanyin", {})
+    if ff:
+        print(f"  反吟伏吟：{ff.get('type', '无')}｜{ff.get('meaning', '')}")
+    for item in pa.get("geju", [])[:6]:
+        print(f"  {item['palace_gua']}{item['palace']}宫 "
+              f"{item['tian']}+{item['di']} = {item['name']}（{item['nature']}）"
+              f"：{item['meaning']}")
+    if not pa.get("geju"):
+        print("  十干克应：未见显著格局")
+    for item in pa.get("men_po", [])[:5]:
+        print(f"  {item['type']}：{item['meaning']}")
+    roles = pa.get("ganzhi_roles", {})
+    if roles:
+        print("  四柱角色：")
+        for key in ("年干", "月干", "日干", "时干"):
+            info = roles.get(key, {})
+            if info:
+                print(f"    {key}{info['gan']}（{info['role']}）"
+                      f"落宫 {info['palaces']}")
     print("-" * 55)
     print("【九重辩证法深度分析】")
     nl = result.get("nine_layers", {})

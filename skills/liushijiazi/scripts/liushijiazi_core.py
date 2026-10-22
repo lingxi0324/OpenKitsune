@@ -175,11 +175,18 @@ YEAR_ZHI_BASE = {2000: '辰'}
 
 
 def get_year_ganzhi(year, target_date=None):
-    """获取年干支（以立春为界）"""
-    # 2000年（庚辰年）立春后为庚辰年——但注意2000年立春前是己卯年
-    # 年干支基准：2000年立春后=庚辰
+    """获取年干支（以立春为界；优先使用 lunar_python 精确节气）。"""
     if target_date is None:
         target_date = date(year, 6, 1)  # 默认年中，肯定在立春后
+    try:
+        from lunar_python import Solar
+        solar = Solar.fromYmd(target_date.year, target_date.month, target_date.day)
+        gz = solar.getLunar().getYearInGanZhiExact()
+        return (gz[0], gz[1])
+    except Exception:
+        pass
+    # 2000年（庚辰年）立春后为庚辰年——但注意2000年立春前是己卯年
+    # 年干支基准：2000年立春后=庚辰
     lichun = get_lishun(year)
     if target_date < lichun:
         # 立春前，用上一年的干支
@@ -225,33 +232,44 @@ JIEQI_MONTH_BOUNDARY = {
 
 
 def get_month_ganzhi(year, month, day):
-    """根据年月日获取月柱（以节气分界）"""
+    """根据年月日获取月柱（以节气分界；优先精确节气）。"""
+    try:
+        from lunar_python import Solar
+        gz = Solar.fromYmd(year, month, day).getLunar().getMonthInGanZhiExact()
+        return (gz[0], gz[1])
+    except Exception:
+        pass
     # 先确定月的地支
     boundary = JIEQI_MONTH_BOUNDARY.get(month, 1)
     if day < boundary:
         # 还在上个月
         prev_month = month - 1 if month > 1 else 12
         prev_year = year if month > 1 else year - 1
-        return get_month_ganzhi(prev_year, prev_month, 31)
-    
+        return get_month_ganzhi(prev_year, prev_month, 28)
+
     # 确定月地支序号
-    month_dz_idx = (month - 2) % 12  # 寅月=2月=idx0
-    # 但需要按节气修正：
     month_to_dz = {2: 0, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5, 8: 6, 9: 7, 10: 8, 11: 9, 12: 10, 1: 11}
     month_dz_idx = month_to_dz.get(month, 0) % 12
     dz_name = MONTH_DIZHI[month_dz_idx]
-    
-    # 确定月天干
-    year_gan = get_year_ganzhi(year)[0]
+
+    # 确定月天干（五虎遁）
+    year_gan = get_year_ganzhi(year, date(year, month, day))[0]
     start_gan = MONTH_START.get(year_gan, '丙')
     start_idx = TIANGAN_ORDER[start_gan] - 1
     tg_idx = (start_idx + month_dz_idx) % 10
-    
+
     return (TIANGAN[tg_idx], dz_name)
 
 
 def get_day_ganzhi(target_date):
-    """根据基准日推算目标日干支"""
+    """根据基准日推算目标日干支（优先 lunar_python）。"""
+    try:
+        from lunar_python import Solar
+        gz = Solar.fromYmd(target_date.year, target_date.month,
+                           target_date.day).getLunar().getDayInGanZhi()
+        return (gz[0], gz[1])
+    except Exception:
+        pass
     delta = (target_date - BASE_DATE).days
     seq_idx = (BASE_SEQ - 1 + delta) % 60
     return LIUSHIHJIAZI[seq_idx][1:]
@@ -323,7 +341,7 @@ def query_date(target_date, hour=None):
     y, m, d = target_date.year, target_date.month, target_date.day
     
     # 年柱
-    year_gz = get_year_ganzhi(y)
+    year_gz = get_year_ganzhi(y, target_date)
     # 月柱
     month_gz = get_month_ganzhi(y, m, d)
     # 日柱
