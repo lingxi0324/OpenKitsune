@@ -1850,7 +1850,16 @@ class MemoryStorage:
                 f"SELECT * FROM memories WHERE {where} LIMIT ?",
                 like_params,
             )
-            return self._rows_to_dicts(cursor)
+            rows = self._rows_to_dicts(cursor)
+            # LIKE 兜底没有 bm25 rank。若不补分数，上层对所有中文命中都会
+            # 算出 score=0，排序退化成“最新优先”，精确命中反而落选。
+            # 用关键词覆盖率给分（全命中 0.75，单命中 0.35+）。
+            keywords_lower = [kw.lower() for kw in keywords]
+            for row in rows:
+                content_lower = str(row.get("content") or "").lower()
+                hits = sum(1 for kw in keywords_lower if kw in content_lower)
+                row["score"] = round(0.35 + 0.4 * (hits / len(keywords_lower)), 4)
+            return rows
         except Exception as e:
             logger.debug(f"LIKE fallback search failed: {e}")
             return []

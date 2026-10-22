@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .name_normalize import normalize_memory, normalize_names
 from .search_backends import FTS5Backend, SearchBackend, create_search_backend
 from .storage import get_shared_storage
 from .types import (
@@ -25,7 +26,6 @@ from .types import (
     Scratchpad,
     SemanticMemory,
 )
-from .name_normalize import normalize_memory, normalize_names
 
 logger = logging.getLogger(__name__)
 
@@ -447,6 +447,10 @@ class UnifiedStore:
         workspace_id: str = "default",
     ) -> SemanticMemory | None:
         """Find existing memory with same subject+predicate for update detection."""
+        # 对称归一化：保存侧把 subject/predicate 里的「用户」→ 配置称呼，
+        # 查询侧同步替换，否则更新检测会找不到已存的记录。
+        subject = normalize_names(subject or "")
+        predicate = normalize_names(predicate or "")
         rows = self.db.query(
             subject=subject,
             scope=scope,
@@ -1310,9 +1314,21 @@ class UnifiedStore:
     # Utilities
     # ======================================================================
 
-    def get_stats(self, scope: str = "global", scope_owner: str = "") -> dict:
+    def get_stats(
+        self,
+        scope: str | None = "global",
+        scope_owner: str | None = "",
+        *,
+        user_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> dict:
         return {
-            "memory_count": self.db.count(scope=scope, scope_owner=scope_owner),
+            "memory_count": self.db.count(
+                scope=scope,
+                scope_owner=scope_owner,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            ),
             "search_backend": self.search.backend_type,
             "search_available": self.search.available,
         }

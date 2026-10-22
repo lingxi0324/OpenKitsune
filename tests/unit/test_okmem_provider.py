@@ -43,7 +43,7 @@ async def test_retrieval_source_maps_records() -> None:
     source = OkmemRetrievalSource(_StubProvider())
     items = await source.retrieve("河图洛书", limit=3)
 
-    assert source.source_name == "openkitsune-brain"
+    assert source.source_name == "okmem"
     assert len(items) == 1
     assert items[0]["id"] == "okmem:1"
     assert items[0]["content"] == "命中:河图洛书"
@@ -83,7 +83,7 @@ async def test_live_provider_reads_legacy_store() -> None:
         hits = await provider.search("方案", limit=3)
         assert isinstance(hits, list)
         for record in hits:
-            assert record.id.startswith(("okmem:", "fusion:", "fusion-fts:"))
+            assert record.id.startswith(("okmem:", "okmem-kb:", "okmem-kb-fts:"))
             page = await provider.read_content(record.id, limit=16)
             assert page["ok"] is True
             assert page["total"] >= len(page["content"])

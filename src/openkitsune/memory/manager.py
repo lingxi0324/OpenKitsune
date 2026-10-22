@@ -38,11 +38,11 @@ from .consolidator import MemoryConsolidator
 from .exceptions import MemoryStorageUnavailable
 from .extractor import MemoryExtractor
 from .json_utils import coerce_text
+from .name_normalize import is_user_subject, normalize_memory, normalize_names
 from .retention import apply_retention
 from .retrieval import RetrievalEngine
 from .session_identity import DESKTOP_USER_ID
 from .telemetry import emit_memory_health_event
-from .name_normalize import is_user_subject, normalize_memory
 from .types import (
     Attachment,
     AttachmentDirection,
@@ -869,6 +869,7 @@ class MemoryManager:
         skip_dedup: bool = False,
     ) -> str:
         """Save user-owned semantic memory through the single owner-aware path."""
+        self._record_process_rule_memory_event(memory)
         # 称呼归一化：任何保存入口统一替换（identity slot 路径同样覆盖）
         normalize_memory(memory)
         write_scope, write_owner = self._current_write_scope()
@@ -922,6 +923,29 @@ class MemoryManager:
         return saved_id
 
     # ==================== Owner Bucket Merge ====================
+
+    def _record_process_rule_memory_event(self, memory: Any) -> None:
+        """R7 记忆事件插桩（fail-open：只审计，不影响保存路径）。
+
+        通过 process_rules.memory_events 识别偏好/纠正/决策类内容并记录事件；
+        冲突类内容由上层（update 路径）单独处理。
+        """
+        try:
+            content = getattr(memory, "content", "") or ""
+            text = content if isinstance(content, str) else str(content or "")
+            if not text.strip():
+                return
+            from openkitsune.process_rules.memory_events import memory_event
+
+            memory_event(
+                event_type="preference",
+                content=text,
+                session_id=self._current_session_id,
+                agent_id=self.agent_id or "",
+                mode="observe",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[Memory] R7 memory event hook degraded: %s", exc)
 
     @staticmethod
     def _merge_recency_key(memory: SemanticMemory) -> tuple[str, str]:
@@ -1227,6 +1251,12 @@ class MemoryManager:
     def query_visible_semantic(self, **kwargs) -> list[SemanticMemory]:
         """Query memories visible to the current turn without leaking other sessions."""
         limit = int(kwargs.pop("limit", 50) or 50)
+        # 精确字段对称归一化：调用方以「用户」作为 subject/predicate/content 查询时，
+        # 与保存侧已替换为配置称呼的记录对齐。
+        for _field in ("subject", "predicate", "content", "entity"):
+            _val = kwargs.get(_field)
+            if isinstance(_val, str) and _val:
+                kwargs[_field] = normalize_names(_val)
         merged: list[SemanticMemory] = []
         seen: set[str] = set()
         per_scope_limit = max(limit, 1)
@@ -1256,6 +1286,9 @@ class MemoryManager:
         filter_type: str | None = None,
     ) -> list[tuple[SemanticMemory, float]]:
         """Search current-session memories first, then explicitly global memories."""
+        # 检索词对称归一化：保存侧把「用户」→ 用户称呼，查询侧同步替换，
+        # 否则「用户住在哪里」检索不到已存为「郎君住在哪里」的记忆。
+        query = normalize_names(query or "")
         merged: list[tuple[SemanticMemory, float]] = []
         seen: set[str] = set()
         for scope, scope_owner, user_id, workspace_id in self._visible_scope_entries():
@@ -1754,6 +1787,9 @@ class MemoryManager:
             loop = asyncio.get_running_loop()
 
             async def _finalize_session():
+                # okmem 长期记忆闭环：会话结束把 user/assistant 轮次落到九格式库。
+                # 放在最前面，避免被后面的 LLM 抽取超时拖住而丢失。
+                await self._persist_session_to_okmem(turns, session_id)
                 episode = None
                 try:
                     episode = await self.extractor.generate_episode(
@@ -1901,6 +1937,69 @@ class MemoryManager:
         self._current_session_id = None
         self._session_turns = []
         self._set_retrieval_scope_context()
+
+    # ------------------------------------------------------------------
+    # okmem 长期记忆（跨会话）
+    # ------------------------------------------------------------------
+    _OKMEM_TURN_LIMIT = 20
+
+    def _okmem_provider(self):
+        """复用 Agent 注册在检索引擎里的 okmem Provider；未启用时返回 None。
+
+        不新建 Provider，避免与 ``_agent_runtime`` 的注册形成两份连接。
+        """
+        engine = getattr(self, "retrieval_engine", None)
+        for source in getattr(engine, "_external_sources", []) or []:
+            if getattr(source, "source_name", "") == "okmem":
+                provider = getattr(source, "provider", None)
+                if provider is not None:
+                    return provider
+        return None
+
+    async def _persist_session_to_okmem(
+        self, turns: list[ConversationTurn], session_id: str
+    ) -> None:
+        """会话结束把轮次写入 okmem（source=openkitsune），补齐跨会话记忆。
+
+        只写有正文的 user→assistant 配对（工具轮/空轮跳过），最多
+        ``_OKMEM_TURN_LIMIT`` 对，避免一次收尾触发过多 embedding 调用。
+        与 ``okmem_save_turn`` 工具复用同一个 Provider 方法，不重复实现。
+        """
+        provider = self._okmem_provider()
+        if provider is None or not session_id:
+            return
+
+        pairs: list[tuple[str, str | None]] = []
+        pending_user: str | None = None
+        for turn in turns:
+            role = (turn.role or "").lower()
+            content = (turn.content or "").strip()
+            if role == "user":
+                if pending_user is not None:
+                    pairs.append((pending_user, None))
+                pending_user = content if len(content) >= 8 else None
+            elif role in ("assistant", "model") and pending_user is not None:
+                pairs.append((pending_user, content or None))
+                pending_user = None
+        if pending_user is not None:
+            pairs.append((pending_user, None))
+        if not pairs:
+            return
+
+        written = 0
+        for user_message, answer in pairs[-self._OKMEM_TURN_LIMIT :]:
+            try:
+                if await provider.save_turn(
+                    user_message=user_message,
+                    assistant_answer=answer,
+                    session_id=session_id,
+                ):
+                    written += 1
+            except Exception as e:  # noqa: BLE001 —— 长期记忆写失败不能阻断收尾
+                logger.debug(f"[Okmem] save_turn skipped: {e}")
+                break
+        if written:
+            logger.info(f"[Okmem] Session {session_id[:8]} persisted {written} turns")
 
     def _enqueue_session_turns_for_extraction(
         self, session_id: str, turns: list[ConversationTurn]
@@ -2323,6 +2422,9 @@ class MemoryManager:
         ``created_after/created_before/updated_after/updated_before``：
         ISO 时间字符串，按 created_at/updated_at 过滤时间范围。
         """
+        # 检索词对称归一化（与保存侧 normalize_memory 一致），保证称呼替换后
+        # 「用户」查询仍能命中已存为配置称呼的记忆。
+        query = normalize_names(query or "")
         now = datetime.now()
         if scope == "global":
             scope = "user"
@@ -2389,8 +2491,13 @@ class MemoryManager:
                         continue
                     if not _in_time_range(memory):
                         continue
-                    if query and query.lower() not in memory.content.lower():
-                        continue
+                    if query:
+                        # 多关键词按 token 全部命中（AND），而不是把整句当成
+                        # 一个字面子串——否则「工具调用 空转 复盘」永远 0 结果。
+                        content_lower = memory.content.lower()
+                        tokens = [t for t in query.lower().split() if t]
+                        if tokens and not all(t in content_lower for t in tokens):
+                            continue
                     collected.append(memory)
             return collected
 
@@ -2621,6 +2728,7 @@ class MemoryManager:
         和 pending_consolidation），避免被搜索后端失败时把这些桶的内容
         泄漏到提示词。
         """
+        query = normalize_names(query or "")
         keywords = [kw for kw in query.lower().split() if len(kw) > 2]
         if not keywords:
             return []
@@ -2828,7 +2936,16 @@ class MemoryManager:
                 priority_counts.get(memory.priority.value, 0) + 1
             )
 
-        v2_stats = self.store.get_stats(scope=scope, scope_owner=scope_owner)
+        # 与上面的缓存统计保持同一口径：scope="global" 且未指定 owner 时不加
+        # scope 过滤（写入统一用 scope="user"，旧口径会永远数到 0）；指定
+        # owner 时必须把 user/workspace 一起传下去，避免跨用户计数泄漏。
+        v2_scope = None if (scope == "global" and not scope_owner) else scope
+        v2_stats = self.store.get_stats(
+            scope=v2_scope,
+            scope_owner=None if v2_scope is None else scope_owner,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
 
         total = sum(type_counts.values())
         return {

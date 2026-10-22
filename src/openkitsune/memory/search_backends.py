@@ -114,14 +114,23 @@ class FTS5Backend:
             results = [r for r in results if r.get("type", "").upper() == filter_type.upper()]
 
         output: list[tuple[str, float]] = []
-        for r in results[:limit]:
-            rank = r.get("rank", 0) or 0
-            if rank <= 0:
-                # FTS5 bm25() 返回负值，越负越相关：score 需随相关度单调递增
-                score = abs(rank) / (1.0 + abs(rank))
+        selected = results[:limit]
+        # bm25() 返回「越负越相关」，且绝对值极小（常见 -1e-6 量级）。
+        # 旧的 abs(rank)/(1+abs(rank)) 会把这些命中统统压成 ~0 分，
+        # 排序退化为“最新优先”。这里改为批次内 min-max 归一化。
+        raws = [-(r.get("rank") or 0.0) for r in selected]
+        lo, hi = (min(raws), max(raws)) if raws else (0.0, 0.0)
+        for r, raw in zip(selected, raws, strict=False):
+            preset_score = r.get("score")
+            if preset_score is not None:
+                # CJK 走 LIKE 兜底时由 storage 层按关键词覆盖率给分。
+                score = float(preset_score)
+            elif hi > lo:
+                score = 0.40 + 0.50 * (raw - lo) / (hi - lo)
+            elif raw > 0:
+                score = 0.65
             else:
-                # 防御：若 rank 为正（非 bm25 布局），退化用倒数但保持单调递减
-                score = 1.0 / (1.0 + rank)
+                score = 0.0
             output.append((r["id"], score))
         return output
 

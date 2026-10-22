@@ -1,6 +1,6 @@
-"""随 OpenKitsune 启动的 openkitsune-brain 记忆栈。
+"""随 OpenKitsune 启动的 okmem 记忆栈。
 
-``openkitsune-brain`` 是独立工程（默认 ``E:\\agents\\openkitsune-brain``），
+数据与依赖来自旧工程 ``E:\\agents\\openkitsune-brain``，对外统一命名为 okmem。
 记忆能力分两层：
 
 - **进程内层**：``memory/okmem_provider.py`` 直接调用 ``okmem`` 读写记忆，
@@ -17,10 +17,10 @@
 
     OPENKITSUNE_OKMEM_AUTOSTART          1/0，总开关（默认 1）
     OPENKITSUNE_OKMEM_HOME               工程根目录
-    OPENKITSUNE_OKMEM_FUSION_AUTOSTART   1/0，是否拉起 fusion-memory（默认 1）
-    OPENKITSUNE_OKMEM_BUS_AUTOSTART      1/0，是否拉起 brain-bus（默认 1）
-    OPENKITSUNE_OKMEM_FUSION_PORT        fusion-memory 端口（默认 4014）
-    OPENKITSUNE_OKMEM_BUS_PORT           brain-bus 端口（默认 8641）
+    OPENKITSUNE_OKMEM_SERVICE_AUTOSTART   1/0，是否拉起 okmem 服务（底层 fusion-memory，默认 1）
+    OPENKITSUNE_OKMEM_BUS_AUTOSTART      1/0，是否拉起 okmem 总线（底层 brain-bus，默认 1）
+    OPENKITSUNE_OKMEM_SERVICE_PORT        okmem 服务端口（默认 4014）
+    OPENKITSUNE_OKMEM_BUS_PORT           okmem 总线端口（默认 8641）
     OPENKITSUNE_OKMEM_STOP_ON_EXIT       宿主退出时停止子进程（默认 1）
     OPENKITSUNE_OKMEM_HEALTH_TIMEOUT     健康探针超时秒数（默认 30）
 """
@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import os
 import re
@@ -48,10 +49,10 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 
 # 4010 是上游 Kitsune fusion-memory 的默认端口；独立部署使用 4014 避免抢占。
-DEFAULT_FUSION_PORT = 4014
+DEFAULT_SERVICE_PORT = 4014
 DEFAULT_BUS_PORT = 8641
 
-_FUSION_BINARY = "fusion-memory.exe" if os.name == "nt" else "fusion-memory"
+_SERVICE_BINARY = "fusion-memory.exe" if os.name == "nt" else "fusion-memory"
 _CREATION_FLAGS = (
     getattr(subprocess, "CREATE_NO_WINDOW", 0)
     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -108,7 +109,7 @@ def _normalize_home(raw: str) -> Path:
 
 
 def resolve_okmem_home(env: Mapping[str, str] | None = None) -> Path:
-    """解析 openkitsune-brain 工程根目录。
+    """解析 okmem 数据工程根目录。
 
     优先级：环境变量 > WSL 挂载 / Windows 固定路径 > 用户目录。
     """
@@ -136,13 +137,13 @@ class OkmemStackConfig:
 
     home: Path
     autostart: bool = True
-    fusion_autostart: bool = True
+    service_autostart: bool = True
     bus_autostart: bool = True
-    fusion_port: int = DEFAULT_FUSION_PORT
+    service_port: int = DEFAULT_SERVICE_PORT
     bus_port: int = DEFAULT_BUS_PORT
     stop_on_exit: bool = True
     health_timeout_s: float = 30.0
-    fusion_data_dir: str = "data/fusion-memory"
+    service_data_dir: str = "data/fusion-memory"
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> OkmemStackConfig:
@@ -150,37 +151,37 @@ class OkmemStackConfig:
         return cls(
             home=resolve_okmem_home(env),
             autostart=_env_flag(env, "OPENKITSUNE_OKMEM_AUTOSTART", True),
-            fusion_autostart=_env_flag(env, "OPENKITSUNE_OKMEM_FUSION_AUTOSTART", True),
+            service_autostart=_env_flag(env, "OPENKITSUNE_OKMEM_SERVICE_AUTOSTART", True),
             bus_autostart=_env_flag(env, "OPENKITSUNE_OKMEM_BUS_AUTOSTART", True),
-            fusion_port=_env_port(env, "OPENKITSUNE_OKMEM_FUSION_PORT", DEFAULT_FUSION_PORT),
+            service_port=_env_port(env, "OPENKITSUNE_OKMEM_SERVICE_PORT", DEFAULT_SERVICE_PORT),
             bus_port=_env_port(env, "OPENKITSUNE_OKMEM_BUS_PORT", DEFAULT_BUS_PORT),
             stop_on_exit=_env_flag(env, "OPENKITSUNE_OKMEM_STOP_ON_EXIT", True),
             health_timeout_s=_env_seconds(env, "OPENKITSUNE_OKMEM_HEALTH_TIMEOUT", 30.0),
         )
 
 
-def fusion_binary(config: OkmemStackConfig) -> Path:
-    """fusion-memory 可执行文件路径（``target/release``）。"""
-    return config.home / "target" / "release" / _FUSION_BINARY
+def service_binary(config: OkmemStackConfig) -> Path:
+    """okmem 服务可执行文件路径（底层为 ``fusion-memory``）。"""
+    return config.home / "target" / "release" / _SERVICE_BINARY
 
 
-def build_fusion_command(config: OkmemStackConfig) -> list[str]:
-    """构造 fusion-memory 启动命令（与 ``scripts/start-memory-stack.ps1`` 对齐）。"""
+def build_service_command(config: OkmemStackConfig) -> list[str]:
+    """构造 okmem 服务启动命令（与 ``scripts/start-memory-stack.ps1`` 对齐）。"""
     return [
-        str(fusion_binary(config)),
+        str(service_binary(config)),
         "--root",
         str(config.home),
         "--port",
-        str(config.fusion_port),
+        str(config.service_port),
         "--data-dir",
-        config.fusion_data_dir,
+        config.service_data_dir,
         "serve",
         "--no-watch",
     ]
 
 
 def _resolve_python() -> str | None:
-    """解析 brain-bus 子进程使用的 Python 解释器。
+    """解析 okmem 总线子进程使用的 Python 解释器。
 
     PyInstaller 冻结环境下 ``sys.executable`` 是宿主 exe，不能直接执行脚本，
     必须走 ``runtime_env`` 提供的项目解释器。
@@ -196,7 +197,7 @@ def _resolve_python() -> str | None:
 
 
 def build_bus_command(config: OkmemStackConfig, python: str | None = None) -> list[str]:
-    """构造 brain-bus 启动命令，复用项目解释器（保证依赖一致）。"""
+    """构造 okmem 总线启动命令，复用项目解释器（保证依赖一致）。"""
     script = config.home / "services" / "brain-bus" / "server.py"
     interpreter = python or _resolve_python() or "python"
     return [interpreter, "-X", "utf8", str(script)]
@@ -205,7 +206,7 @@ def build_bus_command(config: OkmemStackConfig, python: str | None = None) -> li
 def build_bus_env(
     config: OkmemStackConfig, base: Mapping[str, str] | None = None
 ) -> dict[str, str]:
-    """构造 brain-bus 子进程环境：把工程根目录加入 ``PYTHONPATH``。"""
+    """构造 okmem 总线子进程环境：把工程根目录加入 ``PYTHONPATH``。"""
     env = dict(os.environ if base is None else base)
     # 冻结宿主可能设置了 PYTHONHOME；带进另一个解释器会破坏其标准库查找。
     env.pop("PYTHONHOME", None)
@@ -231,12 +232,32 @@ def _port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.2) -> bool
         return False
 
 
-def _http_ok(url: str, timeout: float = 1.0) -> bool:
+def _service_healthy(url: str, timeout: float = 1.0) -> bool:
+    """探针不只看 HTTP 200：带 ``status`` 字段的服务必须是 ok。
+
+    brain-bus 的 ``/api/memory/health`` 会真的查一次 SQLite，连接级故障
+    （跨线程、库损坏）返回 ``status=degraded`` / ``db_ok=false``，
+    这里必须判定为不健康，否则监督器会把瘫痪的记忆器官当成可用。
+    """
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
-            return 200 <= int(response.status) < 300
+            if not 200 <= int(response.status) < 300:
+                return False
+            raw = response.read(4096)
     except Exception:  # noqa: BLE001 -- 探针失败只代表未就绪
         return False
+    if not raw:
+        return True
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        return True  # 非 JSON 探针（如纯文本）只要 2xx 即可
+    if not isinstance(payload, dict):
+        return True
+    if payload.get("db_ok") is False:
+        return False
+    status = str(payload.get("status", "")).strip().lower()
+    return status in ("", "ok", "healthy")
 
 
 @dataclass
@@ -244,6 +265,7 @@ class _Service:
     name: str
     port: int
     autostart: bool
+    health_path: str = "/health"
     process: subprocess.Popen | None = None
     log_files: list[Any] = field(default_factory=list)
     external: bool = False
@@ -251,7 +273,7 @@ class _Service:
 
 
 class OkmemStackSupervisor:
-    """管理 fusion-memory / brain-bus 两个伴随子进程的生命周期。"""
+    """管理 okmem 服务 / 总线两个伴随子进程的生命周期。"""
 
     def __init__(self, config: OkmemStackConfig | None = None) -> None:
         self.config = config or OkmemStackConfig.from_env()
@@ -260,10 +282,20 @@ class OkmemStackSupervisor:
         self._atexit_registered = False
         self._probe: threading.Thread | None = None
         self._services: dict[str, _Service] = {
-            "fusion-memory": _Service(
-                "fusion-memory", self.config.fusion_port, self.config.fusion_autostart
+            "okmem-service": _Service(
+                "okmem-service",
+                self.config.service_port,
+                self.config.service_autostart,
+                health_path="/health",
             ),
-            "brain-bus": _Service("brain-bus", self.config.bus_port, self.config.bus_autostart),
+            "okmem-bus": _Service(
+                "okmem-bus",
+                self.config.bus_port,
+                self.config.bus_autostart,
+                # brain-bus 根 /health 只报存活与显存；记忆器官是否可用必须看
+                # /api/memory/health（它会真的查 SQLite）。
+                health_path="/api/memory/health",
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -286,7 +318,7 @@ class OkmemStackSupervisor:
                 )
                 return self.status()
 
-            self._start_fusion()
+            self._start_service()
             self._start_bus()
 
             if not self._atexit_registered:
@@ -296,8 +328,8 @@ class OkmemStackSupervisor:
         self._start_health_probe()
         return self.status()
 
-    def _start_fusion(self) -> None:
-        service = self._services["fusion-memory"]
+    def _start_service(self) -> None:
+        service = self._services["okmem-service"]
         if not service.autostart:
             service.health = "disabled"
             return
@@ -305,41 +337,41 @@ class OkmemStackSupervisor:
             service.external = True
             service.health = "external"
             logger.info(
-                "[OkmemStack] fusion-memory already listening on :%d (reuse)", service.port
+                "[OkmemStack] okmem-service already listening on :%d (reuse)", service.port
             )
             return
-        binary = fusion_binary(self.config)
+        binary = service_binary(self.config)
         if not binary.exists():
             service.health = "missing-binary"
             logger.warning(
-                "[OkmemStack] fusion-memory binary missing: %s "
+                "[OkmemStack] okmem-service binary missing: %s "
                 "(run `cargo build --release -p openkitsune-memory` in %s)",
                 binary,
                 self.config.home,
             )
             return
-        self._spawn(service, build_fusion_command(self.config), env=None)
+        self._spawn(service, build_service_command(self.config), env=None)
 
     def _start_bus(self) -> None:
-        service = self._services["brain-bus"]
+        service = self._services["okmem-bus"]
         if not service.autostart:
             service.health = "disabled"
             return
         if _port_open(service.port):
             service.external = True
             service.health = "external"
-            logger.info("[OkmemStack] brain-bus already listening on :%d (reuse)", service.port)
+            logger.info("[OkmemStack] okmem-bus already listening on :%d (reuse)", service.port)
             return
         script = self.config.home / "services" / "brain-bus" / "server.py"
         if not script.exists():
             service.health = "missing-script"
-            logger.warning("[OkmemStack] brain-bus script missing: %s", script)
+            logger.warning("[OkmemStack] okmem-bus script missing: %s", script)
             return
         python = _resolve_python()
         if python is None:
             service.health = "no-python"
             logger.warning(
-                "[OkmemStack] no usable Python interpreter for brain-bus "
+                "[OkmemStack] no usable Python interpreter for okmem-bus "
                 "(frozen build without project venv)"
             )
             return
@@ -409,7 +441,7 @@ class OkmemStackSupervisor:
             return
         self._probe = threading.Thread(
             target=self._probe_health,
-            name="openkitsune-brain-health",
+            name="okmem-health",
             daemon=True,
         )
         self._probe.start()
@@ -424,7 +456,9 @@ class OkmemStackSupervisor:
         while pending and time.monotonic() < deadline:
             for name in list(pending):
                 service = self._services[name]
-                if _http_ok(f"http://127.0.0.1:{service.port}/health", timeout=1.0):
+                if _service_healthy(
+                    f"http://127.0.0.1:{service.port}{service.health_path}", timeout=1.0
+                ):
                     service.health = "ok"
                     pending.discard(name)
                     continue

@@ -264,3 +264,26 @@ def _isolate_policy_v2_singletons():
         reset_death_switch_tracker()
         reset_skill_allowlist_manager()
         reset_session_allowlist_manager()
+
+
+# ---------------------------------------------------------------------------
+# 称呼归一化（memory/name_normalize）测试隔离
+#
+# 记忆保存时默认把「用户」→ settings.user_address_terms[0]、
+# 「模型/AI/助手」→ settings.assistant_address_terms[0]（配置驱动，禁止
+# 硬编码）。既有 memory 测试用「用户」作为占位文本断言内容原样，本
+# fixture 把称呼设为与原文相同的幂等值，使断言与用户的个人称呼配置解耦
+# （换称呼不破坏测试）。真实默认称呼（郎君/灵汐）的替换行为由
+# tests/unit/test_name_normalize.py 单独覆盖。
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _name_normalize_idempotent_terms():
+    """测试环境把称呼归一化保持开启，但称呼设为幂等值。"""
+    try:
+        from openkitsune.config import settings as _settings
+
+        _settings.user_address_terms = ("用户",)
+        _settings.assistant_address_terms = ("AI",)
+    except Exception:
+        pass
+    yield

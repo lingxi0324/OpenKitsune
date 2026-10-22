@@ -1,11 +1,11 @@
-"""openkitsune-brain 记忆系统接入适配器（仅记忆，不含自愈大脑）。
+"""okmem 记忆系统接入适配器（仅记忆，不含自愈大脑）。
 
-把 ``E:\\agents\\openkitsune-brain`` 中的两层记忆能力接入
+把旧工程 ``E:\\agents\\openkitsune-brain`` 中的两层记忆能力接入
 :mod:`openkitsune.memory.public_api`：
 
 1. **okmem（读写）** —— 九格式记忆 + 六记忆池 + 四维图谱 + 进度层。
    通过 ``okmem.MemorySystem`` 进程内调用，不需要 brain-bus 服务在线。
-2. **fusion-memory 知识库（只读）** —— ``data/fusion-memory/xuan-yi/knowledge.db``
+2. **okmem 知识库（只读）** —— 原 fusion-memory 数据目录 ``data/fusion-memory/xuan-yi/knowledge.db``
    中的 memories / entities / relations / formulas / acupoints 等真实知识数据。
 
 自愈大脑（cases / incidents / 故障动作）不在本适配器范围内，避免把运维状态
@@ -81,7 +81,7 @@ def _normalize_okmem_home(value: str | Path) -> str:
 
 
 def _default_okmem_home() -> str:
-    """自动选择可用的 openkitsune-brain 数据目录。
+    """自动选择可用的 okmem 数据目录。
 
     优先级：环境变量 > WSL 挂载路径 > Windows 路径 > 用户目录。
     """
@@ -158,9 +158,9 @@ _P0_BACKPRESSURE_LIMIT = 20
 # 跨源融合权重（RRF）
 _SOURCE_WEIGHTS = {
     "okmem": 1.0,
-    "fusion": 1.0,
-    "fusion-fts": 0.85,
-    "fusion-entity": 0.9,
+    "okmem-kb": 1.0,
+    "okmem-kb-fts": 0.85,
+    "okmem-kb-entity": 0.9,
     "pending": 1.2,
 }
 # 领域同义词扩展（只用于召回，不参与词法重叠打分）
@@ -373,14 +373,14 @@ def _count_tables(db: Path, names: tuple[str, ...]) -> dict[str, int]:
 
 
 class OkmemProvider:
-    """openkitsune-brain 记忆 Provider（okmem 读写 + 知识库只读）。"""
+    """okmem 记忆 Provider（okmem 读写 + 知识库只读）。"""
 
-    name = "openkitsune-brain"
+    name = "okmem"
 
     def __init__(
         self,
         *,
-        name: str = "openkitsune-brain",
+        name: str = "okmem",
         home: str | Path | None = None,
         okmem_db: str | Path | None = None,
         knowledge_db: str | Path | None = None,
@@ -391,7 +391,7 @@ class OkmemProvider:
         search_page_size: int = _DEFAULT_SEARCH_PAGE_SIZE,
         content_page_size: int = _DEFAULT_CONTENT_PAGE_SIZE,
     ) -> None:
-        self.name = name or "openkitsune-brain"
+        self.name = name or "okmem"
         self.home = Path(home or DEFAULT_OKMEM_HOME)
         self.okmem_db = Path(
             okmem_db or os.environ.get("OKMEM_DB") or self.home / "data" / "okmem" / "memory.db"
@@ -433,7 +433,7 @@ class OkmemProvider:
         self._content_cache_max = 128
         # okmem 内部持有 sqlite3 连接（默认 check_same_thread=True）。所有
         # okmem 调用都必须落在同一个工作线程，否则切线程会触发 ProgrammingError。
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="openkitsune-brain")
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="okmem")
 
     def _resolve_embed_url(self) -> str:
         """显式配置 > 环境变量 > 本机 8120 自动探测 > 哈希伪嵌入。"""
@@ -783,9 +783,9 @@ class OkmemProvider:
             ]
         else:
             sources["okmem"] = []
-        sources["fusion"] = self._knowledge_search(query, limit)
-        sources["fusion-fts"] = self._knowledge_fts_search(query, limit)
-        sources["fusion-entity"] = self._knowledge_entity_search(query, limit)
+        sources["okmem-kb"] = self._knowledge_search(query, limit)
+        sources["okmem-kb-fts"] = self._knowledge_fts_search(query, limit)
+        sources["okmem-kb-entity"] = self._knowledge_entity_search(query, limit)
         sources["pending"] = self._pending_search(query, limit)
         return self._fuse_sources(sources, limit, query=query)
 
@@ -811,9 +811,9 @@ class OkmemProvider:
             if not hit or hit.get("state") != "active":
                 return None
             return self._okmem_record(hit, page_size=self.content_page_size)
-        if source in ("fusion", "knowledge"):
+        if source in ("okmem-kb", "knowledge"):
             return self._knowledge_get(raw_id)
-        if source in ("fusion-fts", "knowledge-fts"):
+        if source in ("okmem-kb-fts", "knowledge-fts"):
             return self._knowledge_fts_get(raw_id)
         return None
 
@@ -1061,6 +1061,10 @@ class OkmemProvider:
             user_input,
             scene=scene,
             budget_chars=budget_chars,
+            # 主动回忆是读操作。okmem 默认会把 user_input 原样回写成一条
+            # protected 的 session 记忆，工具每被调用一次就污染一次长期库；
+            # 跨会话持久化统一走 end_session 的 save_turn 通道，避免双写。
+            include_write_back=False,
         )
 
     async def proactive_review(self, *, limit: int = 30) -> dict[str, Any]:
@@ -1316,7 +1320,7 @@ class OkmemProvider:
             fmt = "semantic"
             tags = normalize_tags([row["category"], row["kind"]])
             summary = str(row["key"] or "")
-            source_name = "fusion-memory:fts" if source == "fts" else "fusion-memory"
+            source_name = "okmem-kb:fts" if source == "fts" else "okmem-kb"
             importance = float(row["importance"] or 0.5)
             if source == "fts":
                 watermark = str(row["rowid"])
@@ -1528,12 +1532,12 @@ class OkmemProvider:
             else:
                 score = 0.0
             record = MemoryRecord(
-                id=f"fusion:{row['id']}",
+                id=f"okmem-kb:{row['id']}",
                 content=content,
                 type="fact",
                 importance=importance,
                 tags=normalize_tags([row["category"], row["kind"]]),
-                source="fusion-memory",
+                source="okmem-kb",
                 created_at=str(row["created_at"] or ""),
                 updated_at=str(row["updated_at"] or ""),
                 content_total=len(content),
@@ -1541,7 +1545,7 @@ class OkmemProvider:
                 score=score,
                 provider=self.name,
                 metadata={
-                    "backend": "fusion-memory",
+                    "backend": "okmem-kb",
                     "key": row["key"],
                     "category": row["category"],
                     "kind": row["kind"],
@@ -1602,12 +1606,12 @@ class OkmemProvider:
             importance = float(row["importance"] or 0.5)
             score = 0.3 + 0.05 * len(mentioned) + 0.1 * importance
             record = MemoryRecord(
-                id=f"fusion:{row['id']}",
+                id=f"okmem-kb:{row['id']}",
                 content=content,
                 type="fact",
                 importance=importance,
                 tags=normalize_tags([row["category"], row["kind"]] + mentioned[:3]),
-                source="fusion-memory:entity",
+                source="okmem-kb:entity",
                 created_at=str(row["created_at"] or ""),
                 updated_at=str(row["updated_at"] or ""),
                 content_total=len(content),
@@ -1615,7 +1619,7 @@ class OkmemProvider:
                 score=score,
                 provider=self.name,
                 metadata={
-                    "backend": "fusion-entity",
+                    "backend": "okmem-kb-entity",
                     "key": row["key"],
                     "category": row["category"],
                     "kind": row["kind"],
@@ -1668,12 +1672,12 @@ class OkmemProvider:
             if phrase and phrase in haystack:
                 score = min(0.99, score + 0.12)
             record = MemoryRecord(
-                id=f"fusion-fts:{row['rowid']}",
+                id=f"okmem-kb-fts:{row['rowid']}",
                 content=content,
                 type="fact",
                 importance=importance,
                 tags=normalize_tags([row["category"], row["kind"]]),
-                source="fusion-memory:fts",
+                source="okmem-kb:fts",
                 created_at=str(row["created_at"] or ""),
                 updated_at=str(row["updated_at"] or ""),
                 content_total=len(content),
@@ -1681,7 +1685,7 @@ class OkmemProvider:
                 score=score,
                 provider=self.name,
                 metadata={
-                    "backend": "fusion-memory-fts",
+                    "backend": "okmem-kb-fts",
                     "key": row["key"],
                     "category": row["category"],
                     "kind": row["kind"],
@@ -1717,19 +1721,19 @@ class OkmemProvider:
             return None
         content = str(row["content"] or "")
         record = MemoryRecord(
-            id=f"fusion-fts:{row['rowid']}",
+            id=f"okmem-kb-fts:{row['rowid']}",
             content=content,
             type="fact",
             importance=float(row["importance"] or 0.5),
             tags=normalize_tags([row["category"], row["kind"]]),
-            source="fusion-memory:fts",
+            source="okmem-kb:fts",
             created_at=str(row["created_at"] or ""),
             updated_at=str(row["updated_at"] or ""),
             content_total=len(content),
             next_offset=len(content),
             provider=self.name,
             metadata={
-                "backend": "fusion-memory-fts",
+                "backend": "okmem-kb-fts",
                 "key": row["key"],
                 "category": row["category"],
                 "kind": row["kind"],
@@ -1762,19 +1766,19 @@ class OkmemProvider:
             return None
         content = str(row["content"] or "")
         record = MemoryRecord(
-            id=f"fusion:{row['id']}",
+            id=f"okmem-kb:{row['id']}",
             content=content,
             type="fact",
             importance=float(row["importance"] or 0.5),
             tags=normalize_tags([row["category"], row["kind"]]),
-            source="fusion-memory",
+            source="okmem-kb",
             created_at=str(row["created_at"] or ""),
             updated_at=str(row["updated_at"] or ""),
             content_total=len(content),
             next_offset=len(content),
             provider=self.name,
             metadata={
-                "backend": "fusion-memory",
+                "backend": "okmem-kb",
                 "key": row["key"],
                 "category": row["category"],
                 "kind": row["kind"],
@@ -1821,9 +1825,9 @@ class OkmemProvider:
                     row = ms.store.get_memory(int(mid))
                 if row and row.get("state") == "active":
                     full = str(row.get("content") or "")
-        elif source in ("fusion", "knowledge"):
+        elif source in ("okmem-kb", "knowledge"):
             full = self._knowledge_content(raw_id)
-        elif source in ("fusion-fts", "knowledge-fts"):
+        elif source in ("okmem-kb-fts", "knowledge-fts"):
             full = self._knowledge_fts_content(raw_id)
 
         if full is None:
@@ -1840,7 +1844,7 @@ class OkmemProvider:
 
     def _knowledge_content(self, memory_id: str) -> str | None:
         return self._cached_content(
-            f"fusion:{memory_id}", lambda: self._load_knowledge_content(memory_id)
+            f"okmem-kb:{memory_id}", lambda: self._load_knowledge_content(memory_id)
         )
 
     def _load_knowledge_content(self, memory_id: str) -> str | None:
@@ -1861,7 +1865,7 @@ class OkmemProvider:
 
     def _knowledge_fts_content(self, memory_id: str) -> str | None:
         return self._cached_content(
-            f"fusion-fts:{memory_id}",
+            f"okmem-kb-fts:{memory_id}",
             lambda: self._load_knowledge_fts_content(memory_id),
         )
 
@@ -1899,9 +1903,9 @@ class OkmemProvider:
             for name in (
                 "pending",
                 "okmem",
-                "fusion",
-                "fusion-fts",
-                "fusion-entity",
+                "okmem-kb",
+                "okmem-kb-fts",
+                "okmem-kb-entity",
             ):
                 ordered.extend(sources.get(name, []))
             return self._merge(ordered, limit)
@@ -1961,7 +1965,7 @@ class OkmemProvider:
             record.metadata["lexical_overlap"] = round(overlap, 3)
             record.metadata["rrf_sources"] = sorted(entry["sources"])
             record.score = round(fused, 4)
-            record.metadata["fusion_score"] = record.score
+            record.metadata["okmem_score"] = record.score
             scored.append((fused, record))
 
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -2012,7 +2016,7 @@ class OkmemRetrievalSource:
     ``MemoryRecord`` 转换为候选字典，并保留来源、分数与元数据。
     """
 
-    source_name = "openkitsune-brain"
+    source_name = "okmem"
 
     def __init__(self, provider: OkmemProvider | None = None) -> None:
         self.provider = provider or create_okmem_provider()
@@ -2035,7 +2039,7 @@ class OkmemRetrievalSource:
 
 
 def _record_label(record: MemoryRecord) -> str:
-    if record.id.startswith("fusion:") or record.id.startswith("fusion-fts:"):
+    if record.id.startswith("okmem-kb:") or record.id.startswith("okmem-kb-fts:"):
         return "知识"
     return "记忆"
 
@@ -2049,7 +2053,7 @@ OKMEM_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "okmem_recall",
         "category": "Memory",
         "description": (
-            "Run the openkitsune-brain six-pool active recall pipeline and return "
+            "Run the okmem six-pool active recall pipeline and return "
             "prompt-ready memory context for the current user input."
         ),
         "input_schema": {
@@ -2069,7 +2073,7 @@ OKMEM_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "okmem_knowledge_search",
         "category": "Memory",
-        "description": "Search the fusion-memory knowledge base (TCM / xuan-yi notes).",
+        "description": "Search the okmem knowledge base (TCM / xuan-yi notes).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -2104,7 +2108,7 @@ OKMEM_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "okmem_health",
         "category": "Memory",
-        "description": "Get the openkitsune-brain memory health report.",
+        "description": "Get the okmem memory health report.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
@@ -2120,7 +2124,7 @@ OKMEM_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "okmem_backfill",
         "category": "Memory",
         "description": (
-            "Backfill fusion-memory knowledge base notes into okmem. "
+            "Backfill okmem knowledge base notes into okmem. "
             "Dry-run by default; set dry_run=false to actually import."
         ),
         "input_schema": {
@@ -2195,7 +2199,7 @@ async def dispatch_okmem_tool(
     tool_name: str,
     arguments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """把 openkitsune-brain 的方法调用分发为 JSON 结果。"""
+    """把 okmem 的方法调用分发为 JSON 结果。"""
     name = str(tool_name or "").strip()
     args = dict(arguments or {})
 
@@ -2276,9 +2280,9 @@ async def dispatch_okmem_tool(
         )
         return {"ok": bool(result.get("ok")), "result": result}
 
-    raise ValueError(f"Unknown openkitsune-brain tool: {name!r}")
+    raise ValueError(f"Unknown okmem tool: {name!r}")
 
 
 def create_okmem_provider(**kwargs: Any) -> OkmemProvider:
-    """创建 openkitsune-brain Provider（参数透传构造器）。"""
+    """创建 okmem Provider（参数透传构造器）。"""
     return OkmemProvider(**kwargs)

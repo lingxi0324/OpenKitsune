@@ -1,8 +1,8 @@
-"""openkitsune-brain 记忆栈伴随启动测试。
+"""okmem 记忆栈伴随启动测试。
 
 覆盖：
 - 环境变量解析（开关 / 端口 / 超时 / 工程目录）；
-- fusion-memory 与 brain-bus 的启动命令和环境构造；
+- okmem 服务与总线的启动命令和环境构造；
 - 总开关关闭、二进制/脚本缺失时的降级路径（不拉起子进程）。
 """
 
@@ -19,9 +19,9 @@ from openkitsune.memory.okmem_stack import (
     OkmemStackSupervisor,
     build_bus_command,
     build_bus_env,
-    build_fusion_command,
-    fusion_binary,
+    build_service_command,
     resolve_okmem_home,
+    service_binary,
 )
 
 
@@ -35,9 +35,9 @@ def test_env_overrides(tmp_path: Path) -> None:
     env = {
         "OPENKITSUNE_OKMEM_HOME": str(tmp_path),
         "OPENKITSUNE_OKMEM_AUTOSTART": "0",
-        "OPENKITSUNE_OKMEM_FUSION_AUTOSTART": "false",
+        "OPENKITSUNE_OKMEM_SERVICE_AUTOSTART": "false",
         "OPENKITSUNE_OKMEM_BUS_AUTOSTART": "off",
-        "OPENKITSUNE_OKMEM_FUSION_PORT": "5014",
+        "OPENKITSUNE_OKMEM_SERVICE_PORT": "5014",
         "OPENKITSUNE_OKMEM_BUS_PORT": "9641",
         "OPENKITSUNE_OKMEM_STOP_ON_EXIT": "no",
         "OPENKITSUNE_OKMEM_HEALTH_TIMEOUT": "12.5",
@@ -46,9 +46,9 @@ def test_env_overrides(tmp_path: Path) -> None:
 
     assert config.home == tmp_path
     assert config.autostart is False
-    assert config.fusion_autostart is False
+    assert config.service_autostart is False
     assert config.bus_autostart is False
-    assert config.fusion_port == 5014
+    assert config.service_port == 5014
     assert config.bus_port == 9641
     assert config.stop_on_exit is False
     assert config.health_timeout_s == pytest.approx(12.5)
@@ -58,12 +58,12 @@ def test_invalid_port_falls_back_to_default() -> None:
     config = OkmemStackConfig.from_env(
         {
             "OPENKITSUNE_OKMEM_HOME": os.getcwd(),
-            "OPENKITSUNE_OKMEM_FUSION_PORT": "not-a-port",
+            "OPENKITSUNE_OKMEM_SERVICE_PORT": "not-a-port",
             "OPENKITSUNE_OKMEM_BUS_PORT": "70000",
         }
     )
 
-    assert config.fusion_port == okmem_stack.DEFAULT_FUSION_PORT
+    assert config.service_port == okmem_stack.DEFAULT_SERVICE_PORT
     assert config.bus_port == okmem_stack.DEFAULT_BUS_PORT
 
 
@@ -72,10 +72,10 @@ def test_resolve_home_prefers_env(tmp_path: Path) -> None:
 
 
 def test_fusion_command_matches_stack_script(tmp_path: Path) -> None:
-    config = _config(tmp_path, fusion_port=4019)
-    command = build_fusion_command(config)
+    config = _config(tmp_path, service_port=4019)
+    command = build_service_command(config)
 
-    assert command[0] == str(fusion_binary(config))
+    assert command[0] == str(service_binary(config))
     assert command[1:5] == ["--root", str(tmp_path), "--port", "4019"]
     assert command[5:7] == ["--data-dir", "data/fusion-memory"]
     assert command[7:] == ["serve", "--no-watch"]
@@ -121,7 +121,7 @@ def test_autostart_disabled_never_spawns(monkeypatch: pytest.MonkeyPatch, tmp_pa
     status = supervisor.start()
 
     assert status["enabled"] is False
-    assert supervisor.status()["services"]["fusion-memory"]["owned"] is False
+    assert supervisor.status()["services"]["okmem-service"]["owned"] is False
 
 
 def test_missing_binaries_degrade_instead_of_raising(
@@ -138,8 +138,8 @@ def test_missing_binaries_degrade_instead_of_raising(
     status = supervisor.start()
 
     assert status["enabled"] is True
-    assert status["services"]["fusion-memory"]["health"] == "missing-binary"
-    assert status["services"]["brain-bus"]["health"] == "missing-script"
+    assert status["services"]["okmem-service"]["health"] == "missing-binary"
+    assert status["services"]["okmem-bus"]["health"] == "missing-script"
     supervisor.stop(force=True)
 
 
@@ -154,6 +154,6 @@ def test_existing_services_are_reused(monkeypatch: pytest.MonkeyPatch, tmp_path:
 
     status = supervisor.start()
 
-    assert status["services"]["fusion-memory"]["external"] is True
-    assert status["services"]["brain-bus"]["external"] is True
-    assert status["services"]["fusion-memory"]["owned"] is False
+    assert status["services"]["okmem-service"]["external"] is True
+    assert status["services"]["okmem-bus"]["external"] is True
+    assert status["services"]["okmem-service"]["owned"] is False

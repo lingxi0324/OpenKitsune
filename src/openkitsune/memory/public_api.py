@@ -20,6 +20,12 @@
     hits = await api.search("主题", limit=5)
     context = await api.get_injection_context("主题偏好")
 
+    # 四类高级能力（Provider 支持时自动启用，否则安全降级）
+    await api.save_turn(user_message="…", assistant_answer="…")  # 记忆保存（回合闭环）
+    recalled = await api.recall("主题偏好")                       # 记忆检索（六阶段/多轮）
+    due = await api.active_recall(limit=5)                        # 主动回忆（提示卡/复盘）
+    report = await api.manage(action="audit")                     # 记忆管理（体检/维护）
+
 接入外部记忆服务::
 
     class MyMemoryAPI:
@@ -1021,6 +1027,229 @@ class MemorySystemAPI:
 
         return "\n\n".join(parts)[:max_chars]
 
+    # ---- 记忆保存 / 检索 / 主动回忆 / 管理（能力型接口） ----
+    #
+    # 下面四组方法把 okmem 等高级 Provider 的能力统一暴露到公共接口：
+    # 调用方无需知道底层是 okmem、内置 SQLite 还是外部服务；Provider 不支持
+    # 对应能力时自动降级（保存→add，检索→search，主动回忆→空队列，
+    # 管理→stats），绝不因单个 Provider 失败中断。
+
+    def _capability_candidates(self) -> list[Any]:
+        candidates: list[Any] = []
+        builtin = self.registry.builtin
+        if isinstance(builtin, BuiltinMemoryProvider):
+            candidates.append(builtin)
+        candidates.extend(entry.provider for entry in self.registry.list())
+        return candidates
+
+    async def save_turn(
+        self,
+        user_message: str = "",
+        assistant_answer: str | None = None,
+        *,
+        session_id: str = "",
+        signals: dict[str, Any] | None = None,
+        source: str = "agent",
+    ) -> dict[str, Any]:
+        """记忆保存：一回合结构化落盘（user/assistant + 进度信号）。
+
+        优先调用 Provider 的 ``save_turn``（okmem 回合闭环：原文 → WAL →
+        进度 → 异步结论/挂载）；不支持时降级为两条 ``add`` 写入。
+        """
+        record_args = {
+            "user_message": user_message,
+            "assistant_answer": assistant_answer,
+            "session_id": session_id,
+            "signals": signals,
+        }
+        for provider in self._capability_candidates():
+            result = await self._call_provider(provider, "save_turn", **record_args, default=None)
+            if isinstance(result, dict) and (result.get("written_mids") or result.get("ok")):
+                return {
+                    "ok": True,
+                    "provider": str(getattr(provider, "name", "")),
+                    **result,
+                }
+
+        # 降级：内置存储按角色写入，保持"先落盘再浓缩"的语义
+        ids: list[str] = []
+        if user_message:
+            ids.append(
+                await self.add(
+                    MemoryRecord(
+                        content=user_message,
+                        type="experience",
+                        source=source,
+                        metadata={"role": "user", "session_id": session_id},
+                    )
+                )
+            )
+        if assistant_answer:
+            ids.append(
+                await self.add(
+                    MemoryRecord(
+                        content=assistant_answer,
+                        type="fact",
+                        source=source,
+                        metadata={"role": "assistant", "session_id": session_id},
+                    )
+                )
+            )
+        return {
+            "ok": bool(ids),
+            "provider": "builtin",
+            "written_mids": [i for i in ids if i],
+            "degraded": True,
+        }
+
+    async def recall(
+        self,
+        query: str = "",
+        *,
+        mode: str = "auto",
+        scene: str = "mix",
+        budget_chars: int = 4000,
+        limit: int = 10,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        """记忆检索：优先六阶段/多轮检索，失败降级为普通 search。
+
+        返回统一结构：``{ok, mode, provider, context, items}``。
+        ``context`` 可直接注入提示词；``items`` 为 MemoryRecord 字典列表。
+        """
+        for provider in self._capability_candidates():
+            if mode in ("auto", "pipeline"):
+                result = await self._call_provider(
+                    provider,
+                    "recall_pipeline",
+                    query,
+                    scene=scene,
+                    budget_chars=budget_chars,
+                    default=None,
+                )
+                if isinstance(result, dict) and (
+                    result.get("memory_context") or result.get("stage4_injected")
+                ):
+                    return {
+                        "ok": True,
+                        "mode": "pipeline",
+                        "provider": str(getattr(provider, "name", "")),
+                        "context": str(result.get("memory_context") or ""),
+                        "items": self._records_to_dicts(
+                            result.get("stage4_injected") or []
+                        ),
+                        "raw": result,
+                    }
+            if mode in ("auto", "deep", "multi"):
+                kwargs: dict[str, Any] = {}
+                if session_id:
+                    kwargs["session_id"] = session_id
+                result = await self._call_provider(
+                    provider, "deep_recall", query, default=None, **kwargs
+                )
+                if isinstance(result, dict) and result.get("items"):
+                    return {
+                        "ok": True,
+                        "mode": "deep",
+                        "provider": str(getattr(provider, "name", "")),
+                        "context": str(result.get("text") or ""),
+                        "items": [
+                            dict(it) for it in (result.get("items") or [])
+                        ],
+                        "raw": result,
+                    }
+
+        records = await self.search(query, limit=limit)
+        context = "\n".join(f"- {r.content}" for r in records)
+        return {
+            "ok": bool(records),
+            "mode": "search",
+            "provider": "builtin",
+            "context": context,
+            "items": [r.to_dict() for r in records],
+            "degraded": True,
+        }
+
+    async def active_recall(
+        self,
+        *,
+        limit: int = 10,
+        include_review: bool = True,
+    ) -> dict[str, Any]:
+        """主动回忆：到期提示卡 + 主动复盘队列（不依赖用户提问）。"""
+        cards: list[dict[str, Any]] = []
+        review: dict[str, Any] = {}
+        provider_name = ""
+        for provider in self._capability_candidates():
+            got = await self._call_provider(provider, "recall_cards", limit=limit, default=None)
+            if isinstance(got, list) and got:
+                cards = [dict(c) for c in got]
+                provider_name = str(getattr(provider, "name", ""))
+            if include_review:
+                got_review = await self._call_provider(
+                    provider, "proactive_review", limit=max(limit, 30), default=None
+                )
+                if isinstance(got_review, dict) and got_review.get("items") is not None:
+                    review = got_review
+            if cards or review:
+                break
+        return {
+            "ok": bool(cards or review),
+            "provider": provider_name or "builtin",
+            "cards": cards[:limit],
+            "review": review,
+            "count": len(cards),
+        }
+
+    async def manage(
+        self,
+        action: str = "audit",
+        *,
+        apply: bool = False,
+        limit: int = 50,
+        ttl_days: float = 7.0,
+    ) -> dict[str, Any]:
+        """记忆管理：健康体检 / 可逆维护 / 统计。
+
+        action:
+          - ``audit``   ：健康报告 + 统计（只读）
+          - ``maintain``：会话 TTL 归档等可逆维护（``apply=False`` 仅演练）
+        """
+        action = str(action or "audit").strip().lower()
+        result: dict[str, Any] = {"ok": True, "action": action, "apply": apply}
+        for provider in self._capability_candidates():
+            health = await self._call_provider(provider, "health", default=None)
+            if isinstance(health, dict):
+                result.setdefault("health", health)
+                result["provider"] = str(getattr(provider, "name", ""))
+            if action == "maintain":
+                maintained = await self._call_provider(
+                    provider,
+                    "maintain_sessions",
+                    ttl_days=ttl_days,
+                    apply=apply,
+                    default=None,
+                )
+                if isinstance(maintained, dict):
+                    result["maintain"] = maintained
+                    result["provider"] = str(getattr(provider, "name", ""))
+        result["stats"] = await self.stats()
+        result["ok"] = bool(result.get("health") or result.get("stats"))
+        return result
+
+    def _records_to_dicts(self, injected: list[Any]) -> list[dict[str, Any]]:
+        """把 recall_pipeline 的注入项收敛为 MemoryRecord 字典。"""
+        out: list[dict[str, Any]] = []
+        for item in injected:
+            memory = item.get("memory") if isinstance(item, dict) else None
+            if not isinstance(memory, dict):
+                continue
+            record = MemoryRecord.from_dict(memory)
+            if not record.provider:
+                record.provider = "builtin"
+            out.append(record.to_dict())
+        return out
+
     # ---- 内部工具 ----
 
     async def _call_provider(
@@ -1029,12 +1258,13 @@ class MemorySystemAPI:
         method: str,
         *args: Any,
         default: Any = None,
+        **kwargs: Any,
     ) -> Any:
         fn = getattr(provider, method, None)
         if not callable(fn):
             return default
         try:
-            return await _maybe_await(fn(*args))
+            return await _maybe_await(fn(*args, **kwargs))
         except Exception as exc:  # 外部服务不可用不能影响内置记忆
             logger.warning(
                 "[MemoryAPI] provider %s.%s failed: %s",
@@ -1256,6 +1486,89 @@ MEMORY_TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "memory_save_turn",
+        "category": "Memory",
+        "description": (
+            "Save one conversation turn (user message, assistant answer and optional "
+            "progress signals) through the unified memory interface."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_message": {"type": "string", "description": "用户本轮输入"},
+                "assistant_answer": {"type": "string", "description": "助手本轮回答"},
+                "signals": {
+                    "type": "object",
+                    "description": "可选进度信号：goal/task_add/tasks/decision/next_action",
+                },
+            },
+            "required": ["user_message"],
+        },
+    },
+    {
+        "name": "memory_recall",
+        "category": "Memory",
+        "description": (
+            "Recall memories for a query using the active recall pipeline or deep "
+            "multi-round retrieval; returns prompt-ready context plus items."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "当前问题/检索词"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "pipeline", "deep", "search"],
+                    "default": "auto",
+                },
+                "scene": {
+                    "type": "string",
+                    "enum": ["mix", "task", "emotion"],
+                    "default": "mix",
+                },
+                "budget_chars": {"type": "integer", "default": 4000},
+                "limit": {"type": "integer", "default": 10},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "memory_active_recall",
+        "category": "Memory",
+        "description": (
+            "Fetch active-recall cards (spaced repetition) and the proactive review "
+            "queue without waiting for a user question."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 10},
+                "include_review": {"type": "boolean", "default": True},
+            },
+        },
+    },
+    {
+        "name": "memory_manage",
+        "category": "Memory",
+        "description": (
+            "Run memory management: audit health/statistics, or apply reversible "
+            "maintenance such as session TTL archiving."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["audit", "maintain"],
+                    "default": "audit",
+                },
+                "apply": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "default": 50},
+                "ttl_days": {"type": "number", "default": 7},
+            },
+        },
+    },
 ]
 
 MEMORY_TOOL_NAMES: tuple[str, ...] = tuple(schema["name"] for schema in MEMORY_TOOL_SCHEMAS)
@@ -1353,6 +1666,37 @@ async def dispatch_memory_tool(
             max_tokens=int(args.get("max_tokens", 700) or 700),
         )
         return {"ok": bool(context), "context": context}
+
+    if name == "memory_save_turn":
+        signals = args.get("signals")
+        return await api.save_turn(
+            str(args.get("user_message", "") or ""),
+            str(args.get("assistant_answer", "") or "") or None,
+            signals=signals if isinstance(signals, dict) else None,
+        )
+
+    if name == "memory_recall":
+        return await api.recall(
+            str(args.get("query", "") or ""),
+            mode=str(args.get("mode", "auto") or "auto"),
+            scene=str(args.get("scene", "mix") or "mix"),
+            budget_chars=int(args.get("budget_chars", 4000) or 4000),
+            limit=int(args.get("limit", 10) or 10),
+        )
+
+    if name == "memory_active_recall":
+        return await api.active_recall(
+            limit=int(args.get("limit", 10) or 10),
+            include_review=bool(args.get("include_review", True)),
+        )
+
+    if name == "memory_manage":
+        return await api.manage(
+            str(args.get("action", "audit") or "audit"),
+            apply=bool(args.get("apply", False)),
+            limit=int(args.get("limit", 50) or 50),
+            ttl_days=float(args.get("ttl_days", 7) or 7),
+        )
 
     raise ValueError(f"Unknown memory tool: {name!r}")
 

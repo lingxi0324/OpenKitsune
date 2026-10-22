@@ -639,8 +639,8 @@ class Settings(BaseSettings):
     web_search_provider: str = Field(
         default="",
         description=(
-            "激活的搜索源 ID（bocha / tavily / searxng / jina / duckduckgo）；"
-            "留空=按优先级自动检测可用源"
+            "激活的搜索源 ID（hands / bocha / tavily / searxng / jina / duckduckgo）；"
+            "留空=按优先级自动检测可用源（本机 openkitsune-hands 优先）"
         ),
     )
     bocha_api_key: str = Field(
@@ -915,6 +915,19 @@ class Settings(BaseSettings):
     group_response_mode: str = Field(
         default="mention_only",
         description="群聊响应模式: always(全响应) / mention_only(仅@时响应，默认) / smart(AI判断)",
+    )
+
+    # === IM 私聊访问控制 ===
+    im_dm_policy: str = Field(
+        default="open",
+        description="IM 私聊访问策略: open(所有人) / pairing(配对码) / allowlist(白名单)",
+    )
+    im_dm_allowlist: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        description=(
+            "私聊白名单（逗号分隔）。支持 user_id、channel:user_id、channel:chat_id 三种写法；"
+            "在 im_dm_policy=allowlist 时生效，pairing 模式下白名单用户也可直接放行。"
+        ),
     )
 
     # === 通道配置 ===
@@ -1754,6 +1767,32 @@ class Settings(BaseSettings):
                 if s and s not in seen2:
                     seen2.add(s)
                     out2.append(s)
+            return out2
+        return value
+
+    @field_validator("im_dm_allowlist", mode="before")
+    @classmethod
+    def _split_im_dm_allowlist_csv(cls, value: object) -> object:
+        """Accept ``"tg:123,feishu:oc_x"`` from env or a programmatic list."""
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            seen: set[str] = set()
+            out: list[str] = []
+            for part in value.split(","):
+                item = part.strip()
+                if item and item not in seen:
+                    seen.add(item)
+                    out.append(item)
+            return out
+        if isinstance(value, (list, tuple, set, frozenset)):
+            seen2: set[str] = set()
+            out2: list[str] = []
+            for item in value:
+                text = str(item).strip()
+                if text and text not in seen2:
+                    seen2.add(text)
+                    out2.append(text)
             return out2
         return value
 

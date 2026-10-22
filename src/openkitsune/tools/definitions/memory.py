@@ -355,28 +355,28 @@ MEMORY_TOOLS = [
 ]
 
 # ---------------------------------------------------------------------------
-# openkitsune-brain 长期记忆工具
+# okmem 长期记忆工具
 # ---------------------------------------------------------------------------
 # 定义来自 openkitsune.memory.okmem_provider.OKMEM_TOOL_SCHEMAS，
 # 这里补充 Agent 侧的使用说明，避免两处维护同一份 JSON Schema。
 _OKMEM_TOOL_DETAILS = {
-    "okmem_recall": """运行 openkitsune-brain 六池主动回忆闭环，返回可直接注入提示词的记忆上下文。
+    "okmem_recall": """运行 okmem 六池主动回忆闭环，返回可直接注入提示词的记忆上下文。
 
 **适用场景**：需要回顾历史决策、偏好、任务进度、情绪状态或跨会话经历。
 **返回**：`memory_context`（六池召回 + 打分 + 场景注入）与阶段明细。
 **注意**：这是增强检索，不会替代当前会话上下文。""",
-    "okmem_knowledge_search": """检索 fusion-memory 知识库（中医 / 玄学 / 长期笔记）。
+    "okmem_knowledge_search": """检索 okmem 知识库（中医 / 玄学 / 长期笔记）。
 
 **适用场景**：用户询问知识性内容，且当前对话与内置记忆都没有答案。
 **返回**：`fusion:` / `fusion-fts:` 来源的条目，含 key、分类和相似度。""",
-    "okmem_save_turn": """把一轮 user / assistant 对话写入 openkitsune-brain 长期记忆。
+    "okmem_save_turn": """把一轮 user / assistant 对话写入 okmem 长期记忆。
 
 **适用场景**：跨会话需要保留的偏好、决策、承诺或经验。
 **注意**：临时任务参数不要写入；优先使用 `add_memory` 表达明确的长记忆。""",
     "okmem_proactive_review": """获取主动复盘队列：冲突、弱记忆、开放假设、未校验结论、未建网记忆、未完成任务、到期复习。
 
 **适用场景**：空闲自省、开始新任务前检查遗留问题、定期维护。""",
-    "okmem_health": """获取 openkitsune-brain 记忆健康报告（规模、完整性、回忆、图谱质量、冲突）。""",
+    "okmem_health": """获取 okmem 记忆健康报告（规模、完整性、回忆、图谱质量、冲突）。""",
     "okmem_progress": """读取 L1 进度快照：总目标、任务状态、最近决策、下一步动作。
 
 **适用场景**：跨会话恢复任务进度，或用户询问“我们做到哪了”。""",

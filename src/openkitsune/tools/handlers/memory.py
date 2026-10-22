@@ -64,7 +64,7 @@ class MemoryHandler:
         "search_relational_memory",
         "get_session_context",
         "memory_delete_by_query",
-        # openkitsune-brain 长期记忆工具（显式列出，便于 AST 完备性检查）
+        # okmem 长期记忆工具（显式列出，便于 AST 完备性检查）
         "okmem_recall",
         "okmem_knowledge_search",
         "okmem_save_turn",
@@ -90,7 +90,7 @@ class MemoryHandler:
         "search_relational_memory": ApprovalClass.READONLY_SEARCH,
         "get_session_context": ApprovalClass.READONLY_GLOBAL,
         "memory_delete_by_query": ApprovalClass.DESTRUCTIVE,
-        # openkitsune-brain 长期记忆工具
+        # okmem 长期记忆工具
         "okmem_recall": ApprovalClass.READONLY_SEARCH,
         "okmem_knowledge_search": ApprovalClass.READONLY_SEARCH,
         "okmem_save_turn": ApprovalClass.EXEC_LOW_RISK,
@@ -542,7 +542,7 @@ class MemoryHandler:
         elif tool_name == "memory_delete_by_query":
             return self._delete_by_query_structured(params)
         elif tool_name in OKMEM_TOOL_NAMES:
-            return await self._handle_brain_tool(tool_name, params)
+            return await self._handle_okmem_tool(tool_name, params)
         else:
             return f"❌ Unknown memory tool: {tool_name}"
 
@@ -553,10 +553,10 @@ class MemoryHandler:
         return result
 
     # ------------------------------------------------------------------
-    # openkitsune-brain 长期记忆工具
+    # okmem 长期记忆工具
     # ------------------------------------------------------------------
 
-    def _brain_provider(self):
+    def _okmem_provider(self):
         """复用 Agent 启动时创建的外部记忆 Provider；未启用时返回 None。"""
         provider = getattr(self.agent, "_okmem_provider", None)
         if provider is not None:
@@ -574,22 +574,22 @@ class MemoryHandler:
             logger.warning("[Okmem] provider init failed: %s", e)
             return None
 
-    def _brain_session_id(self) -> str:
+    def _okmem_session_id(self) -> str:
         for owner in (self.agent, getattr(self.agent, "memory_manager", None)):
             session_id = getattr(owner, "_current_session_id", "") if owner else ""
             if session_id:
                 return str(session_id)
         return ""
 
-    async def _handle_brain_tool(self, tool_name: str, params: dict) -> str:
-        provider = self._brain_provider()
+    async def _handle_okmem_tool(self, tool_name: str, params: dict) -> str:
+        provider = self._okmem_provider()
         if provider is None:
             return (
-                "❌ openkitsune-brain 记忆源未启用（OPENKITSUNE_OKMEM_ENABLED=0 "
+                "❌ okmem 记忆源未启用（OPENKITSUNE_OKMEM_ENABLED=0 "
                 "或依赖不可用），本次调用已跳过。"
             )
 
-        session_id = self._brain_session_id()
+        session_id = self._okmem_session_id()
         if session_id:
             provider.session_id = session_id
             # recall_pipeline / save_turn 走 MemorySystem 实例内部 session，
