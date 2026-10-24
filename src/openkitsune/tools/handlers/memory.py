@@ -76,6 +76,10 @@ class MemoryHandler:
         "okmem_emotion_state",
         "okmem_detect_emotion",
         "okmem_maintain_sessions",
+        "okmem_search",
+        "okmem_forget",
+        "okmem_forget_by_query",
+        "okmem_pool_stats",
     ]
 
     # C7 explicit ApprovalClass
@@ -102,6 +106,10 @@ class MemoryHandler:
         "okmem_emotion_state": ApprovalClass.READONLY_GLOBAL,
         "okmem_detect_emotion": ApprovalClass.READONLY_GLOBAL,
         "okmem_maintain_sessions": ApprovalClass.EXEC_LOW_RISK,
+        "okmem_search": ApprovalClass.READONLY_SEARCH,
+        "okmem_forget": ApprovalClass.DESTRUCTIVE,
+        "okmem_forget_by_query": ApprovalClass.DESTRUCTIVE,
+        "okmem_pool_stats": ApprovalClass.READONLY_GLOBAL,
     }
 
     TOOL_POLICIES = {

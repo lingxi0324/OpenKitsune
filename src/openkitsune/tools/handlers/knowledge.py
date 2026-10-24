@@ -35,10 +35,10 @@ class KnowledgeHandler:
         "knowledge_list": ApprovalClass.READONLY_SEARCH,
         "knowledge_search": ApprovalClass.READONLY_SEARCH,
         "knowledge_read": ApprovalClass.READONLY_SEARCH,
-        "knowledge_create": ApprovalClass.FILE_WRITE,
-        "knowledge_edit": ApprovalClass.FILE_WRITE,
-        "knowledge_delete": ApprovalClass.FILE_DELETE,
-        "knowledge_rename": ApprovalClass.FILE_WRITE,
+        "knowledge_create": ApprovalClass.MUTATING_SCOPED,
+        "knowledge_edit": ApprovalClass.MUTATING_SCOPED,
+        "knowledge_delete": ApprovalClass.DESTRUCTIVE,
+        "knowledge_rename": ApprovalClass.MUTATING_SCOPED,
     }
 
     def __init__(self, agent: Agent, config_path: Path | None = None) -> None:
@@ -211,8 +211,8 @@ class KnowledgeHandler:
                                 match_lines.append(1)
                             else:
                                 # Search inline #tags
-                                for i, l in enumerate(lines):
-                                    if f"#{tag_query}" in l:
+                                for i, ln in enumerate(lines):
+                                    if f"#{tag_query}" in ln:
                                         matched = True
                                         match_lines.append(i+1)
                                         break
@@ -220,7 +220,7 @@ class KnowledgeHandler:
                             # Full text search
                             if query in content or query in md_file.name:
                                 matched = True
-                                match_lines = [i+1 for i, l in enumerate(lines) if query in l]
+                                match_lines = [i+1 for i, ln in enumerate(lines) if query in ln]
 
                         if matched and match_lines:
                             # Count wiki links [[xxx]]
@@ -239,7 +239,7 @@ class KnowledgeHandler:
                             })
                             if len(results) >= 15:
                                 break
-                    except:
+                    except Exception:
                         pass
 
                 # Auto-learn top results into knowledge graph (循环学习)
@@ -257,7 +257,7 @@ class KnowledgeHandler:
                                     text=content[:3000],  # Only first 3000 chars to keep it fast
                                     source_path=r["file"],
                                 )
-                        except:
+                        except Exception:
                             pass
                     # Get related concepts from learning graph
                     all_nodes = list_nodes(limit=10)
@@ -265,7 +265,7 @@ class KnowledgeHandler:
                         {"label": n["label"], "category": n["category"], "importance": n.get("importance", 0.5)}
                         for n in all_nodes.get("nodes", [])[:8]
                     ]
-                except:
+                except Exception:
                     pass
 
                 return {
@@ -324,7 +324,7 @@ class KnowledgeHandler:
                         source_path=file_path,
                     )
                     learned = True
-                except:
+                except Exception:
                     pass
 
                 return {

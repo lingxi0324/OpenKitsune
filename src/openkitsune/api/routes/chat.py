@@ -19,6 +19,12 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from openkitsune.agent.reasoning_coop import (
+    METHOD_BY_ID,
+    ReasoningPlan,
+    build_plan,
+    render_plan_prompt,
+)
 from openkitsune.agent.security_actions import execute_controlled_action
 from openkitsune.agent.trusted_paths import grant_session_trust
 from openkitsune.core.ask_user_context import AskUserReplyContext
@@ -28,6 +34,134 @@ from openkitsune.core.context_stats import (
     get_context_snapshot,
     merge_context_snapshot_into_usage,
 )
+
+
+# ── 推理预处理：问题类型打分 + 协同编排（代码驱动，不是靠 prompt 自觉） ──
+def _is_reasoning_cooperation_enabled() -> bool:
+    try:
+        from ...core.feature_flags import is_enabled
+
+        return is_enabled("reasoning_cooperation_v1")
+    except Exception:
+        return True
+
+
+def _build_reasoning_plan(user_message: str) -> ReasoningPlan | None:
+    """Return the cooperative plan, or ``None`` when the feature is disabled."""
+    if not _is_reasoning_cooperation_enabled():
+        return None
+    return build_plan(user_message)
+
+
+def _detect_reasoning_method(user_message: str) -> dict:
+    """Legacy single-method view, derived from the planner's primary method."""
+    plan = build_plan(user_message)
+    spec = METHOD_BY_ID[plan.primary]
+    return {
+        "id": spec.id,
+        "name": spec.name,
+        "desc": spec.description,
+        "tier": plan.tier_label,
+    }
+
+
+def _apply_reasoning_method(method: dict, user_message: str) -> str:
+    """根据推理方法，从记忆中提取对应的推理结果。"""
+    try:
+        import sys as _sys
+        _brain_root = r"E:\agents\openkitsune-brain"
+        if _brain_root not in _sys.path:
+            _sys.path.insert(0, _brain_root)
+        from okmem.world_model import (
+            abductive_explanations,
+            analyze_causal_chain,
+            build_timeline,
+            first_principles_breakdown,
+        )
+
+        db = r"E:\agents\openkitsune-brain\data\okmem\memory.db"
+        method_id = method["id"]
+
+        if method_id == "abductive":
+            result = abductive_explanations(db, limit=5)
+            if result:
+                lines = ["最可能的原因/解释："]
+                for i, r in enumerate(result[:5], 1):
+                    lines.append(f"  {i}. {str(r)[:100]}")
+                return "\n".join(lines)
+
+        elif method_id == "causal_chain":
+            result = analyze_causal_chain(db, limit=5)
+            if result:
+                lines = ["因果链条分析："]
+                for i, r in enumerate(result[:5], 1):
+                    lines.append(f"  {i}. {str(r)[:100]}")
+                return "\n".join(lines)
+
+        elif method_id == "timeline":
+            result = build_timeline(db, days=30, limit=8)
+            if result:
+                lines = ["时间线演化："]
+                for i, r in enumerate(result[:8], 1):
+                    lines.append(f"  {i}. {str(r)[:100]}")
+                return "\n".join(lines)
+
+        elif method_id == "first_principles":
+            result = first_principles_breakdown(db, limit=5)
+            if result:
+                lines = ["第一性原理拆解："]
+                for i, r in enumerate(result[:5], 1):
+                    lines.append(f"  {i}. {str(r)[:100]}")
+                return "\n".join(lines)
+
+        # 其他方法如果没有实现，返回空（不阻塞主流程）
+        return ""
+
+    except Exception as e:
+        logger.debug(f"[Reasoning] {method['name']} failed: {e}")
+        return ""
+
+
+def _reasoning_evidence(plan: ReasoningPlan, user_message: str) -> str:
+    """Collect optional memory-side evidence for every method the plan uses."""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for method_id in plan.method_ids():
+        if method_id in seen:
+            continue
+        seen.add(method_id)
+        spec = METHOD_BY_ID[method_id]
+        text = _apply_reasoning_method({"id": method_id, "name": spec.name}, user_message)
+        if text:
+            parts.append(f"[{spec.name}]\n{text}")
+    return "\n".join(parts)
+
+
+def _build_reasoning_injection(user_message: str) -> str:
+    """Build the reasoning system message injected ahead of the user turn."""
+    plan = _build_reasoning_plan(user_message)
+    if plan is None:
+        method = _detect_reasoning_method(user_message)
+        evidence = _apply_reasoning_method(method, user_message)
+        if not evidence:
+            return ""
+        return (
+            f"【推理预处理结果 - {method['name']}】\n{evidence}\n\n"
+            "（以上是系统根据你的问题类型自动执行的推理分析，请基于这些结果回答用户的问题。）"
+        )
+
+    # No method signal means the question is not an analysis task; injecting a
+    # reasoning skeleton would only cost context and steer a plain reply.
+    if not plan.signals.get("matched"):
+        return ""
+
+    content = render_plan_prompt(plan)
+    evidence = _reasoning_evidence(plan, user_message)
+    if evidence:
+        content += f"\n\n【记忆侧证据】\n{evidence}"
+    return content
+
+
 from openkitsune.core.engine_bridge import engine_stream, is_dual_loop, to_engine
 
 from ..schemas import (
@@ -1290,6 +1424,7 @@ async def _stream_chat(
     - ask_user 文本捕获
     - Session 回复保存
     """
+    logger.info(f"[_stream_chat] Entered _stream_chat, session_manager={session_manager is not None}")
 
     _reply_chars = 0
     _reply_preview = ""
@@ -1488,6 +1623,7 @@ async def _stream_chat(
         await _refresh_busy_lease(force=True)
 
         if session_manager and conversation_id:
+            logger.info(f"[SessionMgmt] Entered session management block, conversation_id={conversation_id}")
             try:
                 session = session_manager.get_session(
                     channel="desktop",
@@ -1541,11 +1677,23 @@ async def _stream_chat(
                     )
 
                     # ── 参考 xiaozhi：每轮对话自动查询记忆，注入世界状态上下文 ──
+                    logger.info(f"[Injection] Entering injection block, session_messages_history len={len(session_messages_history)}")
                     try:
                         import sys as _sys
                         _brain_root = r"E:\agents\openkitsune-brain"
                         if _brain_root not in _sys.path:
                             _sys.path.insert(0, _brain_root)
+
+                        # 0. 推理预处理：问题类型打分 → 协同编排 → 注入（代码驱动）
+                        _user_msg = chat_request.message or ""
+                        _reasoning_prompt = _build_reasoning_injection(_user_msg)
+                        if _reasoning_prompt:
+                            session_messages_history.insert(
+                                0, {"role": "system", "content": _reasoning_prompt}
+                            )
+                            logger.info(
+                                f"[Reasoning] plan injected: {len(_reasoning_prompt)} chars"
+                            )
 
                         # 1. 注入世界状态
                         from okmem.world_model import get_world_state_cached
@@ -1606,7 +1754,7 @@ async def _stream_chat(
                             session_messages_history.insert(1, _mem_msg)
                             logger.info(f"[HistoryMem+Graph+Timeline] injected into session_messages: {len(_history_content)} chars")
                     except Exception as _e:
-                        logger.debug(f"[WorldState] injection failed: {type(_e).__name__}: {_e}")
+                        logger.warning(f"[WorldState/Reasoning] injection failed: {type(_e).__name__}: {_e}")
 
                     session_manager.mark_dirty()
             except Exception as e:
@@ -2932,12 +3080,18 @@ async def chat(request: Request, body: ChatRequest):
         from okmem.world_model import get_world_state_cached
         _db = r"E:\agents\openkitsune-brain\data\okmem\memory.db"
         _world = get_world_state_cached(_db, user_input=body.message)
+
+        # 推理预处理：问题类型打分 → 协同编排（代码驱动，不是靠 prompt 自觉）
+        _reasoning_prompt = _build_reasoning_injection(body.message or "")
+
         # 写到文件确认执行
         with open(r"D:\ai\OpenKitsune-main\tools-tmp\world_state_injected.txt", "w", encoding="utf-8") as _f:
             _f.write(f"time: {time.strftime('%H:%M:%S')}\n")
             _f.write(f"message: {body.message[:50]}\n")
             _f.write(f"world_state length: {len(_world)} chars\n")
-            _f.write(f"world_state preview:\n{_world[:500]}\n")
+            _f.write(f"reasoning_prompt length: {len(_reasoning_prompt)} chars\n")
+            if _reasoning_prompt:
+                _f.write(f"reasoning_prompt preview:\n{_reasoning_prompt[:400]}\n")
     except Exception as _e:
         with open(r"D:\ai\OpenKitsune-main\tools-tmp\world_state_inject_error.txt", "w", encoding="utf-8") as _f:
             _f.write(f"error: {type(_e).__name__}: {_e}\n")

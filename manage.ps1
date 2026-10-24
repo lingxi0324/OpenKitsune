@@ -176,10 +176,13 @@ function Show-Status {
 
 function Resolve-TailTarget {
     # 与 start.ps1 保持同一策略：
-    #   优先跟 file handler 实时写入的 <workspace>\logs\openkitsune.log
-    #   （不受 python stdout 块缓冲 / -RedirectStandardOutput 句柄归属影响，
-    #    无论 serve 由 start.ps1 / 桌面端 / 手动启动都在写）。
-    #   找不到时回退到 data\logs\serve_win.log（python stdout 重定向文件）。
+    #   1) 收集候选：工作区 file handler 日志 <workspace>\logs\openkitsune.log
+    #      （不受 python stdout 块缓冲 / -RedirectStandardOutput 句柄归属影响）、
+    #      项目根 logs\openkitsune.log（开发模式 / 工作区解析失败时）、
+    #      以及 data\logs\serve_win.log（python stdout 重定向文件）。
+    #   2) 在所有存在且仍在写入的候选中选 LastWriteTime 最新的一个跟随，
+    #      避免 state.json 指向的工作区与后端实际写入位置不一致时，
+    #      死跟已停更的旧文件（历史 WARNING 等永远挂在窗口的假象）。
     $OkRoot = $env:OPENKITSUNE_ROOT
     if (-not $OkRoot) { $OkRoot = Join-Path $env:USERPROFILE ".openkitsune" }
     $stateFile = Join-Path $OkRoot "state.json"
@@ -199,10 +202,46 @@ function Resolve-TailTarget {
     # 兜底：仓库根 logs\openkitsune.log（开发模式 / 工作区解析失败时）
     $candidates.Add((Join-Path $ProjectRoot "logs\openkitsune.log"))
     $candidates.Add($ServeLog)
-    foreach ($c in $candidates) {
-        if (Test-Path -LiteralPath $c) { return $c }
+    $existing = @($candidates | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Get-Item -LiteralPath $_ })
+    if ($existing.Count -gt 0) {
+        return ($existing | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
     }
     return $null
+}
+
+# 按行解析标准 Python logging 格式，列对齐分段着色：
+#   时间(深绿) | logger(青) | 级别 | 消息
+# 级别配色：INFO=白（正常）、WARNING=黄底黑字（警告）、ERROR=红底白字（错误）、
+# CRITICAL=紫底白字（严重）、DEBUG=暗灰；续行 / traceback 缩进到消息列，保持版面整齐。
+function Write-LogLine {
+    param([string]$Line)
+    $TimeW = 23; $LoggerW = 34; $LevelW = 8; $Sep = "  "
+    $MsgIndent = $TimeW + $Sep.Length + $LoggerW + $Sep.Length + $LevelW + $Sep.Length
+    if ($null -eq $Line) { return }
+    if ($Line -eq "") { Write-Host ""; return }
+    $m = [regex]::Match($Line, '^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-\s*(.+?)\s*-\s*(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b\s*[-:]\s*(.*)$')
+    if (-not $m.Success) {
+        Write-Host ("{0}{1}" -f (" " * $MsgIndent), $Line) -ForegroundColor DarkGray
+        return
+    }
+    $ts = $m.Groups[1].Value.PadRight($TimeW)
+    $logger = $m.Groups[2].Value
+    if ($logger.Length -gt $LoggerW) { $logger = $logger.Substring(0, $LoggerW - 3) + "..." }
+    else { $logger = $logger.PadRight($LoggerW) }
+    $level = $m.Groups[3].Value
+    $msg = $m.Groups[4].Value
+    switch ($level) {
+        "DEBUG"    { $fg = "DarkGray"; $bg = "" }
+        "INFO"     { $fg = "White";    $bg = "" }
+        "WARNING"  { $fg = "Black";    $bg = "Yellow" }
+        "ERROR"    { $fg = "White";    $bg = "Red" }
+        "CRITICAL" { $fg = "White";    $bg = "Magenta" }
+    }
+    Write-Host ("{0}{1}" -f $ts, $Sep)     -ForegroundColor DarkGreen -NoNewline
+    Write-Host ("{0}{1}" -f $logger, $Sep) -ForegroundColor Cyan     -NoNewline
+    if ($bg) { Write-Host ("{0}{1}" -f $level.PadRight($LevelW), $Sep) -ForegroundColor $fg -BackgroundColor $bg -NoNewline }
+    else     { Write-Host ("{0}{1}" -f $level.PadRight($LevelW), $Sep) -ForegroundColor $fg -NoNewline }
+    Write-Host $msg
 }
 
 function Show-Log {
@@ -213,8 +252,9 @@ function Show-Log {
     }
     Write-Host "  实时日志（Ctrl+C 退出，不影响服务）..." -ForegroundColor DarkGray
     Write-Host "  跟随文件：$tailTarget" -ForegroundColor DarkGray
+    Write-Host "  列对齐：时间=深绿  logger=青  INFO=白  WARNING=黄底黑字  ERROR=红底白字  CRITICAL=紫底白字  DEBUG=暗灰" -ForegroundColor DarkGray
     # 显式 -Encoding UTF8：PS 5.1 默认按 ANSI(GBK) 解码无 BOM 的 UTF-8 日志会乱码
-    Get-Content -LiteralPath $tailTarget -Encoding UTF8 -Tail 20 -Wait
+    Get-Content -LiteralPath $tailTarget -Encoding UTF8 -Tail 20 -Wait | ForEach-Object { Write-LogLine $_ }
 }
 
 # ---------------- 入口 ----------------

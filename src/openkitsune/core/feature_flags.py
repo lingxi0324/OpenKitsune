@@ -53,6 +53,8 @@ _DEFAULTS: dict[str, bool] = {
     "text_replace_on_restart_v1": True,
     # Conversation config-workspace / working-directory split.
     "session_working_directory_v1": True,
+    # Cooperative reasoning: method clustering + expansion/counterweight checks.
+    "reasoning_cooperation_v1": True,
 }
 
 

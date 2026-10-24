@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import os
 import subprocess
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,23 +40,67 @@ INPUTS = {
 }
 
 
+def _git_available() -> bool:
+    """git 仓库可用性探测（解压目录/CI 外等无 git 环境应优雅降级而非报错）。"""
+    try:
+        subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "--is-inside-work-tree"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return True
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def _collect_by_glob(inputs: tuple[str, ...]) -> list[Path]:
+    """无 git 时的确定性回退：按输入路径直接收集（目录递归、文件直取），
+    排序基于仓库相对路径，保证指纹跨环境稳定。"""
+    found: set[Path] = set()
+    for rel in inputs:
+        p = (ROOT / rel).resolve()
+        if p.is_dir():
+            for child in p.rglob("*"):
+                if child.is_file():
+                    found.add(child)
+        elif p.is_file():
+            found.add(p)
+    return sorted(found, key=lambda path: path.relative_to(ROOT).as_posix())
+
+
 def _tracked_files(inputs: tuple[str, ...]) -> list[Path]:
-    output = subprocess.check_output(
-        [
-            "git",
-            "-C",
-            str(ROOT),
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-            *inputs,
-        ]
-    )
-    files = ((ROOT / item.decode()).resolve() for item in output.split(b"\0") if item)
-    return sorted(path for path in files if path.is_file())
+    files: list[Path] = []
+    if _git_available():
+        try:
+            output = subprocess.check_output(
+                [
+                    "git",
+                    "-C",
+                    str(ROOT),
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                    *inputs,
+                ],
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            files = sorted(
+                (ROOT / item.decode()).resolve()
+                for item in output.split(b"\0")
+                if item
+            )
+            files = [path for path in files if path.is_file()]
+        except (subprocess.SubprocessError, OSError) as exc:
+            logger.warning("git ls-files 失败，退化为 glob 收集: %s", exc)
+            files = []
+    if not files:
+        files = _collect_by_glob(inputs)
+    return files
 
 
 def _add_file(digest: Any, path: Path) -> None:

@@ -993,6 +993,63 @@ class OkmemProvider:
             import sys as _sysdbg
             print(f"[okmem] provider world_state inject failed: {type(e).__name__}: {e}", file=_sysdbg.stderr)
 
+        # ── 推理预处理：根据问题类型自动匹配推理方法，代码驱动 ──
+        try:
+            import re as _re
+            # 简单的问题类型检测（避免从 chat.py import 导致循环依赖）
+            _msg = query.lower()
+            if _re.search(r'为什么|原因|怎么回事|为啥|何故', _msg):
+                _reasoning_name = "溯因推理"
+                from okmem.world_model import abductive_explanations
+                _result = abductive_explanations(db_path, limit=3)
+            elif _re.search(r'导致|引起|影响|后果|会怎样|会怎么样', _msg):
+                _reasoning_name = "因果链分析"
+                from okmem.world_model import analyze_causal_chain
+                _result = analyze_causal_chain(db_path, limit=3)
+            elif _re.search(r'规律|总结|共同点|特点|特征|归纳', _msg):
+                _reasoning_name = "归纳总结"
+                from okmem.world_model import inductive_patterns
+                _result = inductive_patterns(db_path, min_support=2, limit=3)
+            elif _re.search(r'根本|本质|最基础|从原理|第一性|底层逻辑', _msg):
+                _reasoning_name = "第一性原理分解"
+                from okmem.world_model import first_principles_breakdown
+                _result = first_principles_breakdown(db_path, limit=3)
+            elif _re.search(r'像|类似|类比|对比|和.*相似', _msg):
+                _reasoning_name = "类比映射"
+                from okmem.world_model import analogical_mappings
+                _result = analogical_mappings(db_path, limit=3)
+            elif _re.search(r'怎么看|如何评价|好不好|利弊|优点缺点|正反', _msg):
+                _reasoning_name = "辩证综合"
+                from okmem.world_model import dialectic_synthesis
+                _result = dialectic_synthesis(db_path, limit=3)
+            elif _re.search(r'系统|反馈|循环|回路|生态', _msg):
+                _reasoning_name = "系统论反馈回路"
+                from okmem.world_model import system_feedback_loops
+                _result = system_feedback_loops(db_path, limit=3)
+            elif _re.search(r'历史|发展|演变|过去|现在|未来|历程', _msg):
+                _reasoning_name = "时间线推演"
+                from okmem.world_model import build_timeline
+                _result = build_timeline(db_path, days=30, limit=5)
+            elif _re.search(r'从.*角度|站在.*立场|谁的视角|换位思考', _msg):
+                _reasoning_name = "视角代入"
+                from okmem.world_model import perspective_view
+                _result_str = perspective_view(db_path, limit=3)
+                _result = [_result_str] if _result_str else []
+            else:
+                _reasoning_name = None
+                _result = []
+
+            if _reasoning_name and _result:
+                _lines = [f"\n【推理预处理 - {_reasoning_name}】"]
+                for i, r in enumerate(_result[:3], 1):
+                    _lines.append(f"  {i}. {str(r)[:120]}")
+                _lines.append("（以上是系统根据你的问题类型自动执行的推理分析，请基于这些结果回答用户的问题。）")
+                _reasoning_text = "\n".join(_lines)
+                add(_reasoning_text)
+        except Exception as e:
+            import sys as _sysdbg
+            print(f"[okmem] provider reasoning inject failed: {type(e).__name__}: {e}", file=_sysdbg.stderr)
+
         def add_paged(
             label: str,
             content: str,

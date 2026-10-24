@@ -144,6 +144,40 @@ if (-not $already) {
     if (Test-Path $ServeLog) { Remove-Item $ServeLog -Force -ErrorAction SilentlyContinue }
     if (Test-Path $ServeErr) { Remove-Item $ServeErr -Force -ErrorAction SilentlyContinue }
 
+    # 工作区模式配置合并：服务以工作区目录为 cwd 启动时，pydantic 只读取
+    # 工作区 .env（由 Setup Center 管理，仅含用户显式设置的键），项目根 .env 的
+    # 全局配置（如 INBOX_ENABLED=false、API keys、API_PORT 等）会全部丢失，
+    # 导致 inbox 等模块按默认值开启并刷警告。
+    # 这里把项目根 .env 中「工作区未显式设置」的键注入环境变量（环境变量优先级
+    # 高于 .env 文件，serve 子进程自动继承）；已存在的工作区/系统环境变量不覆盖。
+    $RootEnvPath = Join-Path $ProjectRoot ".env"
+    $WsEnvPath = Join-Path $BackendWorkDir ".env"
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $WsEnvKeys = @{}
+    if (Test-Path $WsEnvPath) {
+        foreach ($line in [System.IO.File]::ReadAllLines($WsEnvPath, $Utf8NoBom)) {
+            $k = [regex]::Match($line, '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=')
+            if ($k.Success) { $WsEnvKeys[$k.Groups[1].Value] = $true }
+        }
+    }
+    if (Test-Path $RootEnvPath) {
+        foreach ($line in [System.IO.File]::ReadAllLines($RootEnvPath, $Utf8NoBom)) {
+            $m = [regex]::Match($line, '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$')
+            if (-not $m.Success) { continue }
+            $key = $m.Groups[1].Value
+            if ($WsEnvKeys.ContainsKey($key)) { continue }
+            $val = $m.Groups[2].Value.Trim()
+            if ($val -eq "") { continue }
+            if ($val.Length -ge 2 -and (($val[0] -eq '"' -and $val[$val.Length - 1] -eq '"') -or
+                ($val[0] -eq "'" -and $val[$val.Length - 1] -eq "'"))) {
+                $val = $val.Substring(1, $val.Length - 2)
+            }
+            if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($key))) {
+                Set-Item -Path "Env:$key" -Value $val
+            }
+        }
+    }
+
     Start-Process -FilePath $ServePy `
         -ArgumentList @("-m", "openkitsune", "serve") `
         -WorkingDirectory $BackendWorkDir `
@@ -189,11 +223,59 @@ Write-Host ""
 # 优先 tail file handler 的 openkitsune.log（不受 stdout 重定向影响，
 # 无论服务由 start.ps1 / launcher / 手动启动，file handler 都在写它，
 # 永远跟着对话滚动）；若该文件不存在（极端情况），回退到 stdout 文件。
+
+# 按行解析标准 Python logging 格式，列对齐分段着色：
+#   时间(深绿) | logger(青) | 级别 | 消息
+# 级别配色：INFO=白（正常）、WARNING=黄底黑字（警告）、ERROR=红底白字（错误）、
+# CRITICAL=紫底白字（严重）、DEBUG=暗灰；续行 / traceback 缩进到消息列，保持版面整齐。
+function Write-LogLine {
+    param([string]$Line)
+    $TimeW = 23; $LoggerW = 34; $LevelW = 8; $Sep = "  "
+    $MsgIndent = $TimeW + $Sep.Length + $LoggerW + $Sep.Length + $LevelW + $Sep.Length
+    if ($null -eq $Line) { return }
+    if ($Line -eq "") { Write-Host ""; return }
+    $m = [regex]::Match($Line, '^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-\s*(.+?)\s*-\s*(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b\s*[-:]\s*(.*)$')
+    if (-not $m.Success) {
+        Write-Host ("{0}{1}" -f (" " * $MsgIndent), $Line) -ForegroundColor DarkGray
+        return
+    }
+    $ts = $m.Groups[1].Value.PadRight($TimeW)
+    $logger = $m.Groups[2].Value
+    if ($logger.Length -gt $LoggerW) { $logger = $logger.Substring(0, $LoggerW - 3) + "..." }
+    else { $logger = $logger.PadRight($LoggerW) }
+    $level = $m.Groups[3].Value
+    $msg = $m.Groups[4].Value
+    switch ($level) {
+        "DEBUG"    { $fg = "DarkGray"; $bg = "" }
+        "INFO"     { $fg = "White";    $bg = "" }
+        "WARNING"  { $fg = "Black";    $bg = "Yellow" }
+        "ERROR"    { $fg = "White";    $bg = "Red" }
+        "CRITICAL" { $fg = "White";    $bg = "Magenta" }
+    }
+    Write-Host ("{0}{1}" -f $ts, $Sep)     -ForegroundColor DarkGreen -NoNewline
+    Write-Host ("{0}{1}" -f $logger, $Sep) -ForegroundColor Cyan     -NoNewline
+    if ($bg) { Write-Host ("{0}{1}" -f $level.PadRight($LevelW), $Sep) -ForegroundColor $fg -BackgroundColor $bg -NoNewline }
+    else     { Write-Host ("{0}{1}" -f $level.PadRight($LevelW), $Sep) -ForegroundColor $fg -NoNewline }
+    Write-Host $msg
+}
+
 if ($ShowLog) {
-    $FileLog = Join-Path $BackendWorkDir "logs\openkitsune.log"
-    $TailTarget = if (Test-Path $FileLog) { $FileLog } else { $ServeLog }
+    # 跟随目标：在所有候选日志中选择最近写入的那个（工作区 / 项目根 file handler 日志、
+    # stdout 重定向文件）。state.json 指向的工作区可能与后端实际写入位置不一致
+    # （例如服务由 launcher 或手动启动时 cwd=项目根），若死跟 state 指向的旧文件，
+    # 会一直看到已停更的旧日志（如历史 WARNING 永远挂在窗口）。
+    $Candidates = @()
+    foreach ($p in @((Join-Path $BackendWorkDir "logs\openkitsune.log"),
+                     (Join-Path $ProjectRoot "logs\openkitsune.log"),
+                     $ServeLog)) {
+        if (Test-Path $p) { $Candidates += Get-Item $p }
+    }
+    $TailTarget = if ($Candidates.Count -gt 0) {
+        ($Candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+    } else { $ServeLog }
     Write-Host "  实时日志（Ctrl+C 退出，不会停止服务）..." -ForegroundColor DarkGray
     Write-Host "  跟随文件：$TailTarget" -ForegroundColor DarkGray
+    Write-Host "  列对齐：时间=深绿  logger=青  INFO=白  WARNING=黄底黑字  ERROR=红底白字  CRITICAL=紫底白字  DEBUG=暗灰" -ForegroundColor DarkGray
     # 显式 -Encoding UTF8：PS 5.1 默认按 ANSI(GBK) 解码无 BOM 的 UTF-8 日志，会导致中文乱码
-    Get-Content $TailTarget -Encoding UTF8 -Tail 20 -Wait
+    Get-Content $TailTarget -Encoding UTF8 -Tail 20 -Wait | ForEach-Object { Write-LogLine $_ }
 }

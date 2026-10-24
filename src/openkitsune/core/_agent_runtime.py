@@ -8380,7 +8380,10 @@ class Agent:
             if task:
                 self.agent_state.cancel_task(reason, session_id=_effective_sid)
             else:
-                logger.warning(
+                # 正常路径：删除空闲会话 / 会话处于准备阶段（task 尚未创建）时，
+                # 取消请求会存为 pending cancel 等待后续检查点消费，无副作用。
+                # 降为 debug，避免每次删除空闲会话都误报 WARNING。
+                logger.debug(
                     f"[StopTask] No task found for session {session_id}, storing as pending cancel"
                 )
                 self._pending_cancels[session_id] = reason
