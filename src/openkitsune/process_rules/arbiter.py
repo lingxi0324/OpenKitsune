@@ -19,9 +19,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from .checkpoints import trigger_checkpoint
 from .config import get_process_rules_config
 from .engine import audit_record, get_rule_engine
-from .checkpoints import trigger_checkpoint
 
 logger = logging.getLogger(__name__)
 

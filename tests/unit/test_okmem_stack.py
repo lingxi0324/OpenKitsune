@@ -77,7 +77,7 @@ def test_fusion_command_matches_stack_script(tmp_path: Path) -> None:
 
     assert command[0] == str(service_binary(config))
     assert command[1:5] == ["--root", str(tmp_path), "--port", "4019"]
-    assert command[5:7] == ["--data-dir", "data/fusion-memory"]
+    assert command[5:7] == ["--data-dir", "data/okmem"]
     assert command[7:] == ["serve", "--no-watch"]
 
 
@@ -133,7 +133,7 @@ def test_missing_binaries_degrade_instead_of_raising(
         raise AssertionError("Popen must not be called when files are missing")
 
     monkeypatch.setattr(okmem_stack.subprocess, "Popen", _fail)
-    supervisor = OkmemStackSupervisor(_config(tmp_path))
+    supervisor = OkmemStackSupervisor(_config(tmp_path, bus_autostart=True))
 
     status = supervisor.start()
 
@@ -150,7 +150,7 @@ def test_existing_services_are_reused(monkeypatch: pytest.MonkeyPatch, tmp_path:
         raise AssertionError("Popen must not be called when ports are already served")
 
     monkeypatch.setattr(okmem_stack.subprocess, "Popen", _fail)
-    supervisor = OkmemStackSupervisor(_config(tmp_path, health_timeout_s=0.1))
+    supervisor = OkmemStackSupervisor(_config(tmp_path, health_timeout_s=0.1, bus_autostart=True))
 
     status = supervisor.start()
 

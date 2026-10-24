@@ -16,13 +16,13 @@
 from __future__ import annotations
 
 import logging
+import queue
 import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 from typing import Any
 
-from . import audio
 from .config import get_tts_config
 from .tts import synthesize_text
 
@@ -259,6 +259,7 @@ class OpenAIStreamer(StreamingTTSProvider):
 
     def stream(self, text: str) -> Iterator[bytes]:
         from openai import OpenAI
+
         from .tts_providers import DEFAULT_OPENAI_BASE_URL
         api_key = (self.section.get("api_key")
                    or _resolve_key("OPENAI_API_KEY", "openai")
@@ -297,9 +298,12 @@ class GeminiStreamer(StreamingTTSProvider):
 
         import requests
 
-        from .tts_providers import (
-            DEFAULT_GEMINI_TTS_BASE_URL, DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_TTS_VOICE)
         from .config import get_env_value
+        from .tts_providers import (
+            DEFAULT_GEMINI_TTS_BASE_URL,
+            DEFAULT_GEMINI_TTS_MODEL,
+            DEFAULT_GEMINI_TTS_VOICE,
+        )
         api_key = (_resolve_key("GEMINI_API_KEY", "gemini") or _resolve_key("GOOGLE_API_KEY", "gemini"))
         model = str(self.section.get("model", DEFAULT_GEMINI_TTS_MODEL)).strip() or DEFAULT_GEMINI_TTS_MODEL
         voice = str(self.section.get("voice", DEFAULT_GEMINI_TTS_VOICE)).strip() or DEFAULT_GEMINI_TTS_VOICE
@@ -517,7 +521,6 @@ def stream_tts_to_speaker(
     streamer = resolve_streaming_provider(cfg, preferred=provider)
     if streamer is not None and not stop():
         logger.info("Streaming TTS via %s (%d Hz)", streamer.__class__.__name__, streamer.sample_rate)
-        import numpy as np
 
         chunks: list[bytes] = []
         rate = streamer.sample_rate

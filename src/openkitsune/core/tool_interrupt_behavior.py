@@ -122,8 +122,10 @@ _INTERRUPT_BEHAVIOR_MAP: dict[str, InterruptBehavior] = {
     "desktop_find_element": "cancel",
     "desktop_hotkey": "block",
     "desktop_inspect": "cancel",
+    "desktop_open": "block",
     "desktop_screenshot": "cancel",
     "desktop_scroll": "block",
+    "desktop_state": "cancel",
     "desktop_type": "block",
     "desktop_wait": "cancel",
     "desktop_window": "block",
@@ -193,6 +195,14 @@ _INTERRUPT_BEHAVIOR_MAP: dict[str, InterruptBehavior] = {
     "knowledge_list": "cancel",
     "knowledge_read": "cancel",
     "knowledge_search": "cancel",
+    # Write-side knowledge tools mutate the local knowledge base: block.
+    "knowledge_create": "block",
+    "knowledge_delete": "block",
+    "knowledge_edit": "block",
+    "knowledge_rename": "block",
+    # ── Library (read-only incremental study) ─────────────────────
+    "library_read_page": "cancel",
+    "library_study": "cancel",
     # ── Mode / persona / profile ────────────────────────────────
     "get_persona_profile": "cancel",
     "get_user_profile": "cancel",

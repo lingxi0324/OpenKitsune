@@ -31,9 +31,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable
 
 __all__ = [
     "TERM_STUFFING_RATIO",

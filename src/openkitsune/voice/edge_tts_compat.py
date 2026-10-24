@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Edge TTS 端点兼容层（迁移自 hermes-agent ``tools/edge_tts_compat.py``，2026-10-12 补丁）。
 
 背景：微软自 2026 年起对经典端点 speech.platform.bing.com 开始大面积返回

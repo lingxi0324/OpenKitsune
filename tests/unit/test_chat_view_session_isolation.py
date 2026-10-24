@@ -85,7 +85,7 @@ def test_hydration_drops_cross_conversation_local_cache():
     source = CHAT_HELPERS.read_text(encoding="utf-8")
 
     assert "function firstUserContent" in source
-    assert "function removeAdjacentDuplicateUserMessages" in source
+    assert "function removeAdjacentDuplicateMessages" in source
     assert "localFirstUser !== backendFirstUser" in source
     assert "return cleanBackend" in source
 

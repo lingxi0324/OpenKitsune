@@ -321,13 +321,13 @@ class AgentToolHandler:
         # R4 多 Agent 冲突裁决插桩（fail-open：只标注，不改返回结构）
         arbiter_note = ""
         try:
-            from openkitsune.process_rules.arbiter import AgentResult, arbitrate
             from openkitsune.config import settings as _arb_settings
+            from openkitsune.process_rules.arbiter import AgentResult, arbitrate
 
             _arb_mode = str(getattr(_arb_settings, "process_rules_arbiter_mode", "observe") or "observe")
             if _arb_mode != "off":
                 _arb_results: list[AgentResult] = []
-                for i, res in enumerate(raw_results):
+                for _i, res in enumerate(raw_results):
                     if isinstance(res, BaseException):
                         continue
                     _disp, _res_text = res
@@ -351,11 +351,11 @@ class AgentToolHandler:
                     )
                     # R4 + 自主决策：分差接近/核心结论时交 AI 判断采纳谁（fail-open）
                     try:
-                        from openkitsune.process_rules.autonomy import (
-                            decide as _arb_autonomy_decide,
-                        )
                         from openkitsune.process_rules.arbiter import (
                             deterministic_arbiter_decision,
+                        )
+                        from openkitsune.process_rules.autonomy import (
+                            decide as _arb_autonomy_decide,
                         )
 
                         _arb_det = deterministic_arbiter_decision(

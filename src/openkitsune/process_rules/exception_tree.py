@@ -160,7 +160,6 @@ def decide_retry(
     # decide_retry 读取 tracker 中已记录的失败（handle_failure 在调用前已 record 本次），
     # 因此这里不再 +1，避免退避序列错位：第 1 次失败 → 1s，第 2 次 → 3s，第 3 次 → 查共性。
     same_class = tracker.same_class_count(tool_name, error_class)
-    total_fails = tracker.total_fails(tool_name)
 
     # 共性成因：同类 ≥3 次 → 停止重试（最优先，任何类别都先查共性）
     if same_class >= cfg.common_cause_threshold:

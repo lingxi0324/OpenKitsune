@@ -1073,7 +1073,6 @@ class ToolExecutor:
             from openkitsune.process_rules.autonomy import decide as _autonomy_decide
             from openkitsune.process_rules.exception_tree import (
                 deterministic_retry_decision,
-                handle_failure,
             )
 
             det = deterministic_retry_decision(
@@ -1887,11 +1886,11 @@ class ToolExecutor:
             默认 None（允许执行）；enforce 模式下命中规则时返回提示文本。
         """
         try:
-            from openkitsune.process_rules.todo_policy import todo_policy_check
             from openkitsune.config import settings as _settings
+            from openkitsune.process_rules.todo_policy import todo_policy_check
 
             mode = str(getattr(_settings, "process_rules_todo_mode", "suggest") or "suggest")
-            return todo_policy_check(
+            result = todo_policy_check(
                 session_id=session_id,
                 tool_name=tool_name,
                 tool_input=tool_input or {},
@@ -1899,6 +1898,9 @@ class ToolExecutor:
                 tool_call_count=getattr(self, "_turn_tool_count", 0),
                 mode=mode,
             )
+            # suggest/off 是软引导：审计照记，但绝不阻断工具执行
+            # （todo 不是工具执行的门槛，见 docstring 历史教训）。
+            return result if mode == "enforce" else None
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[ProcessRules] todo gate degraded, allow: {e}")
             return None
@@ -1961,7 +1963,7 @@ class ToolExecutor:
                     f"⚠️ 该操作命中 Plan 风险信号（{risk}）："
                     "请先创建 Plan（create_plan_file + exit_plan_mode）获得批准后执行。"
                 )
-            return todo_policy_check(
+            todo_policy_check(
                 session_id=session_id,
                 tool_name=tool_name,
                 tool_input=tool_input or {},
@@ -1969,6 +1971,8 @@ class ToolExecutor:
                 tool_call_count=getattr(self, "_turn_tool_count", 0),
                 mode="suggest",
             )
+            # suggest 软引导仅审计，不阻断（与同步路径语义一致）。
+            return None
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[ProcessRules] autonomous todo gate degraded, allow: {e}")
             return None
@@ -2039,8 +2043,8 @@ class ToolExecutor:
         - ``process_rules_preflight_mode=enforce``：issues 非空时返回阻断提示。
         """
         try:
-            from openkitsune.process_rules.preflight import preflight_check
             from openkitsune.config import settings as _settings
+            from openkitsune.process_rules.preflight import preflight_check
 
             mode = str(
                 getattr(_settings, "process_rules_preflight_mode", "observe") or "observe"

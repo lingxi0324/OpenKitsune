@@ -128,11 +128,13 @@ def test_desktop_tools_registered_in_base_tools():
 
     names = [t["name"] for t in BASE_TOOLS]
     desktop = [n for n in names if n.startswith("desktop_")]
-    assert len(desktop) == 14
+    assert len(desktop) == 16
     assert len(set(desktop)) == len(desktop), "desktop tools must be unique in BASE_TOOLS"
 
     for tool in (
         "desktop_screenshot",
+        "desktop_state",
+        "desktop_open",
         "desktop_find_element",
         "desktop_click",
         "desktop_mouse",

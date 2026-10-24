@@ -108,7 +108,7 @@ class ProcessRulesConfig:
     plan_guard_stale_seconds: int = 900
 
     @classmethod
-    def from_settings(cls, settings: object) -> "ProcessRulesConfig":
+    def from_settings(cls, settings: object) -> ProcessRulesConfig:
         """从 openkitsune.config.settings 读取覆盖项；字段缺失时用默认值。
 
         settings 通过 ``process_rules_<field>`` 属性暴露；为避免在核心

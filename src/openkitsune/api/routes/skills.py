@@ -25,6 +25,7 @@ import logging
 import re
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -37,6 +38,9 @@ from openkitsune.skills.marketplace import (
     installed_marketplace_resource_id,
     normalize_skillhub_response,
 )
+
+if TYPE_CHECKING:
+    from openkitsune.skills.loader import SkillLoader
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +64,7 @@ _skills_cache_revision = 0
 # 避免每个请求各自新建 SkillLoader 重复扫描工作区技能目录。
 # 技能变更（install/uninstall/reload/content-update/allowlist-change）时由
 # _invalidate_skills_cache 统一失效，下次请求惰性重建一次。
-_tmp_content_loader: "SkillLoader | None" = None
+_tmp_content_loader: SkillLoader | None = None
 _tmp_content_loader_path: Path | None = None
 _tmp_content_loader_lock = threading.Lock()
 

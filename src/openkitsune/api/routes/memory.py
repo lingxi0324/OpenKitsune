@@ -16,9 +16,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from openkitsune.memory.name_normalize import is_user_subject
 from openkitsune.memory.retention import apply_retention
 from openkitsune.memory.session_identity import DESKTOP_USER_ID
-from openkitsune.memory.name_normalize import is_user_subject
 from openkitsune.memory.types import MemoryPriority, MemoryType, SemanticMemory
 
 logger = logging.getLogger(__name__)

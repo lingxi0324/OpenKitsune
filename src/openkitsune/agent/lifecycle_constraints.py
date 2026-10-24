@@ -23,9 +23,9 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, StrEnum
-from typing import Callable
 
 from openkitsune.agent.state import (
     ReasoningPhase,
@@ -125,10 +125,10 @@ def is_valid(lifecycle: TaskLifecycleState, phase: ReasoningPhase) -> bool:
 def valid_codes() -> list[StateCode]:
     """合法态全集：10 × 8 = 80 组合中恰好 40 个合法，无重复。"""
     return [
-        StateCode(l, p)
-        for l in TaskLifecycleState
+        StateCode(st, p)
+        for st in TaskLifecycleState
         for p in ReasoningPhase
-        if StateCode(l, p).parity_consistent
+        if StateCode(st, p).parity_consistent
     ]
 
 
@@ -353,10 +353,10 @@ class GateCode:
 def gate_valid_codes() -> list[GateCode]:
     """规范完备口径：10×12=120 组合中恰 60 个合法态，无重复。"""
     return [
-        GateCode(l, g)
-        for l in TaskLifecycleState
+        GateCode(st, g)
+        for st in TaskLifecycleState
         for g in GATE_ORDER
-        if GateCode(l, g).parity_consistent
+        if GateCode(st, g).parity_consistent
     ]
 
 

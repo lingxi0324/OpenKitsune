@@ -36,8 +36,8 @@ import asyncio
 import json
 import logging
 import re
-import threading
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from .config import get_process_rules_config
 from .engine import audit_record, get_rule_engine

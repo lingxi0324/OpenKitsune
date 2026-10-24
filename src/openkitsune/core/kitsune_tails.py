@@ -21,10 +21,11 @@ import json
 import logging
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -754,12 +755,16 @@ class ReviewTail:
         mode = verdict.get("mode", "")
         tails = verdict.get("tails", {})
 
-        intent_ok = 0.85 if risk_level in ("low", "medium") else 0.6
-        nine_tail_coverage = round(sum(1 for v in tails.values() if v.get("ok")) / max(len(tails), 1), 3)
-        emotion_ok = 0.9 if emotion.get("confidence", 0) > 0.3 else 0.7
-        plan_ok = 0.85 if reply.strip() else 0.5
-        persona_ok = 0.9  # 确定性：心判注入后模式一致
-        satisfaction = 0.8 if reply.strip() else 0.4
+        six_questions = {
+            "intent_ok": 0.85 if risk_level in ("low", "medium") else 0.6,
+            "nine_tail_coverage": round(
+                sum(1 for v in tails.values() if v.get("ok")) / max(len(tails), 1), 3
+            ),
+            "emotion_ok": 0.9 if emotion.get("confidence", 0) > 0.3 else 0.7,
+            "plan_ok": 0.85 if reply.strip() else 0.5,
+            "persona_ok": 0.9,  # 确定性：心判注入后模式一致
+            "satisfaction": 0.8 if reply.strip() else 0.4,
+        }
 
         improvement_bits: list[str] = []
         guidance = (verdict.get("ethics") or {}).get("guidance", "")
@@ -777,7 +782,7 @@ class ReviewTail:
             "task_id": f"kitsune-{(session_id or 'anon')[:24]}-{int(datetime.now().timestamp() * 1000)}",
             "session_id": session_id,
             "description": (message or "")[:200],
-            "six_questions": {k: locals().get(k, 0.0) for k in _REVIEW_KEYS},
+            "six_questions": six_questions,
             "improvement": improvement,
             "mode": mode,
             "timestamp": _iso_now(),
@@ -854,7 +859,7 @@ class ReviewTail:
                 else:
                     section, rest = tail, ""
                 bullets = [
-                    l for l in section.splitlines() if l.startswith("- [")
+                    line_it for line_it in section.splitlines() if line_it.startswith("- [")
                 ]
                 bullets.append(line)
                 bullets = bullets[-50:]
@@ -872,9 +877,9 @@ class ReviewTail:
                 return []
             lines = self._notes_file.read_text(encoding="utf-8").splitlines()
             out = []
-            for l in lines[-n:]:
-                if l.startswith("- [") and "：" in l:
-                    out.append({"source": "evolution_notes", "text": l[2:]})
+            for ln in lines[-n:]:
+                if ln.startswith("- [") and "：" in ln:
+                    out.append({"source": "evolution_notes", "text": ln[2:]})
             return out
         except Exception as e:  # noqa: BLE001
             logger.debug("[复盘尾] adaptive_optimization failed: %s", e)

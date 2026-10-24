@@ -25,7 +25,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .config import BUILTIN_TTS_PROVIDERS
 
@@ -36,9 +36,9 @@ DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH = 5000
 
 
 # ---- 占位符渲染 ----
-def shell_quote_context(command_template: str, position: int) -> Optional[str]:
+def shell_quote_context(command_template: str, position: int) -> str | None:
     """返回 *position* 前生效的 shell 引号字符（'/"）或 None。"""
-    quote: Optional[str] = None
+    quote: str | None = None
     escaped = False
     i = 0
     while i < position:
@@ -61,7 +61,7 @@ def shell_quote_context(command_template: str, position: int) -> Optional[str]:
     return quote
 
 
-def quote_command_placeholder(value: str, quote_context: Optional[str]) -> str:
+def quote_command_placeholder(value: str, quote_context: str | None) -> str:
     """按模板中的引号上下文转义占位符值。"""
     if quote_context == "'":
         return value.replace("'", r"'\''")
@@ -137,7 +137,7 @@ def run_command_provider(command: str, timeout: float) -> subprocess.CompletedPr
     proc = subprocess.Popen(
         command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, **kwargs)
-    output_queue: queue.Queue[tuple[str, Optional[str]]] = queue.Queue()
+    output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
     chunks: dict[str, list[str]] = {"stdout": [], "stderr": []}
     open_streams = {"stdout", "stderr"}
 
@@ -219,7 +219,7 @@ def is_command_provider_config(config: dict[str, Any]) -> bool:
     return ptype in ("", "command") and isinstance(command, str) and bool(command.strip())
 
 
-def resolve_command_provider_config(provider: str, tts_config: dict[str, Any]) -> Optional[dict[str, Any]]:
+def resolve_command_provider_config(provider: str, tts_config: dict[str, Any]) -> dict[str, Any] | None:
     """解析命令型 provider 配置；内置名/未知/非命令返回 None。"""
     key = (provider or "").lower().strip()
     if not key or key in BUILTIN_TTS_PROVIDERS:
@@ -245,7 +245,7 @@ def command_tts_timeout(config: dict[str, Any]) -> float:
     return value if value > 0 else float(DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS)
 
 
-def command_tts_output_format(config: dict[str, Any], output_path: Optional[str] = None) -> str:
+def command_tts_output_format(config: dict[str, Any], output_path: str | None = None) -> str:
     """输出格式：输出路径后缀 > ``format``/``output_format`` > mp3。"""
     suffix = Path(output_path).suffix.lower().strip().lstrip(".") if output_path else ""
     if suffix in COMMAND_TTS_OUTPUT_FORMATS:

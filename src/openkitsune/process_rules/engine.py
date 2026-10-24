@@ -107,9 +107,8 @@ class RuleEngine:
                 return
             path = Path(audit_dir) / "process_rules.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
-            with self._lock:
-                with path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            with self._lock, path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception:
             pass
 

@@ -73,7 +73,10 @@ def resolve_max_text_length(provider: str | None, tts_config: dict[str, Any] | N
     if override:
         return override
     try:
-        from .tts_command import DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH, resolve_command_provider_config
+        from .tts_command import (
+            DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH,
+            resolve_command_provider_config,
+        )
         if resolve_command_provider_config(key, cfg) is not None:
             return DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH
     except Exception:

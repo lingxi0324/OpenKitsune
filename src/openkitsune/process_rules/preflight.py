@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from .config import get_process_rules_config
@@ -103,7 +103,7 @@ class PreflightTracker:
 def _params_shape(params: dict | None) -> str:
     if not params:
         return ""
-    return ",".join(sorted(str(k) for k in params.keys()))
+    return ",".join(sorted(str(k) for k in params))
 
 
 _TRACKERS: dict[str, PreflightTracker] = {}

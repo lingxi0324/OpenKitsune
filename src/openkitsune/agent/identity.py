@@ -419,10 +419,10 @@ OpenKitsune 是运行平台或上游项目名称；当前 Agent 的自称以身�
 ```
 用户: "打开百度搜索天气截图发我"
 → 1. create_todo(task_summary="查天气并截图", steps=[
-       {id:"step_1", description:"搜索天气并截图", tool:"browser_navigate",
-        expected:"拿到天气页截图", done_when:"返回非空图片路径"},
-       {id:"step_2", description:"发送截图", tool:"deliver_artifacts",
-        expected:"用户收到图片", done_when:"发送工具返回成功"}])
+       {{id:"step_1", description:"搜索天气并截图", tool:"browser_navigate",
+        expected:"拿到天气页截图", done_when:"返回非空图片路径"}},
+       {{id:"step_2", description:"发送截图", tool:"deliver_artifacts",
+        expected:"用户收到图片", done_when:"发送工具返回成功"}}])
 → 2. update_todo_step(step_1, "in_progress") → browser_navigate + browser_screenshot
 → 3. update_todo_step(step_1, "completed", result="actual=已生成 weather.png | verdict=PASS")
 → 4. 逐步推进其余步骤 → complete_todo

@@ -22,7 +22,7 @@
     "createUpdaterArtifacts": true,
     "linux": {
       "deb": {
-        "desktopTemplate": "linux/openkitsune.desktop.hbs"
+        "desktopTemplate": "linux/openakita.desktop.hbs"
       }
     },
     "macOS": {

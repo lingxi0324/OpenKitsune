@@ -14,8 +14,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from .consolidator import MemoryConsolidator
-from .name_normalize import normalize_names
 from .extractor import MemoryExtractor
+from .name_normalize import normalize_names
 from .types import MEMORY_MD_MAX_CHARS, Memory, MemoryPriority, MemoryType, truncate_memory_md
 
 logger = logging.getLogger(__name__)

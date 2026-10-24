@@ -21,7 +21,8 @@ process_rules —— 流程规则引擎（整改版 v2.0 代码落地 + 自主�
 
 from . import plan_guard
 from .arbiter import AgentResult, arbitrate, deterministic_arbiter_decision
-from .autonomy import decide, decide_async_or_sync, get_tracker as get_autonomy_tracker
+from .autonomy import decide, decide_async_or_sync
+from .autonomy import get_tracker as get_autonomy_tracker
 from .checkpoints import (
     CheckpointTracker,
     detect_deviation,
@@ -72,8 +73,10 @@ from .preflight import (
     PreflightTracker,
     classify_preflight,
     deterministic_preflight_decision,
-    get_tracker as get_preflight_tracker,
     preflight_check,
+)
+from .preflight import (
+    get_tracker as get_preflight_tracker,
 )
 from .todo_policy import (
     detect_risk_signal,

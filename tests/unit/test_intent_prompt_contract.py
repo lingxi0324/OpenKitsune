@@ -545,7 +545,7 @@ def test_main_chat_stable_mode_keeps_small_direct_toolset_across_intents():
 def test_stable_main_chat_core_has_bounded_tools_in_fixed_order():
     from openkitsune.tools.defer_config import STABLE_MAIN_CHAT_CORE_TOOLS
 
-    assert 8 <= len(STABLE_MAIN_CHAT_CORE_TOOLS) <= 18
+    assert 8 <= len(STABLE_MAIN_CHAT_CORE_TOOLS) <= 19
     assert STABLE_MAIN_CHAT_CORE_TOOLS == (
         "run_shell",
         "read_file",
@@ -564,6 +564,8 @@ def test_stable_main_chat_core_has_bounded_tools_in_fixed_order():
         "knowledge_list",
         "knowledge_search",
         "knowledge_read",
+        "library_read_page",
+        "library_study",
     )
 
 
