@@ -86,6 +86,16 @@ def main() -> None:
     release = TAURI_DIR / "target" / args.target / "release"
     packages = args.packages or sorted((release / "bundle/deb").glob("*.deb"))
     if not packages:
+        # 诊断：找不到 deb 时把可能的输出位置打出来，便于 CI 日志定位
+        # （tauri 2.x 的 bundle 目录、target 目录是否存在）。
+        print(f"DEBUG: expected deb dir: {release / 'bundle' / 'deb'}")
+        print(f"DEBUG: release dir exists: {(release).is_dir()}")
+        print(f"DEBUG: bundle dir exists: {(release / 'bundle').is_dir()}")
+        bundle_dir = release / "bundle"
+        if bundle_dir.is_dir():
+            for entry in sorted(bundle_dir.rglob("*")):
+                if entry.is_file():
+                    print(f"DEBUG: bundle file: {entry.relative_to(bundle_dir)}")
         parser.error(f"No DEB packages found under {release / 'bundle/deb'}")
     for package in packages:
         verify_deb(package.resolve())

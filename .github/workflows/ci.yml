@@ -293,7 +293,18 @@ jobs:
 
       - name: Run all tests
         if: ${{ hashFiles('tests/**') != '' }}
-        run: pytest tests/ -v --cov=src/openkitsune --cov-report=xml -k "not TestVectorStore"
+        shell: bash
+        # Coverage is only uploaded from ubuntu-3.11, so only that matrix cell
+        # enables --cov. On Windows/macOS it adds no value and its tracer
+        # interacts with pytest-asyncio's per-test loop teardown (observed as
+        # "Event loop is closed" on windows runners); plain pytest keeps those
+        # matrix cells in the same state as a local dev run.
+        run: |
+          COV_ARGS=""
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ] && [ "${{ matrix.python-version }}" = "3.11" ]; then
+            COV_ARGS="--cov=src/openkitsune --cov-report=xml"
+          fi
+          pytest tests/ -v $COV_ARGS -k "not TestVectorStore"
 
       - name: Skip tests (no tests directory)
         if: ${{ hashFiles('tests/**') == '' }}

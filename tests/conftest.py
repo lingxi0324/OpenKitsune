@@ -9,6 +9,8 @@ import platform
 import sys
 from pathlib import Path
 
+import asyncio
+
 # ---------------------------------------------------------------------------
 # Workaround: On Windows, platform._wmi_query() can hang when the WMI
 # service is slow/unresponsive (e.g. after a crash).  Faker triggers this
@@ -287,3 +289,25 @@ def _name_normalize_idempotent_terms():
     except Exception:
         pass
     yield
+
+
+# ---------------------------------------------------------------------------
+# Windows + pytest-asyncio 1.x：防止已关闭事件循环泄漏到后续同步测试
+#
+# pytest-asyncio 1.x 为每个 async 测试创建并关闭自己的 loop。在 Windows
+# ProactorEventLoop 与较新 CPython（3.11.10+/3.12/3.13）的严格检查下，
+# 若 teardown 后 set_event_loop 仍指向已关闭的 loop，后续同步测试调用
+# asyncio.get_event_loop() 会拿到 closed loop 并在其上操作时抛
+# "Event loop is closed"。这里在每个测试结束后兜底清空已关闭的 loop，
+# 保证下一个测试拿到的是干净事件循环。
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _clear_closed_event_loop():
+    """每个测试结束后，若当前事件循环已关闭则清空 set_event_loop。"""
+    yield
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            asyncio.set_event_loop(None)
+    except RuntimeError:
+        pass
