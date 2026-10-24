@@ -32,6 +32,14 @@ from ..sessions import Session, SessionManager
 from ..utils.errors import format_user_friendly_error as format_user_friendly_error  # re-export
 from .base import ChannelAdapter, ChannelDeliveryUnavailable
 from .dead_targets import DeadTargetRegistry, classify_dead_error
+from .delivery import (
+    DeliveryState,
+    SendErrorKind,
+    classify_delivery_error,
+    classify_send_result,
+    is_delivery_ok,
+    should_retry_send,
+)
 from .group_response import GroupResponseMode, SmartModeThrottle
 from .inbound_guard import InboundGuard
 from .types import MediaStatus, MessageContent, OutgoingMessage, UnifiedMessage
@@ -941,6 +949,9 @@ class MessageGateway:
 
         # 注册的适配器 {channel_name: adapter}
         self._adapters: dict[str, ChannelAdapter] = {}
+
+        # 投递结果计数 {channel: {delivered/accepted/skipped/failed: n}}
+        self._delivery_stats: dict[str, dict[str, int]] = {}
 
         # 消息处理队列
         self._message_queue: asyncio.Queue[UnifiedMessage] = asyncio.Queue()
@@ -6055,6 +6066,8 @@ class MessageGateway:
                 original.channel,
                 original.chat_id,
             )
+            bucket = self._delivery_stats.setdefault(original.channel, {})
+            bucket[DeliveryState.SKIPPED.value] = bucket.get(DeliveryState.SKIPPED.value, 0) + 1
             return False
 
         # 解析文本中的媒体引用
@@ -6117,6 +6130,7 @@ class MessageGateway:
                     base_delay=1.0,
                     operation_name=f"send_response[{i + 1}/{len(messages)}]",
                 )
+                self._record_delivery_result(original.channel, send_result)
                 if not self._is_im_send_delivered(send_result):
                     logger.warning(
                         f"Response part {i + 1}/{len(messages)} was not immediately delivered "
@@ -6167,6 +6181,7 @@ class MessageGateway:
             )
             try:
                 plain_result = await adapter.send_message(plain_out)
+                self._record_delivery_result(original.channel, plain_result)
                 if not self._is_im_send_delivered(plain_result):
                     raise RuntimeError("adapter did not confirm immediate delivery")
             except ChannelDeliveryUnavailable as exc:
@@ -6292,35 +6307,61 @@ class MessageGateway:
                             metadata=outgoing_meta,
                         )
 
-        all_files: list[tuple[Any, str]] = [
-            *((item, "file") for item in media_result.files),
-            *((item, "video") for item in media_result.videos),
-        ]
+        async def deliver_path(path: str, sender: Callable[..., Any], *, label: str) -> bool:
+            """Send one resolved path; return False only when the method is unimplemented."""
+            try:
+                await sender(original.chat_id, path, **reply_kwargs(sender))
+                return True
+            except NotImplementedError:
+                return False
+            except Exception as e:
+                logger.warning(f"[SendResponse] {label} failed: {e}")
+                with contextlib.suppress(Exception):
+                    fname = Path(path).name or "file"
+                    await adapter.send_text(
+                        original.chat_id,
+                        f"📎 {fname}",
+                        reply_to=reply_to,
+                        metadata=outgoing_meta,
+                    )
+                return True
+
+        unsupported: list[Any] = []
+
         if adapter.has_capability("send_file"):
-            for file, media_type in all_files:
+            for file in media_result.files:
                 file_path = await self._resolve_extracted_media_path(
-                    file, media_type, adapter, original, reply_to, outgoing_meta
+                    file, "file", adapter, original, reply_to, outgoing_meta
                 )
                 if not file_path:
                     continue
-                try:
-                    await adapter.send_file(
-                        original.chat_id,
-                        file_path,
-                        **reply_kwargs(adapter.send_file),
-                    )
-                except Exception as e:
-                    logger.warning(f"[SendResponse] send extracted file failed: {e}")
-                    with contextlib.suppress(Exception):
-                        fname = Path(file_path).name or "file"
-                        await adapter.send_text(
-                            original.chat_id,
-                            f"📎 {fname}",
-                            reply_to=reply_to,
-                            metadata=outgoing_meta,
-                        )
-        elif all_files:
-            names = [Path(file.path).name or "file" for file, _ in all_files if not file.is_url]
+                if not await deliver_path(
+                    file_path, adapter.send_file, label="send extracted file"
+                ):
+                    unsupported.append(file)
+        else:
+            unsupported.extend(media_result.files)
+
+        for video in media_result.videos:
+            video_path = await self._resolve_extracted_media_path(
+                video, "video", adapter, original, reply_to, outgoing_meta
+            )
+            if not video_path:
+                continue
+            sent = False
+            if adapter.has_capability("send_video"):
+                sent = await deliver_path(
+                    video_path, adapter.send_video, label="send extracted video"
+                )
+            if not sent and adapter.has_capability("send_file"):
+                sent = await deliver_path(
+                    video_path, adapter.send_file, label="send extracted video as file"
+                )
+            if not sent:
+                unsupported.append(video)
+
+        if unsupported:
+            names = [Path(item.path).name or "file" for item in unsupported if not item.is_url]
             if names:
                 with contextlib.suppress(Exception):
                     await adapter.send_text(
@@ -6484,16 +6525,27 @@ class MessageGateway:
 
     @staticmethod
     def _is_im_send_delivered(result: object) -> bool:
-        """Return True only when an adapter reports an immediate delivery.
+        """Return True when the adapter confirms or accepts the message.
 
-        QQ official group bots return an empty string when a proactive message is
-        queued for the next user interaction. That queue is useful, but it is not
-        an immediate notification and should not make scheduler delivery look
-        successful.
+        Adapter return values are normalized by :mod:`openkitsune.channels.delivery`.
+        Empty strings, DingTalk ``circuit_open_*`` and WeCom ``skipped:*`` sentinels
+        mean the message was not delivered; ``queued:*`` / ``stream:*`` mean it was
+        accepted by the platform and still count as success for reply paths.
         """
-        if isinstance(result, str):
-            return bool(result)
-        return result is not None
+        return is_delivery_ok(result)
+
+    def _record_delivery_result(self, channel: str, result: object) -> None:
+        """Bump the per-channel delivery counter from an adapter return value."""
+        state = classify_send_result(result).state.value
+        bucket = self._delivery_stats.setdefault(channel, {})
+        bucket[state] = bucket.get(state, 0) + 1
+
+    def _record_delivery_error(self, channel: str, error: BaseException) -> None:
+        bucket = self._delivery_stats.setdefault(channel, {})
+        bucket[DeliveryState.FAILED.value] = bucket.get(DeliveryState.FAILED.value, 0) + 1
+        bucket["errors"] = bucket.get("errors", 0) + 1
+        kind = classify_delivery_error(error).value
+        bucket[f"error_{kind}"] = bucket.get(f"error_{kind}", 0) + 1
 
     def _record_delivery_failure(
         self,
@@ -6501,9 +6553,16 @@ class MessageGateway:
         error: BaseException,
     ) -> None:
         """把明确的永久性投递失败登记为死目标（瞬时错误忽略）。"""
+        self._record_delivery_error(original.channel, error)
         if isinstance(error, ChannelDeliveryUnavailable) and error.retryable:
             return
-        reason = classify_dead_error(getattr(error, "reason", "") or error)
+        kind = classify_delivery_error(error)
+        reason: str | None = None
+        if kind in (SendErrorKind.FORBIDDEN, SendErrorKind.NOT_FOUND):
+            reason = str(getattr(error, "reason", "") or error)[:200]
+        else:
+            # 平台错误文案仍在变化，保留旧的文本标记匹配作为兜底。
+            reason = classify_dead_error(getattr(error, "reason", "") or error)
         if reason:
             self._dead_targets.mark_dead(original.channel, original.chat_id, reason)
 
@@ -6604,7 +6663,27 @@ class MessageGateway:
             _meta.setdefault("_interim", True)
             kwargs["metadata"] = _meta
 
-            result = await adapter.send_text(chat_id, text, **kwargs)
+            from .retry import async_with_retry
+
+            result = await async_with_retry(
+                adapter.send_text,
+                chat_id,
+                text,
+                max_retries=2,
+                base_delay=0.5,
+                should_retry=should_retry_send,
+                operation_name=f"gateway.send[{channel}]",
+                **kwargs,
+            )
+            self._record_delivery_result(channel, result)
+            if not is_delivery_ok(result):
+                logger.warning(
+                    "[Gateway] send() not confirmed: channel=%s chat_id=%s result=%r",
+                    channel,
+                    chat_id,
+                    result,
+                )
+                return None
 
             # 记录到 session 历史
             if record_to_session and self.session_manager:
@@ -7159,8 +7238,9 @@ class MessageGateway:
                 continue
 
             try:
-                await self.send_to_session(session, text)
-                results[session.channel] = results.get(session.channel, 0) + 1
+                sent = await self.send_to_session(session, text)
+                if sent is not None:
+                    results[session.channel] = results.get(session.channel, 0) + 1
             except Exception as e:
                 logger.error(f"Broadcast error to {session.id}: {e}")
 
@@ -7194,9 +7274,25 @@ class MessageGateway:
 
     def get_stats(self) -> dict:
         """获取网关统计"""
+        capabilities: dict[str, dict[str, bool]] = {}
+        for name, adapter in self._adapters.items():
+            report = getattr(adapter, "capability_report", None)
+            if not callable(report):
+                continue
+            try:
+                data = report()
+            except Exception as exc:  # noqa: BLE001 -- stats must never break the gateway
+                logger.debug("[Gateway] capability_report failed for %s: %s", name, exc)
+                continue
+            if isinstance(data, dict) and isinstance(data.get("capabilities"), dict):
+                capabilities[name] = data["capabilities"]
         return {
             "running": self._running,
             "adapters": {name: adapter.is_running for name, adapter in self._adapters.items()},
+            "capabilities": capabilities,
+            "delivery": {
+                name: dict(bucket) for name, bucket in self._delivery_stats.items()
+            },
             "queue_size": self._message_queue.qsize(),
             "sessions": self.session_manager.get_session_count(),
         }

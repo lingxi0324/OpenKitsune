@@ -87,13 +87,23 @@ function Start-Services {
     Write-Host "  [..] 委派 start.ps1 启动（serve + 90s 健康门控 + 开浏览器）..." -ForegroundColor Cyan
     # 注意：不要把 -ShowLog 透传给 start.ps1。
     # start.ps1 带 -ShowLog 时会在末尾 Get-Content -Wait 死循环跟日志、永不退出，
-    # 导致本函数 & powershell.exe @args 同步阻塞，父窗口永远卡在"委派..."这一行，
+    # 导致本函数等待子进程时父窗口永远卡在"委派..."这一行，
     # 入口处的 Show-Log 也永远走不到。日志跟随统一由本脚本入口的 Show-Log 负责。
-    $args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $StartScript)
-    if ($NoBrowser) { $args += "-NoBrowser" }
-    & powershell.exe @args
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  [FAIL] start.ps1 返回码 $LASTEXITCODE" -ForegroundColor Red
+    #
+    # 用 Start-Process -Wait -NoNewWindow 而不是 & powershell.exe @args：
+    # & 会把子进程 stdout 捕获进 PowerShell 输出流，等子进程退出后一次性 flush；
+    # 从 launcher（C# Process.Start）拉起的 powershell 控制台句柄状态特殊，
+    # 这次 flush 经常丢屏，表现为窗口停在"委派..."一行、后续 [OK] 与日志全不显示。
+    # Start-Process -NoNewWindow 让子进程直接继承父控制台、输出实时写屏。
+    $childArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$StartScript`"")
+    if ($NoBrowser) { $childArgs += "-NoBrowser" }
+    $childProc = Start-Process -FilePath "powershell.exe" `
+        -ArgumentList $childArgs `
+        -WorkingDirectory $ProjectRoot `
+        -Wait -NoNewWindow -PassThru
+    $childExit = $childProc.ExitCode
+    if ($childExit -ne 0) {
+        Write-Host "  [FAIL] start.ps1 返回码 $childExit" -ForegroundColor Red
         exit 1
     }
     $info = Get-ServeInfo

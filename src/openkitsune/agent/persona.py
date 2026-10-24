@@ -436,7 +436,7 @@ class PersonaManager:
         adaptations = []
 
         if ctx["time_period"] == "night":
-            adaptations.append("当前是深夜时段，语气应更温柔安静，回复简洁")
+            adaptations.append("当前是深夜时段，语气应更温柔安静")
         elif ctx["time_period"] == "morning":
             adaptations.append("当前是早晨，语气可以活泼一些")
 

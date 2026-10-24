@@ -9,6 +9,7 @@
 """
 
 from .base import ChannelAdapter, ChannelDeliveryUnavailable
+from .delivery import DeliveryState, SendErrorKind, SendResult
 from .gateway import MessageGateway
 from .types import (
     MediaFile,
@@ -28,6 +29,10 @@ __all__ = [
     # 适配器
     "ChannelAdapter",
     "ChannelDeliveryUnavailable",
+    # 投递结果
+    "DeliveryState",
+    "SendErrorKind",
+    "SendResult",
     # 网关
     "MessageGateway",
 ]

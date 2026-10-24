@@ -533,6 +533,7 @@ class WeChatAdapter(ChannelAdapter):
         "send_file": True,
         "send_voice": True,
         "send_video": True,
+        "typing": True,
         "delete_message": False,
         "edit_message": False,
         "get_chat_info": False,
@@ -1213,6 +1214,24 @@ class WeChatAdapter(ChannelAdapter):
         if not plain:
             return ""
         return await self._send_text(chat_id, plain, ctx_token)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        **kwargs,
+    ) -> str:
+        """发送视频（复用 send_message 的 CDN 媒体链路）。"""
+        message = OutgoingMessage.with_video(
+            chat_id,
+            video_path,
+            caption,
+            reply_to=reply_to,
+            metadata=kwargs.get("metadata") or {},
+        )
+        return await self.send_message(message)
 
     def _resolve_context_token(
         self,

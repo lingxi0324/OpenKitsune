@@ -284,6 +284,32 @@ class ScreenCapture:
         # 使用高质量缩放
         return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
+    def resize_for_analysis(
+        self,
+        img: Image.Image,
+        max_width: int | None = None,
+        max_height: int | None = None,
+    ) -> Image.Image:
+        """把截图缩放到固定的分析尺寸（只缩不放）。
+
+        视觉模型对大图容易读不清细节、推理也慢；统一缩到
+        config.analysis_max_width × analysis_max_height 以内，
+        让 OCR / 画面理解在稳定尺寸下工作。原始截图仍按原尺寸保存。
+        """
+        config = get_config().capture
+        max_w = max_width or config.analysis_max_width
+        max_h = max_height or config.analysis_max_height
+
+        if max_w <= 0 or max_h <= 0:
+            return img
+        if img.width <= max_w and img.height <= max_h:
+            return img
+
+        ratio = min(max_w / img.width, max_h / img.height)
+        new_width = max(1, int(img.width * ratio))
+        new_height = max(1, int(img.height * ratio))
+        return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
     def to_base64(
         self,
         img: Image.Image,

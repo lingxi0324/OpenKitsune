@@ -126,6 +126,41 @@ class TestAgentProfileScopedHistory:
         assert ctx.add_message("user", "done") is True
         assert [m["agent_profile_id"] for m in ctx.messages] == ["english", "politics"]
 
+    def test_profileless_turn_is_deduped_against_tagged_history(self):
+        """回填回归：SQLite turn 未携带 agent_profile_id 时，
+        必须能与已盖章（agent_profile_id="default"）的同内容消息去重，
+        否则崩溃恢复会把同一轮重复 append 进会话历史。"""
+        existing = [
+            {
+                "role": "user",
+                "content": "你好",
+                "timestamp": "2026-10-24T12:28:57.033135",
+                "agent_profile_id": "default",
+            },
+            {
+                "role": "assistant",
+                "content": "回复",
+                "timestamp": "2026-10-24T12:29:54.953969",
+                "agent_profile_id": "default",
+            },
+        ]
+        user_turn = {
+            "role": "user",
+            "content": "你好",
+            "timestamp": "2026-10-24T12:28:57.033135",
+            "tool_calls": None,
+            "tool_results": None,
+        }
+        assistant_turn = {
+            "role": "assistant",
+            "content": "回复",
+            "timestamp": "2026-10-24T12:29:54.953969",
+            "tool_calls": None,
+            "tool_results": None,
+        }
+        assert is_duplicate_message(existing, user_turn) is True
+        assert is_duplicate_message(existing, assistant_turn) is True
+
     def test_filter_messages_for_agent_excludes_other_profile_turns(self):
         ctx = SessionContext(agent_profile_id="english")
         ctx.add_message("user", "English homework")

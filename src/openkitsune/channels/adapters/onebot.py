@@ -79,6 +79,7 @@ class OneBotAdapter(ChannelAdapter):
         "send_image": True,
         "send_file": True,
         "send_voice": True,
+        "typing": True,
         "delete_message": True,
         "edit_message": False,
         "get_chat_info": False,

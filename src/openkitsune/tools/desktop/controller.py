@@ -8,7 +8,7 @@ import asyncio
 import logging
 import sys
 import time
-from typing import Callable
+from collections.abc import Callable
 
 from PIL import Image
 
@@ -1059,13 +1059,15 @@ class DesktopController:
         self,
         action: str | WindowAction,
         title: str | None = None,
+        handle: int | None = None,
     ) -> ActionResult:
         """
         窗口操作
 
         Args:
             action: 操作类型
-            title: 窗口标题
+            title: 窗口标题（模糊匹配）
+            handle: 窗口句柄（优先于 title，适合重名窗口）
 
         Returns:
             ActionResult
@@ -1082,21 +1084,25 @@ class DesktopController:
                 duration_ms=(time.time() - start_time) * 1000,
             )
 
-        # 其他操作需要窗口标题
-        if not title:
+        # 其他操作需要窗口标题或句柄
+        if not title and not handle:
             return ActionResult(
                 success=False,
                 action=action.value,
-                error="Window title required",
+                error="Window title or handle required",
             )
 
-        window = self.uia.find_window_fuzzy(title, timeout=3.0)
+        target = title or f"handle:{handle}"
+        if handle:
+            window = self.uia.find_window(handle=int(handle), timeout=3.0)
+        else:
+            window = self.uia.find_window_fuzzy(title or "", timeout=3.0)
         if not window:
             return ActionResult(
                 success=False,
                 action=action.value,
-                target=title,
-                error=f"Window not found: {title}",
+                target=target,
+                error=f"Window not found: {target}",
                 duration_ms=(time.time() - start_time) * 1000,
             )
 
@@ -1115,7 +1121,7 @@ class DesktopController:
         return ActionResult(
             success=success,
             action=action.value,
-            target=title,
+            target=target,
             message=f"{action.value} window: {window.name}" if success else "",
             error="" if success else f"Failed to {action.value} window",
             duration_ms=(time.time() - start_time) * 1000,
@@ -1285,11 +1291,12 @@ class DesktopController:
             分析结果
         """
         img = self.screenshot(window_title=window_title)
+        analysis_img = self.capture.resize_for_analysis(img)
 
         if query:
-            result = await self.vision.answer_question(query, img)
+            result = await self.vision.answer_question(query, analysis_img)
         else:
-            result = await self.vision.analyze_page(img)
+            result = await self.vision.analyze_page(analysis_img)
 
         return {
             "success": result.success,

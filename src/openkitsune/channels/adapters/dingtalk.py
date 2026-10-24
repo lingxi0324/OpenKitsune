@@ -132,6 +132,7 @@ class DingTalkAdapter(ChannelAdapter):
         "send_image": True,
         "send_file": True,
         "send_voice": True,
+        "typing": True,
         "delete_message": False,
         "edit_message": False,
         "get_chat_info": False,

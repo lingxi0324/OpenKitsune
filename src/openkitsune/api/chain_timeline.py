@@ -37,6 +37,7 @@ from typing import Any
 # Per-entry content caps (characters).
 _THINKING_CAP = 1500
 _TEXT_CAP = 2000
+_TITLE_CAP = 40
 _ARGS_CAP = 500
 _RESULT_CAP = 800
 _CONFIG_HINT_TEXT_CAP = 500
@@ -225,7 +226,11 @@ class ChainTimelineBuilder:
             elif etype == "chain_text":
                 content = str(event.get("content", ""))
                 if content:
-                    self._append_entry({"kind": "text", "content": content[:_TEXT_CAP]})
+                    entry: dict = {"kind": "text", "content": content[:_TEXT_CAP]}
+                    title = event.get("title")
+                    if isinstance(title, str) and title.strip():
+                        entry["title"] = title.strip()[:_TITLE_CAP]
+                    self._append_entry(entry)
             elif etype == "tool_call_start":
                 self._append_entry(
                     {

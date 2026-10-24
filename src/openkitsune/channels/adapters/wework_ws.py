@@ -533,6 +533,7 @@ class WeWorkWsAdapter(ChannelAdapter):
         "send_file": True,
         "send_voice": True,
         "send_video": True,
+        "typing": True,
         "delete_message": False,
         "edit_message": False,
         "get_chat_info": False,

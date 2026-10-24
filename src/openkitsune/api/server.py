@@ -57,6 +57,7 @@ from .routes import (
     inbox,
     kanban,
     knowledge,
+    library,
     logs,
     marketplace,
     mcp,
@@ -1178,6 +1179,7 @@ def create_app(
     app.include_router(upload.router, tags=["文件"])
     app.include_router(web_search_routes.router)
     app.include_router(workspace_io.router, tags=["工作区"])
+    app.include_router(library.router, tags=["图书馆"])
     app.include_router(source_backup.router, tags=["工作区"])
     app.include_router(workspaces.router, tags=["工作区管理"])
     app.include_router(ws_routes.router, tags=["WebSocket"])

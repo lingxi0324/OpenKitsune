@@ -144,6 +144,18 @@ async def list_channels(request: Request):
             "agentProfileId": agent_profile_id,
             "agentProfileName": agent_profile_name,
         }
+        report = getattr(adapter, "capability_report", None)
+        if callable(report):
+            try:
+                capability_data = report()
+            except Exception as exc:  # noqa: BLE001 -- status must never fail on one adapter
+                logger.debug("[IM API] capability_report failed for %s: %s", name, exc)
+                capability_data = None
+            if isinstance(capability_data, dict):
+                entry["capabilities"] = capability_data.get("capabilities", {})
+        delivery_stats = (getattr(gateway, "_delivery_stats", None) or {}).get(str(name))
+        if isinstance(delivery_stats, dict):
+            entry["delivery"] = dict(delivery_stats)
         runtime_error = runtime.get("error")
         if runtime_error:
             entry["error"] = format_user_friendly_error(str(runtime_error))

@@ -50,7 +50,8 @@ try {
     }
 } catch {
     Write-Host "  [WARN] 推理后端未运行（127.0.0.1:8240）" -ForegroundColor Yellow
-    Write-Host "         可先运行 E:\models\Kitsune\scripts\start_services.ps1" -ForegroundColor DarkGray
+    Write-Host "         可先运行 E:\agents\openkitsune-heart\openkitsune-heart-start.bat start" -ForegroundColor DarkGray
+    Write-Host "         （一键启动 Agent Stack：brain 4014/8641 → heart 8240 → hands 8320；详见 docs\agents-runtime.md）" -ForegroundColor DarkGray
 }
 
 # ---------- 2. 检查 Python 与前端 ----------

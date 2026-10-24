@@ -20,6 +20,10 @@ export const StreamEventType = {
   THINKING_DELTA: "thinking_delta",
   THINKING_END: "thinking_end",
   CHAIN_TEXT: "chain_text",
+  // NOTE: chain_text events may carry an optional "title" — the AI-generated
+  // step heading parsed from the model's first line before a tool call (see
+  // src/openkitsune/core/_reasoning_runtime.py:_split_step_title). Frontend
+  // renders it as a bold step node + body. Absent → legacy plain text row.
 
   // ── Text output ──
   TEXT_DELTA: "text_delta",

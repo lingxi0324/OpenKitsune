@@ -26,6 +26,8 @@ STABLE_MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
     "knowledge_list",
     "knowledge_search",
     "knowledge_read",
+    "library_read_page",
+    "library_study",
 )
 STABLE_MAIN_CHAT_CORE_TOOL_SET: frozenset[str] = frozenset(STABLE_MAIN_CHAT_CORE_TOOLS)
 

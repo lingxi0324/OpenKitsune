@@ -451,13 +451,17 @@ class RetrievalEngine:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                         future = pool.submit(
                             asyncio.run,
-                            asyncio.wait_for(source.retrieve(query, 5), timeout=3.0),
+                            asyncio.wait_for(source.retrieve(query, 8), timeout=8.0),
                         )
-                        items = future.result(timeout=5.0)
+                        items = future.result(timeout=12.0)
                 else:
-                    items = asyncio.run(asyncio.wait_for(source.retrieve(query, 5), timeout=3.0))
+                    items = asyncio.run(asyncio.wait_for(source.retrieve(query, 8), timeout=8.0))
 
                 for item in items or []:
+                    # External sources (okmem) return relevance but no
+                    # recency/importance/access signals. Seed them with
+                    # moderate defaults so rerank does not systematically
+                    # suppress external candidates below MIN_RERANK_SCORE.
                     results.append(
                         RetrievalCandidate(
                             memory_id=item.get("id", ""),
@@ -465,6 +469,9 @@ class RetrievalEngine:
                             memory_type="external",
                             source_type=f"plugin:{source_name}",
                             relevance=item.get("relevance", 0.5),
+                            recency_score=0.5,
+                            importance_score=0.5,
+                            access_frequency_score=0.3,
                             score=item.get("relevance", 0.5),
                             raw_data=item,
                         )

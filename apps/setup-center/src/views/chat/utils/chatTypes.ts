@@ -143,7 +143,7 @@ export type StreamEvent =
   | { type: "thinking_start" }
   | { type: "thinking_delta"; content: string }
   | { type: "thinking_end"; duration_ms?: number; has_thinking?: boolean }
-  | { type: "chain_text"; content: string; icon?: string }
+  | { type: "chain_text"; content: string; icon?: string; title?: string }
   | { type: "text_delta"; content: string }
   | { type: "text_replace"; content: string; attachments?: ChatAttachment[] }
   | { type: "tool_call_start"; tool: string; tool_name?: string; args: Record<string, unknown>; id?: string; call_id?: string; protocol_version?: number }
@@ -196,7 +196,7 @@ export type StreamEvent =
   | { type: "agent_switch"; agentName: string; reason: string }
   | { type: "agent_handoff"; from_agent: string; to_agent: string; reason?: string }
   | { type: "sub_agent_state"; agent_id?: string; agentId?: string; session_id?: string; sessionId?: string; status?: string; reason?: string; protocol_version?: number }
-  | { type: "artifact"; artifact_type: string; file_url: string; path: string; name: string; caption: string; size?: number }
+  | { type: "artifact"; artifact_type: string; file_url: string; path: string; name: string; caption: string; size?: number; auto_play?: boolean }
   | {
       type: "security_confirm";
       source: "risk_gate" | "policy_v2";

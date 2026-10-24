@@ -278,6 +278,7 @@ class TelegramAdapter(ChannelAdapter):
         "send_image": True,
         "send_file": True,
         "send_voice": True,
+        "typing": True,
         "delete_message": True,
         "edit_message": True,
         "get_chat_info": True,

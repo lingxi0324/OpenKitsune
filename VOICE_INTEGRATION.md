@@ -216,9 +216,8 @@ print(synthesize_text("测试", provider="piper-local")["paths"])
 Web 聊天（POST /api/chat SSE 流）在每轮回复完成后，若配置开启 `tts.reply_voice`，
 后端自动把回复文本交给 openkitsune.voice 合成 mp3，并以 `artifact` 事件
 （`artifact_type="voice"`）注入流尾（done 之前）。前端 `Artifacts.tsx` 对
-`voice` 类型渲染 `<audio controls>` 播放器——**零前端改动**，每条 assistant
-消息自动出现"语音回复 · 点击播放"音频条；会话持久化时随 artifacts 一起保存，
-历史重放同样可见。
+`voice` 类型渲染 `<audio controls>` 播放器，每条 assistant 消息自动出现
+"语音回复"音频条；会话持久化时随 artifacts 一起保存，历史重放同样可见。
 
 配置（`data/voice_config.json`）：
 
@@ -228,22 +227,34 @@ Web 聊天（POST /api/chat SSE 流）在每轮回复完成后，若配置开启
     "provider": "edge",
     "reply_voice": {
       "enabled": true,
-      "max_chars": 500,
-      "caption": "语音回复 · 点击播放"
+      "segment": true,
+      "max_chunk_chars": 300,
+      "max_total_chars": 2000,
+      "gap_ms": 350,
+      "timeout_seconds": 60,
+      "caption": "语音回复 · 自动播放",
+      "auto_play": true
     }
   }
 }
 ```
 
-- `enabled: false` 可关闭；`max_chars` 超长回复不自动合成（避免拖慢）；
-  合成失败/超时（20s）静默跳过，绝不阻塞文本回复。
+- `enabled: false` 可关闭。
+- **长文本分段（v2.3）**：`segment: true` 时按句界切分（中文。！？…；; 与英文
+  .!?;，超长句先按分句标点/空白再切），每段 ≤ `max_chunk_chars` 逐段合成，
+  再用 ffmpeg 合并并在段间垫入 `gap_ms` 静音（自然停顿）；总字数超过
+  `max_total_chars` 时跳过（避免过慢）。`segment: false` 退化为旧行为
+  （整段 ≤ 上限才合成）。旧键 `max_chars` 兼容为 `max_total_chars` 别名。
+- 合成总耗时上限 `timeout_seconds`（默认 60s），超时静默跳过，绝不阻塞文本回复。
 - 产出目录：会话工作区 `voice_replies/`（受 /api/files 作用域约束）。
 - 实测（2026-10-22）：短对话 SSE 流自动出现 `artifact(voice)`，114KB mp3，
   `/api/files` 返回 200 audio/mpeg ✅。
 
-### 可选升级（未做，需前端改动 + `npm run build:web`）
-- 回复到达后**自动播放**（浏览器需一次用户交互授权，建议默认关、设置里开关）；
-- 浏览器端 `speechSynthesis` 即时朗读（音色为系统语音，非神经语音）。
+### 自动播放（v2.3）
+- live SSE 的 `artifact(voice)` 事件携带 `auto_play`（来自配置，默认 true），
+  前端挂载后自动 `play()`；浏览器自动播放策略拒绝时静默回退为手动点击。
+- 持久化副本显式 `auto_play: false`，切换/重放旧会话不会突然出声。
+- 历史回放安全：前端仅对 `auto_play === true` 的 artifact 自动播放。
 
 ---
 

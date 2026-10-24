@@ -735,6 +735,34 @@ class Checkpoint:
     tool_names: list[str] = field(default_factory=list)  # 该决策调用的工具
 
 
+_STEP_TITLE_MAX = 40
+_STEP_TITLE_MAX_LEN = 30  # 首行超过该长度视为普通正文而非标题（模型未遵守格式时的兜底）
+
+
+def _split_step_title(text: str) -> tuple[str, str]:
+    """把工具调用前的说明文本解析为 (步骤标题, 说明正文)。
+
+    格式约定（见 prompts/core/always_on.md「步骤化行动说明」）：
+    模型在每次调用工具前输出「一行简短标题 + 换行 + 详细说明」。
+    这里做容错解析：
+    - 多行且首行 ≤30 字符（像标题）：第一行（去常见 markdown 前缀）作为标题，
+      其余为正文；
+    - 其余情况（单行 / 首行过长 / 无正文）：返回 ("", "")，调用方保持原文、
+      不生成步骤标题，前端照旧以文本行展示（避免标题与正文重复渲染）。
+    """
+    text = (text or "").strip()
+    if not text:
+        return "", ""
+    lines = [ln.strip() for ln in text.splitlines()]
+    if len(lines) < 2:
+        return "", ""
+    first = re.sub(r"^[-*#>\s]+", "", lines[0]).strip()
+    body = "\n".join(lines[1:]).strip()
+    if not first or not body or len(first) > _STEP_TITLE_MAX_LEN:
+        return "", ""
+    return first[:_STEP_TITLE_MAX], body
+
+
 # Compatibility aliases for guards whose implementations live in the state graph runtime.
 # [整改 2026-10-10 对标 OpenAkita P-RC-5] 无工具完成声明防护（unbacked-action claim）：
 # OpenAkita 在 _handle_final_answer 用 action_claim_re + done 短语 + 文本化工具执行
@@ -1730,6 +1758,13 @@ class ReasoningEngine:
         review_at_exit: bool = True,
     ):
         """Outer wrapper for the streaming ReAct loop."""
+        # ── DEBUG: 打印 messages 里有没有世界状态消息 ──
+        try:
+            for i, m in enumerate(messages[:5]):
+                _content = str(m.get("content", ""))[:80]
+                logger.info(f"[WorldState DEBUG] msg[{i}] role={m.get('role')} content={_content}")
+        except Exception:
+            pass
         captured_state_ref: dict[str, Any] = {"state": None}
         _scope_attach: dict[str, Any] = {"parent": None, "attached": False}
         _stream_done_seen = False
@@ -2876,7 +2911,12 @@ class ReasoningEngine:
                     _decision_text = (decision.text_content or "").strip()
                     if _decision_text and decision.type == DecisionType.TOOL_CALLS:
                         if _decision_text != _last_chain_text:
-                            yield {"type": "chain_text", "content": _decision_text[:2000]}
+                            _step_title, _step_body = _split_step_title(_decision_text)
+                            yield {
+                                "type": "chain_text",
+                                "content": (_step_body or _decision_text)[:2000],
+                                "title": _step_title or None,
+                            }
                             _last_chain_text = _decision_text
                         else:
                             logger.info(
@@ -2888,7 +2928,12 @@ class ReasoningEngine:
                     _decision_text = (decision.text_content or "").strip()
                     if _decision_text:
                         if _decision_text != _last_chain_text:
-                            yield {"type": "chain_text", "content": _decision_text[:2000]}
+                            _step_title, _step_body = _split_step_title(_decision_text)
+                            yield {
+                                "type": "chain_text",
+                                "content": (_step_body or _decision_text)[:2000],
+                                "title": _step_title or None,
+                            }
                             _last_chain_text = _decision_text
                         else:
                             logger.info(

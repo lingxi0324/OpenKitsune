@@ -7,9 +7,9 @@ import { AskUserSummary } from "./AskUserSummary";
 import { ErrorCard } from "./ErrorCard";
 import { SourceStrip } from "./SourceStrip";
 import { MCPCallStrip } from "./MCPCallStrip";
-import { MarkdownContent } from "./MarkdownContent";
 import { OptionalFeatureInstallCard } from "./OptionalFeatureInstallCard";
 import { PlanCard } from "./PlanCard";
+import { ProcessFlow } from "./ProcessFlow";
 
 /**
  * Ordered renderer for an assistant message's `MessagePart[]`.
@@ -89,14 +89,15 @@ export function MessageParts({
           }
           case "text":
             return bodyContent ? (
-              <MarkdownContent
+              <ProcessFlow
                 key={part.id}
-                content={formatSourceTags(bodyContent)}
+                content={bodyContent}
+                msg={msg}
                 mdModules={mdModules}
-                className="chatMdContent"
                 streaming={streaming}
                 apiBaseUrl={apiBaseUrl}
                 onImagePreview={onImagePreview}
+                formatSourceTags={formatSourceTags}
               />
             ) : null;
           case "tools":

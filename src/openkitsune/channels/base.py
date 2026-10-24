@@ -197,6 +197,9 @@ class ChannelAdapter(ABC):
         "send_image": False,
         "send_file": False,
         "send_voice": False,
+        "send_video": False,
+        "typing": False,
+        "add_reaction": False,
         "delete_message": False,
         "edit_message": False,
         "get_chat_info": False,
@@ -228,6 +231,17 @@ class ChannelAdapter(ABC):
 
     def has_capability(self, name: str) -> bool:
         return self.capabilities.get(name, False)
+
+    def capability_report(self) -> dict[str, Any]:
+        """Return the normalized capability matrix for status APIs and plugins."""
+        caps = dict(self.capabilities)
+        for name in ("send_video", "typing", "add_reaction"):
+            caps.setdefault(name, False)
+        return {
+            "channel": self.channel_name,
+            "type": self.channel_type,
+            "capabilities": caps,
+        }
 
     def _build_bot_instance_id(self) -> str:
         """Return the stable namespace used to isolate sessions for this bot."""
@@ -529,6 +543,66 @@ class ChannelAdapter(ABC):
             NotImplementedError: 当前平台不支持发送语音
         """
         raise NotImplementedError(f"{self.channel_name} does not support send_voice")
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        **kwargs,
+    ) -> str:
+        """
+        发送视频（可选能力，子类覆盖实现）
+
+        Raises:
+            NotImplementedError: 当前平台不支持发送视频
+        """
+        raise NotImplementedError(f"{self.channel_name} does not support send_video")
+
+    async def send_media(
+        self,
+        chat_id: str,
+        media_path: str,
+        media_type: str = "file",
+        caption: str | None = None,
+        reply_to: str | None = None,
+        **kwargs,
+    ) -> str:
+        """按媒体类型分发到对应能力，缺失时回退为文件发送。
+
+        插件和工具层只需要调用 ``send_media``，无需了解每个平台的
+        ``send_image`` / ``send_voice`` / ``send_video`` / ``send_file`` 差异。
+        """
+        kind = (media_type or "file").lower()
+        try:
+            if kind == "image" and self.has_capability("send_image"):
+                return await self.send_image(
+                    chat_id, media_path, caption, reply_to=reply_to, **kwargs
+                )
+            if kind in ("voice", "audio") and self.has_capability("send_voice"):
+                return await self.send_voice(chat_id, media_path, caption, **kwargs)
+            if kind == "video" and self.has_capability("send_video"):
+                try:
+                    return await self.send_video(
+                        chat_id, media_path, caption, reply_to=reply_to, **kwargs
+                    )
+                except NotImplementedError:
+                    logger.debug(
+                        "%s: send_video declared but not implemented, falling back to file",
+                        self.channel_name,
+                    )
+        except NotImplementedError:
+            logger.debug(
+                "%s: %s capability unavailable, falling back to file",
+                self.channel_name,
+                kind,
+            )
+        return await self.send_file(chat_id, media_path, caption, **kwargs)
+
+    async def add_reaction(self, message_id: str, emoji_type: str = "DONE") -> bool:
+        """在消息上添加 emoji 反应（可选能力，默认不支持）。"""
+        return False
 
     async def send_typing(self, chat_id: str, thread_id: str | None = None) -> None:
         """发送正在输入状态"""

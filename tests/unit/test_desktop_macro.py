@@ -212,7 +212,6 @@ def test_macro_supports_all_whitelisted_tools():
     assert result["success"] is True
     assert result["steps_completed"] == 18
     assert all(r["success"] for r in result["results"])
-    recorded_kinds = [kind for kind, _ in records]
     assert ("keyboard.type_text", {"text": "abc", "method": "paste"}) in records
     assert ("keyboard.press_multiple", {"key": "space", "presses": 2}) in records
     assert ("keyboard.hotkey", {"keys": ("ctrl", "c")}) in records

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import type { ChainGroup, ChainEntry, ChatToolCall } from "../utils/chatTypes";
 import {
@@ -9,6 +9,15 @@ import { TextWithSourceBadges } from "./SourceBadge";
 import ConfigHintCard, { type ConfigHintPayload } from "../../../components/ConfigHintCard";
 
 const TOOL_RESULT_PREVIEW_CHAR_LIMIT = 120_000;
+
+/** 毫秒 → 「X分X秒 / Xs」人类可读耗时（截图格式：已处理 2分46秒） */
+function formatElapsed(ms: number): string {
+  const totalSec = Math.max(0, Math.round(ms / 1000));
+  if (totalSec < 60) return `${totalSec}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}分${s}秒`;
+}
 
 function previewLongText(text: string, limit = TOOL_RESULT_PREVIEW_CHAR_LIMIT): string {
   if (text.length <= limit) return text;
@@ -194,6 +203,23 @@ function ChainEntryLine({ entry, onSkipStep }: { entry: ChainEntry; onSkipStep?:
         : entry.icon === "refresh"
           ? <IconRefresh size={12} className="chainNarrStatusIcon chainNarrIconInfo" />
           : null;
+      const stepTitle = entry.title?.trim();
+      if (stepTitle) {
+        // AI 生成的步骤标题：节点图标 + 粗体标题 + 说明正文（截图格式）
+        return (
+          <div className="chainStepItem">
+            <div className="chainStepTitle">
+              <span className="chainStepNode" />
+              <span className="chainStepTitleText">{stepTitle}</span>
+            </div>
+            {entry.content && (
+              <div className="chainStepBody">
+                <TextWithSourceBadges text={entry.content} />
+              </div>
+            )}
+          </div>
+        );
+      }
       return (
         <div className={`chainNarrText${svgIcon ? " chainNarrStatus" : ""}`}>
           {svgIcon}<TextWithSourceBadges text={entry.content} />
@@ -263,6 +289,30 @@ function ChainEntryLine({ entry, onSkipStep }: { entry: ChainEntry; onSkipStep?:
 
 // ── ChainGroupItem ──
 
+/** One-line phase title for a collapsed group: first tool description wins. */
+function summarizeGroupPhase(group: ChainGroup): string {
+  for (const entry of group.entries) {
+    if (entry.kind === "tool_start" && entry.description) {
+      return entry.description;
+    }
+  }
+  for (const entry of group.entries) {
+    if (entry.kind === "text" && (entry.title?.trim() || entry.content)) {
+      return entry.title?.trim() || entry.content;
+    }
+  }
+  return "";
+}
+
+function normalizePhaseTitle(text: string): string {
+  return text
+    .trim()
+    .replace(/^正在/, "")
+    .replace(/(\.\.\.|…)$/, "")
+    .replace(/^(调用 [\w.-]+)\(.*\)$/, "$1")
+    .trim();
+}
+
 function ChainGroupItem({ group, onToggle, isLast, streaming, onSkipStep }: {
   group: ChainGroup;
   onToggle: () => void;
@@ -288,11 +338,12 @@ function ChainGroupItem({ group, onToggle, isLast, streaming, onSkipStep }: {
   }
 
   const showContent = !group.collapsed || isActive;
+  const phaseTitle = normalizePhaseTitle(summarizeGroupPhase(group));
   const headerLabel = isActive
     ? t("chat.processing")
-    : group.hasThinking
+    : phaseTitle || (group.hasThinking
       ? t("chat.thoughtFor", { seconds: durationSec || "0" })
-      : t("chat.processed", { seconds: durationSec || "0" });
+      : t("chat.processed", { seconds: durationSec || "0" }));
 
   return (
     <div className={`chainGroup ${group.collapsed && !isActive ? "chainGroupCollapsed" : ""}`}>
@@ -301,6 +352,9 @@ function ChainGroupItem({ group, onToggle, isLast, streaming, onSkipStep }: {
           <IconChevronRight size={11} />
         </span>
         <span className={`chainThinkingLabel ${isActive ? "chainThinkingLabelActive" : ""}`}>{headerLabel}</span>
+        {!isActive && phaseTitle && durationSec && (
+          <span className="chainThinkingDuration">{durationSec}s</span>
+        )}
         {isActive && <IconLoader size={16} className="chainSpinner chainSpinnerActive" />}
       </div>
       {showContent && (
@@ -333,40 +387,105 @@ export function ThinkingChain({ chain, streaming, showChain, onSkipStep, forceEx
   forceExpand?: boolean;
 }) {
   const { t } = useTranslation();
-  const [localChain, setLocalChain] = useState(chain);
+  // Doubao-style default: the reasoning/tool timeline stays folded into a
+  // single summary line; only the currently running iteration is auto-opened
+  // while streaming.
+  const [localChain, setLocalChain] = useState(() => chain.map(g => ({ ...g, collapsed: true })));
+  const wasStreamingRef = useRef(streaming);
 
   useEffect(() => {
     setLocalChain(prev => {
       const prevMap = new Map(prev.map(g => [g.iteration, g.collapsed]));
       return chain.map(g => ({
         ...g,
-        collapsed: prevMap.has(g.iteration) ? prevMap.get(g.iteration)! : g.collapsed,
+        collapsed: prevMap.has(g.iteration) ? prevMap.get(g.iteration)! : true,
       }));
     });
   }, [chain]);
+
+  // Collapse everything again once the turn finishes, so a completed message
+  // never leaves expanded tool cards behind.
+  useEffect(() => {
+    if (wasStreamingRef.current && !streaming) {
+      setLocalChain(prev => prev.map(g => ({ ...g, collapsed: true })));
+    }
+    wasStreamingRef.current = streaming;
+  }, [streaming]);
 
   useEffect(() => {
     if (forceExpand) setLocalChain(prev => prev.map(g => ({ ...g, collapsed: false })));
   }, [forceExpand]);
 
+  // ── 顶部计时：处理中实时累计（已处理 X分X秒），完成后取各轮 durationMs 之和 ──
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  const turnStartRef = useRef<number>(Date.now());
+  useEffect(() => {
+    if (!streaming) return;
+    const timer = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [streaming]);
+
+  const finishedDurationMs = useMemo(
+    () => localChain.reduce((n, g) => n + (g.durationMs || 0), 0),
+    [localChain],
+  );
+  const displayElapsedMs = streaming
+    ? Math.max(nowTick - turnStartRef.current, finishedDurationMs)
+    : finishedDurationMs;
+
+  // ── 底部状态条：当前正在执行的动作（截图格式：正在执行代码）──
+  const activeStatus = useMemo(() => {
+    if (!streaming || localChain.length === 0) return "";
+    const last = localChain[localChain.length - 1];
+    const runningTool = last.entries.find(e => e.kind === "tool_start" && e.status === "running");
+    if (runningTool && runningTool.kind === "tool_start") {
+      return t("chat.executing", "正在执行 {{action}}", {
+        action: runningTool.description || runningTool.tool,
+      });
+    }
+    const lastText = [...last.entries].reverse().find(e => e.kind === "text");
+    if (lastText && lastText.kind === "text" && (lastText.title || lastText.content)) {
+      return t("chat.executing", "正在执行 {{action}}", {
+        action: lastText.title || lastText.content,
+      });
+    }
+    if (last.hasThinking) return t("chat.thinking", "思考中...");
+    return t("chat.processing", "处理中...");
+  }, [localChain, streaming, t]);
+
   if (!showChain || !localChain || localChain.length === 0) return null;
 
   const allCollapsed = localChain.every(g => g.collapsed) && !streaming;
   if (allCollapsed) {
-    const totalSteps = localChain.reduce((n, g) => n + g.entries.length, 0);
+    const toolSteps = localChain.reduce(
+      (n, g) => n + g.entries.filter(e => e.kind === "tool_start").length,
+      0,
+    );
+    const totalSteps = toolSteps > 0 ? toolSteps : localChain.reduce((n, g) => n + g.entries.length, 0);
+    if (totalSteps === 0) return null;
     return (
       <div
         className="chainCollapsedSummary"
         onClick={() => setLocalChain(prev => prev.map(g => ({ ...g, collapsed: false })))}
       >
         <IconChevronRight size={11} />
-        <span>{t("chat.chainCollapsed", { count: totalSteps })}</span>
+        <span>{t("chat.workProcessSummary", { steps: totalSteps })}</span>
+        {displayElapsedMs > 0 && (
+          <span className="chainSummaryDuration">{t("chat.elapsedProcessedShort", "已处理 {{time}}", { time: formatElapsed(displayElapsedMs) })}</span>
+        )}
       </div>
     );
   }
 
   return (
     <div className="thinkingChain">
+      {displayElapsedMs > 0 && (
+        <div className="chainElapsedRow">
+          <span className="chainElapsedClock">⏱</span>
+          <span>{t("chat.elapsedProcessed", "已处理 {{time}}", { time: formatElapsed(displayElapsedMs) })}</span>
+          {streaming && <span className="chainElapsedLive">· 实时</span>}
+        </div>
+      )}
       {localChain.map((group, idx) => (
         <ChainGroupItem
           key={group.iteration}
@@ -381,6 +500,12 @@ export function ThinkingChain({ chain, streaming, showChain, onSkipStep, forceEx
           }}
         />
       ))}
+      {activeStatus && (
+        <div className="chainStatusBar">
+          <IconLoader size={13} className="chainSpinner" />
+          <span className="chainStatusBarText">{activeStatus}</span>
+        </div>
+      )}
     </div>
   );
 }

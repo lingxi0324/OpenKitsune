@@ -71,9 +71,11 @@ def is_duplicate_message(
         if msg.get("role") != role or msg.get("content") != content:
             continue
         existing_profile = _message_agent_profile_id(msg)
-        if candidate_profile or existing_profile:
-            if candidate_profile != existing_profile:
-                continue
+        # 仅当两侧都有明确的 agent_profile_id 且不同，才视为不同 agent 的消息而不去重。
+        # 一侧缺失（如 SQLite turn 回填记录未携带 agent_profile_id）时应照常去重，
+        # 否则崩溃恢复回填会把同一轮消息重复 append 进会话历史（带 artifact 与裸文本各一条）。
+        if candidate_profile and existing_profile and candidate_profile != existing_profile:
+            continue
 
         if msg is last_message:
             return True

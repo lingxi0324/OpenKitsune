@@ -48,11 +48,11 @@ logger = logging.getLogger(__name__)
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 
-# 4010 是上游 Kitsune fusion-memory 的默认端口；独立部署使用 4014 避免抢占。
+# 4010 是上游 Kitsune 的默认端口；独立部署使用 4014 避免抢占。
 DEFAULT_SERVICE_PORT = 4014
-DEFAULT_BUS_PORT = 8641
+DEFAULT_BUS_PORT = 8641  # brain-bus 已退役（主程序进程内直读 okmem SQLite），保留常量仅为兼容
 
-_SERVICE_BINARY = "fusion-memory.exe" if os.name == "nt" else "fusion-memory"
+_SERVICE_BINARY = "okmem.exe" if os.name == "nt" else "okmem"
 _CREATION_FLAGS = (
     getattr(subprocess, "CREATE_NO_WINDOW", 0)
     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -138,12 +138,12 @@ class OkmemStackConfig:
     home: Path
     autostart: bool = True
     service_autostart: bool = True
-    bus_autostart: bool = True
+    bus_autostart: bool = False  # brain-bus 已退役：默认不再拉起 8641 HTTP 总线
     service_port: int = DEFAULT_SERVICE_PORT
     bus_port: int = DEFAULT_BUS_PORT
     stop_on_exit: bool = True
     health_timeout_s: float = 30.0
-    service_data_dir: str = "data/fusion-memory"
+    service_data_dir: str = "data/okmem"
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> OkmemStackConfig:
@@ -152,7 +152,7 @@ class OkmemStackConfig:
             home=resolve_okmem_home(env),
             autostart=_env_flag(env, "OPENKITSUNE_OKMEM_AUTOSTART", True),
             service_autostart=_env_flag(env, "OPENKITSUNE_OKMEM_SERVICE_AUTOSTART", True),
-            bus_autostart=_env_flag(env, "OPENKITSUNE_OKMEM_BUS_AUTOSTART", True),
+            bus_autostart=_env_flag(env, "OPENKITSUNE_OKMEM_BUS_AUTOSTART", False),
             service_port=_env_port(env, "OPENKITSUNE_OKMEM_SERVICE_PORT", DEFAULT_SERVICE_PORT),
             bus_port=_env_port(env, "OPENKITSUNE_OKMEM_BUS_PORT", DEFAULT_BUS_PORT),
             stop_on_exit=_env_flag(env, "OPENKITSUNE_OKMEM_STOP_ON_EXIT", True),

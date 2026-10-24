@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 # 桌面工具列表
 DESKTOP_TOOLS = [
     "desktop_screenshot",
+    "desktop_state",
+    "desktop_open",
     "desktop_find_element",
     "desktop_click",
     "desktop_mouse",
@@ -56,6 +58,8 @@ class DesktopHandler:
     # C7 explicit ApprovalClass — desktop interactions are real-world side effects
     TOOL_CLASSES = {
         "desktop_screenshot": ApprovalClass.READONLY_GLOBAL,
+        "desktop_state": ApprovalClass.READONLY_GLOBAL,
+        "desktop_open": ApprovalClass.EXEC_CAPABLE,
         "desktop_find_element": ApprovalClass.READONLY_GLOBAL,
         "desktop_click": ApprovalClass.EXEC_CAPABLE,
         "desktop_mouse": ApprovalClass.EXEC_CAPABLE,
@@ -134,6 +138,9 @@ class DesktopHandler:
         if not result.get("success"):
             return f"错误: {result.get('error', '操作失败')}"
 
+        if tool_name == "desktop_state":
+            return self._format_desktop_state(result)
+
         # 截图结果（含 OCR / 视觉理解 / 坐标空间）
         if result.get("file_path"):
             return self._format_screenshot(result)
@@ -195,6 +202,101 @@ class DesktopHandler:
 
         # 通用成功
         return f"{result.get('message', '操作成功')}"
+
+    def _format_desktop_state(self, result: dict) -> str:
+        """把实时桌面状态清单渲染成模型可消费的文本。"""
+        screen = result.get("screen_size") or {}
+        pointer = result.get("pointer") or {}
+        lines = [
+            "桌面状态(实时):",
+            f"屏幕: {screen.get('width', 0)}x{screen.get('height', 0)} "
+            f"指针: {pointer.get('x', 0)},{pointer.get('y', 0)}",
+        ]
+
+        active = result.get("active_window") or {}
+        if active:
+            flags = []
+            if active.get("is_focused"):
+                flags.append("focused")
+            if active.get("is_minimized"):
+                flags.append("minimized")
+            if active.get("is_maximized"):
+                flags.append("maximized")
+            meta = " · ".join(
+                str(v) for v in (active.get("process_name"), active.get("class_name")) if v
+            )
+            lines.append(
+                f"活动窗口: {active.get('title', '<untitled>')}"
+                + (f" ({meta})" if meta else "")
+                + (f" [{', '.join(flags)}]" if flags else "")
+                + (f" bbox={active.get('bbox')}" if active.get("bbox") else "")
+            )
+
+        total = result.get("windows_total", len(result.get("windows") or []))
+        windows = result.get("windows") or []
+        lines.append(f"可见窗口: {total}（显示 {len(windows)}）")
+        for i, win in enumerate(windows, 1):
+            flags = []
+            if win.get("is_focused"):
+                flags.append("focused")
+            if win.get("is_minimized"):
+                flags.append("minimized")
+            if win.get("is_maximized"):
+                flags.append("maximized")
+            process = win.get("process_name") or win.get("class_name") or ""
+            bbox = win.get("bbox")
+            lines.append(
+                f"  {i}. {win.get('title', '<untitled>')}"
+                + (f" | {process}" if process else "")
+                + (f" | bbox={bbox}" if bbox else "")
+                + (f" | {','.join(flags)}" if flags else "")
+            )
+
+        capabilities = result.get("capabilities") or {}
+        if capabilities:
+            lines.append(
+                "能力: " + " ".join(f"{k}={'ok' if v else 'missing'}" for k, v in capabilities.items())
+            )
+
+        screenshot = result.get("screenshot") or {}
+        if screenshot.get("ok") and screenshot.get("path"):
+            lines.append(
+                f"截图: {screenshot.get('path')} "
+                f"({screenshot.get('width', 0)}x{screenshot.get('height', 0)}, "
+                f"recent={screenshot.get('recent')})"
+            )
+        else:
+            lines.append("截图: 无（需要时调用 desktop_screenshot）")
+
+        elements_text = result.get("elements_text")
+        if elements_text:
+            body = str(elements_text)
+            if len(body) > 6000:
+                body = body[:6000] + "\n... (元素树已截断)"
+            lines.append(
+                f"元素树[{result.get('elements_window_title')}, "
+                f"depth={result.get('elements_depth')}]:\n{body}"
+            )
+        elif result.get("elements_error"):
+            lines.append(f"元素树: 读取失败 ({result['elements_error']})")
+
+        activity = result.get("activity") or []
+        if activity:
+            lines.append("最近活动(最新在前):")
+            for item in activity[:8]:
+                label = item.get("target") or item.get("window") or item.get("title") or ""
+                location = item.get("location") or ""
+                detail = f" | {location}" if location and location != label else ""
+                lines.append(
+                    f"  - [{item.get('kind', 'activity')}] {label}{detail} "
+                    f"@ {item.get('ts', '')}"
+                )
+
+        errors = result.get("errors") or []
+        if errors:
+            lines.append("错误: " + "；".join(str(e) for e in errors[:3]))
+
+        return "\n".join(lines)
 
     def _format_screenshot(self, result: dict) -> str:
         """把截图结果渲染成模型可消费的文本（文字 + 画面 + 坐标空间）"""

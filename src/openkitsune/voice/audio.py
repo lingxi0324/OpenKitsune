@@ -220,22 +220,140 @@ def pack_under_cap(pieces: list[str], max_chars: int, *, slice_oversized: bool =
     return chunks
 
 
-def split_text_for_tts(text: str, max_chars: int) -> list[str]:
-    """在 provider 上限下拆分长文本（不丢规范化内容）。"""
-    if max_chars <= 0:
-        max_chars = 4000
+# 句末标点：中文。！？；… 与英文 !?;（英文 . 单独处理，避开小数/版本号）
+_SENT_END_CHARS = frozenset("。！？!?；;…")
+# 句末标点后可能紧跟的闭合引号/括号（归入当前句，避免下一段以 " 开头）
+_CLOSE_CHARS = frozenset("\"'”’』」）】》〉")
+# 分句标点：超长句优先在此处切开（逗号/冒号/顿号）
+_CLAUSE_CHARS = frozenset("，、,：:；;")
+
+
+def _is_cjk_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x4E00 <= code <= 0x9FFF   # CJK 统一汉字
+        or 0x3000 <= code <= 0x303F  # CJK 标点
+        or 0xFF00 <= code <= 0xFFEF  # 全角字符
+        or 0x2E80 <= code <= 0x2EFF  # CJK 部首
+        or 0x3400 <= code <= 0x4DBF
+    )
+
+
+def _is_english_sentence_end(text: str, index: int) -> bool:
+    """英文句号视为句末的条件：前一字符非数字（避开 3.14 / v2.1），
+    后随空白、闭合引号或文本结尾。"""
+    if text[index] != ".":
+        return False
+    prev = text[index - 1] if index > 0 else ""
+    nxt = text[index + 1] if index + 1 < len(text) else " "
+    return not prev.isdigit() and (nxt.isspace() or nxt in _CLOSE_CHARS)
+
+
+def _split_sentences(text: str) -> list[str]:
+    """按句末标点拆句；句末标点后紧随的闭合引号吸收进当前句。"""
+    out: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        buf.append(ch)
+        is_end = ch in _SENT_END_CHARS or _is_english_sentence_end(text, i)
+        if is_end:
+            j = i + 1
+            while j < n and text[j] in _CLOSE_CHARS:
+                buf.append(text[j])
+                j += 1
+            i = j
+            segment = "".join(buf).strip()
+            if segment:
+                out.append(segment)
+            buf = []
+            continue
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def _split_clauses(sentence: str) -> list[str]:
+    """超长句按分句标点切；无分句标点时逐词切。"""
+    parts = re.split(r"(?<=[，、,：:；;])\s*", sentence)
+    if len(parts) <= 1:
+        parts = re.split(r"(?<=\s)", sentence)
+    return [p for p in parts if p]
+
+
+def _pack_pieces_cjk(pieces: list[str], max_chunk: int) -> list[str]:
+    """贪心打包：相邻中文字段不插空格（CJK 朗读更自然），超长 piece 硬切。"""
+    chunks: list[str] = []
+    current = ""
+    for piece in pieces:
+        if not piece:
+            continue
+        if len(piece) > max_chunk:
+            if current:
+                chunks.append(current)
+                current = ""
+            for idx in range(0, len(piece), max_chunk):
+                chunks.append(piece[idx:idx + max_chunk])
+            continue
+        if not current:
+            current = piece
+            continue
+        joiner = "" if _is_cjk_char(current[-1]) and _is_cjk_char(piece[0]) else " "
+        candidate = current + joiner + piece
+        if len(candidate) > max_chunk:
+            chunks.append(current)
+            current = piece
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _truncate_keeping_sentences(text: str, max_total: int) -> str:
+    """截断到 *max_total* 内最后一个句末标点（保留完整句子）。"""
+    head = text[:max_total]
+    for idx in range(len(head) - 1, -1, -1):
+        if head[idx] in _SENT_END_CHARS:
+            return head[:idx + 1].strip()
+    return head.rstrip()
+
+
+def segment_text_for_tts(text: str, max_chunk: int = 300, max_total: int | None = None) -> list[str]:
+    """把朗读文本切分为自然的 TTS 分段。
+
+    - 段界优先落在句末标点（中文。！？…；; 与英文 .!?;），句子不跨段
+    - 单句超长时先按分句标点（，、,：:）切，仍超长再逐词/硬切
+    - 每段长度 <= *max_chunk*；*max_total* 为总字数上限（截断时保留完整句子）
+    - 相邻中文字段之间不插空格
+    """
+    if not max_chunk or max_chunk <= 0:
+        max_chunk = 300
     normalized = " ".join((text or "").split())
     if not normalized:
         return []
-    if len(normalized) <= max_chars:
-        return [normalized]
-    expanded: list[str] = []
-    for sentence in filter(None, (s.strip() for s in re.split(r"(?<=[.!?;:,])\s+", normalized))):
-        if len(sentence) <= max_chars:
-            expanded.append(sentence)
+    if max_total and len(normalized) > max_total:
+        normalized = _truncate_keeping_sentences(normalized, max_total)
+        if not normalized:
+            return []
+    sentences = _split_sentences(normalized)
+    pieces: list[str] = []
+    for sentence in sentences:
+        if len(sentence) <= max_chunk:
+            pieces.append(sentence)
         else:
-            expanded.extend(pack_under_cap(sentence.split(), max_chars, slice_oversized=True))
-    return pack_under_cap(expanded, max_chars)
+            pieces.extend(_split_clauses(sentence))
+    return _pack_pieces_cjk(pieces, max_chunk)
+
+
+def split_text_for_tts(text: str, max_chars: int) -> list[str]:
+    """在 provider 上限下拆分长文本：句界优先（中英文），超长句按分句标点再切。"""
+    if max_chars <= 0:
+        max_chars = 4000
+    return segment_text_for_tts(text, max_chunk=max_chars)
 
 
 # ---- 交付打包 ----
@@ -275,9 +393,11 @@ def resolve_audio_delivery_profile(platform: str | None,
     return AudioDeliveryProfile(platform=key, max_file_bytes=max_file_bytes, safety_ratio=float(safety_ratio))
 
 
-def concat_audio_files(audio_paths: list[str], output_path: str, *, voice_compatible: bool = False) -> str | None:
+def concat_audio_files(audio_paths: list[str], output_path: str, *, voice_compatible: bool = False,
+                       gap_ms: int = 0) -> str | None:
     """ffmpeg 合并独立编码的分块（绝不字节拼接）。Ogg/Opus 总是重编码；同后缀 MP3 保留帧
-    （``-c:a copy``）。ffmpeg 缺失/失败返回 None，调用方保留有效分块。"""
+    （``-c:a copy``）。``gap_ms`` > 0 时改走 filter_complex，在每个分块末尾垫入静音
+    （段间自然停顿，避免长回复断句生硬）。ffmpeg 缺失/失败返回 None，调用方保留有效分块。"""
     if not audio_paths:
         raise ValueError("No audio chunks to combine")
     if len(audio_paths) == 1:
@@ -289,6 +409,8 @@ def concat_audio_files(audio_paths: list[str], output_path: str, *, voice_compat
         return None
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if gap_ms and gap_ms > 0:
+        return _concat_audio_with_gap(ffmpeg, audio_paths, destination, voice_compatible, gap_ms)
     concat_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.concat.txt")
     temp_output = destination.with_name(f".{destination.stem}.{uuid.uuid4().hex}.combining{destination.suffix}")
     try:
@@ -311,6 +433,48 @@ def concat_audio_files(audio_paths: list[str], output_path: str, *, voice_compat
     finally:
         for path in (concat_path, temp_output):
             _remove_quietly(path)
+    return None
+
+
+def _concat_audio_with_gap(ffmpeg: str, audio_paths: list[str], destination: Path,
+                           voice_compatible: bool, gap_ms: int) -> str | None:
+    """ffmpeg filter_complex 合并，并在每个分块末尾 ``apad`` 垫入静音。"""
+    temp_output = destination.with_name(f".{destination.stem}.{uuid.uuid4().hex}.gap{destination.suffix}")
+    try:
+        gap = max(0.0, float(gap_ms) / 1000.0)
+        n = len(audio_paths)
+        inputs: list[str] = []
+        for p in audio_paths:
+            inputs += ["-i", p]
+        chain: list[str] = []
+        labels: list[str] = []
+        # 除最后一段外均垫入静音；最后一段原样拼接（避免回复末尾多余停顿）
+        for i in range(n - 1):
+            label = f"[p{i}]"
+            chain.append(f"[{i}:a]apad=pad_dur={gap:.3f}{label}")
+            labels.append(label)
+        if n > 0:
+            labels.append(f"[{n - 1}:a]")
+        chain.append("".join(labels) + f"concat=n={n}:v=0:a=1[out]")
+        suffix = destination.suffix.lower()
+        if voice_compatible or suffix in {".ogg", ".opus"}:
+            out_args = ["-c:a", "libopus", "-ac", "1", "-b:a", "64k", "-vbr", "off"]
+        elif suffix == ".wav":
+            out_args = ["-c:a", "pcm_s16le", "-ac", "1", "-ar", "44100"]
+        else:
+            out_args = ["-c:a", "libmp3lame", "-ac", "1", "-b:a", "48k"]
+        result = _ffmpeg_run(ffmpeg, ["-y", "-loglevel", "error", *inputs,
+                                      "-filter_complex", ";".join(chain),
+                                      "-map", "[out]", *out_args, str(temp_output)], timeout=120)
+        if result.returncode == 0 and temp_output.exists() and temp_output.stat().st_size > 0:
+            os.replace(temp_output, destination)
+            return str(destination)
+        logger.warning("ffmpeg gap-merge failed: %s",
+                       result.stderr.decode("utf-8", errors="ignore")[:500])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("ffmpeg gap-merge failed: %s", exc)
+    finally:
+        _remove_quietly(temp_output)
     return None
 
 

@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ChatArtifact } from "../utils/chatTypes";
 import { resolveAttachmentUrl } from "../utils/attachments";
@@ -12,17 +12,48 @@ function withCacheBust(url: string): string {
   return `${url}${url.includes("?") ? "&" : "?"}_r=${Date.now()}`;
 }
 
-function VoiceArtifact({ displayUrl, fallbackUrl, caption }: { displayUrl: string; fallbackUrl: string; caption?: string }) {
+function VoiceArtifact({ displayUrl, fallbackUrl, caption, autoPlay }: {
+  displayUrl: string;
+  fallbackUrl: string;
+  caption?: string;
+  /** 语音回复到达后自动播放（后端 reply_voice.auto_play 下发；浏览器策略拒绝时静默回退为手动点击） */
+  autoPlay?: boolean;
+}) {
   const { t } = useTranslation();
   const [src, setSrc] = useState(displayUrl);
   const [error, setError] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  const tryAutoPlay = useCallback(() => {
+    if (!autoPlay) return;
+    const el = audioRef.current;
+    if (!el) return;
+    try {
+      const p = el.play();
+      if (p && typeof p.catch === "function") {
+        p.catch(() => {
+          // 浏览器自动播放策略拒绝时静默忽略，保留 controls 供手动播放。
+        });
+      }
+    } catch {
+      // play() 在未加载完成时调用也可能抛异常，忽略即可。
+    }
+  }, [autoPlay]);
+
+  // src 就绪（含 fallbackUrl 切换）后触发自动播放。
+  useEffect(() => {
+    tryAutoPlay();
+  }, [src, tryAutoPlay]);
+
   return (
     <div style={{ marginBottom: 8 }}>
       <audio
+        ref={audioRef}
         controls
-        preload="metadata"
+        preload="auto"
         src={src}
         style={{ maxWidth: "100%" }}
+        onCanPlay={tryAutoPlay}
         onError={() => {
           // asset:// (or stale-token) source failed — try the durable HTTP URL
           // with a freshly read auth token once before surfacing an error.
@@ -186,7 +217,9 @@ export function ArtifactItem({ art, apiBaseUrl, onImagePreview }: {
   }
 
   if (art.artifact_type === "voice") {
-    return <VoiceArtifact displayUrl={displayUrl} fallbackUrl={resolveAttachmentUrl(art, apiBaseUrl).fallbackUrl} caption={art.caption} />;
+    // 仅显式 auto_play=true 的 artifact（live SSE 到达的语音回复）才自动播放；
+    // 持久化副本 auto_play=false、旧数据无该字段，切换旧会话不会突然出声。
+    return <VoiceArtifact displayUrl={displayUrl} fallbackUrl={resolveAttachmentUrl(art, apiBaseUrl).fallbackUrl} caption={art.caption} autoPlay={art.auto_play === true} />;
   }
 
   const FileIcon = getFileTypeIcon(art.name || "");

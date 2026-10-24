@@ -397,7 +397,7 @@ class OkmemProvider:
             okmem_db or os.environ.get("OKMEM_DB") or self.home / "data" / "okmem" / "memory.db"
         )
         self.knowledge_db = Path(
-            knowledge_db or self.home / "data" / "fusion-memory" / "xuan-yi" / "knowledge.db"
+            knowledge_db or self.home / "data" / "okmem" / "xuan-yi" / "knowledge.db"
         )
         self.session_id = session_id
         self.dim = dim
@@ -667,6 +667,21 @@ class OkmemProvider:
         task = loop.create_task(runner())
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+        # 写入成功后异步触发世界模型刷新（fire-and-forget，不阻塞）
+        async def _refresh_world() -> None:
+            try:
+                from okmem.world_model import refresh_world_snapshot
+                db = getattr(self, "_db_path", "") or getattr(self, "db_path", "")
+                if db:
+                    await loop.run_in_executor(None, refresh_world_snapshot, db)
+            except Exception:
+                pass
+
+        refresh_task = loop.create_task(_refresh_world())
+        self._background_tasks.add(refresh_task)
+        refresh_task.add_done_callback(self._background_tasks.discard)
+
         return {"event_id": event_id, "status": "queued", "index_pending": True}
 
     def _record_event(self, event_id: str, payload: dict[str, Any]) -> None:
@@ -820,6 +835,72 @@ class OkmemProvider:
     async def delete(self, memory_id: str) -> bool:
         return await self._enqueue(PRIORITY_WRITE, self._delete_sync, memory_id)
 
+    async def forget_by_query(
+        self,
+        query: str,
+        *,
+        fmt: str = "",
+        limit: int = 50,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        """Batch-forget memories matching a keyword (optionally filtered by fmt).
+
+        Dry-run by default: returns the matching memories without deleting.
+        Set apply=True to actually mark them forgotten.
+        """
+        return await self._enqueue(
+            PRIORITY_WRITE,
+            self._forget_by_query_sync,
+            query,
+            fmt,
+            limit,
+            apply,
+        )
+
+    def _forget_by_query_sync(
+        self, query: str, fmt: str, limit: int, apply: bool
+    ) -> dict[str, Any]:
+        ms = self._ensure_okmem()
+        if ms is None:
+            return {"ok": False, "reason": "okmem unavailable"}
+        with self._lock:
+            # Search active memories by keyword via LIKE on content
+            rows = ms.store.active_memories()
+            matched = []
+            q = (query or "").strip().lower()
+            for row in rows:
+                content = (row.get("content") or "").lower()
+                row_fmt = row.get("fmt") or ""
+                if q and q not in content:
+                    continue
+                if fmt and row_fmt != fmt:
+                    continue
+                matched.append(row)
+                if len(matched) >= limit:
+                    break
+            deleted_ids = []
+            if apply:
+                for row in matched:
+                    mid = int(row["id"])
+                    ms.store.update_memory(mid, state="forgotten")
+                    deleted_ids.append(mid)
+            return {
+                "ok": True,
+                "query": query,
+                "fmt_filter": fmt or None,
+                "matched": len(matched),
+                "deleted": len(deleted_ids),
+                "apply": apply,
+                "samples": [
+                    {
+                        "id": row["id"],
+                        "fmt": row.get("fmt", ""),
+                        "content": (row.get("content") or "")[:100],
+                    }
+                    for row in matched[:10]
+                ],
+            }
+
     def _delete_sync(self, memory_id: str) -> bool:
         memory_id = self._strip_provider_prefix(str(memory_id))
         if memory_id.startswith("pending:"):
@@ -895,6 +976,22 @@ class OkmemProvider:
             parts.append(text)
             used += cost
             return True
+
+        # ── 模块C：世界状态叙事注入（每轮对话自动注入，含10种逻辑推演+缓存）──
+        try:
+            import sys as _sys
+            _brain_root = str(self.home)
+            if _brain_root and _brain_root not in _sys.path:
+                _sys.path.insert(0, _brain_root)
+            from okmem.world_model import get_world_state_cached
+            db_path = str(self.okmem_db)
+            if db_path:
+                world = get_world_state_cached(db_path, user_input=query)
+                if world:
+                    add(world)
+        except Exception as e:
+            import sys as _sysdbg
+            print(f"[okmem] provider world_state inject failed: {type(e).__name__}: {e}", file=_sysdbg.stderr)
 
         def add_paged(
             label: str,
@@ -2022,17 +2119,87 @@ class OkmemRetrievalSource:
         self.provider = provider or create_okmem_provider()
 
     async def retrieve(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Fused retrieval: memory.db search (primary) + six-pool recall (supplement).
+
+        - Primary: provider.search() — vector+keyword hybrid over memory.db,
+          best at hitting migrated conversation turns and semantic memories.
+        - Supplement: recall_pipeline — six-pool active recall (timeline /
+          keyword / impression / task / emotion / profile), used only when
+          the primary search returns too few hits, to surface structured
+          okmem-native memories that plain vector search may miss.
+        """
+        seen_ids: set[str] = set()
+        items: list[dict[str, Any]] = []
+
+        # ── 世界状态叙事注入（每轮对话自动注入，含10种逻辑推演+缓存）──
+        try:
+            import sys as _sys
+            _brain_root = str(getattr(self.provider, "home", ""))
+            if _brain_root and _brain_root not in _sys.path:
+                _sys.path.insert(0, _brain_root)
+            from okmem.world_model import get_world_state_cached
+            db_path = str(getattr(self.provider, "okmem_db", ""))
+            if db_path:
+                world = get_world_state_cached(db_path, user_input=query)
+                if world and len(world) > 50:
+                    items.append({
+                        "id": "world_state:injected",
+                        "content": world,
+                        "relevance": 1.0,
+                        "metadata": {"type": "world_state", "injected": True},
+                    })
+                    seen_ids.add("world_state:injected")
+        except Exception as e:
+            import sys as _sysdbg
+            print(f"[okmem] world_state inject failed: {type(e).__name__}: {e}", file=_sysdbg.stderr)
+
+        # Primary: hybrid search over memory.db + knowledge base
         records = await self.provider.search(query, limit=limit)
-        return [
-            {
-                "id": record.id,
+        for record in records:
+            if not record.content:
+                continue
+            rid = record.id
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            items.append({
+                "id": rid,
                 "content": record.content,
                 "relevance": float(record.score or 0.0),
                 "metadata": dict(record.metadata or {}),
-            }
-            for record in records
-            if record.content
-        ]
+            })
+
+        # Supplement: six-pool active recall if primary returned few hits
+        if len(items) < max(3, limit // 2):
+            try:
+                result = await self.provider.recall_pipeline(
+                    query, scene="mix", budget_chars=1500,
+                )
+                for entry in (result.get("stage3_deduped") or []):
+                    mem = entry.get("memory") or {}
+                    content = mem.get("content") or ""
+                    if not content:
+                        continue
+                    rid = f"okmem:{mem.get('id', '')}"
+                    if rid in seen_ids:
+                        continue
+                    seen_ids.add(rid)
+                    items.append({
+                        "id": rid,
+                        "content": content,
+                        "relevance": float(mem.get("score") or 0.55),
+                        "metadata": {
+                            "pool": entry.get("pool", ""),
+                            "fmt": mem.get("fmt", ""),
+                            "source": "okmem_recall",
+                        },
+                    })
+                    if len(items) >= limit:
+                        break
+            except Exception:
+                pass
+
+        return items[:limit]
 
     def close(self) -> None:
         self.provider.close()
@@ -2053,8 +2220,14 @@ OKMEM_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "okmem_recall",
         "category": "Memory",
         "description": (
-            "Run the okmem six-pool active recall pipeline and return "
-            "prompt-ready memory context for the current user input."
+            "主动回忆：检索与当前对话相关的历史记忆和世界状态。"
+            "【触发场景】当出现以下情况时必须调用："
+            "(1) 用户提到过去发生的事，如'还记得/上次/之前/我们之前/那件事/后来怎么样了'；"
+            "(2) 对话开头或上下文切换，需要确认上次聊到哪里；"
+            "(3) 用户问'我是谁/你是谁/我们是什么关系'等身份关系类问题；"
+            "(4) 用户说'在吗/接着说/继续'等模糊续接，需要回忆上下文才能正确回应。"
+            "【返回内容】上次会话摘要、未完成事项、已知事实、相关历史记忆、用户画像要点。"
+            "【使用方式】调用后基于返回的记忆内容继续对话，不要把用户当陌生人从头开始。"
         ),
         "input_schema": {
             "type": "object",
@@ -2189,6 +2362,85 @@ OKMEM_TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "okmem_search",
+        "category": "Memory",
+        "description": (
+            "Direct hybrid search over okmem memory.db (vector + keyword). "
+            "Use this when you need precise lookups, not the six-pool recall pipeline. "
+            "Returns matching memories with scores."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词或问题"},
+                "limit": {"type": "integer", "default": 8},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "okmem_forget",
+        "category": "Memory",
+        "description": (
+            "Forget (soft-delete) a specific memory by its okmem ID. "
+            "Use this when the user asks to remove a wrong, outdated, or "
+            "unwanted memory. The memory is marked forgotten, not hard-deleted."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "string",
+                    "description": "okmem memory ID (e.g. 'okmem:152' or a raw numeric id)",
+                },
+            },
+            "required": ["memory_id"],
+        },
+    },
+    {
+        "name": "okmem_forget_by_query",
+        "category": "Memory",
+        "description": (
+            "Batch-forget memories matching a keyword, optionally filtered by "
+            "memory format (semantic/episodic/session/working). "
+            "Dry-run by default: lists matching memories without deleting. "
+            "Set apply=true to actually forget them. "
+            "Example: forget all 'code refactor' or 'bug fix' type memories."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "关键词，如 '代码修改'、'bug fix'、'重构'",
+                },
+                "fmt": {
+                    "type": "string",
+                    "enum": ["semantic", "episodic", "session", "working", ""],
+                    "default": "",
+                    "description": "可选：按记忆格式过滤，空=全部",
+                },
+                "limit": {"type": "integer", "default": 50},
+                "apply": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "true=真删，false=仅预览匹配结果",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "okmem_pool_stats",
+        "category": "Memory",
+        "description": (
+            "Get six-pool memory statistics: how many active/forgotten memories "
+            "per format (semantic / episodic / session / working), plus embedding "
+            "and queue status. Use this to audit memory health and size."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
 ]
 
 OKMEM_TOOL_NAMES: tuple[str, ...] = tuple(schema["name"] for schema in OKMEM_TOOL_SCHEMAS)
@@ -2279,6 +2531,47 @@ async def dispatch_okmem_tool(
             apply=bool(args.get("apply", False)),
         )
         return {"ok": bool(result.get("ok")), "result": result}
+
+    if name == "okmem_search":
+        records = await provider.search(
+            str(args.get("query", "") or ""),
+            limit=int(args.get("limit", 8) or 8),
+        )
+        return {
+            "ok": True,
+            "count": len(records),
+            "items": [
+                {
+                    "id": r.id,
+                    "content": r.content,
+                    "score": float(r.score or 0.0),
+                    "metadata": dict(r.metadata or {}),
+                }
+                for r in records
+            ],
+        }
+
+    if name == "okmem_forget":
+        mid = str(args.get("memory_id", "") or "").strip()
+        if not mid:
+            return {"ok": False, "error": "memory_id is required"}
+        removed = await provider.delete(mid)
+        return {"ok": bool(removed), "memory_id": mid, "removed": bool(removed)}
+
+    if name == "okmem_forget_by_query":
+        query = str(args.get("query", "") or "").strip()
+        if not query:
+            return {"ok": False, "error": "query is required"}
+        result = await provider.forget_by_query(
+            query,
+            fmt=str(args.get("fmt", "") or ""),
+            limit=int(args.get("limit", 50) or 50),
+            apply=bool(args.get("apply", False)),
+        )
+        return {"ok": bool(result.get("ok")), "result": result}
+
+    if name == "okmem_pool_stats":
+        return {"ok": True, "result": await provider.pool_stats()}
 
     raise ValueError(f"Unknown okmem tool: {name!r}")
 

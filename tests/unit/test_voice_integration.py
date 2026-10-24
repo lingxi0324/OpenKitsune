@@ -36,7 +36,12 @@ from openkitsune.voice import (
     synthesize_text,
     transcribe_audio,
 )
-from openkitsune.voice.audio import sniff_container, split_text_for_tts, wrap_pcm_as_wav
+from openkitsune.voice.audio import (
+    segment_text_for_tts,
+    sniff_container,
+    split_text_for_tts,
+    wrap_pcm_as_wav,
+)
 
 _EDGE_AVAILABLE = True
 try:
@@ -122,6 +127,55 @@ class TestChunking:
 
     def test_empty(self):
         assert split_text_for_tts("   ", 100) == []
+
+
+# ── 2.1 语音分段（句界优先，长文本可合成、断句自然）──
+class TestSentenceSegmentation:
+    def test_chinese_segments_respect_sentence_boundaries(self):
+        text = ("今天我们来聊聊丹田。丹田位于脐下三寸。"
+                "第一，要放松！第二，要专注……第三，别急。")
+        segments = segment_text_for_tts(text, max_chunk=30)
+        assert all(len(s) <= 30 for s in segments)
+        # 段界只能落在句末标点后，不能把句子拦腰切断
+        for seg in segments[:-1]:
+            assert seg.rstrip()[-1] in "。！？!?…；;"
+
+    def test_oversized_sentence_splits_at_clauses(self):
+        # 单句远超 max_chunk：先按逗号/分号切，再按空白，最后才硬切
+        text = ("这是一句很长的话，" * 40) + "结束。"
+        segments = segment_text_for_tts(text, max_chunk=120)
+        assert all(len(s) <= 120 for s in segments)
+        assert "结束" in segments[-1]
+
+    def test_max_total_truncates_keeping_sentence(self):
+        text = ("第一句话比较长，用来撑字数。第二句话。第三句话。"
+                "第四句话在这里收尾。")
+        segments = segment_text_for_tts(text, max_chunk=20, max_total=24)
+        joined = "".join(segments)
+        # 截断后以完整句子结束，且不再包含被截掉的内容
+        assert joined.endswith("。")
+        assert "第四句话" not in joined
+
+    def test_cjk_adjacent_join_without_space(self):
+        text = "第一句。第二句。第三句。"
+        segments = segment_text_for_tts(text, max_chunk=200)
+        # 单段内中文字句之间不应插入空格
+        assert " " not in segments[0]
+
+    def test_english_decimal_not_split(self):
+        text = "Pi is 3.14 and e is 2.718. That is all."
+        segments = segment_text_for_tts(text, max_chunk=100)
+        # 小数/版本号中的点号受保护，整段保持为一个分句
+        assert len(segments) == 1
+        assert "3.14" in segments[0]
+        assert "2.718" in segments[0]
+
+    def test_split_chinese_over_provider_cap(self):
+        text = "中文句子。" * 300  # 1500 字，超过常见 provider 上限
+        chunks = split_text_for_tts(text, 300)
+        assert all(len(c) <= 300 for c in chunks)
+        # 拼接后内容不丢
+        assert "".join(chunks) == text
 
 
 # ── 3. 音频工具 ──

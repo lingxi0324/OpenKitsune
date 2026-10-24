@@ -22,6 +22,9 @@ import {
   CircleDot,
   WifiOff,
   AlertTriangle,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
 } from "lucide-react";
 import { getAccessToken } from "../platform/auth";
 import { safeFetch } from "../providers";
@@ -32,10 +35,26 @@ const PANEL_CONTEXT_ID = "desktop-panel";
 
 interface DesktopWindowInfo {
   title?: string;
+  handle?: number;
+  process_id?: number;
   class_name?: string;
   process_name?: string;
+  bbox?: number[] | null;
   is_visible?: boolean;
   is_focused?: boolean;
+  is_minimized?: boolean;
+  is_maximized?: boolean;
+}
+
+interface DesktopActivity {
+  kind?: string;
+  ts?: string;
+  target?: string;
+  detail?: string;
+  window?: string;
+  location?: string;
+  x?: number;
+  y?: number;
 }
 
 interface DesktopStateData {
@@ -45,6 +64,7 @@ interface DesktopStateData {
   pointer?: { x?: number; y?: number };
   active_window?: DesktopWindowInfo | null;
   windows?: DesktopWindowInfo[];
+  activity?: DesktopActivity[];
   screenshot?: {
     ok?: boolean;
     path?: string;
@@ -91,6 +111,19 @@ export function DesktopPanel({ apiBaseUrl = DEFAULT_API_BASE }: DesktopPanelProp
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [imgReady, setImgReady] = useState(false);
   const [imgFailed, setImgFailed] = useState(false);
+  const [busyKey, setBusyKey] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [detailsKey, setDetailsKey] = useState("");
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [detailsText, setDetailsText] = useState("");
+  const [detailsError, setDetailsError] = useState("");
+  const [openTarget, setOpenTarget] = useState("");
+  const [openBusy, setOpenBusy] = useState(false);
+  const [openError, setOpenError] = useState("");
+  const [clickThrough, setClickThrough] = useState(false);
+  const [clickBusy, setClickBusy] = useState(false);
+  const [clickError, setClickError] = useState("");
+  const [clickMark, setClickMark] = useState<{ x: number; y: number; ts: number } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   const fetchState = useCallback(
@@ -101,7 +134,7 @@ export function DesktopPanel({ apiBaseUrl = DEFAULT_API_BASE }: DesktopPanelProp
       setLoading(true);
       setFetchError("");
       try {
-        const url = `${apiBaseUrl}/api/desktop/state?include_screenshot=${withScreenshot ? 1 : 0}&context_id=${PANEL_CONTEXT_ID}`;
+        const url = `${apiBaseUrl}/api/desktop/state?include_screenshot=${withScreenshot ? 1 : 0}&context_id=${PANEL_CONTEXT_ID}&refresh=1&screenshot_max_width=1280&screenshot_max_height=720`;
         const res = await safeFetch(url, { signal: controller.signal });
         if (!res.ok) {
           const body = await res.text().catch(() => "");
@@ -120,6 +153,163 @@ export function DesktopPanel({ apiBaseUrl = DEFAULT_API_BASE }: DesktopPanelProp
     },
     [apiBaseUrl],
   );
+
+  const windowKey = useCallback(
+    (win: DesktopWindowInfo) => String(win.handle ?? win.title ?? ""),
+    [],
+  );
+
+  // 用户点击窗口 → 置前/恢复；AI 侧可通过 desktop_state 感知到新的活动窗口
+  const activateWindow = useCallback(
+    async (win: DesktopWindowInfo) => {
+      const key = windowKey(win);
+      if (!key || busyKey) return;
+      setBusyKey(key);
+      setActionError("");
+      try {
+        const res = await safeFetch(`${apiBaseUrl}/api/desktop/window`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "switch",
+            title: win.title,
+            handle: win.handle,
+          }),
+        });
+        const payload = (await res.json()) as {
+          ok?: boolean;
+          error?: string;
+          errors?: string[];
+        };
+        if (!res.ok || !payload.ok) {
+          throw new Error(payload.error || payload.errors?.[0] || `HTTP ${res.status}`);
+        }
+        await fetchState(false);
+      } catch (err) {
+        setActionError((err as Error).message || String(err));
+      } finally {
+        setBusyKey("");
+      }
+    },
+    [apiBaseUrl, busyKey, fetchState, windowKey],
+  );
+
+  // 展开/收起窗口元素树（用户查看 + AI 感知同一份数据源）
+  const toggleDetails = useCallback(
+    async (win: DesktopWindowInfo) => {
+      const key = windowKey(win);
+      if (!key) return;
+      if (detailsKey === key) {
+        setDetailsKey("");
+        return;
+      }
+      setDetailsKey(key);
+      setDetailsText("");
+      setDetailsError("");
+      setDetailsLoading(true);
+      try {
+        const params = new URLSearchParams({ depth: "2" });
+        if (win.handle) params.set("handle", String(win.handle));
+        else params.set("title", win.title || "");
+        const res = await safeFetch(
+          `${apiBaseUrl}/api/desktop/window/elements?${params.toString()}`,
+        );
+        const payload = (await res.json()) as {
+          ok?: boolean;
+          text?: string;
+          error?: string;
+          errors?: string[];
+        };
+        if (!res.ok || !payload.ok) {
+          throw new Error(payload.error || payload.errors?.[0] || `HTTP ${res.status}`);
+        }
+        setDetailsText(payload.text || "");
+      } catch (err) {
+        setDetailsError((err as Error).message || String(err));
+      } finally {
+        setDetailsLoading(false);
+      }
+    },
+    [apiBaseUrl, detailsKey, windowKey],
+  );
+
+  // 用户从面板打开路径/网址；后端会记录活动供 AI 感知
+  const submitOpenTarget = useCallback(async () => {
+    const target = openTarget.trim();
+    if (!target || openBusy) return;
+    setOpenBusy(true);
+    setOpenError("");
+    try {
+      const res = await safeFetch(`${apiBaseUrl}/api/desktop/open`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target }),
+      });
+      const payload = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        errors?: string[];
+      };
+      if (!res.ok || !payload.ok) {
+        throw new Error(payload.error || payload.errors?.[0] || `HTTP ${res.status}`);
+      }
+      await fetchState(true);
+    } catch (err) {
+      setOpenError((err as Error).message || String(err));
+    } finally {
+      setOpenBusy(false);
+    }
+  }, [apiBaseUrl, fetchState, openBusy, openTarget]);
+
+  // 预览图点击穿透：按预览比例换算成屏幕绝对坐标后真实点击
+  const handlePreviewClick = useCallback(
+    async (e: React.MouseEvent<HTMLImageElement>) => {
+      if (!clickThrough || clickBusy) return;
+      const img = e.currentTarget;
+      const rect = img.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+
+      const relX = (e.clientX - rect.left) / rect.width;
+      const relY = (e.clientY - rect.top) / rect.height;
+      const screenW = data?.screen_size?.width || img.naturalWidth;
+      const screenH = data?.screen_size?.height || img.naturalHeight;
+      if (!screenW || !screenH) return;
+
+      const x = Math.round(relX * screenW);
+      const y = Math.round(relY * screenH);
+      setClickBusy(true);
+      setClickError("");
+      setClickMark({ x: relX, y: relY, ts: Date.now() });
+      try {
+        const res = await safeFetch(`${apiBaseUrl}/api/desktop/click`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ x, y, button: "left" }),
+        });
+        const payload = (await res.json()) as {
+          ok?: boolean;
+          error?: string;
+          errors?: string[];
+        };
+        if (!res.ok || !payload.ok) {
+          throw new Error(payload.error || payload.errors?.[0] || `HTTP ${res.status}`);
+        }
+        await fetchState(true);
+      } catch (err) {
+        setClickError((err as Error).message || String(err));
+      } finally {
+        setClickBusy(false);
+      }
+    },
+    [apiBaseUrl, clickBusy, clickThrough, data?.screen_size, fetchState],
+  );
+
+  // 点击标记短暂显示后清除
+  useEffect(() => {
+    if (!clickMark) return;
+    const timer = window.setTimeout(() => setClickMark(null), 800);
+    return () => window.clearTimeout(timer);
+  }, [clickMark]);
 
   // 打开面板时立即拉一次（带截图）
   useEffect(() => {
@@ -156,6 +346,7 @@ export function DesktopPanel({ apiBaseUrl = DEFAULT_API_BASE }: DesktopPanelProp
   const windows = data?.windows ?? [];
   const visibleWindows = windows.filter((w) => w.is_visible !== false).slice(0, 20);
   const capabilities = data?.capabilities ?? {};
+  const activity = data?.activity ?? [];
   const errors = data?.errors ?? [];
 
   const renderScreenshot = () => {
@@ -167,41 +358,95 @@ export function DesktopPanel({ apiBaseUrl = DEFAULT_API_BASE }: DesktopPanelProp
         </div>
       );
     }
+    const interactive = clickThrough;
     return (
-      <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", border: "1px solid var(--line)", background: "rgba(0,0,0,0.25)" }}>
-        {!imgReady && !imgFailed && (
-          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)" }}>
-            <Loader2 size={22} className="dt-spin" />
-          </div>
-        )}
-        {imgFailed ? (
-          <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center", justifyContent: "center", minHeight: 180, color: "var(--warning-text, #b45309)", fontSize: 13 }}>
-            <WifiOff size={24} />
-            <span>{t("desktop.imgFailed", "截图加载失败，点击刷新重试")}</span>
-          </div>
-        ) : (
-          <img
-            src={screenshotUrl}
-            alt="desktop"
-            onLoad={() => { setImgReady(true); setImgFailed(false); }}
-            onError={() => { setImgReady(true); setImgFailed(true); }}
-            style={{
-              display: imgReady ? "block" : "none",
-              width: "100%",
-              maxHeight: 240,
-              objectFit: "contain",
-              background: "rgba(0,0,0,0.4)",
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button
+            onClick={() => {
+              setClickThrough((v) => !v);
+              setClickError("");
             }}
-          />
-        )}
-        {imgReady && data?.screenshot?.captured_at && (
-          <span style={{
-            position: "absolute", right: 8, bottom: 8, padding: "2px 8px", borderRadius: 999,
-            background: "rgba(0,0,0,0.55)", color: "#e5e7eb", fontSize: 11, backdropFilter: "blur(4px)",
-          }}>
-            {formatCapturedAt(data.screenshot.captured_at)}
+            title={t("desktop.clickThroughHint", "开启后可在截图上直接点击")}
+            style={{
+              display: "inline-flex", alignItems: "center", gap: 5,
+              padding: "4px 9px", borderRadius: 8, cursor: "pointer", fontSize: 11,
+              border: `1px solid ${clickThrough ? "color-mix(in srgb, var(--accent, #60a5fa) 45%, var(--line))" : "var(--line)"}`,
+              background: clickThrough ? "color-mix(in srgb, var(--accent, #60a5fa) 12%, transparent)" : "transparent",
+              color: clickThrough ? "var(--accent, #60a5fa)" : "var(--muted)",
+            }}
+          >
+            <MousePointer size={12} />
+            {clickThrough
+              ? t("desktop.clickThroughOn", "点击穿透：开")
+              : t("desktop.clickThrough", "点击穿透")}
+          </button>
+          <span style={{ fontSize: 10, color: "var(--muted)", flex: 1 }}>
+            {clickThrough
+              ? t(
+                  "desktop.clickThroughHintOn",
+                  "点击画面即真实点击；若面板遮挡会先最小化再恢复",
+                )
+              : t("desktop.clickThroughHint", "开启后可在截图上直接点击")}
           </span>
+          {clickBusy && <Loader2 size={12} className="dt-spin" />}
+        </div>
+        {clickError && (
+          <div style={{ fontSize: 11, color: "#dc2626", overflowWrap: "anywhere" }}>
+            {clickError}
+          </div>
         )}
+        <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", border: "1px solid var(--line)", background: "rgba(0,0,0,0.25)" }}>
+          {!imgReady && !imgFailed && (
+            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)" }}>
+              <Loader2 size={22} className="dt-spin" />
+            </div>
+          )}
+          {imgFailed ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center", justifyContent: "center", minHeight: 180, color: "var(--warning-text, #b45309)", fontSize: 13 }}>
+              <WifiOff size={24} />
+              <span>{t("desktop.imgFailed", "截图加载失败，点击刷新重试")}</span>
+            </div>
+          ) : (
+            <img
+              src={screenshotUrl}
+              alt="desktop"
+              onClick={interactive ? handlePreviewClick : undefined}
+              onLoad={() => { setImgReady(true); setImgFailed(false); }}
+              onError={() => { setImgReady(true); setImgFailed(true); }}
+              style={{
+                display: imgReady ? "block" : "none",
+                width: "100%",
+                maxHeight: clickThrough ? undefined : 240,
+                height: clickThrough ? "auto" : undefined,
+                objectFit: clickThrough ? undefined : "contain",
+                cursor: interactive ? "crosshair" : "default",
+                background: "rgba(0,0,0,0.4)",
+              }}
+            />
+          )}
+          {clickMark && (
+            <span
+              style={{
+                position: "absolute",
+                left: `${clickMark.x * 100}%`,
+                top: `${clickMark.y * 100}%`,
+                width: 18, height: 18, marginLeft: -9, marginTop: -9,
+                borderRadius: "50%", border: "2px solid #60a5fa",
+                background: "rgba(96,165,250,0.25)",
+                pointerEvents: "none",
+              }}
+            />
+          )}
+          {imgReady && data?.screenshot?.captured_at && (
+            <span style={{
+              position: "absolute", right: 8, bottom: 8, padding: "2px 8px", borderRadius: 999,
+              background: "rgba(0,0,0,0.55)", color: "#e5e7eb", fontSize: 11, backdropFilter: "blur(4px)",
+            }}>
+              {formatCapturedAt(data.screenshot.captured_at)}
+            </span>
+          )}
+        </div>
       </div>
     );
   };
@@ -319,11 +564,35 @@ export function DesktopPanel({ apiBaseUrl = DEFAULT_API_BASE }: DesktopPanelProp
           {/* 主体 */}
           <div style={{ flex: 1, overflowY: "auto", padding: "12px 16px 20px", display: "flex", flexDirection: "column", gap: 12 }}>
             {fetchError && (
-              <div style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "10px 12px", borderRadius: 10, background: "rgba(245,158,11,0.10)", border: "1px solid rgba(245,158,11,0.3)", color: "var(--warning-text, #b45309)", fontSize: 12 }}>
-                <AlertTriangle size={14} style={{ marginTop: 1, flexShrink: 0 }} />
-                <span style={{ overflowWrap: "anywhere" }}>
-                  {t("desktop.fetchError", "桌面状态获取失败")}: {fetchError}
-                </span>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: "10px 12px", borderRadius: 10, background: "rgba(245,158,11,0.10)", border: "1px solid rgba(245,158,11,0.3)", color: "var(--warning-text, #b45309)", fontSize: 12 }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                  <AlertTriangle size={14} style={{ marginTop: 1, flexShrink: 0 }} />
+                  <span style={{ overflowWrap: "anywhere" }}>
+                    {t("desktop.fetchError", "桌面状态获取失败")}: {fetchError}
+                  </span>
+                </div>
+                {/fetch|network|failed to fetch/i.test(fetchError) && (
+                  <span style={{ opacity: 0.85 }}>
+                    {t(
+                      "desktop.backendDown",
+                      "后端服务未启动或不可达，请确认 openkitsune serve 正在运行",
+                    )}
+                  </span>
+                )}
+                <button
+                  onClick={() => void fetchState(true)}
+                  style={{
+                    alignSelf: "flex-start",
+                    display: "inline-flex", alignItems: "center", gap: 5,
+                    padding: "4px 10px", borderRadius: 8, cursor: "pointer",
+                    border: "1px solid rgba(245,158,11,0.45)",
+                    background: "rgba(245,158,11,0.12)",
+                    color: "var(--warning-text, #b45309)", fontSize: 11,
+                  }}
+                >
+                  <RefreshCw size={12} />
+                  {t("desktop.retry", "重试")}
+                </button>
               </div>
             )}
 
@@ -335,6 +604,52 @@ export function DesktopPanel({ apiBaseUrl = DEFAULT_API_BASE }: DesktopPanelProp
                 </span>
               </div>
             )}
+
+            {/* 打开路径 / 网址（用户打开，AI 通过活动记录感知） */}
+            <section style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <div style={{ fontSize: 11, color: "var(--muted)" }}>
+                {t("desktop.openTarget", "打开路径 / 网址")}
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <input
+                  value={openTarget}
+                  onChange={(e) => setOpenTarget(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void submitOpenTarget();
+                    }
+                  }}
+                  placeholder={t("desktop.openPlaceholder", "C:\\path\\to\\file 或 https://...")}
+                  style={{
+                    flex: 1, minWidth: 0, padding: "6px 9px", borderRadius: 8,
+                    border: "1px solid var(--line)", background: "transparent",
+                    color: "var(--text)", fontSize: 12, outline: "none",
+                  }}
+                />
+                <button
+                  onClick={() => void submitOpenTarget()}
+                  disabled={openBusy || !openTarget.trim()}
+                  style={{
+                    display: "inline-flex", alignItems: "center", gap: 5,
+                    padding: "6px 10px", borderRadius: 8, fontSize: 12,
+                    cursor: openBusy || !openTarget.trim() ? "not-allowed" : "pointer",
+                    border: "1px solid var(--line)",
+                    background: "color-mix(in srgb, var(--accent, #60a5fa) 12%, transparent)",
+                    color: "var(--accent, #60a5fa)",
+                    opacity: openBusy || !openTarget.trim() ? 0.6 : 1,
+                  }}
+                >
+                  {openBusy ? <Loader2 size={12} className="dt-spin" /> : <ExternalLink size={12} />}
+                  {t("desktop.open", "打开")}
+                </button>
+              </div>
+              {openError && (
+                <div style={{ fontSize: 11, color: "#dc2626", overflowWrap: "anywhere" }}>
+                  {openError}
+                </div>
+              )}
+            </section>
 
             {/* 截图 */}
             {renderScreenshot()}
@@ -376,36 +691,157 @@ export function DesktopPanel({ apiBaseUrl = DEFAULT_API_BASE }: DesktopPanelProp
               </section>
             )}
 
-            {/* 可见窗口 */}
+            {/* 可见窗口：用户点击置前；AI 通过 desktop_state 感知同一份清单 */}
             <section style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               <div style={{ fontSize: 11, color: "var(--muted)" }}>
                 {t("desktop.visibleWindows", "可见窗口")}
+                <span style={{ opacity: 0.75 }}>
+                  {" · "}
+                  {t("desktop.clickToActivate", "点击窗口可置前")}
+                </span>
               </div>
+              {actionError && (
+                <div style={{ fontSize: 11, color: "#dc2626", overflowWrap: "anywhere" }}>
+                  {t("desktop.actionFailed", "窗口操作失败")}: {actionError}
+                </div>
+              )}
               {visibleWindows.length === 0 ? (
                 <div style={{ fontSize: 12, color: "var(--muted)", padding: "8px 0" }}>
                   {t("desktop.noWindows", "无可见窗口")}
                 </div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  {visibleWindows.map((win, i) => (
+                  {visibleWindows.map((win) => {
+                    const key = windowKey(win);
+                    const focused = Boolean(win.is_focused);
+                    const busy = busyKey === key;
+                    const open = detailsKey === key;
+                    const bbox = win.bbox;
+                    const size = bbox && bbox.length === 4 && bbox[2] > bbox[0] && bbox[3] > bbox[1]
+                      ? `${bbox[2] - bbox[0]}×${bbox[3] - bbox[1]}`
+                      : "";
+                    const badges = [
+                      win.is_minimized ? "min" : "",
+                      win.is_maximized ? "max" : "",
+                    ].filter(Boolean).join(",");
+                    return (
+                      <div key={key} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                        <div
+                          role="button"
+                          tabIndex={0}
+                          title={t(
+                            "desktop.activateHint",
+                            "点击窗口将其置前；AI 可通过 desktop_state 实时感知当前窗口",
+                          )}
+                          onClick={() => void activateWindow(win)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              void activateWindow(win);
+                            }
+                          }}
+                          style={{
+                            display: "flex", alignItems: "center", gap: 8,
+                            padding: "7px 10px", borderRadius: 10,
+                            cursor: busy ? "progress" : "pointer",
+                            border: `1px solid ${focused ? "color-mix(in srgb, var(--accent, #60a5fa) 45%, var(--line))" : "var(--line)"}`,
+                            background: focused ? "color-mix(in srgb, var(--accent, #60a5fa) 8%, transparent)" : "transparent",
+                            opacity: busy ? 0.7 : 1,
+                            transition: "border-color 0.15s ease, background 0.15s ease",
+                          }}
+                          onMouseEnter={(e) => {
+                            if (!focused) e.currentTarget.style.borderColor = "color-mix(in srgb, var(--accent, #60a5fa) 35%, var(--line))";
+                          }}
+                          onMouseLeave={(e) => {
+                            if (!focused) e.currentTarget.style.borderColor = "var(--line)";
+                          }}
+                        >
+                          <AppWindow size={13} style={{ flexShrink: 0, color: focused ? "var(--accent, #60a5fa)" : "var(--muted)" }} />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div
+                              title={win.title}
+                              style={{ fontSize: 12, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                            >
+                              {win.title || "—"}
+                            </div>
+                            <div style={{ fontSize: 10, color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {[win.process_name, size, badges].filter(Boolean).join(" · ")}
+                            </div>
+                          </div>
+                          {busy ? (
+                            <Loader2 size={13} className="dt-spin" style={{ flexShrink: 0 }} />
+                          ) : (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void toggleDetails(win);
+                              }}
+                              title={open ? t("desktop.hideDetails", "收起") : t("desktop.details", "详情")}
+                              aria-label={open ? t("desktop.hideDetails", "收起") : t("desktop.details", "详情")}
+                              style={{ ...iconBtnStyle, width: 24, height: 24, flexShrink: 0 }}
+                            >
+                              {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                            </button>
+                          )}
+                        </div>
+                        {open && (
+                          <div style={{ marginLeft: 8, padding: "8px 10px", borderRadius: 8, border: "1px solid var(--line)", background: "rgba(0,0,0,0.18)" }}>
+                            {detailsLoading ? (
+                              <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "var(--muted)" }}>
+                                <Loader2 size={12} className="dt-spin" />
+                                {t("desktop.detailsLoading", "读取元素树...")}
+                              </div>
+                            ) : detailsError ? (
+                              <div style={{ fontSize: 11, color: "#dc2626", overflowWrap: "anywhere" }}>
+                                {detailsError}
+                              </div>
+                            ) : (
+                              <pre style={{ margin: 0, maxHeight: 220, overflow: "auto", fontSize: 10, lineHeight: 1.45, color: "var(--muted)", whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+                                {detailsText || "—"}
+                              </pre>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+
+            {/* 最近活动：用户打开/点击/聚焦记录，AI 通过 desktop_state 读取 */}
+            <section style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <div style={{ fontSize: 11, color: "var(--muted)" }}>
+                {t("desktop.activity", "最近活动")}
+              </div>
+              {activity.length === 0 ? (
+                <div style={{ fontSize: 12, color: "var(--muted)", padding: "4px 0" }}>—</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  {activity.slice(0, 8).map((item, i) => (
                     <div
-                      key={i}
+                      key={`${item.ts || ""}-${i}`}
                       style={{
-                        display: "flex", alignItems: "center", gap: 8,
-                        padding: "7px 10px", borderRadius: 10,
-                        border: `1px solid ${win.is_focused ? "color-mix(in srgb, var(--accent, #60a5fa) 45%, var(--line))" : "var(--line)"}`,
-                        background: win.is_focused ? "color-mix(in srgb, var(--accent, #60a5fa) 8%, transparent)" : "transparent",
+                        display: "flex", gap: 8, alignItems: "baseline",
+                        padding: "5px 8px", borderRadius: 8,
+                        border: "1px solid var(--line)", fontSize: 11,
                       }}
                     >
-                      <AppWindow size={13} style={{ flexShrink: 0, color: win.is_focused ? "var(--accent, #60a5fa)" : "var(--muted)" }} />
-                      <span style={{ flex: 1, fontSize: 12, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {win.title || "—"}
+                      <span style={{ color: "var(--accent, #60a5fa)", flexShrink: 0 }}>
+                        {item.kind || "activity"}
                       </span>
-                      {win.process_name && (
-                        <span style={{ fontSize: 10, color: "var(--muted)", flexShrink: 0 }}>
-                          {win.process_name}
-                        </span>
-                      )}
+                      <span
+                        title={item.location || item.target || item.window}
+                        style={{
+                          flex: 1, minWidth: 0, color: "var(--text)",
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                        }}
+                      >
+                        {item.target || item.window || "—"}
+                      </span>
+                      <span style={{ color: "var(--muted)", flexShrink: 0 }}>
+                        {formatCapturedAt(item.ts)}
+                      </span>
                     </div>
                   ))}
                 </div>

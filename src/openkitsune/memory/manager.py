@@ -282,6 +282,10 @@ class MemoryManager:
         self._current_workspace_id: str = "default"
         self._session_turns: list[ConversationTurn] = []
         self._recent_messages: list[dict] = []
+        # Incremental okmem write-back: pair user->assistant per turn so an
+        # unclean shutdown still keeps the last few turns in okmem (not just
+        # waiting for end_session -> _persist_session_to_okmem).
+        self._pending_okmem_user: str | None = None
 
         # Citation tracking: memories retrieved via search_memory this session
         self._session_cited_memories: list[dict] = []
@@ -1397,6 +1401,24 @@ class MemoryManager:
         if self._current_session_id:
             self.consolidator.save_conversation_turn(self._current_session_id, turn)
 
+        # Incremental okmem write-back: don't wait for end_session. Pair
+        # user message with the next assistant reply and fire an async save_turn
+        # so an unclean shutdown still keeps recent turns in okmem.
+        try:
+            if role == "user" and len(content) >= 12:
+                self._pending_okmem_user = content
+            elif role in ("assistant", "model") and self._pending_okmem_user:
+                user_msg = self._pending_okmem_user
+                self._pending_okmem_user = None
+                sid = self._current_session_id or "openkitsune"
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    self._safe_okmem_incremental_save(user_msg, content, sid)
+                )
+        except RuntimeError:
+            # no running event loop (sync context) — skip incremental write
+            pass
+
     def record_cited_memories(self, memories: list[dict]) -> None:
         """Record memories retrieved via search_memory for later LLM scoring.
 
@@ -1955,6 +1977,22 @@ class MemoryManager:
                 if provider is not None:
                     return provider
         return None
+
+    async def _safe_okmem_incremental_save(
+        self, user_message: str, assistant_answer: str, session_id: str
+    ) -> None:
+        """每轮对话后增量写 okmem（不等会话结束），异常关闭也不丢最近对话。"""
+        try:
+            provider = self._okmem_provider()
+            if provider is None:
+                return
+            await provider.save_turn(
+                user_message=user_message,
+                assistant_answer=assistant_answer,
+                session_id=session_id,
+            )
+        except Exception as e:  # noqa: BLE001 —— 增量写失败不阻断对话
+            logger.debug("[Okmem] incremental save_turn skipped: %s", e)
 
     async def _persist_session_to_okmem(
         self, turns: list[ConversationTurn], session_id: str
@@ -2602,6 +2640,35 @@ class MemoryManager:
                     "Replace-mode memory backend failed, falling back to built-in",
                     exc_info=True,
                 )
+
+        # Augment-mode providers (e.g. okmem) — call each one and merge
+        # their injection context. This is what makes okmem's six-pool
+        # active recall run on every turn, not just when LLM calls search_memory.
+        augment_parts: list[str] = []
+        for backend in self._iter_memory_backends():
+            if backend is replace:
+                continue
+            inject_fn = getattr(backend, "get_injection_context", None)
+            if inject_fn is None:
+                continue
+            try:
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        asyncio.run,
+                        inject_fn(task_description, 500),
+                    )
+                    text = future.result(timeout=8)
+                if text and str(text).strip():
+                    name = getattr(backend, "name", "memory")
+                    augment_parts.append(f"[{name}]\n{text}")
+            except Exception:
+                logger.debug(
+                    "Augment backend %s injection failed, skipped",
+                    getattr(backend, "name", "?"),
+                )
+
         retrieve_kwargs = {
             "query": task_description,
             "recent_messages": self._recent_messages,
@@ -2609,7 +2676,14 @@ class MemoryManager:
         }
         if precomputed_keywords:
             retrieve_kwargs["precomputed_keywords"] = precomputed_keywords
-        return self.retrieval_engine.retrieve(**retrieve_kwargs)
+        local_result = self.retrieval_engine.retrieve(**retrieve_kwargs)
+
+        if augment_parts:
+            merged = "\n\n".join(augment_parts)
+            if local_result:
+                return f"{local_result}\n\n{merged}"
+            return merged
+        return local_result
 
     def save_precompact_snapshot(self, snapshot: dict) -> None:
         """Store the latest session-scoped compaction snapshot."""
@@ -2649,28 +2723,51 @@ class MemoryManager:
         precomputed_keywords: list[str] | None = None,
     ) -> str:
         replace = self._get_replace_backend()
+        result_parts: list[str] = []
         if replace is not None:
             try:
-                return await asyncio.wait_for(
-                    replace.get_injection_context(task_description, 700),
+                ctx = await asyncio.wait_for(
+                    replace.get_injection_context(task_description, 500),
                     timeout=10,
                 )
+                if ctx:
+                    result_parts.append(ctx)
             except Exception:
                 logger.warning(
                     "Replace-mode memory backend failed, falling back to built-in",
                     exc_info=True,
                 )
-        retrieve_kwargs = {}
-        if precomputed_keywords:
-            retrieve_kwargs["precomputed_keywords"] = precomputed_keywords
-        return await asyncio.to_thread(
-            self.retrieval_engine.retrieve,
-            task_description,
-            self._recent_messages,
-            None,
-            700,
-            **retrieve_kwargs,
-        )
+        else:
+            retrieve_kwargs = {}
+            if precomputed_keywords:
+                retrieve_kwargs["precomputed_keywords"] = precomputed_keywords
+            builtin = await asyncio.to_thread(
+                self.retrieval_engine.retrieve,
+                task_description,
+                self._recent_messages,
+                None,
+                500,
+                **retrieve_kwargs,
+            )
+            if builtin:
+                result_parts.append(builtin)
+
+        # ── 追加 external source（okmem 世界状态叙事）──
+        try:
+            external = await asyncio.to_thread(
+                self.retrieval_engine._call_external_sources_sync,
+                task_description,
+            )
+            for cand in external:
+                if cand.memory_type == "external" and cand.score >= 0.35:
+                    content = cand.content.strip()
+                    if content and len(content) > 30:
+                        result_parts.append(content)
+                        break  # 只取最高分的一条（world_state 排第一）
+        except Exception:
+            pass
+
+        return "\n\n".join(result_parts)
 
     # Phase 1B：明确"绝不可从缓存直接返回给上层"的隔离桶。
     # 走 `iter_cached`/`_keyword_search`/`get_stats` 这些会被注入提示词或

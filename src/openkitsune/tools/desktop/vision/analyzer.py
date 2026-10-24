@@ -4,6 +4,7 @@ Windows 桌面自动化 - 视觉分析器
 基于 DashScope Qwen-VL 实现 UI 视觉识别
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -77,6 +78,7 @@ class VisionAnalyzer:
         self,
         prompt: str,
         image: Image.Image,
+        max_tokens: int = 1024,
     ) -> str:
         """
         调用视觉模型（模型由 LLM 端点配置决定）
@@ -84,6 +86,7 @@ class VisionAnalyzer:
         Args:
             prompt: 提示词
             image: 图片
+            max_tokens: 输出上限（桌面截图任务输出越短越快，避免长文本拖慢闭环）
 
         Returns:
             模型响应文本
@@ -102,12 +105,21 @@ class VisionAnalyzer:
             )
         ]
 
-        response = await self.llm_client.chat(
+        try:
+            from ..config import get_config
+
+            timeout = float(get_config().vision.timeout or 0)
+        except Exception:
+            timeout = 0.0
+
+        call = self.llm_client.chat(
             messages=messages,
-            max_tokens=4096,
+            max_tokens=max_tokens,
             temperature=1.0,
             **self._endpoint_kwargs(),
         )
+        # 本地视觉模型可能长时间生成；超时后走调用方的降级路径，避免卡死
+        response = await asyncio.wait_for(call, timeout=timeout) if timeout > 0 else await call
 
         if response.content:
             for block in response.content:
@@ -349,7 +361,7 @@ class VisionAnalyzer:
         prompt = PromptTemplates.get_find_element_prompt(description)
 
         try:
-            response = await self._call_vision_model(prompt, image)
+            response = await self._call_vision_model(prompt, image, max_tokens=384)
             result = self._parse_json_response(response)
 
             if not result:
@@ -419,7 +431,7 @@ class VisionAnalyzer:
         prompt = PromptTemplates.LIST_CLICKABLE
 
         try:
-            response = await self._call_vision_model(prompt, image)
+            response = await self._call_vision_model(prompt, image, max_tokens=1024)
             result = self._parse_json_response(response)
 
             if not result:
@@ -473,7 +485,7 @@ class VisionAnalyzer:
         prompt = PromptTemplates.LIST_INPUT
 
         try:
-            response = await self._call_vision_model(prompt, image)
+            response = await self._call_vision_model(prompt, image, max_tokens=1024)
             result = self._parse_json_response(response)
 
             if not result:
@@ -527,7 +539,7 @@ class VisionAnalyzer:
         prompt = PromptTemplates.ANALYZE_PAGE
 
         try:
-            response = await self._call_vision_model(prompt, image)
+            response = await self._call_vision_model(prompt, image, max_tokens=512)
             result = self._parse_json_response(response)
 
             if not result:
@@ -606,7 +618,7 @@ class VisionAnalyzer:
         prompt = PromptTemplates.get_answer_question_prompt(question)
 
         try:
-            response = await self._call_vision_model(prompt, image)
+            response = await self._call_vision_model(prompt, image, max_tokens=512)
             result = self._parse_json_response(response)
 
             if not result:
@@ -673,7 +685,7 @@ class VisionAnalyzer:
 
         try:
             try:
-                response = await self._call_vision_model(prompt, image)
+                response = await self._call_vision_model(prompt, image, max_tokens=1200)
             except Exception as e:
                 logger.warning(f"LLM vision call failed ({e}), falling back to local OCR")
                 return self._extract_text_local_ocr(image, error=f"LLM unavailable: {e}")
@@ -700,7 +712,23 @@ class VisionAnalyzer:
                     )
 
             if elements:
+                # 去重保序 + 有界：全屏截图文本量可能非常大，必须截断，
+                # 否则工具结果会挤占上下文并拖慢后续推理。
+                seen: set[str] = set()
+                unique: list[ElementLocation] = []
+                for elem in elements:
+                    key = elem.description.strip()
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    unique.append(elem)
+                    if len(unique) >= 80:
+                        break
+                elements = unique
+
                 answer = "\n".join(e.description for e in elements)
+                if len(answer) > 12000:
+                    answer = answer[:12000] + "\n... (文本已截断)"
                 return VisionResult(
                     success=True,
                     query="extract_text",
@@ -922,7 +950,7 @@ class VisionAnalyzer:
         prompt = PromptTemplates.get_verify_action_prompt(action_description, expected_result)
 
         try:
-            response = await self._call_vision_model(prompt, combined)
+            response = await self._call_vision_model(prompt, combined, max_tokens=384)
             result = self._parse_json_response(response)
 
             if isinstance(result, list):

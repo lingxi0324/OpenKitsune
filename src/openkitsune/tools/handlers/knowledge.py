@@ -27,11 +27,18 @@ PROVIDER_BAILIAN = "aliyun-bailian"
 
 
 class KnowledgeHandler:
-    TOOLS = ["knowledge_list", "knowledge_search", "knowledge_read"]
+    TOOLS = [
+        "knowledge_list", "knowledge_search", "knowledge_read",
+        "knowledge_create", "knowledge_edit", "knowledge_delete", "knowledge_rename",
+    ]
     TOOL_CLASSES = {
         "knowledge_list": ApprovalClass.READONLY_SEARCH,
         "knowledge_search": ApprovalClass.READONLY_SEARCH,
         "knowledge_read": ApprovalClass.READONLY_SEARCH,
+        "knowledge_create": ApprovalClass.FILE_WRITE,
+        "knowledge_edit": ApprovalClass.FILE_WRITE,
+        "knowledge_delete": ApprovalClass.FILE_DELETE,
+        "knowledge_rename": ApprovalClass.FILE_WRITE,
     }
 
     def __init__(self, agent: Agent, config_path: Path | None = None) -> None:
@@ -112,6 +119,13 @@ class KnowledgeHandler:
         return [item for item in selected if item["id"] == requested_id]
 
     async def handle(self, tool_name: str, params: dict[str, Any]) -> dict:
+        # Write tools: always go directly to local KB (cloud KB is read-only)
+        if tool_name in {"knowledge_create", "knowledge_edit", "knowledge_delete", "knowledge_rename"}:
+            result = await self._handle_local_kb(tool_name, params)
+            self._record_priority_status(tool_name, result)
+            return result
+
+        # Read tools: try cloud KB first, fallback to local
         if tool_name == "knowledge_list":
             result = await self._list(params)
         elif tool_name == "knowledge_search":
@@ -124,8 +138,307 @@ class KnowledgeHandler:
                 "error_code": "unknown_tool",
                 "message": f"Unknown knowledge tool: {tool_name}",
             }
+
+        # Fallback: if cloud KB is disabled/failed, use local knowledge base
+        if not result.get("success") and result.get("error_code") in {"connector_disabled", "no_knowledge_bases", "missing_credentials"}:
+            local_result = await self._handle_local_kb(tool_name, params)
+            if local_result.get("success"):
+                result = local_result
+
         self._record_priority_status(tool_name, result)
         return result
+
+    async def _handle_local_kb(self, tool_name: str, params: dict[str, Any]) -> dict:
+        """Fallback to local knowledge base at D:\\ai\\OpenKitsune-main\\knowledge."""
+        from pathlib import Path
+        local_root = Path(r"D:\ai\OpenKitsune-main\knowledge")
+        if not local_root.exists():
+            return {"success": False, "error_code": "local_kb_not_found", "message": "Local knowledge base folder not found."}
+
+        try:
+            if tool_name == "knowledge_list":
+                folder = params.get("folder_id", "") or ""
+                target = local_root / folder if folder else local_root
+                if not target.exists() or not target.is_dir():
+                    return {"success": False, "error_code": "folder_not_found", "message": f"Folder not found: {folder}"}
+                items = []
+                for child in sorted(target.iterdir()):
+                    items.append({
+                        "name": child.name,
+                        "type": "folder" if child.is_dir() else "file",
+                        "path": str(child.relative_to(local_root)),
+                    })
+                return {"success": True, "items": items, "source": "local", "root": str(local_root)}
+
+            elif tool_name == "knowledge_search":
+                query = params.get("query", "").strip()
+                if not query:
+                    return {"success": False, "error_code": "empty_query", "message": "Query is required."}
+
+                # Detect if query is a tag (starts with #)
+                is_tag_search = query.startswith("#")
+                tag_query = query[1:] if is_tag_search else ""
+
+                results = []
+                for md_file in local_root.rglob("*.md"):
+                    try:
+                        content = md_file.read_text(encoding="utf-8", errors="ignore")
+                        lines = content.split("\n")
+
+                        # Extract frontmatter
+                        frontmatter = {}
+                        if lines and lines[0].strip() == "---":
+                            fm_end = None
+                            for i in range(1, min(20, len(lines))):
+                                if lines[i].strip() == "---":
+                                    fm_end = i
+                                    break
+                            if fm_end:
+                                for fm_line in lines[1:fm_end]:
+                                    if ":" in fm_line:
+                                        k, v = fm_line.split(":", 1)
+                                        frontmatter[k.strip()] = v.strip().strip('"').strip("'")
+
+                        # Search logic
+                        matched = False
+                        match_lines = []
+
+                        if is_tag_search:
+                            # Tag search: search in frontmatter tags or inline #tags
+                            fm_tags = frontmatter.get("tags", "")
+                            if tag_query in fm_tags:
+                                matched = True
+                                match_lines.append(1)
+                            else:
+                                # Search inline #tags
+                                for i, l in enumerate(lines):
+                                    if f"#{tag_query}" in l:
+                                        matched = True
+                                        match_lines.append(i+1)
+                                        break
+                        else:
+                            # Full text search
+                            if query in content or query in md_file.name:
+                                matched = True
+                                match_lines = [i+1 for i, l in enumerate(lines) if query in l]
+
+                        if matched and match_lines:
+                            # Count wiki links [[xxx]]
+                            wiki_links = content.count("[[")
+                            # Extract title from frontmatter or filename
+                            title = frontmatter.get("title", md_file.stem)
+
+                            results.append({
+                                "file": str(md_file.relative_to(local_root)),
+                                "title": title,
+                                "tags": frontmatter.get("tags", ""),
+                                "matches": len(match_lines),
+                                "first_line": match_lines[0],
+                                "wiki_links": wiki_links,
+                                "excerpt": "\n".join(lines[max(0,match_lines[0]-2):match_lines[0]+3])[:300],
+                            })
+                            if len(results) >= 15:
+                                break
+                    except:
+                        pass
+
+                # Auto-learn top results into knowledge graph (循环学习)
+                related_concepts = []
+                try:
+                    from openkitsune.knowledge.learning import ingest_document, list_nodes
+                    # Auto-learn top 3 results
+                    for r in results[:3]:
+                        try:
+                            file_path = local_root / r["file"]
+                            if file_path.exists():
+                                content = file_path.read_text(encoding="utf-8", errors="ignore")
+                                ingest_document(
+                                    title=r.get("title", file_path.stem),
+                                    text=content[:3000],  # Only first 3000 chars to keep it fast
+                                    source_path=r["file"],
+                                )
+                        except:
+                            pass
+                    # Get related concepts from learning graph
+                    all_nodes = list_nodes(limit=10)
+                    related_concepts = [
+                        {"label": n["label"], "category": n["category"], "importance": n.get("importance", 0.5)}
+                        for n in all_nodes.get("nodes", [])[:8]
+                    ]
+                except:
+                    pass
+
+                return {
+                    "success": True,
+                    "results": results,
+                    "query": query,
+                    "search_type": "tag" if is_tag_search else "fulltext",
+                    "source": "local",
+                    "result_count": len(results),
+                    "related_concepts": related_concepts,
+                    "auto_learned": True,
+                }
+
+            elif tool_name == "knowledge_read":
+                file_path = params.get("file_id", "") or params.get("path", "") or ""
+                if not file_path:
+                    return {"success": False, "error_code": "missing_path", "message": "file_id or path is required."}
+                target = local_root / file_path
+                if not target.exists() or not target.is_file():
+                    return {"success": False, "error_code": "file_not_found", "message": f"File not found: {file_path}"}
+                content = target.read_text(encoding="utf-8", errors="ignore")
+
+                # Extract obsidian-specific info
+                lines = content.split("\n")
+                frontmatter = {}
+                if lines and lines[0].strip() == "---":
+                    fm_end = None
+                    for i in range(1, min(30, len(lines))):
+                        if lines[i].strip() == "---":
+                            fm_end = i
+                            break
+                    if fm_end:
+                        for fm_line in lines[1:fm_end]:
+                            if ":" in fm_line:
+                                k, v = fm_line.split(":", 1)
+                                frontmatter[k.strip()] = v.strip().strip('"').strip("'")
+
+                # Extract headings (outline)
+                outline = []
+                for i, line in enumerate(lines):
+                    if line.startswith("#"):
+                        level = len(line) - len(line.lstrip("#"))
+                        heading = line.lstrip("#").strip()
+                        outline.append({"level": level, "title": heading, "line": i+1})
+
+                # Count wiki links
+                wiki_link_count = content.count("[[")
+
+                # Auto-learn this document into knowledge graph (循环学习)
+                learned = False
+                try:
+                    from openkitsune.knowledge.learning import ingest_document
+                    ingest_document(
+                        title=frontmatter.get("title", target.stem),
+                        text=content[:5000],  # First 5000 chars
+                        source_path=file_path,
+                    )
+                    learned = True
+                except:
+                    pass
+
+                return {
+                    "success": True,
+                    "content": content,
+                    "file": file_path,
+                    "source": "local",
+                    "title": frontmatter.get("title", target.stem),
+                    "tags": frontmatter.get("tags", ""),
+                    "created": frontmatter.get("created", ""),
+                    "updated": frontmatter.get("updated", ""),
+                    "outline": outline[:20],  # First 20 headings
+                    "wiki_links": wiki_link_count,
+                    "line_count": len(lines),
+                    "size_bytes": len(content.encode("utf-8")),
+                    "auto_learned": learned,
+                }
+
+            elif tool_name == "knowledge_create":
+                file_path = params.get("path", "").strip()
+                content = params.get("content", "")
+                title = params.get("title", "").strip()
+                tags = params.get("tags", "").strip()
+                if not file_path:
+                    return {"success": False, "error_code": "missing_path", "message": "path is required."}
+                target = local_root / file_path
+                # Auto-create parent directories
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # Add frontmatter if title or tags provided
+                if title or tags:
+                    from datetime import date
+                    fm_lines = ["---"]
+                    if title:
+                        fm_lines.append(f'title: "{title}"')
+                    if tags:
+                        fm_lines.append(f"tags: [{tags}]")
+                    fm_lines.append(f'created: "{date.today().isoformat()}"')
+                    fm_lines.append("---")
+                    content = "\n".join(fm_lines) + "\n\n" + content
+                target.write_text(content, encoding="utf-8")
+                return {
+                    "success": True,
+                    "file": file_path,
+                    "source": "local",
+                    "size_bytes": len(content.encode("utf-8")),
+                    "line_count": len(content.split("\n")),
+                }
+
+            elif tool_name == "knowledge_edit":
+                file_path = params.get("path", "").strip()
+                mode = params.get("mode", "replace")
+                content = params.get("content", "")
+                if not file_path:
+                    return {"success": False, "error_code": "missing_path", "message": "path is required."}
+                target = local_root / file_path
+                if not target.exists() or not target.is_file():
+                    return {"success": False, "error_code": "file_not_found", "message": f"File not found: {file_path}"}
+                if mode == "append":
+                    existing = target.read_text(encoding="utf-8", errors="ignore")
+                    new_content = existing + "\n\n" + content
+                else:
+                    new_content = content
+                target.write_text(new_content, encoding="utf-8")
+                return {
+                    "success": True,
+                    "file": file_path,
+                    "mode": mode,
+                    "source": "local",
+                    "size_bytes": len(new_content.encode("utf-8")),
+                    "line_count": len(new_content.split("\n")),
+                }
+
+            elif tool_name == "knowledge_delete":
+                file_path = params.get("path", "").strip()
+                if not file_path:
+                    return {"success": False, "error_code": "missing_path", "message": "path is required."}
+                target = local_root / file_path
+                if not target.exists():
+                    return {"success": False, "error_code": "not_found", "message": f"Path not found: {file_path}"}
+                if target.is_dir():
+                    import shutil
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+                return {
+                    "success": True,
+                    "deleted": file_path,
+                    "type": "folder" if target.is_dir() else "file",
+                    "source": "local",
+                }
+
+            elif tool_name == "knowledge_rename":
+                old_path = params.get("old_path", "").strip()
+                new_path = params.get("new_path", "").strip()
+                if not old_path or not new_path:
+                    return {"success": False, "error_code": "missing_paths", "message": "old_path and new_path are required."}
+                old_target = local_root / old_path
+                new_target = local_root / new_path
+                if not old_target.exists():
+                    return {"success": False, "error_code": "not_found", "message": f"Old path not found: {old_path}"}
+                # Auto-create parent directories for new path
+                new_target.parent.mkdir(parents=True, exist_ok=True)
+                old_target.rename(new_target)
+                return {
+                    "success": True,
+                    "old_path": old_path,
+                    "new_path": new_path,
+                    "source": "local",
+                }
+
+            else:
+                return {"success": False, "error_code": "unknown_tool", "message": f"Unknown tool: {tool_name}"}
+        except Exception as e:
+            return {"success": False, "error_code": "local_kb_error", "message": f"Local KB error: {e}"}
 
     def _record_priority_status(self, tool_name: str, result: dict) -> None:
         if not getattr(self.agent, "_knowledge_priority_active", False):

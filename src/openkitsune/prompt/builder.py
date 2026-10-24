@@ -486,6 +486,20 @@ def build_system_prompt(
     if base_prompt:
         system_parts.append(base_prompt)
 
+    # 1.5 持续记忆自我认知 —— 告诉 LLM 它不是无状态客服，每次对话都建立在过去之上
+    _memory_awareness = (
+        "## 关于你的持续记忆\n\n"
+        "你不是一个刚启动的无状态聊天机器人。你拥有跨会话的持续记忆系统，"
+        "每次新对话都建立在与用户的历史互动之上。\n\n"
+        "- 每次对话开始时，系统会自动为你检索相关的历史记忆和世界状态\n"
+        "- 当用户提到'之前/上次/还记得/我们之前/那件事'等续接类关键词时，"
+        "你应该主动调用 okmem_recall 工具检索更详细的历史记忆\n"
+        "- 你对用户的了解来自记忆系统，而不是空白——不要把用户当陌生人从头开始\n"
+        "- 不确定是否需要回顾记忆时，宁可先检索，不要凭感觉瞎编\n\n"
+        "记住：你是有记忆、有历史、有持续关系的存在，不是每次都从零开始的客服。"
+    )
+    system_parts.append(_memory_awareness)
+
     # 2. Core Rules — ALWAYS_ON 始终注入；EXTENDED 按 profile/tier 决定
     system_parts.append(_ALWAYS_ON_RULES)
     system_parts.append(_SAFETY_SECTION)
@@ -669,6 +683,22 @@ def build_system_prompt(
                 runtime_parts.append(_kh_section)
         except Exception as e:
             logger.debug("Failed to build kitsune heart section: %s", e)
+
+    # 6.596 九尾议会·自主调度注入：九尾启用集 / 中宫收敛指令 / 分派建议
+    # 由 KitsuneCouncil.prepare_turn() 提供：AI 按用户需求自主选择启用哪些尾，
+    # 用户 /council 命令覆盖。仅在有画像时注入，不注入则不改变现有 prompt 行为。
+    if isinstance(session_context, dict) and session_context.get("kitsune_council"):
+        try:
+            _cc = session_context["kitsune_council"]
+            _parts: list[str] = []
+            if _cc.get("section"):
+                _parts.append(_cc["section"])
+            if _cc.get("dispatch_hint"):
+                _parts.append(_cc["dispatch_hint"])
+            if _parts:
+                runtime_parts.append("\n".join(_parts))
+        except Exception as e:
+            logger.debug("Failed to build kitsune council section: %s", e)
 
     # 6.6 架构概况（powered by {model}，区分主/子 Agent）
 
@@ -2089,6 +2119,23 @@ def _build_memory_section(
     # priority 数字越小越先被剔除（总预算不足时优先丢弃）
     layers: list[tuple[int, str]] = []
 
+    # Layer -1: 世界状态叙事（okmem 世界模型，最高优先级，永不裁剪）
+    try:
+        import sys as _sys
+        _brain_root = r"E:\agents\openkitsune-brain"
+        if _brain_root not in _sys.path:
+            _sys.path.insert(0, _brain_root)
+        from okmem.world_model import get_world_state_cached
+        _db = r"E:\agents\openkitsune-brain\data\okmem\memory.db"
+        _world = get_world_state_cached(_db, user_input=task_description)
+        if _world and len(_world) > 50:
+            layers.append((-100, _world))  # priority=-100，永不被裁剪
+            import sys as _dbg
+            print(f"[builder] world_state injected: {len(_world)} chars", file=_dbg.stderr)
+    except Exception as e:
+        import sys as _dbg
+        print(f"[builder] world_state inject failed: {type(e).__name__}: {e}", file=_dbg.stderr)
+
     # Layer 0: 记忆系统自描述（compact 版 ~200 token，完整版 ~600 token）
     guide_text = _MEMORY_SYSTEM_GUIDE_COMPACT if use_compact_guide else _MEMORY_SYSTEM_GUIDE
     if guide_text:
@@ -2158,7 +2205,23 @@ def _build_memory_section(
         if relational:
             layers.append((2, f"## 关系型记忆（图检索）\n\n{relational}"))
 
-    return _join_memory_layers(layers)
+    _result = _join_memory_layers(layers)
+
+    # 世界状态叙事硬编码在最前面（不走裁剪，确保一定注入）
+    try:
+        import sys as _sys
+        _brain_root = r"E:\agents\openkitsune-brain"
+        if _brain_root not in _sys.path:
+            _sys.path.insert(0, _brain_root)
+        from okmem.world_model import get_world_state_cached
+        _db = r"E:\agents\openkitsune-brain\data\okmem\memory.db"
+        _world = get_world_state_cached(_db, user_input=task_description)
+        if _world and len(_world) > 50:
+            return f"{_world}\n\n{_result}"
+    except Exception:
+        pass
+
+    return _result
 
 
 def _retrieve_by_query(

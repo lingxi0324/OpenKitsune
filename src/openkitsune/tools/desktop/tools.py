@@ -209,6 +209,111 @@ DESKTOP_TOOLS = [
         },
     },
     {
+        "name": "desktop_state",
+        "category": "Desktop",
+        "description": (
+            "Query the live desktop state list without taking a screenshot: screen size, mouse "
+            "pointer, active window, and all visible windows with handle/bbox/process/minimized "
+            "state, plus capability probe and optional UI element tree. Use refresh=true for a "
+            "real-time snapshot. Prefer this over screenshots when you only need window/element "
+            "inventory or coordinates; it is faster and token-cheaper."
+        ),
+        "detail": """实时桌面状态清单（不截图即可感知）。
+
+**返回内容**：
+- screen_size / pointer：屏幕尺寸、鼠标坐标
+- active_window：活动窗口标题、进程、类名、bbox、是否最小化/最大化/聚焦
+- windows：全部可见窗口列表（标题、句柄、进程、bbox、状态），可用 max_windows 限制
+- activity：用户最近打开的文件/目录/网址、窗口聚焦与点击穿透记录（AI 感知用户操作）
+- capabilities：mss / pyautogui / pywinauto / PIL 是否可用
+- screenshot：最近截图信息（include_screenshot=true 时现场截一张）
+- elements_text：指定窗口的 UI 元素树（传 window_title 时返回）
+
+**实时性**：refresh=true（默认）会清空状态缓存后重新采集；
+频繁轮询可传 refresh=false 复用 5 秒缓存。
+
+**使用建议**：
+- 需要"有哪些窗口/窗口在哪/谁在前台"→ 用本工具，不要截图
+- 需要窗口内部控件结构 → window_title + inspect_depth
+- 需要文字/画面内容 → desktop_screenshot（会自动 OCR + 画面理解）""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "refresh": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否清空缓存后实时重新采集",
+                },
+                "include_screenshot": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "是否现场截一张图（返回路径/尺寸）",
+                },
+                "max_windows": {
+                    "type": "integer",
+                    "default": 20,
+                    "description": "最多返回多少个可见窗口（1~50）",
+                },
+                "window_title": {
+                    "type": "string",
+                    "description": "可选，返回该窗口的 UI 元素树",
+                },
+                "inspect_depth": {
+                    "type": "integer",
+                    "default": 2,
+                    "description": "元素树深度（1~6，配合 window_title）",
+                },
+                "context_id": {
+                    "type": "string",
+                    "description": "截图分目录标识（include_screenshot 时可选）",
+                },
+                "screenshot_max_width": {
+                    "type": "integer",
+                    "default": 1280,
+                    "description": "include_screenshot 时的截图宽度上限（0 = 原尺寸）",
+                },
+                "screenshot_max_height": {
+                    "type": "integer",
+                    "default": 720,
+                    "description": "include_screenshot 时的截图高度上限（0 = 原尺寸）",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "desktop_open",
+        "category": "Desktop",
+        "description": (
+            "Open a local file/folder or a URL with the system default application. "
+            "Use when you need to: (1) Open a folder in Explorer, (2) Open a document in its "
+            "default editor, (3) Open a web page in the default browser. The action is recorded "
+            "in desktop_state.activity so the user can see what the AI opened."
+        ),
+        "detail": """打开文件路径 / 文件夹 / 网址（系统默认程序）。
+
+**target 支持**：
+- 文件：`D:\\projects\\report.docx`
+- 目录：`D:\\projects`（资源管理器打开）
+- 网址：`https://example.com` 或 `www.example.com`
+
+**行为**：
+- 使用 ShellExecute 打开，等同于用户双击
+- 打开后尝试把目标窗口带到前台
+- 写入活动记录（kind=open），用户可在面板「最近活动」看到
+- 需要编辑文件内容时，打开后配合 read_file / edit_file / write_file""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "文件路径、目录路径或 URL",
+                },
+            },
+            "required": ["target"],
+        },
+    },
+    {
         "name": "desktop_find_element",
         "category": "Desktop",
         "description": "Find desktop UI elements using UIAutomation (fast, accurate) or vision recognition (fallback). When you need to: (1) Locate buttons/menus/icons, (2) Get element positions before clicking, (3) Verify UI state. Supports: natural language ('save button'), name: prefix, id: prefix, type: prefix. For browser webpage elements, use browser_* tools instead.",
@@ -614,6 +719,10 @@ keys 是按键数组，如 ['ctrl', 'c']""",
                     "description": "操作类型",
                 },
                 "title": {"type": "string", "description": "窗口标题（模糊匹配），list 操作不需要"},
+                "handle": {
+                    "type": "integer",
+                    "description": "窗口句柄（优先于 title，适合重名窗口；可从 desktop_state 获取）",
+                },
             },
             "required": ["action"],
         },
@@ -882,6 +991,10 @@ class DesktopToolHandler:
         try:
             if tool_name == "desktop_screenshot":
                 return await self._handle_screenshot(params)
+            elif tool_name == "desktop_state":
+                return await self._handle_state(params)
+            elif tool_name == "desktop_open":
+                return await self._handle_open(params)
             elif tool_name == "desktop_find_element":
                 return await self._handle_find_element(params)
             elif tool_name == "desktop_click":
@@ -1021,15 +1134,23 @@ class DesktopToolHandler:
             result["analysis"] = analysis
 
         # 自动 OCR + 视觉语义分析：并行调用，避免串行等待（本地视觉模型较慢）
+        # 统一缩放到固定分析尺寸：大图（如 4K 全屏）会显著降低 OCR/视觉模型
+        # 的读取质量与速度；分析副本缩放，保存给用户的原图保持不变。
         if auto_ocr or auto_vision:
             from .vision.analyzer import get_vision_analyzer
+
+            analysis_img = self.controller.capture.resize_for_analysis(img)
+            result["analysis_width"] = analysis_img.width
+            result["analysis_height"] = analysis_img.height
+            if img.width:
+                result["analysis_scale"] = round(analysis_img.width / img.width, 4)
 
             analyzer = get_vision_analyzer()
             tasks = []
             if auto_ocr:
-                tasks.append(analyzer.extract_text(img))
+                tasks.append(analyzer.extract_text(analysis_img))
             if auto_vision:
-                tasks.append(analyzer.analyze_page(img))
+                tasks.append(analyzer.analyze_page(analysis_img))
 
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
             idx = 0
@@ -1063,6 +1184,64 @@ class DesktopToolHandler:
                     result["vision_success"] = False
 
         return result
+
+    async def _handle_state(self, params: dict) -> dict:
+        """实时桌面状态清单（窗口列表 / 指针 / 活动窗口 / 可选元素树）。"""
+        # UIA 枚举是阻塞调用，放到线程里避免卡住事件循环
+        return await asyncio.to_thread(self._collect_state_payload, params)
+
+    def _collect_state_payload(self, params: dict) -> dict:
+        from .state import clear_prompt_context_cache, clear_state_cache, collect_state
+
+        if bool(params.get("refresh", True)):
+            clear_state_cache()
+            clear_prompt_context_cache()
+
+        try:
+            max_windows = max(1, min(int(params.get("max_windows", 20) or 20), 50))
+        except (TypeError, ValueError):
+            max_windows = 20
+
+        context_id = str(params.get("context_id") or "agent")
+        state = collect_state(
+            include_screenshot=bool(params.get("include_screenshot", False)),
+            context_id=context_id,
+            screenshot_transport="path",
+            screenshot_max_width=max(0, int(params.get("screenshot_max_width", 1280) or 0)),
+            screenshot_max_height=max(0, int(params.get("screenshot_max_height", 720) or 0)),
+        )
+        state = dict(state)
+        state["success"] = True
+
+        windows = list(state.get("windows") or [])
+        state["windows_total"] = len(windows)
+        state["windows"] = windows[:max_windows]
+
+        window_title = params.get("window_title")
+        if window_title:
+            try:
+                depth = max(1, min(int(params.get("inspect_depth", 2) or 2), 6))
+            except (TypeError, ValueError):
+                depth = 2
+            try:
+                state["elements_window_title"] = str(window_title)
+                state["elements_depth"] = depth
+                state["elements_text"] = self.controller.inspect_text(
+                    window_title=str(window_title), depth=depth
+                )
+            except Exception as e:
+                state["elements_error"] = str(e)
+
+        return state
+
+    async def _handle_open(self, params: dict) -> dict:
+        """打开文件/目录/网址（与面板打开共用实现）。"""
+        target = str(params.get("target") or "").strip()
+        if not target:
+            return {"error": "target is required"}
+        from .open_target import open_target
+
+        return await asyncio.to_thread(open_target, target)
 
     async def _handle_find_element(self, params: dict) -> dict:
         """处理查找元素请求"""
@@ -1320,6 +1499,7 @@ class DesktopToolHandler:
         """处理窗口操作请求"""
         action = params.get("action")
         title = params.get("title")
+        handle = params.get("handle")
 
         if action == "list":
             windows = self.controller.list_windows()
@@ -1329,7 +1509,7 @@ class DesktopToolHandler:
                 "count": len(windows),
             }
 
-        result = self.controller.window_action(action, title)
+        result = self.controller.window_action(action, title, handle=handle)
         return result.to_dict()
 
     async def _handle_wait(self, params: dict) -> dict:

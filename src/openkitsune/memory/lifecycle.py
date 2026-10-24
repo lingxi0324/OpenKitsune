@@ -26,6 +26,7 @@ from .storage import _is_db_locked
 if TYPE_CHECKING:
     import asyncio
     from collections.abc import Callable
+from .name_normalize import user_subject_query_values
 from .types import (
     MEMORY_MD_MAX_CHARS,
     ConversationTurn,
@@ -34,7 +35,6 @@ from .types import (
     SemanticMemory,
 )
 from .unified_store import UnifiedStore
-from .name_normalize import normalize_names, user_subject_query_values
 
 logger = logging.getLogger(__name__)
 
@@ -1542,7 +1542,9 @@ class LifecycleManager:
             elif mem.type == MemoryType.FACT:
                 categories["basic"].append(content)
 
-        lines = [normalize_names("# 用户档案\n"), "> 由记忆系统自动生成\n"]
+        # 文档层保真：USER.md 保留原文（称呼归一化在 prompt 注入层完成），
+        # 保证文档可审计、可迁移、称呼配置变更后仍一致。
+        lines = ["# 用户档案\n", "> 由记忆系统自动生成\n"]
 
         section_map = {
             "basic": "基本信息",

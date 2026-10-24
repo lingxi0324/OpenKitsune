@@ -35,6 +35,7 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,81 @@ _PROMPT_WINDOW_LIMIT = 5
 
 _SAFE_CONTEXT_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 _SCREENSHOT_SUFFIXES = {".png", ".jpg", ".jpeg"}
+
+# 用户/AI 的桌面活动记录（最近打开、切换、点击），供面板展示与 AI 感知。
+_ACTIVITY_MAX = 50
+_activity_log: deque[dict[str, Any]] = deque(maxlen=_ACTIVITY_MAX)
+
+
+def record_activity(kind: str, **fields: Any) -> dict[str, Any]:
+    """记录一条桌面活动（打开路径/URL、窗口聚焦、点击穿透等）。"""
+    entry: dict[str, Any] = {
+        "kind": str(kind or "activity"),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **fields,
+    }
+    _activity_log.appendleft(entry)
+    return entry
+
+
+def recent_activity(limit: int = 20) -> list[dict[str, Any]]:
+    """返回最近的活动记录（最新在前）。"""
+    if limit <= 0:
+        return []
+    return list(_activity_log)[:limit]
+
+
+def clear_activity() -> None:
+    """清空活动记录（测试/隐私重置）。"""
+    _activity_log.clear()
+
+
+def collect_active_context() -> dict[str, Any]:
+    """活动窗口信息 + 尽力读取地址栏/路径（浏览器 URL、资源管理器路径）。"""
+    try:
+        from .controller import get_controller
+        from .uia.elements import UIAElementWrapper
+
+        controller = get_controller()
+        window = controller.get_active_window()
+        if not window:
+            return {}
+        payload = window.to_dict()
+        root = controller.uia.find_window(handle=window.handle, timeout=1.0)
+        if root is None:
+            return payload
+
+        scanned = 0
+        for child in root.control.descendants():
+            scanned += 1
+            if scanned > 1200:
+                break
+            try:
+                wrapper = UIAElementWrapper(child)
+                name = wrapper.name or ""
+                value = wrapper.value or ""
+                control_type = (wrapper.control_type or "").lower()
+            except Exception:
+                continue
+            lowered = name.lower()
+            if control_type == "edit" and (
+                "address" in lowered or "地址" in name or "search" in lowered
+            ):
+                location = value or name
+                if location:
+                    payload["location"] = location
+                    break
+            if value and (
+                value.startswith("http://")
+                or value.startswith("https://")
+                or re.match(r"^[A-Za-z]:\\", value)
+            ):
+                payload["location"] = value
+                break
+        return payload
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[DesktopState] active context failed: %s", exc)
+        return {}
 
 # 能力探测：名称 -> 可导入模块
 _CAPABILITY_MODULES: dict[str, str] = {
@@ -267,6 +343,8 @@ def capture_screenshot(
     path: str | Path | None = None,
     context_id: str = "",
     transport: str = "path",
+    max_width: int = 0,
+    max_height: int = 0,
 ) -> dict[str, Any]:
     """截取当前屏幕并保存，返回结构化结果。
 
@@ -274,6 +352,8 @@ def capture_screenshot(
         path: 显式保存路径；为空时保存到 screenshots/<context>/desktop-<ts>.png
         context_id: 聊天/会话上下文标识，用于分目录
         transport: 存储方式（"path" 持久保存 / "ephemeral" 仅保留最新并清理旧图）
+        max_width / max_height: 保存前缩小到指定上限（0 = 保持原尺寸）
+            面板预览与视觉分析都用固定小图，避免大图难以读取/传输。
 
     Returns:
         {ok, path, format, width, height, captured_at, recent, context_id, error}
@@ -303,6 +383,15 @@ def capture_screenshot(
         img = get_controller().screenshot()
         if not isinstance(img, _PILImage.Image):
             raise TypeError("screenshot did not return a PIL Image")
+        if max_width > 0 or max_height > 0:
+            limit_w = max_width if max_width > 0 else img.width
+            limit_h = max_height if max_height > 0 else img.height
+            if img.width > limit_w or img.height > limit_h:
+                ratio = min(limit_w / img.width, limit_h / img.height)
+                img = img.resize(
+                    (max(1, int(img.width * ratio)), max(1, int(img.height * ratio))),
+                    _PILImage.Resampling.LANCZOS,
+                )
         img.save(target, format="PNG")
         width, height = int(img.width), int(img.height)
     except Exception as exc:
@@ -373,6 +462,8 @@ def collect_state(
     screenshot_path: str | Path | None = None,
     context_id: str = "",
     screenshot_transport: str = "path",
+    screenshot_max_width: int = 0,
+    screenshot_max_height: int = 0,
 ) -> dict[str, Any]:
     """采集一次完整的桌面状态快照（参照 agent-zero collect_state）。
 
@@ -381,6 +472,7 @@ def collect_state(
         screenshot_path: 截图显式保存路径（可选）
         context_id: 聊天/会话上下文标识
         screenshot_transport: 截图存储方式（"path" / "ephemeral"）
+        screenshot_max_width / screenshot_max_height: 截图缩放上限（0 = 原尺寸）
 
     Returns:
         稳定状态字典（永不抛异常）
@@ -415,6 +507,8 @@ def collect_state(
             path=screenshot_path,
             context_id=context_id,
             transport=screenshot_transport,
+            max_width=screenshot_max_width,
+            max_height=screenshot_max_height,
         )
     else:
         screenshot = latest_screenshot(context_id=context_id)
@@ -457,6 +551,7 @@ def stable_state(
         "windows": windows or [],
         "screenshot": screenshot or empty_shot,
         "capabilities": capabilities or collect_capabilities(),
+        "activity": recent_activity(20),
         "errors": clean_errors,
     }
 
@@ -506,6 +601,20 @@ def compact_prompt_context(state: dict[str, Any] | None = None) -> str:
     if screenshot.get("recent") and screenshot.get("path"):
         lines.append(f"- recent_screenshot={screenshot['path']}")
 
+    activity = state.get("activity") or []
+    if activity:
+        parts: list[str] = []
+        for item in activity[:2]:
+            label = item.get("target") or item.get("title") or item.get("window") or ""
+            kind = item.get("kind") or "activity"
+            parts.append(f"{kind}:{label}" if label else str(kind))
+        lines.append("- activity=" + "; ".join(parts))
+
+    lines.append(
+        "- list=窗口清单/指针/活动窗口/窗口 bbox/元素树用 desktop_state"
+        "（refresh=true 实时采集，比截图快且省 token；含 activity：用户最近打开的路径/网址、"
+        "窗口聚焦与点击穿透记录）；只有需要文字或画面内容时才用 desktop_screenshot"
+    )
     lines.append(
         "- next=操作桌面应用前先用 desktop_screenshot() 观察"
         "（默认自动返回 OCR 文字 + 画面理解 + 坐标空间）；"
@@ -522,6 +631,20 @@ def compact_prompt_context(state: dict[str, Any] | None = None) -> str:
         "拖拽+按键、游戏连招）；拖拽用 desktop_mouse(action=drag)，相对移动用 move_relative；"
         "执行宏前传 focus_window=目标窗口标题（引擎会自动标题栏单击加固前台）；"
         "步骤默认带 120ms 步间延迟，紧随注入键的 WM_CHAR 不再丢失"
+    )
+    lines.append(
+        "- files=打开文件/目录用 desktop_open（等同双击，打开后写 activity）；"
+        "读取/修改/保存内容用 read_file / edit_file / write_file；"
+        "定位路径用 list_directory / glob；保存后可用 read_file 或 desktop_screenshot 复核"
+    )
+    lines.append(
+        "- web=要正文与结构（标题/链接/列表）用 browser_navigate + browser_get_content；"
+        "要看真实渲染画面或已登录站点时用 desktop_open 打开浏览器 + desktop_screenshot"
+        "（自动 OCR + 画面理解），再结合文本做深度解读"
+    )
+    lines.append(
+        "- image=本地图片文件用 view_image 提取信息；"
+        "屏幕上的图片/图表/扫描件用 desktop_screenshot，读其 OCR 文字与画面理解"
     )
     lines.append(
         "- verify=每次点击/输入后用新截图验证结果，确认界面已按预期变化"

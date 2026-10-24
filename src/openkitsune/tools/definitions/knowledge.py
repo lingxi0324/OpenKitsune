@@ -165,4 +165,129 @@ KNOWLEDGE_TOOLS = [
             "required": ["media_id", "knowledge_base_id"],
         },
     },
+    {
+        "name": "knowledge_create",
+        "category": "Knowledge",
+        "description": (
+            "Create a new markdown file in the local knowledge base. "
+            "Use this when the user wants to write a note, save an idea, or create a new document. "
+            "Automatically adds YAML frontmatter with title, created date, and tags if provided. "
+            "This tool writes to the local knowledge base."
+        ),
+        "triggers": [
+            "创建笔记",
+            "保存到知识库",
+            "新建文档",
+        ],
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "文件路径（相对于知识库根目录），例如 '丹道玄医录/新笔记.md'",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "文件内容（markdown 格式）",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "文档标题（会自动写入 frontmatter）",
+                    "default": "",
+                },
+                "tags": {
+                    "type": "string",
+                    "description": "标签列表，逗号分隔（会自动写入 frontmatter）",
+                    "default": "",
+                },
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "knowledge_edit",
+        "category": "Knowledge",
+        "description": (
+            "Edit an existing markdown file in the local knowledge base. "
+            "Use this when the user wants to modify, update, or append to an existing note. "
+            "You can either replace the whole file or append to the end. "
+            "This tool writes to the local knowledge base."
+        ),
+        "triggers": [
+            "编辑笔记",
+            "更新知识库",
+            "修改文档",
+        ],
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "文件路径（相对于知识库根目录）",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["replace", "append"],
+                    "description": "编辑模式：replace = 替换整个文件，append = 在末尾追加",
+                    "default": "replace",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "新的文件内容（replace 模式）或要追加的内容（append 模式）",
+                },
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "knowledge_delete",
+        "category": "Knowledge",
+        "description": (
+            "Delete a file or folder from the local knowledge base. "
+            "Use this when the user wants to remove an old or unwanted note. "
+            "WARNING: This is permanent - use with caution."
+        ),
+        "triggers": [
+            "删除笔记",
+            "清理知识库",
+            "移除文档",
+        ],
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "要删除的文件或文件夹路径（相对于知识库根目录）",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "knowledge_rename",
+        "category": "Knowledge",
+        "description": (
+            "Rename or move a file in the local knowledge base. "
+            "Use this when the user wants to rename a note or move it to a different folder."
+        ),
+        "triggers": [
+            "重命名笔记",
+            "移动文件",
+            "整理知识库",
+        ],
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "old_path": {
+                    "type": "string",
+                    "description": "原来的文件路径（相对于知识库根目录）",
+                },
+                "new_path": {
+                    "type": "string",
+                    "description": "新的文件路径（相对于知识库根目录）",
+                },
+            },
+            "required": ["old_path", "new_path"],
+        },
+    },
 ]

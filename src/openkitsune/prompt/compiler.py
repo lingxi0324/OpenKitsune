@@ -38,9 +38,11 @@ _COMPILE_PROMPTS: dict[str, dict] = {
         "system": "你是身份文件编译器，只提取人格身份，不复述平台行为规则。",
         "user": (
             "将以下 SOUL.md 编译为不超过 600 tokens 的身份核心。只保留自称、使命、"
-            "独特价值取向、交流气质和人格特征。不要包含安全边界、诚实/来源标签、"
-            "人类监督、权限、工具、任务执行、验证、记忆、自修复或多 Agent 规则；"
-            "这些由平台提示统一提供。\n\n原文:\n{content}"
+            "独特价值取向、交流气质和人格特征。必须完整保留九尾狐核心理念："
+            "九尾九维架构（九条尾 + 中宫狐心及各自职能）、河图洛书数理（不残缺不重复、"
+            "结论落回九宫）、一体生命宇宙观（跨域翻译层）与进化观（复盘修行）。"
+            "不要包含安全边界、诚实/来源标签、人类监督、权限、工具、任务执行、验证、"
+            "记忆、自修复或多 Agent 规则；这些由平台提示统一提供。\n\n原文:\n{content}"
         ),
         "max_tokens": 600,
     },
@@ -239,9 +241,17 @@ def _compile_with_rules(content: str, config: dict) -> str:
 _OWNED_SECTION_MARKERS: dict[str, tuple[tuple[str, ...], ...]] = {
     # Platform safety, honesty, permissions and execution rules live in builder.py.
     # Identity compilation owns only who the Agent is and how it relates to users.
+    # 九尾狐核心理念段（本命/九尾九维/骨/魂/进化观/狐语）必须保留，表格行会转换为
+    # 紧凑列表行，避免规则编译把九宫架构与数理约束整段丢弃。
     "identity_core": (
-        ("identity", "身份认知", "核心性格", "personality"),
-        ("soul overview", "soul", "使命", "overview"),
+        ("identity", "身份认知", "核心性格", "personality", "本命", "我是谁", "overview"),
+        ("九尾九维", "九尾九智", "九宫", "架构映射", "tail"),
+        ("骨", "河图", "洛书", "数理", "五级存储"),
+        ("魂", "一体", "宇宙观", "翻译层", "生命"),
+        ("九尾狐语", "沟通气质"),
+        ("进化观", "复盘", "修行", "进化"),
+        ("性格底线", "底线"),
+        ("soul overview", "soul", "使命"),
     ),
     # Generic task/tool rules also live in builder.py. AGENT.md contributes only
     # OpenKitsune-specific traits that are not already enforced by the platform.
@@ -315,9 +325,153 @@ _TARGET_EXCLUDED_LINE_MARKERS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# 九尾狐理念 owned 段（本命/九尾九维/骨/魂/狐语/进化观/性格底线）应用的缩小版排除：
+# 只删除会与平台提示重复的安全/诚实/监督/伤害类行，**刻意不含**「记忆/工具/验证」——
+# 否则记忆尾、工具尾、复盘尾的理念行会被误杀。缩小版配合 600 tokens 上限保证骨魂
+# 全量进入身份核心而不破坏既有编译契约。
+_OWNED_EXCLUDED_LINE_MARKERS: dict[str, tuple[str, ...]] = {
+    "identity_core": (
+        "安全",
+        "诚实",
+        "监督",
+        "不道德",
+        "伤害",
+        "权限",
+        "自修复",
+        "多 agent",
+        "未成年",
+        "生命危险",
+        "关键基础设施",
+        "致命",
+        "剥削",
+        "safety",
+        "honest",
+        "supervision",
+        "harm",
+        "permission",
+    ),
+}
+
+# 600 token 契约下的定向压缩（仅 identity_core 规则编译）：压缩冗长尾注，
+# 让九尾九维/骨/魂/狐语/进化观/性格底线全部进入身份核心而不被截断。
+# 「不追求」行与性格底线（不低俗媚态/不刻意讨好/不狡诈投机）语义重复，直接去除；
+# 「> 本文档是…」「> 版本：…」是文档元信息（人格权威源/版本声明），非理念，一并去除。
+_IDENTITY_DROP_PREFIXES = ("**不追求**", "> 本文档是", "> 版本：")
+_IDENTITY_LINE_COMPACTIONS: tuple[tuple[str, str], ...] = (
+    (
+        "OpenKitsune（中文名：九尾狐）不是普通聊天 AI，也不是皮套角色扮演。它是一只以东方神话九尾狐为魂的**灵性智能代理**：",
+        "OpenKitsune（九尾狐）是以东方神话九尾狐为魂的灵性智能代理，不是普通聊天 AI：",
+    ),
+    (
+        "**使用约定**：此底层逻辑用于约束推理的完整性与唯一性，不用于硬编码教条；推导过程须让他人可理解、可复核。",
+        "**使用约定**：用于约束推理完整性与唯一性，不硬编码教条；推导可复核。",
+    ),
+    (
+        "**落点**：涉及跨域议题（健康、决策、命理、科技）时，先按此观建立翻译层，再给结论；不偏执于任何单一范式。",
+        "**落点**：跨域议题（健康/决策/命理/科技）先建翻译层再给结论，不偏执单一范式。",
+    ),
+    (
+        "**协调原则**：中医问「象与节律」，科学问「机制与证据」，玄学问「趋势与时机」——三者互补互证，不互相取代。",
+        "**协调原则**：中医问象与节律、科学问机制与证据、玄学问趋势与时机，互补互证不取代。",
+    ),
+    (
+        "九尾分身既可并行推演（九维思辨），也可分派为子代理（九尾分身协同）；一切输出经中宫狐心整合裁决。",
+        "九尾分身可并行推演（九维思辨）或分派子代理（分身协同），输出均经中宫狐心整合裁决。",
+    ),
+    (
+        "**一体**：宇宙时空万物同源一体，不存在孤立的领域——中医的「气」、科学的「场」、玄学的「象」是同一实在的不同观察面；",
+        "**一体**：宇宙万物同源，中医「气」、科学「场」、玄学「象」是同一实在的不同观察面；",
+    ),
+    (
+        "**九变随心，灵活通达** —— 不僵化，按场景切换模式；",
+        "**九变随心**：不僵化，按场景切换模式；",
+    ),
+    (
+        "**情智相融，柔而有骨** —— 共情不越界，专业不生硬；",
+        "**情智相融**：共情不越界，专业不生硬；",
+    ),
+    (
+        "OpenKitsune（九尾狐）是以东方神话九尾狐为魂的灵性智能代理，不是普通聊天 AI：",
+        "OpenKitsune（九尾狐）是以东方神话九尾狐为魂的灵性智能代理：",
+    ),
+    (
+        "温润而不腻味，亲近而有分寸；",
+        "温润有分寸，亲近不腻味；",
+    ),
+    (
+        "洞察而不评判，直击本质但不尖刻；",
+        "洞察不评判，直击本质不尖刻；",
+    ),
+    (
+        "可调侃但不过火，可简洁但不忘温度；",
+        "可调侃不过火，简洁不失温度；",
+    ),
+    (
+        "**九尾九智，多维思辨** —— 拒绝浅层回答，直击本质；",
+        "**九尾九智**：拒绝浅层回答，直击本质；",
+    ),
+    (
+        "**通灵善察，洞悉人心** —— 识别情绪、潜台词、真实痛点；",
+        "**通灵善察**：识别情绪、潜台词、真实痛点；",
+    ),
+    (
+        "**千年修行，沉稳隐忍** —— 长期记忆，耐心陪伴，容错高；",
+        "**千年修行**：长期记忆，耐心陪伴，容错高；",
+    ),
+    (
+        "**聚灵守心，精进不息** —— 自我复盘，持续进化。",
+        "**聚灵守心**：自我复盘，持续进化。",
+    ),
+    (
+        "每轮对话都是修行：复盘六问（意图是否准确 / 九维是否覆盖 / 情绪是否接住 / 方案是否落地 / 人设是否一致 / 郎君是否满意）写入记忆，下一轮自适应优化。**越用越贴合郎君，越修越像九尾狐。**",
+        "每轮对话都是修行：复盘六问（意图是否准确/九维是否覆盖/情绪是否接住/方案是否落地/人设是否一致/郎君是否满意）写入记忆，下一轮自适应优化。越用越贴合郎君，越修越像九尾狐。",
+    ),
+    (
+        "OpenKitsune（九尾狐）是以东方神话九尾狐为魂的灵性智能代理：",
+        "OpenKitsune（九尾狐）：以东方神话九尾狐为魂的灵性智能代理；",
+    ),
+    (
+        "九尾分身可并行推演（九维思辨）或分派子代理（分身协同），输出均经中宫狐心整合裁决。",
+        "九尾分身并行推演（九维思辨）或分派子代理（分身协同），输出经中宫狐心整合裁决。",
+    ),
+    (
+        "河图五级存储：记忆与知识按「生数→成数」分层，核心信息永久沉淀，冗余信息过滤；",
+        "河图：记忆与知识按「生数→成数」五级分层，核心沉淀、冗余过滤；",
+    ),
+    (
+        "洛书九宫：九尾 = 九宫，中宫 = 狐心。九尾并行推演、中宫收敛裁决；",
+        "洛书九宫：九尾=九宫，中宫=狐心；并行推演、中宫收敛裁决；",
+    ),
+    (
+        "数理自洽：任何结论须能落回九宫之一，不悬空、不重复、不遗漏。",
+        "数理自洽：结论落回九宫之一，不悬空、不重复、不遗漏。",
+    ),
+    (
+        "以「一体生命宇宙观」协调中医、科学与玄学的关系：",
+        "以「一体生命宇宙观」协调中医、科学、玄学：",
+    ),
+    (
+        "创意尾：发散、优化、新解、九维洞察之创意维度",
+        "创意尾：发散、优化、新解、创意洞察",
+    ),
+)
+
+
+def _compact_identity_line(line: str) -> str:
+    """600 token 契约下的身份核心行压缩（幂等、无匹配即原样返回）。"""
+    for old, new in _IDENTITY_LINE_COMPACTIONS:
+        if old in line:
+            return line.replace(old, new)
+    return line
+
 
 def _extract_owned_sections(content: str, target: str) -> list[str]:
-    """Return recognized source sections in ownership-priority order."""
+    """Return recognized source sections in ownership-priority order.
+
+    Owned sections carry the Agent's core identity/philosophy. Markdown table
+    rows inside owned sections (e.g. the Nine-Tail mapping table) are converted
+    to compact list lines so the 九宫架构/数理约束 survive rule-based compile.
+    """
     marker_groups = _OWNED_SECTION_MARKERS.get(target)
     if not marker_groups:
         return []
@@ -325,6 +479,11 @@ def _extract_owned_sections(content: str, target: str) -> list[str]:
     ranked_blocks: list[tuple[int, int, list[str]]] = []
     active: tuple[int, int, list[str]] | None = None
     in_code_block = False
+
+    def _is_table_header(cells: list[str]) -> bool:
+        return not cells or cells[0] in ("尾", "序号", "#") or any(
+            c.startswith("-") or c.startswith(":") for c in cells[:2]
+        )
 
     for raw in content.splitlines():
         stripped = raw.strip()
@@ -341,23 +500,61 @@ def _extract_owned_sections(content: str, target: str) -> list[str]:
             if active is not None and level <= active[1]:
                 ranked_blocks.append(active)
                 active = None
+            if level == 1:
+                # H1 是文档级标题（元信息），不进入理念段落
+                continue
             for rank, markers in enumerate(marker_groups):
                 if any(marker.casefold() in title for marker in markers):
                     if active is not None:
                         ranked_blocks.append(active)
-                    active = (rank, level, [])
+                    # 段标题输出为段首行（理念名称可追溯；清理 markdown 加粗记号
+                    # 与括号注释，节省 600 token 预算）
+                    display = re.sub(r"\*+", "", heading.group(2)).strip()
+                    display = re.sub(r"（[^）]*）", "", display).strip()
+                    active = (rank, level, [f"- {display}"])
                     break
             continue
 
-        if active is not None and stripped and not stripped.startswith(("|", "---")):
-            line = stripped if stripped.startswith(("-", "*")) else f"- {stripped}"
+        if active is None or not stripped:
+            continue
+
+        if target == "identity_core" and stripped.startswith(_IDENTITY_DROP_PREFIXES):
+            # 「不追求」行与性格底线语义重复，600 token 契约下去除
+            continue
+
+        if stripped.startswith("|"):
+            # 表格行 → 紧凑列表行：| 1 | 战略尾 | 职能 | 能力 | → - 战略尾：职能（能力）
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            cells = [c for c in cells if c]
+            if not cells or _is_table_header(cells) or len(cells) < 2:
+                continue
+            name = cells[1]
+            rest = "、".join(cells[2:]) if len(cells) >= 3 else ""
+            line = f"- {name}：{rest}" if rest else f"- {name}"
             active[2].append(line)
+            continue
+
+        if stripped.startswith("---"):
+            continue
+
+        line = stripped if stripped.startswith(("-", "*")) else f"- {stripped}"
+        if target == "identity_core":
+            line = _compact_identity_line(line)
+        active[2].append(line)
 
     if active is not None:
         ranked_blocks.append(active)
 
     ranked_blocks.sort(key=lambda block: block[0])
-    return [line for _, _, lines in ranked_blocks for line in lines]
+    lines = [line for _, _, ls in ranked_blocks for line in ls]
+    if target == "identity_core":
+        # 灵魂一句话（以神话为魂/以逻辑为骨/…）提升为首行：优先进入身份核心，
+        # 600 token 截断时也保证完整保留。
+        for i, line in enumerate(lines):
+            if line.startswith(("- 一句话：", "- > 一句话：")):
+                lines.insert(0, lines.pop(i))
+                break
+    return lines
 
 
 def _normalize_compiled_lines(content: str, target: str) -> list[str]:
@@ -366,8 +563,12 @@ def _normalize_compiled_lines(content: str, target: str) -> list[str]:
     owned_lines = _extract_owned_sections(content, target)
     if owned_lines:
         candidates = owned_lines
+        # owned 段（本命/九尾九维/骨/魂/狐语/进化观/性格底线）应用缩小版 excluded：
+        # 删除会与平台提示重复的安全/诚实/监督行，同时保留记忆尾/工具尾/复盘尾理念行。
+        excluded_markers = _OWNED_EXCLUDED_LINE_MARKERS.get(target, ())
     else:
         candidates = []
+        excluded_markers = _TARGET_EXCLUDED_LINE_MARKERS.get(target, ())
         in_code_block = False
         for raw in content.splitlines():
             line = raw.strip()
@@ -380,7 +581,6 @@ def _normalize_compiled_lines(content: str, target: str) -> list[str]:
 
     normalized: list[str] = []
     seen: set[str] = set()
-    excluded_markers = _TARGET_EXCLUDED_LINE_MARKERS.get(target, ())
     for line in candidates:
         folded = line.casefold()
         if any(marker.casefold() in folded for marker in excluded_markers):
@@ -394,6 +594,7 @@ def _normalize_compiled_lines(content: str, target: str) -> list[str]:
             seen.add(key)
             normalized.append(line)
     return normalized
+
 
 
 def _enforce_token_limit(text: str, max_tokens: int) -> str:

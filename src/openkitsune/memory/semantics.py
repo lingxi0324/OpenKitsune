@@ -2,7 +2,7 @@
 记忆语义方法逻辑（多层记忆 / 去重 / 接替 / 核心预算）
 
 将已验证的记忆方法学（core-memory / memory-boundaries / time-aware-recall /
-memory-trust），以及已在 `lcs-fusion-memory`（Rust crate，HTTP 4010）
+memory-trust），以及已在 `lcs-fusion-memory`（Rust crate，本机部署 HTTP 4014）
 落地并验证的语义，移植进 OpenKitsune 自带的记忆系统。
 纯逻辑模块，无 IO。
 

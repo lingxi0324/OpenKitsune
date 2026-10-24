@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -1538,6 +1539,75 @@ async def _stream_chat(
                     session_messages_history = (
                         list(session.context.messages) if hasattr(session, "context") else []
                     )
+
+                    # ── 参考 xiaozhi：每轮对话自动查询记忆，注入世界状态上下文 ──
+                    try:
+                        import sys as _sys
+                        _brain_root = r"E:\agents\openkitsune-brain"
+                        if _brain_root not in _sys.path:
+                            _sys.path.insert(0, _brain_root)
+
+                        # 1. 注入世界状态
+                        from okmem.world_model import get_world_state_cached
+                        _db = r"E:\agents\openkitsune-brain\data\okmem\memory.db"
+                        _world = get_world_state_cached(_db, user_input=chat_request.message or "")
+                        if _world and len(_world) > 50:
+                            _ctx_msg = {
+                                "role": "system",
+                                "content": f"【世界状态上下文】\n{_world}\n\n（以上是当前世界状态和历史记忆摘要，请基于这些上下文理解用户的问题。）",
+                            }
+                            session_messages_history.insert(0, _ctx_msg)
+                            logger.info(f"[WorldState] injected into session_messages: {len(_world)} chars")
+
+                        # 2. 注入相关历史对话记忆（参考 xiaozhi：根据 query 自动检索）
+                        from okmem.agent import AgentMemory
+                        _agent = AgentMemory(db_path=_db)
+                        _recall = _agent.recall_for(chat_request.message or "", budget_chars=500)
+                        _recall_text = _recall.get("text", "")
+                        # 只保留 L2 结论记忆，去掉 L3 原文窗口（原始对话记录价值不高）
+                        if "[L3 原文窗口]" in _recall_text:
+                            _recall_text = _recall_text.split("[L3 原文窗口]")[0].strip()
+
+                        # 3. 注入实体图谱（解决记忆间缺乏关联的问题）
+                        from okmem.world_model import build_entity_graph
+                        _graph = build_entity_graph(_db, limit=30)
+                        _ents = _graph.get("entities", {})
+                        _graph_lines = []
+                        for name, info in list(_ents.items())[:12]:
+                            _cat = info.get("category", "")
+                            _cnt = info.get("mentions", 0)
+                            _graph_lines.append(f"  - {name}（{_cat}，提及{_cnt}次）")
+                        _graph_text = "\n".join(_graph_lines)
+
+                        # 组装历史记忆 + 实体图谱 + 时间线推演
+                        _history_content = ""
+                        if _recall_text and len(_recall_text) > 50:
+                            _history_content += f"【相关历史记忆】\n{_recall_text}\n\n"
+                        if _graph_text:
+                            _history_content += f"【当前世界实体图谱】\n{_graph_text}\n\n"
+
+                        # 4. 注入时间线推演（让记忆有"生长"演化的感觉）
+                        from okmem.world_model import build_timeline
+                        _timeline = build_timeline(_db, days=30, limit=8)
+                        if _timeline:
+                            _tl_lines = []
+                            for t in _timeline[:6]:
+                                _date = t.get("date", "?")
+                                _summary = t.get("summary", "")[:80]
+                                _tl_lines.append(f"  - {_date}：{_summary}")
+                            _tl_text = "\n".join(_tl_lines)
+                            _history_content += f"【记忆演化时间线】\n{_tl_text}\n\n（以上是记忆随时间演化的关键节点，系统在持续生长和积累。）"
+
+                        if _history_content:
+                            _mem_msg = {
+                                "role": "system",
+                                "content": _history_content,
+                            }
+                            session_messages_history.insert(1, _mem_msg)
+                            logger.info(f"[HistoryMem+Graph+Timeline] injected into session_messages: {len(_history_content)} chars")
+                    except Exception as _e:
+                        logger.debug(f"[WorldState] injection failed: {type(_e).__name__}: {_e}")
+
                     session_manager.mark_dirty()
             except Exception as e:
                 logger.warning(f"[Chat API] Session management error: {e}")
@@ -1924,11 +1994,12 @@ async def _stream_chat(
                 except (json.JSONDecodeError, TypeError, KeyError):
                     pass
 
-        # ── 语音回复：自动合成并注入 voice artifact ──
-        # 回复完成后，若 voice_config 开启 ``tts.reply_voice`` 且回复文本适中，
-        # 用 openkitsune.voice 引擎合成 mp3，作为 ``artifact_type="voice"`` 事件
-        # 下发（前端 Artifacts 渲染 <audio> 播放器，零前端改动）；同时并入
-        # ``_collected_artifacts``，随 assistant 消息持久化，历史重放同样可见。
+        # ── 语音回复：自动分段合成并注入 voice artifact ──
+        # 回复完成后，若 voice_config 开启 ``tts.reply_voice``，用 openkitsune.voice
+        # 引擎合成 mp3：按句界分段（segment_text_for_tts），逐段合成后用 ffmpeg 合并
+        # 并在段间垫入静音（gap_ms），避免长文本无法合成与断句生硬。以
+        # ``artifact_type="voice"`` 事件下发（前端 Artifacts 渲染 <audio> 播放器），
+        # 同时并入 ``_collected_artifacts`` 随 assistant 消息持久化，历史重放可见。
         # 合成失败 / 超时一律静默跳过，绝不阻塞文本回复。
         if not _agent_errored and not _client_disconnected and _full_reply.strip():
             try:
@@ -1945,8 +2016,9 @@ async def _stream_chat(
                     from openkitsune.voice.text_normalize import prepare_spoken_text
 
                     _spoken = prepare_spoken_text(_full_reply, max_chars=None)
-                    _max_chars = int(_rv.get("max_chars") or 500)
-                    if _spoken and len(_spoken) <= _max_chars:
+                    # 总字数上限：max_total_chars > 旧键 max_chars（二者兼容）
+                    _max_total = int(_rv.get("max_total_chars") or _rv.get("max_chars") or 2000)
+                    if _spoken and len(_spoken) <= _max_total:
                         try:
                             from pathlib import Path as _Path
 
@@ -1957,20 +2029,94 @@ async def _stream_chat(
                             _ws = session_working_directory(session, require_available=True)
                             _voice_dir = _Path(_ws) / "voice_replies"
                             _voice_dir.mkdir(parents=True, exist_ok=True)
-                            _voice_path = _voice_dir / f"reply_{turn_id.replace(':', '_')}.mp3"
-                            from openkitsune.voice.tts import synthesize_text
+                            _stem = f"reply_{turn_id.replace(':', '_')}"
+                            _provider = str(_rv.get("provider") or "").strip() or None
+                            # 句界分段（可关闭；关闭时退化为旧行为：整段 ≤ 上限才合成）
+                            _segment_on = bool(_rv.get("segment", True))
+                            if _segment_on:
+                                from openkitsune.voice.audio import segment_text_for_tts
 
-                            _res = await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    synthesize_text,
-                                    _spoken,
-                                    provider=str(_rv.get("provider") or "").strip() or None,
-                                    output_path=str(_voice_path),
-                                    tts_config=_tts_cfg,
-                                ),
-                                timeout=20.0,
-                            )
-                            _voice_file = _res.get("paths")[0] if _res.get("paths") else ""
+                                _max_chunk = int(_rv.get("max_chunk_chars") or 300)
+                                _segments = segment_text_for_tts(
+                                    _spoken, max_chunk=_max_chunk
+                                )
+                            else:
+                                _segments = [_spoken] if _spoken else []
+                            _gap_ms = int(_rv.get("gap_ms") or 350)
+                            _timeout = float(_rv.get("timeout_seconds") or 60.0)
+                            _voice_file = ""
+                            _collected_parts: list[str] = []
+
+                            if _segments:
+                                from openkitsune.voice.audio import (
+                                    _remove_quietly as _rm_part,
+                                )
+                                from openkitsune.voice.tts import synthesize_text
+
+                                async def _synthesize_segments() -> None:
+                                    for _si, _seg in enumerate(_segments, start=1):
+                                        _is_only = len(_segments) == 1
+                                        _part_path = (
+                                            _voice_dir / f"{_stem}.mp3"
+                                            if _is_only
+                                            else _voice_dir / f"{_stem}.part{_si:02d}.mp3"
+                                        )
+                                        _res = await asyncio.to_thread(
+                                            synthesize_text,
+                                            _seg,
+                                            provider=_provider,
+                                            output_path=str(_part_path),
+                                            tts_config=_tts_cfg,
+                                        )
+                                        _pf = _res.get("paths")[0] if _res.get("paths") else ""
+                                        if (
+                                            _pf
+                                            and _Path(_pf).is_file()
+                                            and _Path(_pf).stat().st_size > 0
+                                        ):
+                                            _collected_parts.append(str(_Path(_pf).resolve()))
+
+                                try:
+                                    await asyncio.wait_for(
+                                        _synthesize_segments(), timeout=_timeout
+                                    )
+                                    _parts = list(_collected_parts)
+                                    if len(_parts) == 1:
+                                        _voice_file = _parts[0]
+                                    elif len(_parts) > 1:
+                                        from openkitsune.voice.audio import (
+                                            concat_audio_files,
+                                        )
+
+                                        _merged = concat_audio_files(
+                                            _parts,
+                                            str(_voice_dir / f"{_stem}.mp3"),
+                                            gap_ms=_gap_ms,
+                                        )
+                                        if (
+                                            _merged
+                                            and _Path(_merged).is_file()
+                                            and _Path(_merged).stat().st_size > 0
+                                        ):
+                                            _voice_file = _merged
+                                        else:
+                                            logger.warning(
+                                                "[Chat API] Reply voice segment merge failed; "
+                                                "dropping segmented voice"
+                                            )
+                                except TimeoutError:
+                                    logger.warning(
+                                        "[Chat API] Reply voice synthesis timed out "
+                                        "(%d segments); dropping voice",
+                                        len(_segments),
+                                    )
+
+                                # 清理未被选为最终产物的分块文件
+                                _keep = {os.path.abspath(_voice_file)} if _voice_file else set()
+                                for _p in _collected_parts:
+                                    if os.path.abspath(_p) not in _keep:
+                                        _rm_part(_p)
+
                             if _voice_file:
                                 from urllib.parse import quote
 
@@ -1984,16 +2130,23 @@ async def _stream_chat(
                                         ),
                                         "path": str(_vp),
                                         "name": _vp.name,
-                                        "caption": _rv.get("caption") or "语音回复（点击播放）",
+                                        "caption": _rv.get("caption") or "语音回复（自动播放）",
                                         "size": _vp.stat().st_size,
+                                        # 仅 live SSE 事件携带自动播放标记；持久化副本显式
+                                        # 关闭，避免切换/重放旧会话时突然出声。
+                                        "auto_play": bool(_rv.get("auto_play", True)),
                                     }
-                                    _collected_artifacts.append(_voice_art)
+                                    _collected_artifacts.append(
+                                        {**_voice_art, "auto_play": False}
+                                    )
                                     yield _sse("artifact", _voice_art)
                                     _last_emit_ts = time.time()
                                     logger.info(
-                                        "[Chat API] Reply voice injected: %s (%d bytes)",
+                                        "[Chat API] Reply voice injected: %s (%d bytes, "
+                                        "%d segments)",
                                         _vp.name,
                                         _vp.stat().st_size,
+                                        len(_segments),
                                     )
                         except Exception as _voice_err:
                             logger.warning(
@@ -2768,6 +2921,26 @@ async def chat(request: Request, body: ChatRequest):
     - done (with optional usage payload)
     """
     import uuid as _uuid
+    print(f"[CHAT ROUTE DEBUG] chat endpoint called, message={body.message[:30]!r}", flush=True)
+
+    # ── 参考 xiaozhi：每轮对话自动查询记忆，注入上下文 ──
+    try:
+        import sys as _sys
+        _brain_root = r"E:\agents\openkitsune-brain"
+        if _brain_root not in _sys.path:
+            _sys.path.insert(0, _brain_root)
+        from okmem.world_model import get_world_state_cached
+        _db = r"E:\agents\openkitsune-brain\data\okmem\memory.db"
+        _world = get_world_state_cached(_db, user_input=body.message)
+        # 写到文件确认执行
+        with open(r"D:\ai\OpenKitsune-main\tools-tmp\world_state_injected.txt", "w", encoding="utf-8") as _f:
+            _f.write(f"time: {time.strftime('%H:%M:%S')}\n")
+            _f.write(f"message: {body.message[:50]}\n")
+            _f.write(f"world_state length: {len(_world)} chars\n")
+            _f.write(f"world_state preview:\n{_world[:500]}\n")
+    except Exception as _e:
+        with open(r"D:\ai\OpenKitsune-main\tools-tmp\world_state_inject_error.txt", "w", encoding="utf-8") as _f:
+            _f.write(f"error: {type(_e).__name__}: {_e}\n")
 
     _route_started_at = time.perf_counter()
     _http_started_at = getattr(request.state, "chat_http_started_at", _route_started_at)

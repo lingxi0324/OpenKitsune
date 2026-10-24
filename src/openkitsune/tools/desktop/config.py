@@ -17,6 +17,10 @@ class CaptureConfig:
     max_width: int = 1920
     max_height: int = 1080
     cache_ttl: float = 1.0  # 截图缓存时间（秒）
+    # 视觉/OCR 分析用缩放上限：截图过大时模型读不清、推理也慢。
+    # 仅影响分析副本，不改变保存给用户的原始截图。
+    analysis_max_width: int = 1280
+    analysis_max_height: int = 720
 
     @classmethod
     def from_env(cls) -> "CaptureConfig":
@@ -26,6 +30,8 @@ class CaptureConfig:
             max_width=int(os.getenv("DESKTOP_MAX_WIDTH", "1920")),
             max_height=int(os.getenv("DESKTOP_MAX_HEIGHT", "1080")),
             cache_ttl=float(os.getenv("DESKTOP_CACHE_TTL", "1.0")),
+            analysis_max_width=int(os.getenv("DESKTOP_ANALYSIS_MAX_WIDTH", "1280")),
+            analysis_max_height=int(os.getenv("DESKTOP_ANALYSIS_MAX_HEIGHT", "720")),
         )
 
 
@@ -52,7 +58,8 @@ class VisionConfig:
 
     enabled: bool = True
     max_retries: int = 2
-    timeout: float = 30.0
+    # 单次视觉调用超时（本地 CPU 视觉模型较慢；超时后走降级路径而不是卡死）
+    timeout: float = 120.0
     # 指定桌面截图分析使用的 LLM 端点（留空 = 按端点优先级自动选择）
     endpoint: str = ""
 
@@ -61,7 +68,7 @@ class VisionConfig:
         return cls(
             enabled=os.getenv("DESKTOP_VISION_ENABLED", "true").lower() == "true",
             max_retries=int(os.getenv("DESKTOP_VISION_MAX_RETRIES", "2")),
-            timeout=float(os.getenv("DESKTOP_VISION_TIMEOUT", "30.0")),
+            timeout=float(os.getenv("DESKTOP_VISION_TIMEOUT", "120.0")),
             endpoint=os.getenv("DESKTOP_VISION_ENDPOINT", "").strip(),
         )
 

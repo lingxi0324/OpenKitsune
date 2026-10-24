@@ -6754,6 +6754,31 @@ class Agent:
         self._current_conversation_id = conversation_id
 
         # v1.28 conversation concurrency (S1.3 + S1.4)：与 chat_with_session 同源，
+
+        # ── P0: 会话启动轻量 recall —— 注入短背景注记（100-200 token）──
+        # 不是全量世界状态灌注，而是告诉 LLM：上次聊到哪里、有什么没说完
+        print(f"[P0 DEBUG] chat_with_session_stream reached, message={message[:30]!r}", flush=True)
+        try:
+            import sys as _sys
+            _brain_root = r"E:\agents\openkitsune-brain"
+            if _brain_root not in _sys.path:
+                _sys.path.insert(0, _brain_root)
+            from okmem.world_model import get_world_state_cached
+            _db = r"E:\agents\openkitsune-brain\data\okmem\memory.db"
+            _world = get_world_state_cached(_db, user_input=message)
+            if _world and len(_world) > 50:
+                # 只取前 300 字符（约 100-150 token），作为轻量背景注记
+                _brief = _world[:300]
+                if len(_world) > 300:
+                    _brief += "..."
+                _ctx_msg = {
+                    "role": "system",
+                    "content": f"【会话上下文摘要】\n{_brief}",
+                }
+                session_messages.insert(0, _ctx_msg)
+                logger.info(f"[WorldState] P0 lightweight recall injected: {len(_brief)} chars")
+        except Exception as e:
+            logger.debug(f"[WorldState] P0 recall failed: {e}")
         # 显式 preempt/queue 协议替换旧的隐式共享 TaskState。详见
         # :meth:`_preempt_or_queue_prev_task`。
         _preempt_decision = await self._preempt_or_queue_prev_task(

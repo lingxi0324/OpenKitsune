@@ -321,18 +321,38 @@ function firstUserContent(msgs: ChatMessage[]): string {
   return msgs.find((msg) => msg.role === "user")?.content.trim() ?? "";
 }
 
-function removeAdjacentDuplicateUserMessages(msgs: ChatMessage[]): ChatMessage[] {
+/**
+ * 消息"信息量"打分：hydration 遇到相邻重复助手消息时，保留更富的一条
+ * （例如后端 bug 曾把同一轮回复同时存成"带 voice artifact 的富消息"和
+ * "裸文本消息"两条，渲染时出现两个气泡）。
+ */
+function messageRichness(msg: ChatMessage): number {
+  return (msg.artifacts?.length ?? 0) * 1000 +
+    (msg.usage ? 200 : 0) +
+    (msg.thinkingChain?.length ?? 0) * 100 +
+    (msg.sources?.length ?? 0) * 50 +
+    (msg.mcpCalls?.length ?? 0) * 50 +
+    (msg.todo?.steps?.length ?? 0) * 20 +
+    (msg.parts?.length ?? 0) * 10;
+}
+
+function removeAdjacentDuplicateMessages(msgs: ChatMessage[]): ChatMessage[] {
   let changed = false;
   const deduped: ChatMessage[] = [];
   for (const msg of msgs) {
     const prev = deduped[deduped.length - 1];
     if (
-      msg.role === "user" &&
-      prev?.role === "user" &&
+      prev &&
+      prev.role === msg.role &&
       prev.content === msg.content &&
       attachmentSignature(prev.attachments) === attachmentSignature(msg.attachments)
     ) {
       changed = true;
+      // 相邻重复的助手消息保留信息更全的一条（带 artifact / usage / 思维链等），
+      // 避免把带语音播放器的版本丢掉；用户消息保留先出现的版本。
+      if (msg.role === "assistant" && messageRichness(msg) > messageRichness(prev)) {
+        deduped[deduped.length - 1] = msg;
+      }
       continue;
     }
     deduped.push(msg);
@@ -379,8 +399,8 @@ function mergeMissingAttachments(primary: ChatMessage[], secondary: ChatMessage[
  * choosing the history to render.
  */
 export function chooseHydratedMessages(localMsgs: ChatMessage[], backendMsgs: ChatMessage[]): ChatMessage[] {
-  const cleanBackend = removeAdjacentDuplicateUserMessages(backendMsgs);
-  const cleanLocal = removeAdjacentDuplicateUserMessages(localMsgs);
+  const cleanBackend = removeAdjacentDuplicateMessages(backendMsgs);
+  const cleanLocal = removeAdjacentDuplicateMessages(localMsgs);
   const backendWithLocalAttachments = mergeMissingAttachments(cleanBackend, cleanLocal);
   if (backendWithLocalAttachments.length === 0) return cleanLocal;
   if (cleanLocal.length === 0) return cleanBackend;
@@ -391,7 +411,7 @@ export function chooseHydratedMessages(localMsgs: ChatMessage[], backendMsgs: Ch
     return backendWithLocalAttachments;
   }
 
-  const patchedLocal = removeAdjacentDuplicateUserMessages(
+  const patchedLocal = removeAdjacentDuplicateMessages(
     mergeMissingAttachments(patchMessagesWithBackend(cleanLocal, backendWithLocalAttachments), backendWithLocalAttachments),
   );
 
@@ -501,7 +521,12 @@ function coerceTimelineEntries(raw: unknown): ChainEntry[] {
         out.push({ kind: "thinking", content: String(r.content ?? "") });
         break;
       case "text":
-        out.push({ kind: "text", content: String(r.content ?? ""), ...(r.icon ? { icon: String(r.icon) } : {}) });
+        out.push({
+          kind: "text",
+          content: String(r.content ?? ""),
+          ...(r.icon ? { icon: String(r.icon) } : {}),
+          ...(typeof r.title === "string" && r.title.trim() ? { title: r.title.trim() } : {}),
+        });
         break;
       case "tool_start":
         out.push({
@@ -600,6 +625,132 @@ function toolCallsFromChainEntries(entries: ChainEntry[]): ChainToolCall[] {
 export function basename(path: string): string {
   if (!path) return "";
   return path.replace(/\\/g, "/").split("/").pop() || path;
+}
+
+// ── 过程步骤切分（正文中的 `> 工具描述` 引用块） ──
+//
+// 后端的 reasoning runtime 会把每次工具调用的人类可读描述以
+// `\n> 正在读取 xxx...\n` 的形式混入正文流（过程可见化）。聊天界面不应把
+// 这些行当普通引用块展开，而是折叠成一行"过程步骤"，点击才展开参数/结果。
+
+export type ProcessSegment =
+  | { kind: "text"; text: string }
+  | { kind: "step"; label: string; status: "running" | "done"; note?: string };
+
+/** 与后端 `ReasoningEngine._describe_tool_call` 的输出前缀保持一致。 */
+const PROCESS_STEP_PREFIXES = [
+  "正在读取 ",
+  "正在写入 ",
+  "正在编辑 ",
+  "搜索 \"",
+  "在网上搜索 \"",
+  "执行命令:",
+  "执行代码",
+  "访问 ",
+  "截取页面截图",
+  "制定计划:",
+  "更新计划步骤 ",
+  "切换角色:",
+  "获取当前人格配置",
+  "向用户提问:",
+  "列出目录 ",
+  "交付文件",
+];
+
+/** Result-summary lines emitted by `ReasoningEngine._summarize_tool_result`. */
+const PROCESS_STEP_RESULT_PATTERNS: RegExp[] = [
+  /^已读取 \(\d+ 行, \d+ 字符\)$/,
+  /^找到 \d+ 条结果$/,
+  /^无匹配结果$/,
+  /^搜索完成 \(\d+ 字符\)$/,
+  /^执行完成: /,
+  /^写入成功$/,
+  /^完成 \(\d+ 字符\)$/,
+  /^截图已获取$/,
+  /^桌面截图已保存$/,
+  /^已交付 \d+ 个文件$/,
+  /^切换完成$/,
+  /^出错: /,
+  /^命令执行失败/,
+];
+
+function matchProcessStepLine(line: string, streaming: boolean, isLastLine: boolean): string | null {
+  // 仅匹配单层引用块；`>>` 视为模型自己的引用内容。
+  const match = /^\s{0,3}>\s?(.*\S)\s*$/.exec(line);
+  if (!match) return null;
+  const body = match[1];
+  if (body.startsWith(">")) return null;
+  if (PROCESS_STEP_PREFIXES.some((prefix) => body.startsWith(prefix))) return body;
+  if (/使用缓存结果$/.test(body)) return body;
+  if (/^调用 [\w.-]+\(.*\)(\.\.\.|…)?$/.test(body)) return body;
+  // 流式过程中描述可能只到达半行（"> 正在读"），先折叠避免引用块闪一下。
+  if (streaming && isLastLine && PROCESS_STEP_PREFIXES.some((prefix) => prefix.startsWith(body))) {
+    return body;
+  }
+  return null;
+}
+
+function isProcessResultLine(line: string): string | null {
+  const match = /^\s{0,3}>\s?(.*\S)\s*$/.exec(line);
+  if (!match) return null;
+  const body = match[1];
+  return PROCESS_STEP_RESULT_PATTERNS.some((pattern) => pattern.test(body)) ? body : null;
+}
+
+/**
+ * Split assistant body text into prose segments and collapsed process-step
+ * markers. Fenced code blocks are respected so a `> ...` line inside code is
+ * never mistaken for a step marker.
+ */
+export function splitProcessSegments(content: string, streaming = false): ProcessSegment[] {
+  if (!content) return [];
+  const lines = content.split("\n");
+  const segments: ProcessSegment[] = [];
+  let buffer: string[] = [];
+  let fence: string | null = null;
+
+  const flush = () => {
+    if (buffer.length === 0) return;
+    const text = buffer.join("\n").replace(/^\n+|\n+$/g, "");
+    buffer = [];
+    if (text.trim()) segments.push({ kind: "text", text });
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (fence) {
+      buffer.push(line);
+      if (line.trim().startsWith(fence)) fence = null;
+      continue;
+    }
+    const fenceMatch = /^\s*(```|~~~)/.exec(line);
+    if (fenceMatch) {
+      fence = fenceMatch[1];
+      buffer.push(line);
+      continue;
+    }
+    const label = matchProcessStepLine(line, streaming, i === lines.length - 1);
+    if (label != null) {
+      flush();
+      const running = streaming && i === lines.length - 1;
+      segments.push({ kind: "step", label, status: running ? "running" : "done" });
+      continue;
+    }
+    // Result summary (`> 已读取 (3 行, 170 字符)` etc.) belongs to the step
+    // that just finished — fold it into that row instead of leaving a stray
+    // blockquote in the prose.
+    const note = isProcessResultLine(line);
+    if (note != null && buffer.join("\n").trim() === "") {
+      const last = segments[segments.length - 1];
+      if (last && last.kind === "step") {
+        segments[segments.length - 1] = { ...last, note, status: "done" };
+        continue;
+      }
+    }
+    buffer.push(line);
+  }
+  flush();
+  return segments;
 }
 
 export function formatToolDescription(tool: string, args: Record<string, unknown>): string {

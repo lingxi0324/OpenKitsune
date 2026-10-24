@@ -28,48 +28,69 @@ def retrieve_memory(
 
     v2: 优先使用 RetrievalEngine, 回退到旧路径。
     """
+    parts: list[str] = []
+
+    # ── 世界状态叙事优先注入（确保排在最前面，不被 rerank 过滤）──
+    try:
+        import sys as _sys
+        _brain_root = r"E:\agents\openkitsune-brain"
+        if _brain_root not in _sys.path:
+            _sys.path.insert(0, _brain_root)
+        from okmem.world_model import get_world_state_cached
+        _db = r"E:\agents\openkitsune-brain\data\okmem\memory.db"
+        _world = get_world_state_cached(_db, user_input=query)
+        if _world and len(_world) > 50:
+            parts.append(_world)
+    except Exception:
+        pass
+
     retrieval_engine = getattr(memory_manager, "retrieval_engine", None)
     if retrieval_engine and query and query.strip():
         try:
             recent = getattr(memory_manager, "_recent_messages", None)
-            return retrieval_engine.retrieve(
+            _retrieved = retrieval_engine.retrieve(
                 query=query,
                 recent_messages=recent,
                 max_tokens=max_tokens,
             )
+            if _retrieved and _retrieved.strip():
+                parts.append(_retrieved)
         except Exception as e:
             logger.warning(f"[Retriever] RetrievalEngine failed, using legacy path: {e}")
 
-    lines: list[str] = []
+    if not parts:
+        lines: list[str] = []
 
-    core_memory = _get_core_memory(memory_manager, max_chars=max_tokens * 2)
-    if core_memory:
-        lines.append("## 核心记忆\n")
-        lines.append(core_memory)
+        core_memory = _get_core_memory(memory_manager, max_chars=max_tokens * 2)
+        if core_memory:
+            lines.append("## 核心记忆\n")
+            lines.append(core_memory)
 
-    if query and query.strip():
-        related, used_vector = _search_related_memories(
-            query=query,
-            memory_manager=memory_manager,
-            max_items=max_items,
-            min_importance=min_importance,
-        )
-        if related:
-            search_type = "语义匹配" if used_vector else "关键词匹配"
-            lines.append(f"\n## 相关记忆（{search_type}）\n")
-            lines.append(related)
+        if query and query.strip():
+            related, used_vector = _search_related_memories(
+                query=query,
+                memory_manager=memory_manager,
+                max_items=max_items,
+                min_importance=min_importance,
+            )
+            if related:
+                search_type = "语义匹配" if used_vector else "关键词匹配"
+                lines.append(f"\n## 相关记忆（{search_type}）\n")
+                lines.append(related)
 
-    result = "\n".join(lines)
-    max_chars = max_tokens * 4
+        result = "\n".join(lines)
+        max_chars = max_tokens * 4
 
-    if len(result) > max_chars:
-        result = result[:max_chars]
-        last_newline = result.rfind("\n")
-        if last_newline > max_chars * 0.8:
-            result = result[:last_newline]
-        result += "\n...(记忆已截断)"
+        if len(result) > max_chars:
+            result = result[:max_chars]
+            last_newline = result.rfind("\n")
+            if last_newline > max_chars * 0.8:
+                result = result[:last_newline]
+            result += "\n...(记忆已截断)"
 
-    return result
+        parts.append(result)
+
+    return "\n\n".join(parts)
 
 
 def _get_core_memory(memory_manager: "MemoryManager", max_chars: int = 800) -> str:

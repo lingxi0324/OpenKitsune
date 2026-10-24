@@ -71,7 +71,7 @@ import {
   IconPin, IconSearch, IconCircleDot, IconXCircle,
   IconBuilding, IconAlertCircle,
   IconHourglass, IconTarget, IconCheckCircle, IconPlug, IconClock, IconBarChart, IconGlobe, IconMail,
-  IconFile, IconFolder, IconFolderOpen, IconRefresh,
+  IconFile, IconFolder, IconFolderOpen, IconRefresh, IconBook,
 } from "../icons";
 
 // ─── Chat module imports ───
@@ -135,6 +135,7 @@ import type {
   SecurityTimeoutDefault,
 } from "./chat/components";
 import type { MessageListHandle } from "./chat/components";
+import { LibraryReaderPanel } from "./chat/components/LibraryReaderPanel";
 
 type SecurityPresentationState = "active" | "queued" | "resolved";
 type SecurityConfirmData = SecurityConfirmModalData & {
@@ -303,7 +304,7 @@ function _applySubAgentStreamEvent(
     next = { ...next, chain: groups };
   };
 
-  const appendProcessText = (content: string, icon?: string) => {
+  const appendProcessText = (content: string, icon?: string, title?: string) => {
     const text = content.trim();
     if (!text) return;
     const created = _withSubAgentGroup(groups);
@@ -312,7 +313,12 @@ function _applySubAgentStreamEvent(
       ...created.current,
       entries: [
         ...created.current.entries,
-        { kind: "text", content: text, ...(icon ? { icon } : {}) },
+        {
+          kind: "text",
+          content: text,
+          ...(icon ? { icon } : {}),
+          ...(title ? { title } : {}),
+        },
       ],
     });
   };
@@ -356,7 +362,11 @@ function _applySubAgentStreamEvent(
       break;
     }
     case "chain_text": {
-      appendProcessText(String(event.content || ""), event.icon ? String(event.icon) : undefined);
+      appendProcessText(
+        String(event.content || ""),
+        event.icon ? String(event.icon) : undefined,
+        typeof event.title === "string" && event.title.trim() ? event.title.trim() : undefined,
+      );
       break;
     }
     case "text_delta": {
@@ -4741,9 +4751,13 @@ export function ChatView({
                 }
                 if (event.content) {
                   const grp: ChainGroup = currentChainGroup;
-                  const entry: ChainEntry = event.icon
-                    ? { kind: "text" as const, content: event.content, icon: event.icon }
-                    : { kind: "text" as const, content: event.content };
+                  const title = typeof event.title === "string" && event.title.trim() ? event.title.trim() : undefined;
+                  const entry: ChainEntry = {
+                    kind: "text" as const,
+                    content: event.content,
+                    ...(event.icon ? { icon: event.icon } : {}),
+                    ...(title ? { title } : {}),
+                  };
                   currentChainGroup = {
                     ...grp,
                     entries: [...grp.entries, entry],
@@ -5331,6 +5345,7 @@ export function ChatView({
                   name: event.name,
                   caption: event.caption,
                   size: event.size,
+                  auto_play: event.auto_play,
                 }];
                 break;
               case "source_used":
@@ -5634,7 +5649,14 @@ export function ChatView({
                     progressEvents: currentProgressEvents.length > 0 ? [...currentProgressEvents] : null,
                     askUser: currentAsk,
                     errorInfo: currentError,
-                    artifacts: currentArtifacts.length > 0 ? [...currentArtifacts] : null,
+                    artifacts: currentArtifacts.length > 0
+                      ? (event.type === "done"
+                          // 流结束提交时剥掉 voice 的自动播放标记：live 到达时已播过一次，
+                          // 提交后的状态 / localStorage 副本不应在切回会话时重放。
+                          ? currentArtifacts.map((a) =>
+                              a.artifact_type === "voice" ? { ...a, auto_play: false } : a)
+                          : [...currentArtifacts])
+                      : null,
                     attachments: currentAttachments.length > 0 ? [...currentAttachments] : null,
                     sources: currentSources.length > 0 ? [...currentSources] : null,
                     mcpCalls: currentMcpCalls.length > 0 ? [...currentMcpCalls] : null,
@@ -7296,6 +7318,9 @@ export function ChatView({
     },
   ), [agentConvs, pinnedConvs, t]);
 
+  // 图书馆读书面板开关
+  const [libraryOpen, setLibraryOpen] = useState(false);
+
   const quickStartItems = useMemo<Array<{
     id: string;
     icon: ReactNode;
@@ -7777,6 +7802,30 @@ export function ChatView({
                 <div className="text-base font-semibold">{t("chat.emptyTitle")}</div>
                 <div className="mt-1 text-sm text-muted-foreground">{t("chat.emptyDesc")}</div>
               </div>
+              {/* 图书馆读书入口 */}
+              <button
+                type="button"
+                onClick={() => setLibraryOpen(true)}
+                className="quickStartCard"
+                style={{
+                  display: "flex", alignItems: "center", gap: 12,
+                  width: "min(680px, 100%)", maxWidth: "100%",
+                  padding: "15px 18px", borderRadius: 14,
+                  border: "1px solid var(--primary)", background: "rgba(14,165,233,0.08)",
+                  cursor: "pointer", textAlign: "left", fontSize: 13,
+                  transition: "border-color 0.15s, background 0.15s",
+                }}
+              >
+                <span style={{ flexShrink: 0, display: "flex", alignItems: "center", color: "var(--primary)" }}>
+                  <IconBook size={22} />
+                </span>
+                <span style={{ color: "var(--text)", lineHeight: 1.4, fontWeight: 600 }}>
+                  {t("chat.libraryOpen", "📚 图书馆 · 阅读典籍")}
+                </span>
+                <span style={{ marginLeft: "auto", fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}>
+                  {t("chat.libraryHint", "丹道 · 医藏 · 玄学 · 道藏")}
+                </span>
+              </button>
               <div className="inline-grid max-w-full grid-cols-1 gap-3 sm:grid-cols-2">
                 {quickStartItems.map((item) => (
                   <button
@@ -8473,6 +8522,23 @@ export function ChatView({
                 </Tooltip>
                 <input ref={fileInputRef} type="file" multiple accept="image/*,video/*,audio/*,.pdf,.txt,.md,.py,.js,.ts,.json,.csv" style={{ display: "none" }} onChange={handleFileSelect} />
 
+                {/* 图书馆读书入口 */}
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      data-slot="toolbar"
+                      type="button"
+                      aria-label={t("chat.library", "图书馆")}
+                      onClick={() => setLibraryOpen(true)}
+                      className="chatInputIconBtn"
+                      title={t("chat.library", "图书馆")}
+                    >
+                      <IconBook size={16} />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" className="text-xs">{t("chat.library", "图书馆")}</TooltipContent>
+                </Tooltip>
+
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <button data-slot="toolbar" type="button" aria-label={isRecording ? t("chat.stopRecording") : t("chat.voice")} onClick={toggleRecording} className={`chatInputIconBtn ${isRecording ? "chatInputIconBtnDanger" : ""}`} style={isRecording ? { animation: "pulse 1.5s ease-in-out infinite" } : undefined}>
@@ -9050,6 +9116,21 @@ export function ChatView({
           </button>
         </div>,
         document.body,
+      )}
+
+      {/* 图书馆读书面板 */}
+      {libraryOpen && (
+        <LibraryReaderPanel
+          open={libraryOpen}
+          onClose={() => setLibraryOpen(false)}
+          apiBaseUrl={apiBaseUrl}
+          messages={messages}
+          activeConvId={activeConvId}
+          onAsk={(prompt) => {
+            // 问题直接汇入工作区当前会话；面板保持打开，回答经 messages 流式回到 AI 伴学列
+            void sendMessage(prompt, activeConvId || undefined);
+          }}
+        />
       )}
     </div>
   );
