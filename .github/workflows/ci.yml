@@ -440,18 +440,25 @@ jobs:
           # Cargo.toml pins a git dependency (tao fork) for a panic guard.
           # Fresh runners without a rust-cache hit must clone it over the
           # network; transient GitHub fetch timeouts have failed macOS jobs.
-          # Retry the whole step a few times to absorb that flake, mirroring
-          # the same approach release-dryrun uses for the release build.
+          # Retry the whole step a few times to absorb that flake, and emit
+          # ::error:: lines so the failure tail lands in check annotations
+          # (job logs are not otherwise readable from outside).
           attempt=0
           while [ "$attempt" -lt 3 ]; do
             attempt=$((attempt + 1))
-            if "$CARGO_BIN/cargo" check && "$CARGO_BIN/cargo" test --all-targets; then
-              exit 0
-            fi
-            echo "cargo check/test attempt $attempt failed; retrying in 10s"
+            check_out="$("$CARGO_BIN/cargo" check 2>&1)" && {
+              test_out="$("$CARGO_BIN/cargo" test --all-targets 2>&1)" && exit 0 || {
+                echo "::error::cargo test --all-targets failed (attempt $attempt)"
+                printf '%s\n' "$test_out" | tail -60 | sed 's/^/::error::/'
+              }
+            } || {
+              echo "::error::cargo check failed (attempt $attempt)"
+              printf '%s\n' "$check_out" | tail -60 | sed 's/^/::error::/'
+            }
+            echo "retrying in 10s"
             sleep 10
           done
-          echo "cargo check/test failed after 3 attempts"
+          echo "::error::cargo check/test failed after 3 attempts"
           exit 1
 
       - name: Skip Rust check (project not present)
