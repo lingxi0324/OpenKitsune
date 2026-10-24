@@ -436,7 +436,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+          # Resolve cargo through PATH: rustup installs to $HOME/.cargo/bin on
+          # ubuntu/windows, but macOS runners carry a Homebrew Rust and
+          # rustup may not populate $HOME/.cargo there. The "Prefer rustup
+          # Cargo on PATH" step above puts the rustup bin dir first when it
+          # exists, so PATH resolution prefers rustup and falls back to
+          # Homebrew, which matches what tauri_full_build_check uses.
+          CARGO="$(command -v cargo || true)"
+          if [ -z "$CARGO" ]; then
+            echo "::error::cargo not found on PATH (CARGO_HOME=${CARGO_HOME:-unset}, HOME=$HOME)"
+            exit 1
+          fi
           # Cargo.toml pins a git dependency (tao fork) for a panic guard.
           # Fresh runners without a rust-cache hit must clone it over the
           # network; transient GitHub fetch timeouts have failed macOS jobs.
@@ -446,8 +456,8 @@ jobs:
           attempt=0
           while [ "$attempt" -lt 3 ]; do
             attempt=$((attempt + 1))
-            check_out="$("$CARGO_BIN/cargo" check 2>&1)" && {
-              test_out="$("$CARGO_BIN/cargo" test --all-targets 2>&1)" && exit 0 || {
+            check_out="$("$CARGO" check 2>&1)" && {
+              test_out="$("$CARGO" test --all-targets 2>&1)" && exit 0 || {
                 echo "::error::cargo test --all-targets failed (attempt $attempt)"
                 printf '%s\n' "$test_out" | tail -60 | sed 's/^/::error::/'
               }
