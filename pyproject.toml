@@ -239,10 +239,13 @@ finance-auto = [
 ]
 
 # 开发依赖
+# NOTE: pytest>=9 + pytest-asyncio>=1.4 is the combination verified on
+# Windows (full suite green). Older pytest-asyncio 0.2x on Windows
+# ProactorEventLoop fails with "Event loop is closed" across the suite.
 dev = [
-    "pytest>=8.0.0,<9",
-    "pytest-asyncio>=0.23.0,<1",
-    "pytest-cov>=4.1.0",
+    "pytest>=9.0.0,<10",
+    "pytest-asyncio>=1.4.0,<2",
+    "pytest-cov>=6.0.0",
     "ruff>=0.1.9",
     "mypy>=1.8.0",
     "pyright>=1.1.0",
