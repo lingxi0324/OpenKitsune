@@ -462,3 +462,6 @@ temp/
 .data/
 .tools-tmp/
 
+
+# Local knowledge base data (not code, don't commit)
+knowledge/
