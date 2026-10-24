@@ -19,8 +19,19 @@ import sys
 
 import pytest
 
-from openkitsune.tools.desktop import state as desktop_state
-from openkitsune.api.routes import desktop as desktop_routes
+# 桌面自动化模块是 Windows-only 且需要 pyautogui/mss 等非 dev 依赖：
+# CI（ubuntu/macos runner、以及未装 desktop extras 的 windows runner）上
+# 顶层 import 会抛 ImportError，必须显式跳过而不是让 collection 失败。
+desktop_state = pytest.importorskip(
+    "openkitsune.tools.desktop.state",
+    reason="desktop automation is Windows-only and needs pyautogui/mss (desktop extras)",
+    exc_type=ImportError,
+)
+desktop_routes = pytest.importorskip(
+    "openkitsune.api.routes.desktop",
+    reason="desktop API routes depend on the Windows desktop module",
+    exc_type=ImportError,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,13 @@ pytestmark = pytest.mark.skipif(
     sys.platform != "win32", reason="desktop automation is Windows-only"
 )
 
+# CI 只装 [dev] extras：Windows runner 上也跳过（缺少 mss/pyautogui 等）。
+pytest.importorskip(
+    "openkitsune.tools.desktop",
+    reason="desktop automation requires Windows + desktop extras (mss/pyautogui/pywinauto)",
+    exc_type=ImportError,
+)
+
 
 def _state_payload() -> dict:
     return {

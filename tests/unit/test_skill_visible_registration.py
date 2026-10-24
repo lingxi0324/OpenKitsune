@@ -118,8 +118,26 @@ def test_intent_catalog_injects_xuanxue_skills(query: str, expected: set[str]):
 # ── 3. 桌面工具全局定义面注册 ───────────────────────────────────
 
 
+def _desktop_runtime_available() -> bool:
+    """desktop 运行时依赖（mss/pyautogui/pywinauto，desktop extras）是否可用。
+
+    CI 只装 [dev] extras，Windows runner 上也没有这些依赖；此时
+    BASE_TOOLS 不含 desktop_* 工具，相关断言应跳过而不是失败。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import openkitsune.tools.desktop  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="desktop tools are Windows-only")
 def test_desktop_tools_registered_in_base_tools():
+    if not _desktop_runtime_available():
+        pytest.skip("desktop tools require desktop extras (mss/pyautogui/pywinauto)")
     from openkitsune.tools.definitions import (
         BASE_TOOLS,
         _TOOL_DEFINITIONS_BY_NAME,
@@ -155,6 +173,8 @@ def test_desktop_tools_registered_in_base_tools():
 
 @pytest.mark.skipif(sys.platform != "win32", reason="desktop tools are Windows-only")
 def test_desktop_tools_in_catalog_prompt():
+    if not _desktop_runtime_available():
+        pytest.skip("desktop tools require desktop extras (mss/pyautogui/pywinauto)")
     from openkitsune.tools.catalog import ToolCatalog
     from openkitsune.tools.definitions import BASE_TOOLS
 
@@ -168,7 +188,14 @@ def test_desktop_tool_definition_source_matches_runtime():
     """definitions 与运行时 schema 同源：Windows 上两者必须是同一份列表。"""
     if sys.platform != "win32":
         pytest.skip("desktop tools are Windows-only")
+    if not _desktop_runtime_available():
+        pytest.skip("desktop tools require desktop extras (mss/pyautogui/pywinauto)")
     from openkitsune.tools.definitions import DESKTOP_TOOLS as DEF_DESKTOP
-    from openkitsune.tools.desktop.tools import DESKTOP_TOOLS as RUNTIME_DESKTOP
 
-    assert DEF_DESKTOP is RUNTIME_DESKTOP
+    runtime_tools = pytest.importorskip(
+        "openkitsune.tools.desktop.tools",
+        reason="desktop tools require Windows + desktop extras",
+        exc_type=ImportError,
+    )
+
+    assert DEF_DESKTOP is runtime_tools.DESKTOP_TOOLS
