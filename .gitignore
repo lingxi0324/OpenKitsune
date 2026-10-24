@@ -204,6 +204,8 @@ smart_classify.py
 analyze_*.py
 check_*.py
 verify_*.py
+# CI/release workflows execute this verifier, so it must stay tracked.
+!scripts/verify_linux_deb.py
 
 # Chrome history scripts (temporary)
 read_chrome_history.py
