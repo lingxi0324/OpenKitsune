@@ -3069,32 +3069,6 @@ async def chat(request: Request, body: ChatRequest):
     - done (with optional usage payload)
     """
     import uuid as _uuid
-    print(f"[CHAT ROUTE DEBUG] chat endpoint called, message={body.message[:30]!r}", flush=True)
-
-    # ── 参考 xiaozhi：每轮对话自动查询记忆，注入上下文 ──
-    try:
-        import sys as _sys
-        _brain_root = r"E:\agents\openkitsune-brain"
-        if _brain_root not in _sys.path:
-            _sys.path.insert(0, _brain_root)
-        from okmem.world_model import get_world_state_cached
-        _db = r"E:\agents\openkitsune-brain\data\okmem\memory.db"
-        _world = get_world_state_cached(_db, user_input=body.message)
-
-        # 推理预处理：问题类型打分 → 协同编排（代码驱动，不是靠 prompt 自觉）
-        _reasoning_prompt = _build_reasoning_injection(body.message or "")
-
-        # 写到文件确认执行
-        with open(r"D:\ai\OpenKitsune-main\tools-tmp\world_state_injected.txt", "w", encoding="utf-8") as _f:
-            _f.write(f"time: {time.strftime('%H:%M:%S')}\n")
-            _f.write(f"message: {body.message[:50]}\n")
-            _f.write(f"world_state length: {len(_world)} chars\n")
-            _f.write(f"reasoning_prompt length: {len(_reasoning_prompt)} chars\n")
-            if _reasoning_prompt:
-                _f.write(f"reasoning_prompt preview:\n{_reasoning_prompt[:400]}\n")
-    except Exception as _e:
-        with open(r"D:\ai\OpenKitsune-main\tools-tmp\world_state_inject_error.txt", "w", encoding="utf-8") as _f:
-            _f.write(f"error: {type(_e).__name__}: {_e}\n")
 
     _route_started_at = time.perf_counter()
     _http_started_at = getattr(request.state, "chat_http_started_at", _route_started_at)
