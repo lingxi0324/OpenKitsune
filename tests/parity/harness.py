@@ -35,6 +35,15 @@ class ParityCase:
         return self.label or self.id
 
 
+#: Keys injected by ``runners._dispatch`` to prove the two import paths
+#: resolve to real source files. They are diagnostics, not behaviour: whether
+#: ``v2_file`` is present depends on import order (the v1 run happens before
+#: ``v2`` has imported its module), so including them in the comparison makes
+#: parity order-dependent. They stay available to ``assert_parity`` for the
+#: facade-self-equivalence check.
+FILE_METADATA_KEYS: frozenset[str] = frozenset({'v1_file', 'v2_file'})
+
+
 @dataclass
 class ParityResult:
     """Normalised execution output that can be compared verbatim."""
@@ -45,7 +54,8 @@ class ParityResult:
     extras: dict[str, Any] = field(default_factory=dict)
 
     def to_compare(self, ignore: Iterable[str] = ()) -> dict[str, Any]:
-        ignored = set(ignore)
+        # `v1_file` / `v2_file` are harness diagnostics, never behaviour.
+        ignored = set(ignore) | set(FILE_METADATA_KEYS)
         data: dict[str, Any] = {
             'final_message': self.final_message,
             'success': self.success,
