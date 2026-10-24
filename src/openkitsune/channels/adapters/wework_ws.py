@@ -703,7 +703,12 @@ class WeWorkWsAdapter(ChannelAdapter):
             self._connection_task.cancel()
             try:
                 await asyncio.wait_for(self._connection_task, timeout=force_close_after_s)
-            except (asyncio.CancelledError, TimeoutError):
+            except asyncio.CancelledError:
+                # Cooperative cancel finished the task. `wait_for` surfaces the
+                # inner CancelledError the same way it surfaces our own cancel,
+                # so this is the normal shutdown path, not a stuck handshake.
+                pass
+            except TimeoutError:
                 logger.warning(
                     "[WeWork WS] _connection_task did not finish within %.1fs, "
                     "abandoning (was likely stuck in ws.close handshake)",

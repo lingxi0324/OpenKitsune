@@ -15,6 +15,7 @@
 import asyncio
 import base64
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,7 +34,6 @@ from openkitsune.channels.adapters.wework_ws import (
     _generate_req_id,
 )
 from openkitsune.channels.types import MediaFile, OutgoingMessage
-
 
 # ==================== Fixtures ====================
 
@@ -990,6 +990,12 @@ class TestPendingAckRejection:
             adapter._reject_all_pending("test reason")
             assert fut1.done()
             assert fut2.done()
+            # Consume the injected errors: an unretrieved future exception makes
+            # asyncio log "Future exception was never retrieved" when the loop
+            # closes, which pollutes the test run with false ERROR lines.
+            for fut in (fut1, fut2):
+                with pytest.raises(ConnectionError, match="test reason"):
+                    fut.result()
             assert len(adapter._pending_acks) == 0
             assert len(adapter._reply_locks) == 0
             assert len(adapter._pre_streams) == 0
@@ -1018,15 +1024,23 @@ class TestAdapterProperties:
 
 class TestLifecycle:
     @pytest.mark.asyncio
-    async def test_stop_cleans_up(self, connected_adapter):
+    async def test_stop_cleans_up(self, connected_adapter, caplog):
         adapter = connected_adapter
         adapter._connection_task = asyncio.create_task(asyncio.sleep(999))
         adapter._heartbeat_task = asyncio.create_task(asyncio.sleep(999))
 
         loop = asyncio.get_event_loop()
-        adapter._pending_acks["test"] = loop.create_future()
+        pending = loop.create_future()
+        adapter._pending_acks["test"] = pending
 
-        await adapter.stop()
+        with caplog.at_level(logging.WARNING, logger="openkitsune.channels.adapters.wework_ws"):
+            await adapter.stop()
+        # A cancelled connection task is the normal shutdown path; it must not
+        # be reported as a stuck close handshake.
+        assert "did not finish within" not in caplog.text
+        # Consume the rejection so asyncio does not log it as unretrieved.
+        with pytest.raises(ConnectionError, match="adapter stopped"):
+            pending.result()
         assert adapter._running is False
         assert adapter._ws is None
         assert len(adapter._pending_acks) == 0
